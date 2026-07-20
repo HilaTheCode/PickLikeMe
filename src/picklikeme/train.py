@@ -30,16 +30,33 @@ class ImageTensorDataset(Dataset):
         return image_tensor, target
 
 
-def train(config: ProjectConfig, loader, dataset=None) -> PreferenceHead:
+def train(
+    config: ProjectConfig,
+    loader,
+    dataset=None,
+    checkpoint_path: str | Path | None = None,
+    resume: bool = False,
+) -> PreferenceHead:
     if dataset is None:
         dataset = LabelDataset(config.labels_path, config.raw_root)
     data_loader = DataLoader(ImageTensorDataset(dataset, loader), batch_size=config.batch_size, shuffle=True)
 
     print(f"Starting training with {len(dataset)} relevant images")
     print(f"Loaded {len(dataset)} images from the accepted/rejected roots")
+
     model = PreferenceHead()
     optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
     criterion = nn.MSELoss()
+
+    if checkpoint_path is not None:
+        checkpoint_path = Path(checkpoint_path)
+        if resume and checkpoint_path.exists():
+            print(f"Resuming from checkpoint {checkpoint_path}")
+            checkpoint = torch.load(checkpoint_path, map_location=config.device)
+            model.load_state_dict(checkpoint["model_state_dict"])
+            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        elif not resume and checkpoint_path.exists():
+            print(f"Overwriting existing checkpoint at {checkpoint_path}")
 
     model.train()
     for epoch in range(config.epochs):
@@ -53,6 +70,17 @@ def train(config: ProjectConfig, loader, dataset=None) -> PreferenceHead:
             optimizer.step()
             processed_batches += 1
             print(f"  processed batch {processed_batches} (loss={loss.item():.4f})")
+
+    if checkpoint_path is not None:
+        checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(
+            {
+                "model_state_dict": model.state_dict(),
+                "optimizer_state_dict": optimizer.state_dict(),
+            },
+            checkpoint_path,
+        )
+        print(f"Saved checkpoint to {checkpoint_path}")
 
     return model
 
@@ -128,6 +156,9 @@ def main() -> None:
     parser.add_argument("--reject-root", default=None)
     parser.add_argument("--output-csv", default="training_results.csv")
     parser.add_argument("--max-rows", type=int, default=1000)
+    parser.add_argument("--checkpoint-path", default="model_checkpoint.pt")
+    parser.add_argument("--resume", action="store_true", help="Resume from the existing checkpoint if present")
+    parser.add_argument("--fresh-start", action="store_true", help="Start training from scratch instead of resuming")
     args = parser.parse_args()
 
     if not args.select_root or not args.reject_root:
@@ -139,7 +170,8 @@ def main() -> None:
 
     loader = RawImageLoader(config.raw_root)
     dataset = FolderLabelDataset(select_root=args.select_root, reject_root=args.reject_root, raw_root=raw_root)
-    model = train(config, loader, dataset=dataset)
+    should_resume = args.resume or (not args.fresh_start and Path(args.checkpoint_path).exists())
+    model = train(config, loader, dataset=dataset, checkpoint_path=args.checkpoint_path, resume=should_resume)
     ranked = rank_dataset(model, dataset, loader, device="cpu")
     print(f"Detected sequences: {dataset.count_sequences()}")
     output_paths = write_results_csv(args.output_csv, dataset, ranked, args.select_root, args.reject_root, max_rows=args.max_rows)
