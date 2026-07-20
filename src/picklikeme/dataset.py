@@ -56,3 +56,14 @@ class FolderLabelDataset:
 
     def __getitem__(self, index: int) -> ImageLabel:
         return self.items[index]
+
+    def count_sequences(self) -> int:
+        seen: set[str] = set()
+        for item in self.items:
+            path = Path(item.image_path)
+            parts = path.parts
+            if len(parts) >= 2:
+                seen.add("/".join(parts[-2:-1]))
+            else:
+                seen.add(path.parent.name)
+        return len(seen)
