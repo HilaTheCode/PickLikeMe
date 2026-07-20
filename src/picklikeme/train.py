@@ -9,7 +9,7 @@ from torch import nn
 from torch.utils.data import DataLoader, Dataset
 
 from .config import ProjectConfig
-from .dataset import LabelDataset
+from .dataset import FolderLabelDataset, LabelDataset
 from .model import PreferenceHead
 
 
@@ -29,8 +29,9 @@ class ImageTensorDataset(Dataset):
         return image_tensor, target
 
 
-def train(config: ProjectConfig, loader) -> PreferenceHead:
-    dataset = LabelDataset(config.labels_path, config.raw_root)
+def train(config: ProjectConfig, loader, dataset=None) -> PreferenceHead:
+    if dataset is None:
+        dataset = LabelDataset(config.labels_path, config.raw_root)
     data_loader = DataLoader(ImageTensorDataset(dataset, loader), batch_size=config.batch_size, shuffle=True)
 
     model = PreferenceHead()
@@ -49,7 +50,7 @@ def train(config: ProjectConfig, loader) -> PreferenceHead:
     return model
 
 
-def rank_dataset(model: nn.Module, dataset: LabelDataset, loader, device: str = "cpu") -> list[tuple[str, float]]:
+def rank_dataset(model: nn.Module, dataset, loader, device: str = "cpu") -> list[tuple[str, float]]:
     model.eval()
     scored: list[tuple[str, float]] = []
     with torch.no_grad():
@@ -67,16 +68,22 @@ def rank_dataset(model: nn.Module, dataset: LabelDataset, loader, device: str = 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train a personal preference model")
-    parser.add_argument("--raw-root", default="data/raw")
+    parser.add_argument("--raw-root", default=None)
     parser.add_argument("--labels", default="data/labels.csv")
+    parser.add_argument("--select-root", default=None)
+    parser.add_argument("--reject-root", default=None)
     args = parser.parse_args()
 
-    config = ProjectConfig(raw_root=args.raw_root, labels_path=args.labels)
+    if not args.select_root or not args.reject_root:
+        raise SystemExit("Both --select-root and --reject-root are required.")
+
+    raw_root = args.raw_root or args.select_root
+    config = ProjectConfig(raw_root=raw_root, labels_path=args.labels)
     from .raw_io import RawImageLoader
 
     loader = RawImageLoader(config.raw_root)
-    model = train(config, loader)
-    dataset = LabelDataset(config.labels_path, config.raw_root)
+    dataset = FolderLabelDataset(select_root=args.select_root, reject_root=args.reject_root, raw_root=raw_root)
+    model = train(config, loader, dataset=dataset)
     ranked = rank_dataset(model, dataset, loader, device="cpu")
     print("Top-ranked images:")
     for image_name, score in ranked[:10]:
