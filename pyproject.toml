@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pick-likeme"
+version = "0.1.0"
+description = "A personal wildlife photo selection model trained on historical keep/reject decisions"
+requires-python = ">=3.10"
+dependencies = [
+  "torch",
+  "torchvision",
+  "rawpy",
+  "opencv-python",
+  "albumentations",
+  "pandas",
+  "scikit-learn",
+  "timm",
+  "matplotlib",
+  "pyarrow",
+  "tqdm"
+]
+
+[project.scripts]
+picklikeme = "picklikeme.ingest.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

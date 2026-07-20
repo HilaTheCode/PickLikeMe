@@ -1,0 +1,2 @@
+[console_scripts]
+picklikeme = picklikeme.ingest.cli:main
