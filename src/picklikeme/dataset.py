@@ -15,9 +15,18 @@ class ImageLabel:
     preference: float = 0.0
 
 
+def load_table(table_path: str | Path) -> pd.DataFrame:
+    """Load a manifest-shaped table; the parquet manifest is the canonical
+    source, CSV is accepted for small fixtures and ad-hoc inputs."""
+    table_path = Path(table_path)
+    if table_path.suffix.lower() == ".parquet":
+        return pd.read_parquet(table_path)
+    return pd.read_csv(table_path)
+
+
 class PathSuffixIndex:
     """Resolve per-image values (burst_id, split, ...) for absolute paths by
-    matching against the relative paths stored in a manifest-derived CSV.
+    matching against the relative paths stored in the manifest or split table.
 
     Filename-only joins are unsafe here: camera file counters reset across
     card reformats, so the same basename recurs across shoots in a multi-year
@@ -30,9 +39,9 @@ class PathSuffixIndex:
         self._by_name: dict[str, list[tuple[tuple[str, ...], str]]] = {}
 
     @classmethod
-    def from_csv(cls, csv_path: str | Path, value_column: str) -> "PathSuffixIndex":
+    def from_table(cls, table_path: str | Path, value_column: str) -> "PathSuffixIndex":
         index = cls()
-        frame = pd.read_csv(csv_path)
+        frame = load_table(table_path)
         for row in frame.itertuples(index=False):
             value = getattr(row, value_column, None)
             if value is None or (isinstance(value, float) and pd.isna(value)):
@@ -58,21 +67,23 @@ class PathSuffixIndex:
 
 
 class LabelDataset:
-    def __init__(self, labels_path: str, raw_root: str):
-        self.labels_path = Path(labels_path)
+    def __init__(self, manifest_path: str, raw_root: str):
+        self.manifest_path = Path(manifest_path)
         self.raw_root = Path(raw_root)
-        self.frame = pd.read_csv(self.labels_path)
+        self.frame = load_table(self.manifest_path)
 
     def __len__(self) -> int:
         return len(self.frame)
 
     def __getitem__(self, index: int) -> ImageLabel:
         row = self.frame.iloc[index]
+        burst = row.get("burst_id", None)
+        preference = row.get("preference", 0.0)
         return ImageLabel(
             image_path=str(self.raw_root / row["image_path"]),
             label=int(row["label"]),
-            burst_id=str(row.get("burst_id", "")) or None,
-            preference=float(row.get("preference", 0.0)),
+            burst_id=None if burst is None or pd.isna(burst) or str(burst) == "" else str(burst),
+            preference=0.0 if preference is None or pd.isna(preference) else float(preference),
         )
 
 
@@ -82,7 +93,7 @@ class FolderLabelDataset:
         select_root: str,
         reject_root: str,
         raw_root: str,
-        burst_labels_path: Optional[str] = None,
+        manifest_path: Optional[str] = None,
     ):
         self.select_root = Path(select_root).resolve()
         self.reject_root = Path(reject_root).resolve()
@@ -90,8 +101,8 @@ class FolderLabelDataset:
         self.items: list[ImageLabel] = []
 
         burst_index = (
-            PathSuffixIndex.from_csv(burst_labels_path, "burst_id")
-            if burst_labels_path is not None
+            PathSuffixIndex.from_table(manifest_path, "burst_id")
+            if manifest_path is not None
             else None
         )
 

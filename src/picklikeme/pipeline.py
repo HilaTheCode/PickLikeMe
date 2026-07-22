@@ -7,7 +7,7 @@ from .dataset import LabelDataset
 
 
 def build_dataset(config: ProjectConfig) -> LabelDataset:
-    return LabelDataset(labels_path=config.labels_path, raw_root=config.raw_root)
+    return LabelDataset(manifest_path=config.manifest_path, raw_root=config.raw_root)
 
 
 def ensure_data_dirs(config: ProjectConfig) -> None:

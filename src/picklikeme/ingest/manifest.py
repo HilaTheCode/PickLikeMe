@@ -131,9 +131,6 @@ def build_manifest(
     return manifest, issues
 
 
-def save_manifest(manifest: pd.DataFrame, manifest_path: Path, labels_csv_path: Path | None = None) -> None:
+def save_manifest(manifest: pd.DataFrame, manifest_path: Path) -> None:
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
     manifest.to_parquet(manifest_path, index=False)
-    if labels_csv_path is not None:
-        labels_csv_path.parent.mkdir(parents=True, exist_ok=True)
-        manifest[["image_path", "label", "burst_id"]].to_csv(labels_csv_path, index=False)

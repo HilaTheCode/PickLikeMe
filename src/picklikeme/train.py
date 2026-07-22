@@ -70,7 +70,7 @@ def train(
     checkpoint_interval: timedelta | None = None,
 ) -> PreferenceHead:
     if dataset is None:
-        dataset = LabelDataset(config.labels_path, config.raw_root)
+        dataset = LabelDataset(config.manifest_path, config.raw_root)
     data_loader = DataLoader(ImageTensorDataset(dataset, loader), batch_size=config.batch_size, shuffle=True)
 
     timestamp = datetime.now().strftime("%H:%M:%S")
@@ -215,7 +215,7 @@ def write_results_csv(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train a personal preference model")
     parser.add_argument("--raw-root", default=None)
-    parser.add_argument("--labels", default="data/labels.csv")
+    parser.add_argument("--manifest", default="data/manifest.parquet", help="Manifest parquet (from picklikeme.ingest.cli build-manifest); supplies burst IDs")
     parser.add_argument("--select-root", default=None)
     parser.add_argument("--reject-root", default=None)
     parser.add_argument("--output-csv", default="training_results.csv")
@@ -235,23 +235,23 @@ def main() -> None:
         raise SystemExit("Both --select-root and --reject-root are required.")
 
     raw_root = args.raw_root or args.select_root
-    config = ProjectConfig(raw_root=raw_root, labels_path=args.labels)
+    config = ProjectConfig(raw_root=raw_root, manifest_path=args.manifest)
     from .raw_io import RawImageLoader
 
     loader = RawImageLoader(config.raw_root, resize_mode=args.resize_mode)
-    burst_labels_path = args.labels if Path(args.labels).exists() else None
-    if burst_labels_path is None:
-        print(f"Labels CSV not found at {args.labels}; burst IDs will be unavailable (burst metrics need them)")
+    manifest_path = args.manifest if Path(args.manifest).exists() else None
+    if manifest_path is None:
+        print(f"Manifest not found at {args.manifest}; burst IDs will be unavailable (burst metrics need them)")
     dataset = FolderLabelDataset(
         select_root=args.select_root,
         reject_root=args.reject_root,
         raw_root=raw_root,
-        burst_labels_path=burst_labels_path,
+        manifest_path=manifest_path,
     )
 
     test_items = []
     if args.split:
-        split_index = PathSuffixIndex.from_csv(args.split, "split")
+        split_index = PathSuffixIndex.from_table(args.split, "split")
         all_items = list(dataset.items)
         test_items = [item for item in all_items if split_index.get(item.image_path) == "test"]
         dataset.items = [item for item in all_items if split_index.get(item.image_path) != "test"]

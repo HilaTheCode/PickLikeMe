@@ -5,7 +5,7 @@ from dataclasses import dataclass
 class ProjectConfig:
     data_root: str = "data"
     raw_root: str = "data/raw"
-    labels_path: str = "data/labels.csv"
+    manifest_path: str = "data/manifest.parquet"
     batch_size: int = 16
     image_size: int = 384
     num_workers: int = 4

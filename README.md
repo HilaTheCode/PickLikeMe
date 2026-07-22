@@ -20,13 +20,17 @@ pip install -r requirements.txt
 ### 2. Build a manifest from a Select/Reject folder pair
 
 ```bash
-python -m picklikeme.ingest.cli build-manifest --select-root "C:\\path\\to\\select" --reject-root "C:\\path\\to\\reject" --manifest-path data/manifest.parquet --labels-csv data/labels.csv
+python -m picklikeme.ingest.cli build-manifest --select-root "C:\\path\\to\\select" --reject-root "C:\\path\\to\\reject" --manifest-path data/manifest.parquet
 ```
+
+`data/manifest.parquet` (image_path, label, burst_id, capture metadata, ...) is
+the single source of truth for labels and burst membership; there is no
+separate labels CSV to keep in sync with it.
 
 ### 3. Create the frozen evaluation split (once)
 
 ```bash
-python -m picklikeme.split --labels data/labels.csv --output data/split.csv
+python -m picklikeme.split --manifest data/manifest.parquet --output data/split.csv
 ```
 
 The split is assigned per burst (never per image) and is frozen: every model
@@ -36,7 +40,7 @@ The command refuses to overwrite an existing split unless `--force` is given.
 ### 4. Train the model
 
 ```bash
-python -m picklikeme.train --select-root "C:\\path\\to\\select" --reject-root "C:\\path\\to\\reject" --labels data/labels.csv --split data/split.csv
+python -m picklikeme.train --select-root "C:\\path\\to\\select" --reject-root "C:\\path\\to\\reject" --manifest data/manifest.parquet --split data/split.csv
 ```
 
 With `--split`, training uses only train-split images and afterwards reports the

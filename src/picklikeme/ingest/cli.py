@@ -51,9 +51,8 @@ def _build_manifest_command(args: argparse.Namespace) -> None:
                 for path in [img.path.resolve()]
             ]
         )
-        save_manifest(manifest, manifest_path, Path(args.labels_csv))
+        save_manifest(manifest, manifest_path)
         print(f"Manifest written to {manifest_path}")
-        print(f"Labels CSV written to {args.labels_csv}")
         print()
         print(summarize(manifest, issues))
         return
@@ -69,9 +68,8 @@ def _build_manifest_command(args: argparse.Namespace) -> None:
     except ExifToolNotFoundError as exc:
         raise SystemExit(str(exc)) from exc
 
-    save_manifest(manifest, manifest_path, Path(args.labels_csv))
+    save_manifest(manifest, manifest_path)
     print(f"Manifest written to {manifest_path}")
-    print(f"Labels CSV written to {args.labels_csv}")
     print()
     print(summarize(manifest, issues))
 
@@ -109,7 +107,6 @@ def main(argv: list[str] | None = None) -> None:
     build_parser.add_argument("--select-root", help="Full path to a Select/Keep root folder to scan recursively")
     build_parser.add_argument("--reject-root", help="Full path to a Reject root folder to scan recursively")
     build_parser.add_argument("--manifest-path", default="data/manifest.parquet")
-    build_parser.add_argument("--labels-csv", default="data/labels.csv")
     build_parser.add_argument("--exiftool-path", default="exiftool")
     build_parser.add_argument("--gap-seconds", type=float, default=1.5, help="Max gap between frames in the same burst")
     build_parser.set_defaults(func=_build_manifest_command)

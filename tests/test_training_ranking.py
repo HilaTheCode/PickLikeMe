@@ -26,8 +26,8 @@ class DummyLoader:
 class RankingTests(unittest.TestCase):
     def test_rank_dataset_returns_sorted_predictions(self):
         with tempfile.TemporaryDirectory() as tmpdir:
-            labels_path = Path(tmpdir) / "labels.csv"
-            labels_path.write_text(
+            manifest_path = Path(tmpdir) / "manifest.csv"
+            manifest_path.write_text(
                 "image_path,label,burst_id,preference\n"
                 "img1.jpg,1,b1,2\n"
                 "img2.jpg,0,b1,1\n"
@@ -35,7 +35,7 @@ class RankingTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            dataset = LabelDataset(str(labels_path), str(tmpdir))
+            dataset = LabelDataset(str(manifest_path), str(tmpdir))
             ranked = rank_dataset(DummyModel(), dataset, DummyLoader(), device="cpu")
 
             self.assertEqual(ranked[0][0], "img1.jpg")

@@ -24,7 +24,7 @@ class FolderLabelDatasetTests(unittest.TestCase):
             self.assertEqual(dataset[0].label, 1)
             self.assertEqual(dataset[1].label, 0)
 
-    def test_burst_ids_resolved_from_labels_csv(self):
+    def test_burst_ids_resolved_from_manifest(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             select_root = root / "accepted"
@@ -34,8 +34,8 @@ class FolderLabelDatasetTests(unittest.TestCase):
             (select_root / "nested" / "keep.arw").write_bytes(b"keep")
             (reject_root / "nested" / "drop.nef").write_bytes(b"drop")
 
-            labels_csv = root / "labels.csv"
-            labels_csv.write_text(
+            manifest_csv = root / "manifest.csv"
+            manifest_csv.write_text(
                 "image_path,label,burst_id\n"
                 "nested/keep.arw,1,burst-01\n"
                 "nested/drop.nef,0,burst-01\n",
@@ -46,7 +46,7 @@ class FolderLabelDatasetTests(unittest.TestCase):
                 select_root=str(select_root),
                 reject_root=str(reject_root),
                 raw_root=str(root),
-                burst_labels_path=str(labels_csv),
+                manifest_path=str(manifest_csv),
             )
             self.assertEqual(dataset[0].burst_id, "burst-01")
             self.assertEqual(dataset[1].burst_id, "burst-01")
