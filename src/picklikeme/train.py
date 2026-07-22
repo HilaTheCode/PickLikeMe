@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import numpy as np
@@ -30,19 +32,49 @@ class ImageTensorDataset(Dataset):
         return image_tensor, target
 
 
+def save_checkpoint(model: nn.Module, optimizer, checkpoint_path: str | Path, epoch: int | None = None) -> None:
+    checkpoint_path = Path(checkpoint_path)
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "epoch": epoch,
+    }
+    torch.save(payload, checkpoint_path)
+
+
+def write_progress_state(status_path: str | Path, epoch: int, total_epochs: int, batch: int, total_batches: int | None, loss: float | None, message: str) -> None:
+    status_path = Path(status_path)
+    status_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "epoch": epoch,
+        "total_epochs": total_epochs,
+        "batch": batch,
+        "total_batches": total_batches,
+        "loss": loss,
+        "message": message,
+        "updated_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    status_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
 def train(
     config: ProjectConfig,
     loader,
     dataset=None,
     checkpoint_path: str | Path | None = None,
     resume: bool = False,
+    status_path: str | Path | None = None,
+    status_interval: timedelta | None = None,
+    checkpoint_interval: timedelta | None = None,
 ) -> PreferenceHead:
     if dataset is None:
         dataset = LabelDataset(config.labels_path, config.raw_root)
     data_loader = DataLoader(ImageTensorDataset(dataset, loader), batch_size=config.batch_size, shuffle=True)
 
-    print(f"Starting training with {len(dataset)} relevant images")
-    print(f"Loaded {len(dataset)} images from the accepted/rejected roots")
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    print(f"[{timestamp}] Starting training with {len(dataset)} relevant images")
+    print(f"[{timestamp}] Loaded {len(dataset)} images from the accepted/rejected roots")
 
     model = PreferenceHead()
     optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
@@ -58,9 +90,13 @@ def train(
         elif not resume and checkpoint_path.exists():
             print(f"Overwriting existing checkpoint at {checkpoint_path}")
 
+    total_batches = len(data_loader)
+    last_status_write = datetime.now()
+    last_checkpoint_write = datetime.now()
     model.train()
     for epoch in range(config.epochs):
-        print(f"Starting epoch {epoch + 1}/{config.epochs}")
+        current_epoch = epoch + 1
+        print(f"Starting epoch {current_epoch}/{config.epochs} (progress: {current_epoch}/{config.epochs})")
         processed_batches = 0
         for batch_idx, (images, labels) in enumerate(data_loader):
             optimizer.zero_grad()
@@ -69,7 +105,34 @@ def train(
             loss.backward()
             optimizer.step()
             processed_batches += 1
-            print(f"  processed batch {processed_batches} (loss={loss.item():.4f})")
+            now = datetime.now()
+            if status_path is not None and status_interval is not None and now - last_status_write >= status_interval:
+                write_progress_state(
+                    status_path,
+                    current_epoch,
+                    config.epochs,
+                    processed_batches,
+                    total_batches,
+                    float(loss.item()),
+                    f"processed batch {processed_batches}",
+                )
+                last_status_write = now
+            if checkpoint_path is not None and checkpoint_interval is not None and now - last_checkpoint_write >= checkpoint_interval:
+                save_checkpoint(model, optimizer, checkpoint_path, epoch=current_epoch)
+                print(f"[{now.strftime('%H:%M:%S')}] Saved checkpoint to {checkpoint_path}")
+                last_checkpoint_write = now
+            print(f"[{datetime.now().strftime('%H:%M:%S')}]   processed batch {processed_batches} (loss={loss.item():.4f})")
+        if status_path is not None:
+            write_progress_state(
+                status_path,
+                current_epoch,
+                config.epochs,
+                processed_batches,
+                total_batches,
+                None,
+                f"completed epoch {current_epoch}/{config.epochs}",
+            )
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] Completed epoch {current_epoch}/{config.epochs}; {config.epochs - current_epoch} epochs remaining")
 
     if checkpoint_path is not None:
         checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
@@ -157,6 +220,9 @@ def main() -> None:
     parser.add_argument("--output-csv", default="training_results.csv")
     parser.add_argument("--max-rows", type=int, default=1000)
     parser.add_argument("--checkpoint-path", default="model_checkpoint.pt")
+    parser.add_argument("--status-path", default="training_status.json")
+    parser.add_argument("--status-interval-minutes", type=int, default=10)
+    parser.add_argument("--checkpoint-interval-minutes", type=int, default=15)
     parser.add_argument("--resume", action="store_true", help="Resume from the existing checkpoint if present")
     parser.add_argument("--fresh-start", action="store_true", help="Start training from scratch instead of resuming")
     args = parser.parse_args()
@@ -171,7 +237,16 @@ def main() -> None:
     loader = RawImageLoader(config.raw_root)
     dataset = FolderLabelDataset(select_root=args.select_root, reject_root=args.reject_root, raw_root=raw_root)
     should_resume = args.resume or (not args.fresh_start and Path(args.checkpoint_path).exists())
-    model = train(config, loader, dataset=dataset, checkpoint_path=args.checkpoint_path, resume=should_resume)
+    model = train(
+        config,
+        loader,
+        dataset=dataset,
+        checkpoint_path=args.checkpoint_path,
+        resume=should_resume,
+        status_path=args.status_path,
+        status_interval=timedelta(minutes=args.status_interval_minutes),
+        checkpoint_interval=timedelta(minutes=args.checkpoint_interval_minutes),
+    )
     ranked = rank_dataset(model, dataset, loader, device="cpu")
     print(f"Detected sequences: {dataset.count_sequences()}")
     output_paths = write_results_csv(args.output_csv, dataset, ranked, args.select_root, args.reject_root, max_rows=args.max_rows)
