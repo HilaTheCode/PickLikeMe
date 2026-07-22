@@ -12,7 +12,8 @@ from torch import nn
 from torch.utils.data import DataLoader, Dataset
 
 from .config import ProjectConfig
-from .dataset import FolderLabelDataset, LabelDataset
+from .dataset import FolderLabelDataset, LabelDataset, PathSuffixIndex
+from .evaluate import compute_metrics, format_metrics, score_items, write_metrics_json
 from .model import PreferenceHead
 
 
@@ -225,6 +226,9 @@ def main() -> None:
     parser.add_argument("--checkpoint-interval-minutes", type=int, default=15)
     parser.add_argument("--resume", action="store_true", help="Resume from the existing checkpoint if present")
     parser.add_argument("--fresh-start", action="store_true", help="Start training from scratch instead of resuming")
+    parser.add_argument("--split", default=None, help="Frozen split CSV (see picklikeme.split); trains on train rows, evaluates on test rows")
+    parser.add_argument("--metrics-json", default="evaluation_metrics.json", help="Where to write test-set metrics when --split is given")
+    parser.add_argument("--resize-mode", default="letterbox", choices=["letterbox", "stretch"], help="letterbox = V2 aspect-preserving; stretch = V1 baseline behavior")
     args = parser.parse_args()
 
     if not args.select_root or not args.reject_root:
@@ -234,8 +238,25 @@ def main() -> None:
     config = ProjectConfig(raw_root=raw_root, labels_path=args.labels)
     from .raw_io import RawImageLoader
 
-    loader = RawImageLoader(config.raw_root)
-    dataset = FolderLabelDataset(select_root=args.select_root, reject_root=args.reject_root, raw_root=raw_root)
+    loader = RawImageLoader(config.raw_root, resize_mode=args.resize_mode)
+    burst_labels_path = args.labels if Path(args.labels).exists() else None
+    if burst_labels_path is None:
+        print(f"Labels CSV not found at {args.labels}; burst IDs will be unavailable (burst metrics need them)")
+    dataset = FolderLabelDataset(
+        select_root=args.select_root,
+        reject_root=args.reject_root,
+        raw_root=raw_root,
+        burst_labels_path=burst_labels_path,
+    )
+
+    test_items = []
+    if args.split:
+        split_index = PathSuffixIndex.from_csv(args.split, "split")
+        all_items = list(dataset.items)
+        test_items = [item for item in all_items if split_index.get(item.image_path) == "test"]
+        dataset.items = [item for item in all_items if split_index.get(item.image_path) != "test"]
+        print(f"Split {args.split}: {len(dataset.items)} train images, {len(test_items)} held-out test images")
+
     should_resume = args.resume or (not args.fresh_start and Path(args.checkpoint_path).exists())
     model = train(
         config,
@@ -247,6 +268,13 @@ def main() -> None:
         status_interval=timedelta(minutes=args.status_interval_minutes),
         checkpoint_interval=timedelta(minutes=args.checkpoint_interval_minutes),
     )
+    if test_items:
+        print(f"Evaluating on {len(test_items)} held-out test images")
+        metrics = compute_metrics(score_items(model, test_items, loader, device="cpu"))
+        print(format_metrics(metrics))
+        metrics_path = write_metrics_json(metrics, args.metrics_json)
+        print(f"Metrics written to {metrics_path}")
+
     ranked = rank_dataset(model, dataset, loader, device="cpu")
     print(f"Detected sequences: {dataset.count_sequences()}")
     output_paths = write_results_csv(args.output_csv, dataset, ranked, args.select_root, args.reject_root, max_rows=args.max_rows)

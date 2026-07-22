@@ -23,15 +23,33 @@ pip install -r requirements.txt
 python -m picklikeme.ingest.cli build-manifest --select-root "C:\\path\\to\\select" --reject-root "C:\\path\\to\\reject" --manifest-path data/manifest.parquet --labels-csv data/labels.csv
 ```
 
-### 3. Train the model
+### 3. Create the frozen evaluation split (once)
 
 ```bash
-python -m picklikeme.train --raw-root "C:\\path\\to\\raw" --labels data/labels.csv
+python -m picklikeme.split --labels data/labels.csv --output data/split.csv
 ```
+
+The split is assigned per burst (never per image) and is frozen: every model
+version trains and evaluates against the same split so results are comparable.
+The command refuses to overwrite an existing split unless `--force` is given.
+
+### 4. Train the model
+
+```bash
+python -m picklikeme.train --select-root "C:\\path\\to\\select" --reject-root "C:\\path\\to\\reject" --labels data/labels.csv --split data/split.csv
+```
+
+With `--split`, training uses only train-split images and afterwards reports the
+protocol metrics (Top-1/Top-3 burst accuracy, ROC AUC, precision/recall) on the
+held-out test split, writing them to `evaluation_metrics.json`.
+
+`--resize-mode stretch` reproduces the V1 baseline preprocessing; the default
+`letterbox` is the V2 aspect-ratio-preserving behavior.
 
 ## Project structure
 
 - docs/architecture.md: architecture rationale and design decisions
+- docs/roadmap.md: the V1-V10 version roadmap and evaluation protocol
 - src/picklikeme/: Python package containing the training and ingestion pipeline
 - tests/: unit tests
 
