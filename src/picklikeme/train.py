@@ -14,7 +14,7 @@ from torch.utils.data import DataLoader, Dataset
 from .config import ProjectConfig
 from .dataset import FolderLabelDataset, LabelDataset, PathSuffixIndex
 from .evaluate import compute_metrics, format_metrics, score_items, write_metrics_json
-from .model import PreferenceHead
+from .model import DINOV3_BACKBONE, ModelConfig, PreferenceHead
 
 
 class ImageTensorDataset(Dataset):
@@ -68,6 +68,7 @@ def train(
     status_path: str | Path | None = None,
     status_interval: timedelta | None = None,
     checkpoint_interval: timedelta | None = None,
+    model_config: ModelConfig | None = None,
 ) -> PreferenceHead:
     if dataset is None:
         dataset = LabelDataset(config.manifest_path, config.raw_root)
@@ -77,8 +78,11 @@ def train(
     print(f"[{timestamp}] Starting training with {len(dataset)} relevant images")
     print(f"[{timestamp}] Loaded {len(dataset)} images from the accepted/rejected roots")
 
-    model = PreferenceHead()
-    optimizer = torch.optim.Adam(model.parameters(), lr=config.learning_rate)
+    model = PreferenceHead(model_config)
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total = sum(p.numel() for p in model.parameters())
+    print(f"Backbone: {model.config.backbone} (trainable params: {trainable:,} / {total:,})")
+    optimizer = torch.optim.Adam((p for p in model.parameters() if p.requires_grad), lr=config.learning_rate)
     criterion = nn.MSELoss()
 
     if checkpoint_path is not None:
@@ -229,6 +233,9 @@ def main() -> None:
     parser.add_argument("--split", default=None, help="Frozen split CSV (see picklikeme.split); trains on train rows, evaluates on test rows")
     parser.add_argument("--metrics-json", default="evaluation_metrics.json", help="Where to write test-set metrics when --split is given")
     parser.add_argument("--resize-mode", default="letterbox", choices=["letterbox", "stretch"], help="letterbox = V2 aspect-preserving; stretch = V1 baseline behavior")
+    parser.add_argument("--backbone", default=DINOV3_BACKBONE, help="V3 pretrained backbone (any timm model name), or 'cnn' to reproduce the V1/V2 baseline backbone")
+    parser.add_argument("--no-pretrained", action="store_true", help="Randomly initialize the backbone instead of loading pretrained weights (debugging only)")
+    parser.add_argument("--unfreeze-backbone", action="store_true", help="Fine-tune the pretrained backbone instead of the default linear-probe (frozen backbone)")
     args = parser.parse_args()
 
     if not args.select_root or not args.reject_root:
@@ -257,6 +264,11 @@ def main() -> None:
         dataset.items = [item for item in all_items if split_index.get(item.image_path) != "test"]
         print(f"Split {args.split}: {len(dataset.items)} train images, {len(test_items)} held-out test images")
 
+    model_config = ModelConfig(
+        backbone=args.backbone,
+        pretrained=not args.no_pretrained,
+        freeze_backbone=not args.unfreeze_backbone,
+    )
     should_resume = args.resume or (not args.fresh_start and Path(args.checkpoint_path).exists())
     model = train(
         config,
@@ -267,6 +279,7 @@ def main() -> None:
         status_path=args.status_path,
         status_interval=timedelta(minutes=args.status_interval_minutes),
         checkpoint_interval=timedelta(minutes=args.checkpoint_interval_minutes),
+        model_config=model_config,
     )
     if test_items:
         print(f"Evaluating on {len(test_items)} held-out test images")

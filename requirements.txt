@@ -5,7 +5,7 @@ opencv-python
 albumentations
 pandas
 scikit-learn
-timm
+timm>=1.0.20
 matplotlib
 pyarrow
 tqdm

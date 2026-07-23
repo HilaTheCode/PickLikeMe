@@ -50,6 +50,13 @@ held-out test split, writing them to `evaluation_metrics.json`.
 `--resize-mode stretch` reproduces the V1 baseline preprocessing; the default
 `letterbox` is the V2 aspect-ratio-preserving behavior.
 
+The default backbone is a pretrained **DINOv3** ViT (V3), used as a frozen
+feature extractor (linear probe) behind the same `PreferenceHead`. Pass
+`--backbone cnn` to reproduce the V1/V2 custom-CNN backbone for comparison,
+or `--unfreeze-backbone` to fine-tune DINOv3 instead of linear-probing it.
+Downloading pretrained weights requires internet access on first run (cached
+under the Hugging Face hub cache afterwards).
+
 ## Project structure
 
 - docs/architecture.md: architecture rationale and design decisions

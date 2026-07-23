@@ -11,7 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from picklikeme.config import ProjectConfig
 from picklikeme.dataset import ImageLabel
-from picklikeme.model import PreferenceHead
+from picklikeme.model import ModelConfig, PreferenceHead
 from picklikeme.train import train
 
 
@@ -45,11 +45,13 @@ class TrainingCheckpointTests(unittest.TestCase):
             dataset = TinyDataset()
             loader = DummyLoader()
 
-            first_model = train(config, loader, dataset=dataset, checkpoint_path=checkpoint_path, resume=False)
+            model_config = ModelConfig(backbone="cnn")
+
+            first_model = train(config, loader, dataset=dataset, checkpoint_path=checkpoint_path, resume=False, model_config=model_config)
             self.assertTrue(checkpoint_path.exists())
             self.assertIsInstance(first_model, PreferenceHead)
 
-            second_model = train(config, loader, dataset=dataset, checkpoint_path=checkpoint_path, resume=True)
+            second_model = train(config, loader, dataset=dataset, checkpoint_path=checkpoint_path, resume=True, model_config=model_config)
             self.assertIsInstance(second_model, PreferenceHead)
             self.assertTrue(torch.equal(second_model.state_dict()["classifier.weight"], second_model.state_dict()["classifier.weight"]))
 
