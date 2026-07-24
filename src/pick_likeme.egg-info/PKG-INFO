@@ -10,7 +10,7 @@ Requires-Dist: opencv-python
 Requires-Dist: albumentations
 Requires-Dist: pandas
 Requires-Dist: scikit-learn
-Requires-Dist: timm
+Requires-Dist: timm>=1.0.20
 Requires-Dist: matplotlib
 Requires-Dist: pyarrow
 Requires-Dist: tqdm
