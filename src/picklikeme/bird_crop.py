@@ -141,6 +141,28 @@ def save_crop_png(cache_path: Path, crop_rgb: np.ndarray) -> None:
 # Detector
 # ---------------------------------------------------------------------------
 
+@dataclass(frozen=True)
+class BirdDetection:
+    """A single bird detection: its box (x1, y1, x2, y2), confidence score, and
+    COCO class. The rich result other code consumes so nobody re-implements the
+    selection or confidence logic."""
+
+    box: tuple[float, float, float, float]
+    score: float
+    label: int = COCO_BIRD_CLASS
+
+
+@dataclass
+class CropResult:
+    """Everything build_crop produces for one image: the crop the model will
+    receive, the detection it came from (None on full-frame fallback), and the
+    expanded box actually cropped (None on fallback)."""
+
+    crop: np.ndarray
+    detection: BirdDetection | None
+    expanded_box: tuple[int, int, int, int] | None
+
+
 class BirdDetector:
     """COCO-pretrained Faster R-CNN v2 restricted to the bird class.
 
@@ -162,9 +184,12 @@ class BirdDetector:
         weights = FasterRCNN_ResNet50_FPN_V2_Weights.COCO_V1
         self.model = fasterrcnn_resnet50_fpn_v2(weights=weights).to(device).eval()
 
-    def best_bird_box(self, image_rgb: np.ndarray) -> tuple[float, float, float, float] | None:
-        """Return the highest-confidence bird box (x1, y1, x2, y2) above the
-        confidence threshold, or None if no bird is found."""
+    def detect_best_bird(self, image_rgb: np.ndarray) -> BirdDetection | None:
+        """Highest-confidence bird detection above the threshold, or None.
+
+        This is the single source of truth for bird selection and confidence:
+        everything that needs a box and/or a score goes through here.
+        """
         torch = self._torch
         tensor = torch.from_numpy(image_rgb).permute(2, 0, 1).contiguous().float().div(255.0)
         with torch.no_grad():
@@ -174,30 +199,37 @@ class BirdDetector:
         labels = output["labels"].cpu().numpy()
         scores = output["scores"].cpu().numpy()
 
-        best_box = None
+        best: BirdDetection | None = None
         best_score = self.conf_threshold
         for box, label, score in zip(boxes, labels, scores):
-            if label == COCO_BIRD_CLASS and score >= best_score:
-                best_score = score
-                best_box = tuple(float(v) for v in box)
-        return best_box
+            if int(label) == COCO_BIRD_CLASS and score >= best_score:
+                best_score = float(score)
+                best = BirdDetection(box=tuple(float(v) for v in box), score=float(score), label=COCO_BIRD_CLASS)
+        return best
+
+    def best_bird_box(self, image_rgb: np.ndarray) -> tuple[float, float, float, float] | None:
+        """Convenience wrapper over detect_best_bird for callers that only need
+        the box (e.g. a presence check). No detection logic of its own."""
+        detection = self.detect_best_bird(image_rgb)
+        return detection.box if detection is not None else None
 
 
 def build_crop(
     image_rgb: np.ndarray,
     detector: BirdDetector,
     params: CropParams,
-) -> tuple[np.ndarray, bool]:
-    """Produce the cached crop for one decoded image.
+) -> CropResult:
+    """Produce the crop for one decoded image, returning the crop plus the
+    detection and expanded box it came from.
 
-    Returns (crop_rgb, found_bird). When no bird is detected the full frame is
-    returned (downscaled) so the image still yields a usable, bird-agnostic
-    input rather than being dropped.
+    When no bird is detected the full frame is returned (downscaled) so the
+    image still yields a usable, bird-agnostic input rather than being dropped;
+    in that case detection and expanded_box are None.
     """
     height, width = image_rgb.shape[:2]
-    box = detector.best_bird_box(image_rgb)
-    if box is None:
-        return downscale_long_side(image_rgb, params.max_side), False
-    expanded = expand_and_clamp_box(box, params.margin_frac, width, height)
-    crop = crop_to_box(image_rgb, expanded)
-    return downscale_long_side(crop, params.max_side), True
+    detection = detector.detect_best_bird(image_rgb)
+    if detection is None:
+        return CropResult(crop=downscale_long_side(image_rgb, params.max_side), detection=None, expanded_box=None)
+    expanded = expand_and_clamp_box(detection.box, params.margin_frac, width, height)
+    crop = downscale_long_side(crop_to_box(image_rgb, expanded), params.max_side)
+    return CropResult(crop=crop, detection=detection, expanded_box=expanded)

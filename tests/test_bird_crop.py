@@ -5,10 +5,14 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from picklikeme.bird_crop import (
+    COCO_BIRD_CLASS,
+    BirdDetection,
+    BirdDetector,
     CropParams,
     crop_cache_path,
     crop_to_box,
@@ -19,6 +23,54 @@ from picklikeme.bird_crop import (
     write_crop_params,
 )
 from picklikeme.raw_io import RawImageLoader
+
+
+def _detector_with_fake_model(boxes, labels, scores, conf_threshold=0.3):
+    """A BirdDetector whose torchvision model is replaced by a fixed output, so
+    detect_best_bird's real selection logic can be tested without downloading
+    or running the actual network."""
+    detector = BirdDetector.__new__(BirdDetector)
+    detector._torch = torch
+    detector.device = "cpu"
+    detector.conf_threshold = conf_threshold
+    output = {
+        "boxes": torch.tensor(boxes, dtype=torch.float),
+        "labels": torch.tensor(labels),
+        "scores": torch.tensor(scores),
+    }
+    detector.model = lambda images: [output]
+    return detector
+
+
+class DetectBestBirdTests(unittest.TestCase):
+    IMG = np.zeros((40, 40, 3), dtype=np.uint8)
+
+    def test_picks_highest_scoring_bird_above_threshold(self):
+        detector = _detector_with_fake_model(
+            boxes=[[0, 0, 10, 10], [5, 5, 20, 20], [1, 1, 2, 2]],
+            labels=[COCO_BIRD_CLASS, COCO_BIRD_CLASS, 1],  # two birds + a person
+            scores=[0.5, 0.8, 0.99],
+        )
+        detection = detector.detect_best_bird(self.IMG)
+        self.assertIsInstance(detection, BirdDetection)
+        self.assertEqual(detection.box, (5.0, 5.0, 20.0, 20.0))  # bird with score 0.8
+        self.assertAlmostEqual(detection.score, 0.8, places=5)
+        self.assertEqual(detection.label, COCO_BIRD_CLASS)
+
+    def test_best_bird_box_wrapper_returns_just_the_box(self):
+        detector = _detector_with_fake_model(
+            boxes=[[5, 5, 20, 20]], labels=[COCO_BIRD_CLASS], scores=[0.8]
+        )
+        self.assertEqual(detector.best_bird_box(self.IMG), (5.0, 5.0, 20.0, 20.0))
+
+    def test_none_when_only_non_birds_or_below_threshold(self):
+        detector = _detector_with_fake_model(
+            boxes=[[0, 0, 10, 10], [5, 5, 20, 20]],
+            labels=[COCO_BIRD_CLASS, 1],  # bird below threshold, person high
+            scores=[0.1, 0.99],
+        )
+        self.assertIsNone(detector.detect_best_bird(self.IMG))
+        self.assertIsNone(detector.best_bird_box(self.IMG))
 
 
 class BoxGeometryTests(unittest.TestCase):

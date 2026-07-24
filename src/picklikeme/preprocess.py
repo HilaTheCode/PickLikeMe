@@ -77,10 +77,10 @@ def build_cache(
         try:
             # Decode to full-resolution RGB uint8 for detection + cropping.
             rgb_uint8 = decoder._decode_full_frame(image_path)
-            crop, found = build_crop(rgb_uint8, detector, params)
-            save_crop_png(target, crop)
+            result = build_crop(rgb_uint8, detector, params)
+            save_crop_png(target, result.crop)
             stats["cached"] += 1
-            stats["birds" if found else "fallbacks"] += 1
+            stats["birds" if result.detection is not None else "fallbacks"] += 1
         except Exception as exc:  # noqa: BLE001 - report and continue, one bad file shouldn't stop the pass
             stats["errors"] += 1
             print(f"  ERROR on {image_path}: {type(exc).__name__}: {exc}")

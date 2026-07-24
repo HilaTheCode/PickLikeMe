@@ -28,13 +28,9 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
 from .bird_crop import (
-    COCO_BIRD_CLASS,
     CropParams,
     build_crop,
     crop_cache_path,
-    crop_to_box,
-    downscale_long_side,
-    expand_and_clamp_box,
     read_crop_params,
 )
 from .config import DEFAULT_CROP_CACHE_DIR, DEFAULT_INSPECTION_DIR
@@ -190,45 +186,17 @@ class PipelineResult:
     model_input_rgb: np.ndarray                      # exactly what the model receives (uint8 RGB)
 
 
-def detect_bird(detector, image_rgb: np.ndarray) -> tuple[tuple[float, float, float, float] | None, float | None]:
-    """Highest-confidence bird box AND its score. Mirrors
-    BirdDetector.best_bird_box exactly (same class filter, threshold, argmax)
-    but also returns the score, which best_bird_box discards. Read-only; does
-    not modify the detector."""
-    torch = detector._torch
-    tensor = torch.from_numpy(image_rgb).permute(2, 0, 1).contiguous().float().div(255.0)
-    with torch.no_grad():
-        output = detector.model([tensor.to(detector.device)])[0]
-    boxes = output["boxes"].cpu().numpy()
-    labels = output["labels"].cpu().numpy()
-    scores = output["scores"].cpu().numpy()
-
-    best_box = None
-    best_score = detector.conf_threshold
-    for box, label, score in zip(boxes, labels, scores):
-        if label == COCO_BIRD_CLASS and score >= best_score:
-            best_score = float(score)
-            best_box = tuple(float(v) for v in box)
-    return best_box, (best_score if best_box is not None else None)
-
-
 def run_pipeline(loader: RawImageLoader, detector, source_path: str, params: CropParams) -> PipelineResult:
-    """Decode -> detect -> crop -> resize/pad, reproducing preprocessing +
-    RawImageLoader exactly, while also capturing the box/score/sizes needed for
-    the report and overlay. The crop steps are the same helper calls
-    bird_crop.build_crop uses, so model_input is byte-identical to training."""
+    """Decode -> build_crop -> resize/pad, then read the box/score/sizes off the
+    result for the report and overlay. Reuses bird_crop.build_crop and
+    RawImageLoader directly (no re-implemented detection or crop logic), so the
+    rendered crop is byte-identical to what training receives."""
     full = loader._decode_full_frame(source_path)  # uint8 RGB, full resolution
     height, width = full.shape[:2]
-    box, score = detect_bird(detector, full)
 
-    if box is None:
-        crop = downscale_long_side(full, params.max_side)
-        expanded = None
-        found = False
-    else:
-        expanded = expand_and_clamp_box(box, params.margin_frac, width, height)
-        crop = downscale_long_side(crop_to_box(full, expanded), params.max_side)
-        found = True
+    result = build_crop(full, detector, params)
+    crop = result.crop
+    detection = result.detection
 
     if loader.resize_mode == "letterbox":
         model_input = loader._letterbox(crop)
@@ -239,10 +207,10 @@ def run_pipeline(loader: RawImageLoader, detector, source_path: str, params: Cro
 
     return PipelineResult(
         source_path=source_path,
-        found=found,
-        score=score,
-        box=tuple(int(round(v)) for v in box) if box is not None else None,
-        expanded_box=expanded,
+        found=detection is not None,
+        score=detection.score if detection is not None else None,
+        box=tuple(int(round(v)) for v in detection.box) if detection is not None else None,
+        expanded_box=result.expanded_box,
         original_size=(width, height),
         crop_size=(crop.shape[1], crop.shape[0]),
         full_rgb=full,

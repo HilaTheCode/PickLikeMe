@@ -5,16 +5,14 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-import torch
 from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from picklikeme.bird_crop import CropParams, build_crop
+from picklikeme.bird_crop import BirdDetection, CropParams, build_crop
 from picklikeme.inspect_crops import (
     PipelineResult,
     build_pair_sheet,
-    detect_bird,
     draw_bbox_overlay,
     run_pipeline,
     write_folder_report,
@@ -25,48 +23,16 @@ FIXED_BOX = (10.0, 10.0, 50.0, 50.0)
 
 
 class StubDetector:
-    """Stands in for BirdDetector: same interface (best_bird_box + the internals
-    detect_bird reaches into), returning a fixed bird box."""
+    """Stands in for BirdDetector via its public detect_best_bird API,
+    returning a fixed bird detection (no real model)."""
 
-    _torch = torch
-    device = "cpu"
-    conf_threshold = 0.3
-
-    def best_bird_box(self, image_rgb):
-        return FIXED_BOX
-
-    def model(self, images):
-        return [{
-            "boxes": torch.tensor([list(FIXED_BOX)]),
-            "labels": torch.tensor([16]),  # COCO bird
-            "scores": torch.tensor([0.9]),
-        }]
+    def detect_best_bird(self, image_rgb):
+        return BirdDetection(box=FIXED_BOX, score=0.9)
 
 
-class NoBirdDetector(StubDetector):
-    def best_bird_box(self, image_rgb):
+class NoBirdDetector:
+    def detect_best_bird(self, image_rgb):
         return None
-
-    def model(self, images):
-        return [{
-            "boxes": torch.tensor([[0.0, 0.0, 5.0, 5.0]]),
-            "labels": torch.tensor([1]),   # person, not a bird
-            "scores": torch.tensor([0.99]),
-        }]
-
-
-class DetectBirdTests(unittest.TestCase):
-    def test_returns_box_and_score(self):
-        img = np.zeros((60, 80, 3), dtype=np.uint8)
-        box, score = detect_bird(StubDetector(), img)
-        self.assertEqual(tuple(box), FIXED_BOX)
-        self.assertAlmostEqual(score, 0.9, places=5)
-
-    def test_returns_none_when_no_bird(self):
-        img = np.zeros((60, 80, 3), dtype=np.uint8)
-        box, score = detect_bird(NoBirdDetector(), img)
-        self.assertIsNone(box)
-        self.assertIsNone(score)
 
 
 class RunPipelineFaithfulnessTests(unittest.TestCase):
@@ -80,11 +46,11 @@ class RunPipelineFaithfulnessTests(unittest.TestCase):
             params = CropParams()
 
             full = loader._decode_full_frame(path)
-            expected_crop, _found = build_crop(full, StubDetector(), params)
-            expected_input = loader._letterbox(expected_crop)
+            expected_input = loader._letterbox(build_crop(full, StubDetector(), params).crop)
 
             result = run_pipeline(loader, StubDetector(), path, params)
             self.assertTrue(result.found)
+            self.assertAlmostEqual(result.score, 0.9, places=5)
             self.assertEqual(result.model_input_rgb.shape, (32, 32, 3))
             self.assertTrue(np.array_equal(result.model_input_rgb, expected_input))
             self.assertEqual(result.original_size, (80, 60))
