@@ -459,7 +459,7 @@ def main() -> None:
     parser.add_argument("--device", default=None, help="Override the device (default: cuda if available, else cpu)")
     parser.add_argument("--num-workers", type=int, default=None, help=f"DataLoader worker processes (default: {ProjectConfig.num_workers})")
     parser.add_argument("--log-interval-batches", type=int, default=1, help="Print training progress every N batches (1 = every batch, the default; higher = less noise; 0 = only at epoch end)")
-    parser.add_argument("--crop-birds", action="store_true", help="Feed pre-computed bird crops (from picklikeme.preprocess) instead of full frames")
+    parser.add_argument("--crop-birds", action=argparse.BooleanOptionalAction, default=True, help="Feed pre-computed bird crops from picklikeme.preprocess (default); pass --no-crop-birds to train on full frames")
     parser.add_argument("--crop-cache-dir", default=str(DEFAULT_CROP_CACHE_DIR), help="Directory of the bird-crop cache used by --crop-birds")
     args = parser.parse_args()
 
@@ -477,7 +477,19 @@ def main() -> None:
 
     crop_cache_dir = args.crop_cache_dir if args.crop_birds else None
     if args.crop_birds:
-        print(f"Bird-crop input enabled; reading crops from {Path(crop_cache_dir).resolve()}")
+        cache_path = Path(crop_cache_dir)
+        if cache_path.exists() and any(cache_path.glob("*.png")):
+            print(f"Bird-crop input enabled (default); reading crops from {cache_path.resolve()}")
+        else:
+            print("=" * 64)
+            print("WARNING: --crop-birds is on (default) but no crop cache was found at")
+            print(f"  {cache_path.resolve()}")
+            print("Training will FALL BACK TO FULL FRAMES for every image.")
+            print("Run `python -m picklikeme.preprocess --select-root ... --reject-root ...`")
+            print("first, or pass --no-crop-birds to train on full frames on purpose.")
+            print("=" * 64)
+    else:
+        print("Bird-crop input disabled (--no-crop-birds); using full frames.")
     loader = RawImageLoader(config.raw_root, resize_mode=args.resize_mode, crop_cache_dir=crop_cache_dir)
     manifest_path = args.manifest if Path(args.manifest).exists() else None
     if manifest_path is None:

@@ -63,25 +63,29 @@ held-out test split, writing them to `evaluation_metrics.json`.
 `--resize-mode stretch` reproduces the V1 baseline preprocessing; the default
 `letterbox` is the V2 aspect-ratio-preserving behavior.
 
-### Optional: bird-cropped input
+### Bird-cropped input (default)
 
-Instead of the full frame, training can feed a tight crop around the detected
-bird, so the model sees a bird-centered image (background is discarded). This
-is opt-in via `--crop-birds` so it can be A/B-compared against the full-frame
-model.
+Training feeds a tight crop around the detected bird, so the model sees a
+bird-centered image (background discarded). This is **on by default**; pass
+`--no-crop-birds` to train on full frames instead (e.g. to A/B-compare).
 
-Build the crop cache once (detects the bird per image, crops with a small
-safety margin, aspect ratio preserved, and caches the result):
+Build the crop cache once **before training** (detects the bird per image,
+crops with a small safety margin, aspect ratio preserved, and caches the
+result):
 
 ```bash
 python -m picklikeme.preprocess --select-root "C:\\path\\to\\select" --reject-root "C:\\path\\to\\reject"
 ```
 
-Then train against it:
+Then train (cropping is already the default):
 
 ```bash
-python -m picklikeme.train --select-root "..." --reject-root "..." --crop-birds
+python -m picklikeme.train --select-root "..." --reject-root "..."
 ```
+
+If `--crop-birds` is on but the cache is empty, training prints a warning and
+falls back to full frames — so build the cache first, or pass
+`--no-crop-birds` intentionally.
 
 Detection uses torchvision's COCO-pretrained Faster R-CNN v2 (the "bird" class)
 and runs **once** in this single-process pass — never per epoch and never in
