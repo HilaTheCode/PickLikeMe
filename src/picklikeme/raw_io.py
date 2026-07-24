@@ -14,7 +14,7 @@ except ImportError:  # pragma: no cover - depends on environment
 
 
 class RawImageLoader:
-    RAW_EXTENSIONS = {".arw", ".cr2", ".dng", ".nef", ".orf", ".raw", ".rw2"}
+    RAW_EXTENSIONS = {".arw", ".cr2", ".cr3", ".dng", ".nef", ".orf", ".raw", ".rw2"}
     RESIZE_MODES = {"letterbox", "stretch"}
 
     def __init__(

@@ -37,24 +37,51 @@ from .config import DEFAULT_CROP_CACHE_DIR, DEFAULT_INSPECTION_DIR
 from .dataset import FolderLabelDataset
 from .raw_io import RawImageLoader
 
-# Supported inputs for folder mode: the RAW formats the pipeline decodes, plus
-# common standard image formats (so a mixed acceptance folder still works).
+# Supported inputs for folder mode: the exact RAW formats the pipeline decodes
+# (so the acceptance test mirrors preprocessing/training — includes .nef/.cr3/
+# .arw), plus common standard image formats for convenience.
 SUPPORTED_INPUT_EXTS = RawImageLoader.RAW_EXTENSIONS | {
     ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp",
 }
 
 
-def resolve_device(requested: str) -> str:
-    if requested.startswith("cuda"):
+def resolve_device(requested: str | None) -> str:
+    """Auto-select the device: GPU when available, else CPU. `requested` may be
+    None (auto) or an explicit override like 'cpu'."""
+    want_cuda = requested is None or requested.startswith("cuda")
+    if want_cuda:
         try:
             import torch
 
-            if not torch.cuda.is_available():
-                print(f"Requested device '{requested}' but CUDA is not available; using CPU")
-                return "cpu"
+            if torch.cuda.is_available():
+                return requested if (requested and requested != "cuda") else "cuda"
         except ImportError:
-            return "cpu"
+            pass
+        if requested is not None:
+            print(f"Requested device '{requested}' but CUDA is not available; using CPU")
+        return "cpu"
     return requested
+
+
+def discover_images(input_folder: Path) -> list[str]:
+    """Recursively find every supported image under a folder, case-insensitively
+    (e.g. .CR3, .cr3, .Cr3 all match)."""
+    return sorted(
+        str(p) for p in input_folder.rglob("*")
+        if p.is_file() and p.suffix.lower() in SUPPORTED_INPUT_EXTS
+    )
+
+
+def _build_loader(raw_root: str, args, crop_cache_dir: str | None = None) -> RawImageLoader:
+    """Construct a loader that mirrors training: omit output_size when the user
+    didn't override it, so RawImageLoader's own default (what training uses) is
+    applied, and default to letterbox padding."""
+    kwargs: dict = {"raw_root": raw_root, "resize_mode": args.resize_mode}
+    if args.output_size:
+        kwargs["output_size"] = (args.output_size, args.output_size)
+    if crop_cache_dir is not None:
+        kwargs["crop_cache_dir"] = crop_cache_dir
+    return RawImageLoader(**kwargs)
 
 
 def find_cached_pairs(select_root: str, reject_root: str, cache_dir: Path) -> list[tuple[str, Path]]:
@@ -329,10 +356,7 @@ def inspect_folder(args) -> None:
     if not input_folder.exists():
         raise SystemExit(f"Input folder does not exist: {input_folder}")
 
-    image_paths = sorted(
-        str(p) for p in input_folder.rglob("*")
-        if p.is_file() and p.suffix.lower() in SUPPORTED_INPUT_EXTS
-    )
+    image_paths = discover_images(input_folder)
     if not image_paths:
         raise SystemExit(f"No supported images ({sorted(SUPPORTED_INPUT_EXTS)}) found in {input_folder.resolve()}")
     print(f"Found {len(image_paths)} images in {input_folder.resolve()}")
@@ -343,11 +367,7 @@ def inspect_folder(args) -> None:
     images_dir.mkdir(parents=True, exist_ok=True)
 
     params = CropParams(margin_frac=args.margin_frac, conf_threshold=args.conf_threshold, max_side=args.max_side)
-    loader = RawImageLoader(
-        raw_root=str(input_folder),
-        output_size=(args.output_size, args.output_size),
-        resize_mode=args.resize_mode,
-    )
+    loader = _build_loader(str(input_folder), args)
     device = resolve_device(args.device)
     print(f"Loading detector on {device} (read-only)...")
     detector = BirdDetector(device=device, conf_threshold=params.conf_threshold)
@@ -437,12 +457,7 @@ def inspect_cache(args) -> None:
     sample = pairs if len(pairs) <= args.sample_size else rng.sample(pairs, args.sample_size)
     print(f"Sampling {len(sample)} crops for inspection (seed={args.seed}).")
 
-    display_loader = RawImageLoader(
-        raw_root=args.select_root,
-        output_size=(args.output_size, args.output_size),
-        resize_mode=args.resize_mode,
-        crop_cache_dir=str(cache_dir),
-    )
+    display_loader = _build_loader(args.select_root, args, crop_cache_dir=str(cache_dir))
     cache_reader = RawImageLoader(raw_root=args.select_root)
 
     from .bird_crop import BirdDetector
@@ -484,13 +499,13 @@ def main() -> None:
     parser.add_argument("--cols", type=int, default=10, help="Thumbnails per row in a grid contact sheet")
     parser.add_argument("--thumb", type=int, default=256, help="Thumbnail size in pixels")
     parser.add_argument("--per-sheet", type=int, default=100, help="Max items per contact-sheet image")
-    parser.add_argument("--output-size", type=int, default=384, help="Model input size to render (match training)")
-    parser.add_argument("--resize-mode", default="letterbox", choices=["letterbox", "stretch"])
+    parser.add_argument("--output-size", type=int, default=None, help="Model input size to render (default: the training pipeline's own default)")
+    parser.add_argument("--resize-mode", default="letterbox", choices=["letterbox", "stretch"], help="Default letterbox = aspect-preserving padding, matching training")
     parser.add_argument("--margin-frac", type=float, default=CropParams.margin_frac, help="Folder mode: crop safety margin (match preprocess)")
     parser.add_argument("--conf-threshold", type=float, default=CropParams.conf_threshold, help="Folder mode: detection threshold (match preprocess)")
     parser.add_argument("--max-side", type=int, default=CropParams.max_side, help="Folder mode: crop long-side cap (match preprocess)")
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--device", default=None, help="Device (default: auto - CUDA if available, else CPU)")
     args = parser.parse_args()
 
     if args.input_folder:
