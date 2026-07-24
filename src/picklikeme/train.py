@@ -4,6 +4,8 @@ import argparse
 import csv
 import json
 import math
+import time
+import traceback
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -67,6 +69,51 @@ def _format_duration(seconds: float) -> str:
 
 
 _BANNER = "-" * 49
+_ALERT_BANNER = "!" * 49
+
+# A save is retried once after this pause, to ride out a transient filesystem
+# hiccup (a briefly-locked file, a momentary network-drive drop) without
+# aborting a multi-day run.
+CHECKPOINT_RETRY_DELAY_SECONDS = 3.0
+
+
+def _write_checkpoint_atomic(model, optimizer, checkpoint_path: Path, epoch, best_loss) -> None:
+    """Perform the actual atomic write: temp file + rename over the target, so
+    a crash mid-write can never leave a truncated, unloadable checkpoint."""
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "epoch": epoch,
+    }
+    if best_loss is not None:
+        payload["best_loss"] = best_loss
+    tmp_path = checkpoint_path.with_name(checkpoint_path.name + ".tmp")
+    torch.save(payload, tmp_path)
+    tmp_path.replace(checkpoint_path)
+
+
+def _print_save_success(checkpoint_path: Path, reason: str, epoch, best_loss, on_retry: bool) -> None:
+    print(_BANNER)
+    print("Saving checkpoint" + (" (retry SUCCEEDED)" if on_retry else ""))
+    print(f"Path: {checkpoint_path.resolve()}")
+    print(f"Reason: {reason or 'unspecified'}")
+    print(f"Epoch: {epoch}")
+    print(f"Best loss: {best_loss}")
+    print("Status: SUCCESS")
+    print(_BANNER)
+
+
+def _print_save_failure(checkpoint_path: Path, reason: str, epoch, exc: Exception) -> None:
+    print(_BANNER)
+    print("Checkpoint save FAILED")
+    print(f"Path: {checkpoint_path.resolve()}")
+    print(f"Reason: {reason or 'unspecified'}")
+    print(f"Epoch: {epoch}")
+    print(f"Exception: {type(exc).__name__}: {exc}")
+    print("Full traceback:")
+    print(traceback.format_exc().rstrip())
+    print(_BANNER)
 
 
 def save_checkpoint(
@@ -76,49 +123,53 @@ def save_checkpoint(
     epoch: int | None = None,
     best_loss: float | None = None,
     reason: str = "",
+    retry_delay_seconds: float = CHECKPOINT_RETRY_DELAY_SECONDS,
 ) -> bool:
-    """Save a checkpoint atomically: write to a temp file, then rename over
-    the target so a Ctrl+C (or crash) mid-write can never leave a truncated,
-    unloadable checkpoint on disk.
+    """Save a checkpoint atomically, with a retry-once-then-abort policy.
 
     `epoch` records the last *fully completed* epoch, not the epoch in
     progress — that's what let resume() know which epoch to restart from
     without silently skipping unfinished work.
 
-    Prints a transparent SUCCESS/FAILED diagnostics block and returns whether
-    the save succeeded. A failed save is reported but never raises, so one bad
-    write (e.g. a transient disk error) can't abort a multi-day run.
+    Reliability policy for long-running jobs: if the first save fails, the
+    full exception (with traceback), path, and reason are logged, then after a
+    short pause the save is retried exactly once. A transient filesystem issue
+    should not abort training — but if the retry also fails, a highly visible
+    error is printed and a RuntimeError is raised to stop training, because
+    continuing a multi-day run with no ability to checkpoint is too risky.
+
+    Returns True on success (first attempt or retry); raises RuntimeError if
+    both attempts fail.
     """
     checkpoint_path = Path(checkpoint_path)
     try:
-        checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {
-            "model_state_dict": model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "epoch": epoch,
-        }
-        if best_loss is not None:
-            payload["best_loss"] = best_loss
-        tmp_path = checkpoint_path.with_name(checkpoint_path.name + ".tmp")
-        torch.save(payload, tmp_path)
-        tmp_path.replace(checkpoint_path)
-        print(_BANNER)
-        print("Saving checkpoint")
-        print(f"Path: {checkpoint_path.resolve()}")
-        print(f"Reason: {reason or 'unspecified'}")
-        print(f"Epoch: {epoch}")
-        print(f"Best loss: {best_loss}")
-        print("Status: SUCCESS")
-        print(_BANNER)
+        _write_checkpoint_atomic(model, optimizer, checkpoint_path, epoch, best_loss)
+    except Exception as exc:  # noqa: BLE001 - reported, then retried before any abort
+        _print_save_failure(checkpoint_path, reason, epoch, exc)
+        print(f"Waiting {retry_delay_seconds:.0f}s, then retrying the checkpoint save once...")
+        time.sleep(retry_delay_seconds)
+        try:
+            _write_checkpoint_atomic(model, optimizer, checkpoint_path, epoch, best_loss)
+        except Exception as retry_exc:  # noqa: BLE001 - second failure is fatal on purpose
+            print(_ALERT_BANNER)
+            print("!!! CHECKPOINTING IS NO LONGER RELIABLE - STOPPING TRAINING !!!")
+            print("The checkpoint save failed twice (initial attempt + one retry).")
+            print(f"Path: {checkpoint_path.resolve()}")
+            print(f"Reason: {reason or 'unspecified'}")
+            print(f"Retry exception: {type(retry_exc).__name__}: {retry_exc}")
+            print("Refusing to continue: a multi-day run that cannot save")
+            print("checkpoints could lose all progress on the next failure.")
+            print(_ALERT_BANNER)
+            raise RuntimeError(
+                f"Checkpoint save failed twice for {checkpoint_path.resolve()} "
+                f"(reason: {reason or 'unspecified'}); aborting training because "
+                "checkpointing is no longer reliable."
+            ) from retry_exc
+        _print_save_success(checkpoint_path, reason, epoch, best_loss, on_retry=True)
         return True
-    except Exception as exc:  # noqa: BLE001 - a checkpoint failure must never kill training
-        print(_BANNER)
-        print("Checkpoint save FAILED")
-        print(f"Path: {checkpoint_path.resolve()}")
-        print(f"Reason: {reason or 'unspecified'}")
-        print(f"Exception: {type(exc).__name__}: {exc}")
-        print(_BANNER)
-        return False
+
+    _print_save_success(checkpoint_path, reason, epoch, best_loss, on_retry=False)
+    return True
 
 
 def load_checkpoint(checkpoint_path: str | Path, map_location) -> dict:

@@ -4,11 +4,13 @@ import tempfile
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
+from unittest import mock
 
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+import picklikeme.train as train_module
 from picklikeme.config import DEFAULT_CHECKPOINT_DIR, DEFAULT_CHECKPOINT_PATH, PROJECT_ROOT
 from picklikeme.model import ModelConfig, PreferenceHead
 from picklikeme.train import load_checkpoint, save_checkpoint
@@ -36,8 +38,10 @@ class SaveDiagnosticsTests(unittest.TestCase):
             self.assertIn("Reason: End of epoch 3", output)
             self.assertIn(str(path.resolve()), output)
 
-    def test_failure_block_printed_and_returns_false_without_raising(self):
-        # Point the checkpoint at a path whose parent is a *file*, so mkdir fails.
+    def test_persistent_failure_retries_once_then_raises(self):
+        # Point the checkpoint at a path whose parent is a *file*, so every
+        # write attempt fails. Under the reliability policy this must retry
+        # once and then raise RuntimeError (retry_delay_seconds=0 keeps it fast).
         with tempfile.TemporaryDirectory() as tmpdir:
             blocker = Path(tmpdir) / "not_a_dir"
             blocker.write_text("x", encoding="utf-8")
@@ -45,12 +49,45 @@ class SaveDiagnosticsTests(unittest.TestCase):
             model, optimizer = _model_and_opt()
             buf = io.StringIO()
             with redirect_stdout(buf):
-                ok = save_checkpoint(model, optimizer, path, epoch=1, reason="End of epoch 1")
+                with self.assertRaises(RuntimeError):
+                    save_checkpoint(model, optimizer, path, epoch=1, reason="End of epoch 1", retry_delay_seconds=0)
             output = buf.getvalue()
 
-            self.assertFalse(ok)
             self.assertIn("Checkpoint save FAILED", output)
-            self.assertIn("Exception:", output)
+            self.assertIn("Full traceback:", output)
+            self.assertIn("Waiting", output)
+            self.assertIn("CHECKPOINTING IS NO LONGER RELIABLE", output)
+
+    def test_transient_failure_is_retried_and_succeeds(self):
+        # First write attempt raises, second succeeds: save_checkpoint must
+        # recover, print a retry-succeeded block, and return True (no raise).
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "ckpt.pt"
+            model, optimizer = _model_and_opt()
+            real_write = train_module._write_checkpoint_atomic
+            calls = {"n": 0}
+
+            def flaky_write(*args, **kwargs):
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    raise OSError("simulated transient disk error")
+                return real_write(*args, **kwargs)
+
+            buf = io.StringIO()
+            with mock.patch.object(train_module, "_write_checkpoint_atomic", side_effect=flaky_write):
+                with redirect_stdout(buf):
+                    ok = save_checkpoint(model, optimizer, path, epoch=2, best_loss=0.3, reason="End of epoch 2", retry_delay_seconds=0)
+            output = buf.getvalue()
+
+            self.assertTrue(ok)
+            self.assertEqual(calls["n"], 2)
+            self.assertIn("Checkpoint save FAILED", output)
+            self.assertIn("retry SUCCEEDED", output)
+            self.assertIn("Status: SUCCESS", output)
+            # The file really exists after the successful retry.
+            self.assertTrue(path.exists() and path.stat().st_size > 0)
+            checkpoint = torch.load(path, map_location="cpu")
+            self.assertEqual(checkpoint["epoch"], 2)
 
 
 class LoadDiagnosticsTests(unittest.TestCase):
