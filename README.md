@@ -130,6 +130,33 @@ writing `crops_sheet_*.png`, `fallback_sheet_*.png`, and `report.txt` into
 read-only on the sampled crops, since preprocessing doesn't record per-image
 outcomes.
 
+### Auto-crop for photo editors (Lightroom)
+
+Separately from training, `picklikeme.auto_crop` writes editor crop metadata
+from the same bird detector, to run **before** importing RAWs into Lightroom
+(`RAW → PickLikeMe Auto Crop → Lightroom`):
+
+```bash
+python -m picklikeme.auto_crop --input "D:\\Photos" --margin 12
+```
+
+For every supported RAW (NEF/ARW/CR3/DNG, recursive, case-insensitive) it
+detects the bird and computes a **composition** crop that is deliberately
+different from the training crop: it expands the bird box by `--margin` percent
+and grows it to the **original image aspect ratio** (never square, never
+letterboxed, never stretched), then writes it as normalized `[0,1]`
+Lightroom `crs:` crop fields only (no develop settings):
+
+- proprietary RAW → a `.xmp` sidecar next to the file (`DSC1234.NEF → DSC1234.xmp`)
+- DNG → embedded into the DNG's own XMP via `exiftool` (Lightroom ignores a
+  sidecar next to a DNG), so exiftool must be on PATH when DNGs are present
+
+Existing sidecars / embedded crops are left untouched unless `--overwrite-xmp`
+is given. The training/preprocessing crop (`build_crop`) is unchanged — this
+reuses `BirdDetector.detect_best_bird` and a shared `compute_composition_crop`,
+and new editors can be added as exporters in `exporters.py` without touching
+detection or crop logic.
+
 The default backbone is a pretrained **DINOv3-Huge+** ViT (V3, ~840M params),
 used as a frozen feature extractor (linear probe) behind the same
 `PreferenceHead` — the largest DINOv3 variant that comfortably fits a 12GB

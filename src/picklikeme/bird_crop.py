@@ -163,6 +163,20 @@ class CropResult:
     expanded_box: tuple[int, int, int, int] | None
 
 
+@dataclass(frozen=True)
+class NormalizedCrop:
+    """An editor-agnostic crop rectangle in normalized [0, 1] image coordinates
+    (fractions of width/height), plus rotation angle. This is the generic crop
+    representation the crop engine exposes; exporters translate it into a
+    specific editor's format (e.g. Lightroom crs: fields)."""
+
+    left: float
+    top: float
+    right: float
+    bottom: float
+    angle: float = 0.0
+
+
 class BirdDetector:
     """COCO-pretrained Faster R-CNN v2 restricted to the bird class.
 
@@ -233,3 +247,60 @@ def build_crop(
     expanded = expand_and_clamp_box(detection.box, params.margin_frac, width, height)
     crop = downscale_long_side(crop_to_box(image_rgb, expanded), params.max_side)
     return CropResult(crop=crop, detection=detection, expanded_box=expanded)
+
+
+def compute_composition_crop(
+    detection: BirdDetection,
+    image_width: int,
+    image_height: int,
+    margin_frac: float = 0.0,
+) -> NormalizedCrop:
+    """A compositional crop for photo editors, derived from the same bird
+    detection as training but with a different policy.
+
+    Unlike build_crop (tight, variable aspect, maximizes bird area for the
+    model), this expands the bird box by a margin and then grows it to the
+    ORIGINAL image aspect ratio, so an editor receives an undistorted crop that
+    is never square (as a photo), never letterboxed, never stretched. Returns
+    normalized [0, 1] coordinates (the editor-agnostic representation).
+
+    Steps: (1) expand the bird box symmetrically by margin_frac; (2) grow the
+    smaller dimension until the box matches the image aspect ratio, keeping the
+    center; (3) if that no longer fits, the aspect-correct crop is the whole
+    frame; (4) otherwise shift the box back inside the frame, preserving the
+    center where possible.
+    """
+    x1, y1, x2, y2 = detection.box
+    box_w = x2 - x1
+    box_h = y2 - y1
+    x1 -= box_w * margin_frac
+    x2 += box_w * margin_frac
+    y1 -= box_h * margin_frac
+    y2 += box_h * margin_frac
+
+    center_x = (x1 + x2) / 2.0
+    center_y = (y1 + y2) / 2.0
+    width = x2 - x1
+    height = y2 - y1
+
+    target_aspect = image_width / image_height
+    if width / height < target_aspect:
+        width = height * target_aspect
+    else:
+        height = width / target_aspect
+
+    if width >= image_width or height >= image_height:
+        return NormalizedCrop(0.0, 0.0, 1.0, 1.0)
+
+    center_x = min(max(center_x, width / 2.0), image_width - width / 2.0)
+    center_y = min(max(center_y, height / 2.0), image_height - height / 2.0)
+
+    def _clamp01(value: float) -> float:
+        return min(max(value, 0.0), 1.0)
+
+    return NormalizedCrop(
+        left=_clamp01((center_x - width / 2.0) / image_width),
+        top=_clamp01((center_y - height / 2.0) / image_height),
+        right=_clamp01((center_x + width / 2.0) / image_width),
+        bottom=_clamp01((center_y + height / 2.0) / image_height),
+    )
