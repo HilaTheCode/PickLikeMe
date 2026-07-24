@@ -5,6 +5,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from .bird_crop import crop_cache_path
+
 try:
     import rawpy  # type: ignore
 except ImportError:  # pragma: no cover - depends on environment
@@ -20,12 +22,17 @@ class RawImageLoader:
         raw_root: str,
         output_size: tuple[int, int] = (384, 384),
         resize_mode: str = "letterbox",
+        crop_cache_dir: str | None = None,
     ):
         if resize_mode not in self.RESIZE_MODES:
             raise ValueError(f"resize_mode must be one of {sorted(self.RESIZE_MODES)}, got {resize_mode!r}")
         self.raw_root = Path(raw_root)
         self.output_size = output_size
         self.resize_mode = resize_mode
+        # When set, load_image reads pre-computed bird crops from this cache
+        # (built by picklikeme.preprocess) instead of the full frame.
+        self.crop_cache_dir = Path(crop_cache_dir) if crop_cache_dir is not None else None
+        self._warned_missing_crop = False
 
     def _resolve_path(self, image_path: str) -> Path:
         path = Path(image_path)
@@ -70,16 +77,39 @@ class RawImageLoader:
         canvas[top : top + new_height, left : left + new_width] = resized
         return canvas
 
-    def load_image(self, image_path: str) -> np.ndarray:
+    def _decode_full_frame(self, image_path: str) -> np.ndarray:
+        """Decode the source image to a full-resolution RGB uint8 array (no
+        resize). Used both by the normal load path and by the preprocessing
+        pass that detects birds on the native-resolution frame."""
         path = self._resolve_path(image_path)
         if not path.exists():
             raise FileNotFoundError(f"Image file not found: {path}")
+        if path.suffix.lower() in self.RAW_EXTENSIONS:
+            return self._read_raw_image(path)
+        return self._read_standard_image(path)
 
-        suffix = path.suffix.lower()
-        if suffix in self.RAW_EXTENSIONS:
-            rgb = self._read_raw_image(path)
-        else:
-            rgb = self._read_standard_image(path)
+    def _source_pixels(self, image_path: str) -> np.ndarray:
+        """Full-resolution RGB uint8 to feed the resize step.
+
+        With a crop cache configured, reads the pre-computed bird crop; if a
+        crop is missing (cache not built for this image) it falls back to the
+        full frame and warns once, rather than loading a detector inside a
+        DataLoader worker.
+        """
+        if self.crop_cache_dir is not None:
+            cache_path = crop_cache_path(self.crop_cache_dir, self._resolve_path(image_path))
+            if cache_path.exists():
+                return self._read_standard_image(cache_path)
+            if not self._warned_missing_crop:
+                print(
+                    f"[RawImageLoader] crop cache enabled but missing entry for {image_path}; "
+                    "falling back to full frame. Run `python -m picklikeme.preprocess` to build crops."
+                )
+                self._warned_missing_crop = True
+        return self._decode_full_frame(image_path)
+
+    def load_image(self, image_path: str) -> np.ndarray:
+        rgb = self._source_pixels(image_path)
 
         if self.resize_mode == "letterbox":
             rgb = self._letterbox(rgb)

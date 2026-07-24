@@ -63,6 +63,33 @@ held-out test split, writing them to `evaluation_metrics.json`.
 `--resize-mode stretch` reproduces the V1 baseline preprocessing; the default
 `letterbox` is the V2 aspect-ratio-preserving behavior.
 
+### Optional: bird-cropped input
+
+Instead of the full frame, training can feed a tight crop around the detected
+bird, so the model sees a bird-centered image (background is discarded). This
+is opt-in via `--crop-birds` so it can be A/B-compared against the full-frame
+model.
+
+Build the crop cache once (detects the bird per image, crops with a small
+safety margin, aspect ratio preserved, and caches the result):
+
+```bash
+python -m picklikeme.preprocess --select-root "C:\\path\\to\\select" --reject-root "C:\\path\\to\\reject"
+```
+
+Then train against it:
+
+```bash
+python -m picklikeme.train --select-root "..." --reject-root "..." --crop-birds
+```
+
+Detection uses torchvision's COCO-pretrained Faster R-CNN v2 (the "bird" class)
+and runs **once** in this single-process pass — never per epoch and never in
+DataLoader workers. Crops are cached as PNGs under `cache/crops/` (keyed by
+source path, reusable across model input sizes). Images with no detected bird
+fall back to the full frame. The crop is a true sub-rectangle then
+letterbox-padded to the input size, so the bird is never stretched.
+
 The default backbone is a pretrained **DINOv3-Huge+** ViT (V3, ~840M params),
 used as a frozen feature extractor (linear probe) behind the same
 `PreferenceHead` — the largest DINOv3 variant that comfortably fits a 12GB

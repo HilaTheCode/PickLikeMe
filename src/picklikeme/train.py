@@ -14,7 +14,7 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
 
-from .config import DEFAULT_CHECKPOINT_PATH, ProjectConfig
+from .config import DEFAULT_CHECKPOINT_PATH, DEFAULT_CROP_CACHE_DIR, ProjectConfig
 from .dataset import FolderLabelDataset, LabelDataset, PathSuffixIndex
 from .evaluate import compute_metrics, format_metrics, score_items, write_metrics_json
 from .model import DINOV3_BACKBONE, ModelConfig, PreferenceHead
@@ -459,6 +459,8 @@ def main() -> None:
     parser.add_argument("--device", default=None, help="Override the device (default: cuda if available, else cpu)")
     parser.add_argument("--num-workers", type=int, default=None, help=f"DataLoader worker processes (default: {ProjectConfig.num_workers})")
     parser.add_argument("--log-interval-batches", type=int, default=1, help="Print training progress every N batches (1 = every batch, the default; higher = less noise; 0 = only at epoch end)")
+    parser.add_argument("--crop-birds", action="store_true", help="Feed pre-computed bird crops (from picklikeme.preprocess) instead of full frames")
+    parser.add_argument("--crop-cache-dir", default=str(DEFAULT_CROP_CACHE_DIR), help="Directory of the bird-crop cache used by --crop-birds")
     args = parser.parse_args()
 
     if not args.select_root or not args.reject_root:
@@ -473,7 +475,10 @@ def main() -> None:
     )
     from .raw_io import RawImageLoader
 
-    loader = RawImageLoader(config.raw_root, resize_mode=args.resize_mode)
+    crop_cache_dir = args.crop_cache_dir if args.crop_birds else None
+    if args.crop_birds:
+        print(f"Bird-crop input enabled; reading crops from {Path(crop_cache_dir).resolve()}")
+    loader = RawImageLoader(config.raw_root, resize_mode=args.resize_mode, crop_cache_dir=crop_cache_dir)
     manifest_path = args.manifest if Path(args.manifest).exists() else None
     if manifest_path is None:
         print(f"Manifest not found at {args.manifest}; burst IDs will be unavailable (burst metrics need them)")
