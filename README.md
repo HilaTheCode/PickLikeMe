@@ -90,6 +90,20 @@ source path, reusable across model input sizes). Images with no detected bird
 fall back to the full frame. The crop is a true sub-rectangle then
 letterbox-padded to the input size, so the bird is never stretched.
 
+To visually inspect crop quality before training, render contact sheets of
+sampled cached crops (exactly as the model receives them, letterbox padding
+included) plus a detection-rate report and a separate sheet of full-frame
+fallbacks:
+
+```bash
+python -m picklikeme.inspect_crops --select-root "..." --reject-root "..."
+```
+
+Outputs land in `inspection/` (`crops_sheet_*.png`, `fallback_sheet_*.png`,
+`report.txt`). This is read-only — it never changes the cache, detector, or
+training. Detected-vs-fallback is re-derived by running the detector read-only
+on the sampled crops, since preprocessing doesn't record per-image outcomes.
+
 The default backbone is a pretrained **DINOv3-Huge+** ViT (V3, ~840M params),
 used as a frozen feature extractor (linear probe) behind the same
 `PreferenceHead` — the largest DINOv3 variant that comfortably fits a 12GB

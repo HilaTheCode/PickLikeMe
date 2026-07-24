@@ -8,6 +8,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CHECKPOINT_DIR = PROJECT_ROOT / "checkpoints"
 DEFAULT_CHECKPOINT_PATH = DEFAULT_CHECKPOINT_DIR / "model_checkpoint.pt"
 DEFAULT_CROP_CACHE_DIR = PROJECT_ROOT / "cache" / "crops"
+DEFAULT_INSPECTION_DIR = PROJECT_ROOT / "inspection"
 
 
 @dataclass(frozen=True)
