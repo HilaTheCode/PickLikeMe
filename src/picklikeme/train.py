@@ -169,7 +169,7 @@ def train(
     checkpoint_interval: timedelta | None = None,
     model_config: ModelConfig | None = None,
     best_checkpoint_path: str | Path | None = None,
-    log_interval_batches: int = 50,
+    log_interval_batches: int = 1,
 ) -> PreferenceHead:
     if dataset is None:
         dataset = LabelDataset(config.manifest_path, config.raw_root)
@@ -407,7 +407,7 @@ def main() -> None:
     parser.add_argument("--unfreeze-backbone", action="store_true", help="Fine-tune the pretrained backbone instead of the default linear-probe (frozen backbone)")
     parser.add_argument("--device", default=None, help="Override the device (default: cuda if available, else cpu)")
     parser.add_argument("--num-workers", type=int, default=None, help=f"DataLoader worker processes (default: {ProjectConfig.num_workers})")
-    parser.add_argument("--log-interval-batches", type=int, default=50, help="Print training progress every N batches instead of every batch (0 = only at epoch end)")
+    parser.add_argument("--log-interval-batches", type=int, default=1, help="Print training progress every N batches (1 = every batch, the default; higher = less noise; 0 = only at epoch end)")
     args = parser.parse_args()
 
     if not args.select_root or not args.reject_root:
