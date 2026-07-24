@@ -21,7 +21,7 @@ try:
 except ImportError:  # pragma: no cover - depends on environment
     timm = None
 
-DINOV3_BACKBONE = "vit_small_patch16_dinov3"
+DINOV3_BACKBONE = "vit_huge_plus_patch16_dinov3"
 
 
 @dataclass

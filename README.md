@@ -17,6 +17,19 @@ Pick Like Me is a personal machine-learning project for learning an individual w
 pip install -r requirements.txt
 ```
 
+`requirements.txt` pulls whatever CPU/CUDA build of torch pip resolves by
+default. To actually use an NVIDIA GPU, install a CUDA build matching your
+driver from the [PyTorch wheel index](https://download.pytorch.org/whl/),
+e.g. for a driver that supports CUDA 13.0:
+
+```bash
+pip install --index-url https://download.pytorch.org/whl/cu130 torch torchvision
+```
+
+Verify with `python -c "import torch; print(torch.cuda.is_available())"`.
+Training defaults to `cuda` (see `ProjectConfig.device`) and falls back to
+CPU automatically, with a warning, if CUDA isn't available.
+
 ### 2. Build a manifest from a Select/Reject folder pair
 
 ```bash
@@ -50,12 +63,33 @@ held-out test split, writing them to `evaluation_metrics.json`.
 `--resize-mode stretch` reproduces the V1 baseline preprocessing; the default
 `letterbox` is the V2 aspect-ratio-preserving behavior.
 
-The default backbone is a pretrained **DINOv3** ViT (V3), used as a frozen
-feature extractor (linear probe) behind the same `PreferenceHead`. Pass
-`--backbone cnn` to reproduce the V1/V2 custom-CNN backbone for comparison,
-or `--unfreeze-backbone` to fine-tune DINOv3 instead of linear-probing it.
-Downloading pretrained weights requires internet access on first run (cached
-under the Hugging Face hub cache afterwards).
+The default backbone is a pretrained **DINOv3-Huge+** ViT (V3, ~840M params),
+used as a frozen feature extractor (linear probe) behind the same
+`PreferenceHead` — the largest DINOv3 variant that comfortably fits a 12GB
+GPU (~4.4GB peak at batch size 16). Pass `--backbone cnn` to reproduce the
+V1/V2 custom-CNN backbone for comparison, `--backbone vit_small_patch16_dinov3`
+(or another `timm` DINOv3 name) for a smaller/faster variant, or
+`--unfreeze-backbone` to fine-tune instead of linear-probing. Downloading
+pretrained weights requires internet access on first run (cached under the
+Hugging Face hub cache afterwards).
+
+### Checkpointing and resuming
+
+- A checkpoint is written to `--checkpoint-path` (default `model_checkpoint.pt`)
+  at the end of every epoch, plus periodically during a long epoch
+  (`--checkpoint-interval-minutes`, default 15). Writes are atomic (temp file
+  + rename), so a checkpoint file is never left half-written.
+- The lowest-average-training-loss epoch is also saved separately to
+  `--best-checkpoint-path` (default `<checkpoint-path>_best.pt`).
+- Pressing Ctrl+C saves a checkpoint before the process exits, so at most the
+  epoch currently in progress is lost.
+- Training resumes automatically from `--checkpoint-path` if it exists (pass
+  `--fresh-start` to ignore it, or `--resume` to force resuming). Resuming
+  continues from the last **fully completed** epoch toward the same
+  `--epochs` target — it does not restart the epoch count or re-run
+  already-completed epochs.
+- This only protects processes started with this checkpointing logic —
+  editing the code has no effect on a training run already in progress.
 
 ## Project structure
 

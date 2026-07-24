@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -33,7 +34,28 @@ class ImageTensorDataset(Dataset):
         return image_tensor, target
 
 
-def save_checkpoint(model: nn.Module, optimizer, checkpoint_path: str | Path, epoch: int | None = None) -> None:
+def resolve_device(requested: str) -> str:
+    if requested.startswith("cuda") and not torch.cuda.is_available():
+        print(f"Requested device '{requested}' but CUDA is not available; falling back to CPU")
+        return "cpu"
+    return requested
+
+
+def save_checkpoint(
+    model: nn.Module,
+    optimizer,
+    checkpoint_path: str | Path,
+    epoch: int | None = None,
+    best_loss: float | None = None,
+) -> None:
+    """Save a checkpoint atomically: write to a temp file, then rename over
+    the target so a Ctrl+C (or crash) mid-write can never leave a truncated,
+    unloadable checkpoint on disk.
+
+    `epoch` records the last *fully completed* epoch, not the epoch in
+    progress — that's what let resume() know which epoch to restart from
+    without silently skipping unfinished work.
+    """
     checkpoint_path = Path(checkpoint_path)
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -41,7 +63,11 @@ def save_checkpoint(model: nn.Module, optimizer, checkpoint_path: str | Path, ep
         "optimizer_state_dict": optimizer.state_dict(),
         "epoch": epoch,
     }
-    torch.save(payload, checkpoint_path)
+    if best_loss is not None:
+        payload["best_loss"] = best_loss
+    tmp_path = checkpoint_path.with_name(checkpoint_path.name + ".tmp")
+    torch.save(payload, tmp_path)
+    tmp_path.replace(checkpoint_path)
 
 
 def write_progress_state(status_path: str | Path, epoch: int, total_epochs: int, batch: int, total_batches: int | None, loss: float | None, message: str) -> None:
@@ -69,86 +95,119 @@ def train(
     status_interval: timedelta | None = None,
     checkpoint_interval: timedelta | None = None,
     model_config: ModelConfig | None = None,
+    best_checkpoint_path: str | Path | None = None,
 ) -> PreferenceHead:
     if dataset is None:
         dataset = LabelDataset(config.manifest_path, config.raw_root)
     data_loader = DataLoader(ImageTensorDataset(dataset, loader), batch_size=config.batch_size, shuffle=True)
 
+    device = resolve_device(config.device)
     timestamp = datetime.now().strftime("%H:%M:%S")
-    print(f"[{timestamp}] Starting training with {len(dataset)} relevant images")
+    print(f"[{timestamp}] Starting training with {len(dataset)} relevant images on device={device}")
     print(f"[{timestamp}] Loaded {len(dataset)} images from the accepted/rejected roots")
 
-    model = PreferenceHead(model_config)
+    model = PreferenceHead(model_config).to(device)
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total = sum(p.numel() for p in model.parameters())
     print(f"Backbone: {model.config.backbone} (trainable params: {trainable:,} / {total:,})")
     optimizer = torch.optim.Adam((p for p in model.parameters() if p.requires_grad), lr=config.learning_rate)
     criterion = nn.MSELoss()
 
+    start_epoch = 0
+    best_loss = math.inf
     if checkpoint_path is not None:
         checkpoint_path = Path(checkpoint_path)
         if resume and checkpoint_path.exists():
             print(f"Resuming from checkpoint {checkpoint_path}")
-            checkpoint = torch.load(checkpoint_path, map_location=config.device)
+            checkpoint = torch.load(checkpoint_path, map_location=device)
             model.load_state_dict(checkpoint["model_state_dict"])
             optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+            start_epoch = checkpoint.get("epoch") or 0
+            best_loss = checkpoint.get("best_loss", math.inf)
+            print(f"Resumed after epoch {start_epoch}/{config.epochs}; best_loss so far={best_loss}")
         elif not resume and checkpoint_path.exists():
             print(f"Overwriting existing checkpoint at {checkpoint_path}")
+
+    if best_checkpoint_path is not None:
+        best_checkpoint_path = Path(best_checkpoint_path)
+    elif checkpoint_path is not None:
+        best_checkpoint_path = checkpoint_path.with_name(f"{checkpoint_path.stem}_best{checkpoint_path.suffix}")
 
     total_batches = len(data_loader)
     last_status_write = datetime.now()
     last_checkpoint_write = datetime.now()
+    last_completed_epoch = start_epoch
     model.train()
-    for epoch in range(config.epochs):
-        current_epoch = epoch + 1
-        print(f"Starting epoch {current_epoch}/{config.epochs} (progress: {current_epoch}/{config.epochs})")
-        processed_batches = 0
-        for batch_idx, (images, labels) in enumerate(data_loader):
-            optimizer.zero_grad()
-            logits = model(images)
-            loss = criterion(logits.squeeze(-1), labels)
-            loss.backward()
-            optimizer.step()
-            processed_batches += 1
-            now = datetime.now()
-            if status_path is not None and status_interval is not None and now - last_status_write >= status_interval:
+    try:
+        for epoch in range(start_epoch, config.epochs):
+            current_epoch = epoch + 1
+            print(f"Starting epoch {current_epoch}/{config.epochs} (progress: {current_epoch}/{config.epochs})")
+            processed_batches = 0
+            epoch_loss_sum = 0.0
+            for batch_idx, (images, labels) in enumerate(data_loader):
+                images = images.to(device)
+                labels = labels.to(device)
+                optimizer.zero_grad()
+                logits = model(images)
+                loss = criterion(logits.squeeze(-1), labels)
+                loss.backward()
+                optimizer.step()
+                processed_batches += 1
+                epoch_loss_sum += float(loss.item())
+                now = datetime.now()
+                if status_path is not None and status_interval is not None and now - last_status_write >= status_interval:
+                    write_progress_state(
+                        status_path,
+                        current_epoch,
+                        config.epochs,
+                        processed_batches,
+                        total_batches,
+                        float(loss.item()),
+                        f"processed batch {processed_batches}",
+                    )
+                    last_status_write = now
+                if checkpoint_path is not None and checkpoint_interval is not None and now - last_checkpoint_write >= checkpoint_interval:
+                    # epoch in progress isn't done yet: record last_completed_epoch,
+                    # not current_epoch, so a resume redoes this epoch instead of
+                    # wrongly treating it as finished.
+                    save_checkpoint(model, optimizer, checkpoint_path, epoch=last_completed_epoch, best_loss=best_loss)
+                    print(f"[{now.strftime('%H:%M:%S')}] Saved checkpoint to {checkpoint_path} (mid-epoch {current_epoch}, last completed={last_completed_epoch})")
+                    last_checkpoint_write = now
+                print(f"[{datetime.now().strftime('%H:%M:%S')}]   processed batch {processed_batches} (loss={loss.item():.4f})")
+
+            last_completed_epoch = current_epoch
+            epoch_avg_loss = epoch_loss_sum / processed_batches if processed_batches else None
+
+            if status_path is not None:
                 write_progress_state(
                     status_path,
                     current_epoch,
                     config.epochs,
                     processed_batches,
                     total_batches,
-                    float(loss.item()),
-                    f"processed batch {processed_batches}",
+                    epoch_avg_loss,
+                    f"completed epoch {current_epoch}/{config.epochs}",
                 )
-                last_status_write = now
-            if checkpoint_path is not None and checkpoint_interval is not None and now - last_checkpoint_write >= checkpoint_interval:
-                save_checkpoint(model, optimizer, checkpoint_path, epoch=current_epoch)
-                print(f"[{now.strftime('%H:%M:%S')}] Saved checkpoint to {checkpoint_path}")
-                last_checkpoint_write = now
-            print(f"[{datetime.now().strftime('%H:%M:%S')}]   processed batch {processed_batches} (loss={loss.item():.4f})")
-        if status_path is not None:
-            write_progress_state(
-                status_path,
-                current_epoch,
-                config.epochs,
-                processed_batches,
-                total_batches,
-                None,
-                f"completed epoch {current_epoch}/{config.epochs}",
-            )
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] Completed epoch {current_epoch}/{config.epochs}; {config.epochs - current_epoch} epochs remaining")
 
-    if checkpoint_path is not None:
-        checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(
-            {
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-            },
-            checkpoint_path,
-        )
-        print(f"Saved checkpoint to {checkpoint_path}")
+            if epoch_avg_loss is not None and epoch_avg_loss < best_loss:
+                best_loss = epoch_avg_loss
+                if best_checkpoint_path is not None:
+                    save_checkpoint(model, optimizer, best_checkpoint_path, epoch=last_completed_epoch, best_loss=best_loss)
+                    print(f"[{datetime.now().strftime('%H:%M:%S')}] New best loss {best_loss:.4f} -> saved {best_checkpoint_path}")
+
+            if checkpoint_path is not None:
+                # Save after the best_loss update above so a later resume reads
+                # back the correct running-best, not a stale pre-epoch value.
+                save_checkpoint(model, optimizer, checkpoint_path, epoch=last_completed_epoch, best_loss=best_loss)
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] Saved checkpoint to {checkpoint_path} (epoch {current_epoch} complete)")
+
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] Completed epoch {current_epoch}/{config.epochs}; {config.epochs - current_epoch} epochs remaining")
+    except KeyboardInterrupt:
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] KeyboardInterrupt received; saving checkpoint before exiting")
+        if checkpoint_path is not None:
+            save_checkpoint(model, optimizer, checkpoint_path, epoch=last_completed_epoch, best_loss=best_loss)
+            print(f"Saved interrupt checkpoint to {checkpoint_path} (last completed epoch={last_completed_epoch})")
+        raise
 
     return model
 
@@ -225,6 +284,7 @@ def main() -> None:
     parser.add_argument("--output-csv", default="training_results.csv")
     parser.add_argument("--max-rows", type=int, default=1000)
     parser.add_argument("--checkpoint-path", default="model_checkpoint.pt")
+    parser.add_argument("--best-checkpoint-path", default=None, help="Where to save the lowest-training-loss checkpoint (default: <checkpoint-path>_best.pt)")
     parser.add_argument("--status-path", default="training_status.json")
     parser.add_argument("--status-interval-minutes", type=int, default=10)
     parser.add_argument("--checkpoint-interval-minutes", type=int, default=15)
@@ -236,13 +296,14 @@ def main() -> None:
     parser.add_argument("--backbone", default=DINOV3_BACKBONE, help="V3 pretrained backbone (any timm model name), or 'cnn' to reproduce the V1/V2 baseline backbone")
     parser.add_argument("--no-pretrained", action="store_true", help="Randomly initialize the backbone instead of loading pretrained weights (debugging only)")
     parser.add_argument("--unfreeze-backbone", action="store_true", help="Fine-tune the pretrained backbone instead of the default linear-probe (frozen backbone)")
+    parser.add_argument("--device", default=None, help="Override the device (default: cuda if available, else cpu)")
     args = parser.parse_args()
 
     if not args.select_root or not args.reject_root:
         raise SystemExit("Both --select-root and --reject-root are required.")
 
     raw_root = args.raw_root or args.select_root
-    config = ProjectConfig(raw_root=raw_root, manifest_path=args.manifest)
+    config = ProjectConfig(raw_root=raw_root, manifest_path=args.manifest, device=args.device or ProjectConfig.device)
     from .raw_io import RawImageLoader
 
     loader = RawImageLoader(config.raw_root, resize_mode=args.resize_mode)
@@ -280,15 +341,17 @@ def main() -> None:
         status_interval=timedelta(minutes=args.status_interval_minutes),
         checkpoint_interval=timedelta(minutes=args.checkpoint_interval_minutes),
         model_config=model_config,
+        best_checkpoint_path=args.best_checkpoint_path,
     )
+    device = resolve_device(config.device)
     if test_items:
         print(f"Evaluating on {len(test_items)} held-out test images")
-        metrics = compute_metrics(score_items(model, test_items, loader, device="cpu"))
+        metrics = compute_metrics(score_items(model, test_items, loader, device=device))
         print(format_metrics(metrics))
         metrics_path = write_metrics_json(metrics, args.metrics_json)
         print(f"Metrics written to {metrics_path}")
 
-    ranked = rank_dataset(model, dataset, loader, device="cpu")
+    ranked = rank_dataset(model, dataset, loader, device=device)
     print(f"Detected sequences: {dataset.count_sequences()}")
     output_paths = write_results_csv(args.output_csv, dataset, ranked, args.select_root, args.reject_root, max_rows=args.max_rows)
     print("Top-ranked images:")

@@ -1,3 +1,6 @@
+# For GPU training, install a CUDA build matching your driver instead, e.g.:
+#   pip install --index-url https://download.pytorch.org/whl/cu130 torch torchvision
+# (see README) rather than relying on the CPU-only build these two lines resolve to.
 torch
 torchvision
 rawpy

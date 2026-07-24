@@ -80,6 +80,10 @@ Design constraints:
 - Start with the backbone frozen (linear probe) as the primary V3 experiment; full or
   partial fine-tuning is a recorded sub-variant (V3a/V3b), not a separate version.
 - Everything else (preprocessing from V2, MSE loss, training loop) stays unchanged.
+- Pick the largest DINOv3 variant that comfortably fits the training GPU's VRAM as a
+  frozen backbone; on this project's 12GB card that's `vit_huge_plus_patch16_dinov3`
+  (~840M params, ~4.4GB peak at batch size 16). `vit_7b_patch16_dinov3` (~27GB) does
+  not fit and is out of scope without multi-GPU/offload infrastructure.
 
 Files: `src/picklikeme/model.py` (+ backbone weights dependency).
 
