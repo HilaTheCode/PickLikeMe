@@ -17,17 +17,35 @@ read-only on the cached images.
 from __future__ import annotations
 
 import argparse
+import csv
 import math
 import random
+from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
-from .bird_crop import CropParams, crop_cache_path, read_crop_params
+from .bird_crop import (
+    COCO_BIRD_CLASS,
+    CropParams,
+    build_crop,
+    crop_cache_path,
+    crop_to_box,
+    downscale_long_side,
+    expand_and_clamp_box,
+    read_crop_params,
+)
 from .config import DEFAULT_CROP_CACHE_DIR, DEFAULT_INSPECTION_DIR
 from .dataset import FolderLabelDataset
 from .raw_io import RawImageLoader
+
+# Supported inputs for folder mode: the RAW formats the pipeline decodes, plus
+# common standard image formats (so a mixed acceptance folder still works).
+SUPPORTED_INPUT_EXTS = RawImageLoader.RAW_EXTENSIONS | {
+    ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp",
+}
 
 
 def resolve_device(requested: str) -> str:
@@ -155,22 +173,281 @@ def _format_report(cache_dir: Path, total_cached: int, tagged: list[tuple[str, P
     return "\n".join(lines)
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Render contact sheets of cached bird crops for visual QA")
-    parser.add_argument("--select-root", required=True)
-    parser.add_argument("--reject-root", required=True)
-    parser.add_argument("--cache-dir", default=str(DEFAULT_CROP_CACHE_DIR))
-    parser.add_argument("--output-dir", default=str(DEFAULT_INSPECTION_DIR))
-    parser.add_argument("--sample-size", type=int, default=100, help="Approx number of cached crops to sample and classify")
-    parser.add_argument("--cols", type=int, default=10, help="Thumbnails per row in a contact sheet")
-    parser.add_argument("--thumb", type=int, default=256, help="Thumbnail size in pixels")
-    parser.add_argument("--per-sheet", type=int, default=100, help="Max thumbnails per contact-sheet image")
-    parser.add_argument("--output-size", type=int, default=384, help="Model input size to render (match training)")
-    parser.add_argument("--resize-mode", default="letterbox", choices=["letterbox", "stretch"])
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--device", default="cuda")
-    args = parser.parse_args()
+# ===========================================================================
+# Folder mode: run the live pipeline on a user-supplied acceptance folder
+# ===========================================================================
 
+@dataclass
+class PipelineResult:
+    source_path: str
+    found: bool
+    score: float | None
+    box: tuple[int, int, int, int] | None          # raw detected box
+    expanded_box: tuple[int, int, int, int] | None  # box actually used for the crop
+    original_size: tuple[int, int]                   # (width, height)
+    crop_size: tuple[int, int]                       # (width, height) of the tight crop
+    full_rgb: np.ndarray                             # decoded original (uint8 RGB)
+    model_input_rgb: np.ndarray                      # exactly what the model receives (uint8 RGB)
+
+
+def detect_bird(detector, image_rgb: np.ndarray) -> tuple[tuple[float, float, float, float] | None, float | None]:
+    """Highest-confidence bird box AND its score. Mirrors
+    BirdDetector.best_bird_box exactly (same class filter, threshold, argmax)
+    but also returns the score, which best_bird_box discards. Read-only; does
+    not modify the detector."""
+    torch = detector._torch
+    tensor = torch.from_numpy(image_rgb).permute(2, 0, 1).contiguous().float().div(255.0)
+    with torch.no_grad():
+        output = detector.model([tensor.to(detector.device)])[0]
+    boxes = output["boxes"].cpu().numpy()
+    labels = output["labels"].cpu().numpy()
+    scores = output["scores"].cpu().numpy()
+
+    best_box = None
+    best_score = detector.conf_threshold
+    for box, label, score in zip(boxes, labels, scores):
+        if label == COCO_BIRD_CLASS and score >= best_score:
+            best_score = float(score)
+            best_box = tuple(float(v) for v in box)
+    return best_box, (best_score if best_box is not None else None)
+
+
+def run_pipeline(loader: RawImageLoader, detector, source_path: str, params: CropParams) -> PipelineResult:
+    """Decode -> detect -> crop -> resize/pad, reproducing preprocessing +
+    RawImageLoader exactly, while also capturing the box/score/sizes needed for
+    the report and overlay. The crop steps are the same helper calls
+    bird_crop.build_crop uses, so model_input is byte-identical to training."""
+    full = loader._decode_full_frame(source_path)  # uint8 RGB, full resolution
+    height, width = full.shape[:2]
+    box, score = detect_bird(detector, full)
+
+    if box is None:
+        crop = downscale_long_side(full, params.max_side)
+        expanded = None
+        found = False
+    else:
+        expanded = expand_and_clamp_box(box, params.margin_frac, width, height)
+        crop = downscale_long_side(crop_to_box(full, expanded), params.max_side)
+        found = True
+
+    if loader.resize_mode == "letterbox":
+        model_input = loader._letterbox(crop)
+    else:
+        import cv2
+
+        model_input = cv2.resize(crop, loader.output_size, interpolation=cv2.INTER_AREA)
+
+    return PipelineResult(
+        source_path=source_path,
+        found=found,
+        score=score,
+        box=tuple(int(round(v)) for v in box) if box is not None else None,
+        expanded_box=expanded,
+        original_size=(width, height),
+        crop_size=(crop.shape[1], crop.shape[0]),
+        full_rgb=full,
+        model_input_rgb=model_input,
+    )
+
+
+def _fit_into_square(image_rgb: np.ndarray, size: int, bg: tuple[int, int, int] = (24, 24, 24)) -> Image.Image:
+    """Thumbnail an image into a square canvas, preserving aspect ratio (letterbox
+    into the cell) so grids align without distorting the picture."""
+    pil = Image.fromarray(image_rgb)
+    pil.thumbnail((size, size), Image.LANCZOS)
+    canvas = Image.new("RGB", (size, size), bg)
+    canvas.paste(pil, ((size - pil.width) // 2, (size - pil.height) // 2))
+    return canvas
+
+
+def draw_bbox_overlay(result: PipelineResult) -> Image.Image:
+    """Original image with the detected box (green) and the expanded crop
+    region (yellow) drawn on top; 'NO BIRD' in red for fallbacks."""
+    image = Image.fromarray(result.full_rgb).copy()
+    draw = ImageDraw.Draw(image)
+    font = ImageFont.load_default()
+    line_w = max(3, image.width // 250)
+    if result.found and result.box is not None:
+        draw.rectangle(result.box, outline=(0, 255, 0), width=line_w)
+        if result.expanded_box is not None:
+            draw.rectangle(result.expanded_box, outline=(255, 230, 0), width=max(2, line_w // 2))
+        label = f"bird {result.score:.2f}"
+        draw.text((result.box[0] + 2, max(0, result.box[1] - 12)), label, fill=(0, 255, 0), font=font)
+    else:
+        draw.text((6, 6), "NO BIRD - full-frame fallback", fill=(255, 60, 60), font=font)
+    return image
+
+
+def build_pair_sheet(
+    rows: list[tuple[Image.Image, Image.Image, str]],
+    thumb: int,
+    caption_h: int = 18,
+    arrow_w: int = 44,
+) -> Image.Image:
+    """One row per image: [original] -> [final model input], filename beneath."""
+    row_w = thumb + arrow_w + thumb
+    row_h = thumb + caption_h
+    sheet = Image.new("RGB", (row_w, row_h * max(1, len(rows))), (24, 24, 24))
+    draw = ImageDraw.Draw(sheet)
+    font = ImageFont.load_default()
+    for i, (left, right, caption) in enumerate(rows):
+        y = i * row_h
+        sheet.paste(left, (0, y))
+        draw.text((thumb + arrow_w // 2 - 6, y + thumb // 2 - 4), "->", fill=(230, 230, 230), font=font)
+        sheet.paste(right, (thumb + arrow_w, y))
+        draw.text((2, y + thumb + 2), _truncate(caption, max(8, row_w // 6)), fill=(230, 230, 230), font=font)
+    return sheet
+
+
+def _paginate(items: list, per_sheet: int) -> list[list]:
+    return [items[i : i + per_sheet] for i in range(0, len(items), per_sheet)] or [[]]
+
+
+def write_folder_report(output_dir: Path, results: list[PipelineResult], errors: list[tuple[str, str]]) -> Path:
+    processed = len(results)
+    detected = sum(1 for r in results if r.found)
+    failures = processed - detected
+    rate = (detected / processed * 100.0) if processed else 0.0
+
+    lines = [
+        "Bird detection / crop acceptance report",
+        "=======================================",
+        f"Images processed:           {processed}",
+        f"Successful detections:      {detected}",
+        f"Detector failures (fallback): {failures}",
+        f"Detection success rate:     {rate:.1f}%",
+    ]
+    if errors:
+        lines.append(f"Unreadable images (skipped): {len(errors)}")
+    lines.append("")
+    lines.append("Per-image detail:")
+    for r in results:
+        name = Path(r.source_path).name
+        if r.found:
+            box = ",".join(str(v) for v in r.box)
+            lines.append(
+                f"  {name}: DETECTED conf={r.score:.3f} box=[{box}] "
+                f"orig={r.original_size[0]}x{r.original_size[1]} crop={r.crop_size[0]}x{r.crop_size[1]}"
+            )
+        else:
+            lines.append(
+                f"  {name}: *** FALLBACK (no bird) *** conf=n/a box=n/a "
+                f"orig={r.original_size[0]}x{r.original_size[1]} crop={r.crop_size[0]}x{r.crop_size[1]} (full frame)"
+            )
+    for path, err in errors:
+        lines.append(f"  {Path(path).name}: ERROR {err}")
+
+    report_path = output_dir / "report.txt"
+    report_path.write_text("\n".join(lines), encoding="utf-8")
+
+    # Machine-readable companion for archiving/comparison.
+    with (output_dir / "report.csv").open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["filename", "detected", "fallback", "confidence", "box_x1", "box_y1", "box_x2", "box_y2", "orig_w", "orig_h", "crop_w", "crop_h"])
+        for r in results:
+            box = r.box if r.box is not None else ("", "", "", "")
+            writer.writerow([
+                Path(r.source_path).name, r.found, not r.found,
+                f"{r.score:.4f}" if r.score is not None else "",
+                *box, r.original_size[0], r.original_size[1], r.crop_size[0], r.crop_size[1],
+            ])
+    return report_path
+
+
+def inspect_folder(args) -> None:
+    from .bird_crop import BirdDetector
+
+    input_folder = Path(args.input_folder)
+    if not input_folder.exists():
+        raise SystemExit(f"Input folder does not exist: {input_folder}")
+
+    image_paths = sorted(
+        str(p) for p in input_folder.rglob("*")
+        if p.is_file() and p.suffix.lower() in SUPPORTED_INPUT_EXTS
+    )
+    if not image_paths:
+        raise SystemExit(f"No supported images ({sorted(SUPPORTED_INPUT_EXTS)}) found in {input_folder.resolve()}")
+    print(f"Found {len(image_paths)} images in {input_folder.resolve()}")
+
+    # Self-contained, timestamped run folder for archiving.
+    run_dir = Path(args.output_dir) / f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    images_dir = run_dir / "images"
+    images_dir.mkdir(parents=True, exist_ok=True)
+
+    params = CropParams(margin_frac=args.margin_frac, conf_threshold=args.conf_threshold, max_side=args.max_side)
+    loader = RawImageLoader(
+        raw_root=str(input_folder),
+        output_size=(args.output_size, args.output_size),
+        resize_mode=args.resize_mode,
+    )
+    device = resolve_device(args.device)
+    print(f"Loading detector on {device} (read-only)...")
+    detector = BirdDetector(device=device, conf_threshold=params.conf_threshold)
+
+    results: list[PipelineResult] = []
+    errors: list[tuple[str, str]] = []
+    for path in image_paths:
+        try:
+            result = run_pipeline(loader, detector, path, params)
+            results.append(result)
+            # Per-image side-by-side saved individually for close inspection.
+            left = _fit_into_square(result.full_rgb, args.thumb)
+            right = Image.fromarray(result.model_input_rgb).resize((args.thumb, args.thumb), Image.LANCZOS)
+            build_pair_sheet([(left, right, Path(path).name)], thumb=args.thumb).save(
+                images_dir / f"{Path(path).stem}_compare.png"
+            )
+            status = f"conf={result.score:.2f}" if result.found else "FALLBACK"
+            print(f"  {Path(path).name}: {'bird' if result.found else 'no bird'} ({status})")
+        except Exception as exc:  # noqa: BLE001 - one unreadable file shouldn't stop the acceptance run
+            errors.append((path, f"{type(exc).__name__}: {exc}"))
+            print(f"  {Path(path).name}: ERROR {type(exc).__name__}: {exc}")
+
+    # Contact sheet: rows of original -> final crop.
+    pair_rows = [
+        (
+            _fit_into_square(r.full_rgb, args.thumb),
+            Image.fromarray(r.model_input_rgb).resize((args.thumb, args.thumb), Image.LANCZOS),
+            Path(r.source_path).name,
+        )
+        for r in results
+    ]
+    pair_sheets = []
+    for page_no, page in enumerate(_paginate(pair_rows, args.per_sheet), start=1):
+        if not page:
+            continue
+        sheet = build_pair_sheet(page, thumb=args.thumb)
+        out = run_dir / f"comparison_sheet_{page_no:02d}.png"
+        sheet.save(out)
+        pair_sheets.append(out)
+
+    # Contact sheet: originals with bounding-box overlay.
+    overlay_cells = [(_fit_into_square(np.asarray(draw_bbox_overlay(r)), args.thumb), Path(r.source_path).name) for r in results]
+    overlay_sheets = []
+    for page_no, page in enumerate(_paginate(overlay_cells, args.per_sheet), start=1):
+        if not page:
+            continue
+        sheet = build_contact_sheet(page, cols=args.cols, thumb=args.thumb)
+        out = run_dir / f"bbox_overlay_sheet_{page_no:02d}.png"
+        sheet.save(out)
+        overlay_sheets.append(out)
+
+    report_path = write_folder_report(run_dir, results, errors)
+
+    detected = sum(1 for r in results if r.found)
+    print("\n" + report_path.read_text(encoding="utf-8"))
+    print(f"\nAll outputs written to: {run_dir.resolve()}")
+    print(f"  comparison sheets: {len(pair_sheets)}")
+    print(f"  bbox overlay sheets: {len(overlay_sheets)}")
+    print(f"  per-image images:  {images_dir.resolve()}")
+    print(f"  report:            {report_path.resolve()} (+ report.csv)")
+    print(f"Summary: {detected}/{len(results)} detected, {len(results) - detected} fallback, {len(errors)} errors.")
+
+
+# ===========================================================================
+# Cache mode (existing): sample and inspect an already-built crop cache
+# ===========================================================================
+
+def inspect_cache(args) -> None:
     cache_dir = Path(args.cache_dir)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -192,15 +469,12 @@ def main() -> None:
     sample = pairs if len(pairs) <= args.sample_size else rng.sample(pairs, args.sample_size)
     print(f"Sampling {len(sample)} crops for inspection (seed={args.seed}).")
 
-    # Loader used for display reads the crop cache and letterboxes to the model
-    # input size, so thumbnails are exactly what the model receives.
     display_loader = RawImageLoader(
         raw_root=args.select_root,
         output_size=(args.output_size, args.output_size),
         resize_mode=args.resize_mode,
         crop_cache_dir=str(cache_dir),
     )
-    # Loader used to read raw cached PNGs at native size for the detector.
     cache_reader = RawImageLoader(raw_root=args.select_root)
 
     from .bird_crop import BirdDetector
@@ -228,6 +502,35 @@ def main() -> None:
 
     print("\n" + report)
     print(f"\nReport written to {report_path.resolve()}")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Visual QA for bird detection and cropping")
+    # Two modes: --input-folder (live acceptance run) OR --select-root/--reject-root (sample the built cache).
+    parser.add_argument("--input-folder", default=None, help="Run the live pipeline on every image in this folder (acceptance test)")
+    parser.add_argument("--select-root", default=None, help="Cache mode: sample crops already built for this select root")
+    parser.add_argument("--reject-root", default=None, help="Cache mode: paired reject root")
+    parser.add_argument("--cache-dir", default=str(DEFAULT_CROP_CACHE_DIR))
+    parser.add_argument("--output-dir", default=str(DEFAULT_INSPECTION_DIR))
+    parser.add_argument("--sample-size", type=int, default=100, help="Cache mode: approx crops to sample")
+    parser.add_argument("--cols", type=int, default=10, help="Thumbnails per row in a grid contact sheet")
+    parser.add_argument("--thumb", type=int, default=256, help="Thumbnail size in pixels")
+    parser.add_argument("--per-sheet", type=int, default=100, help="Max items per contact-sheet image")
+    parser.add_argument("--output-size", type=int, default=384, help="Model input size to render (match training)")
+    parser.add_argument("--resize-mode", default="letterbox", choices=["letterbox", "stretch"])
+    parser.add_argument("--margin-frac", type=float, default=CropParams.margin_frac, help="Folder mode: crop safety margin (match preprocess)")
+    parser.add_argument("--conf-threshold", type=float, default=CropParams.conf_threshold, help="Folder mode: detection threshold (match preprocess)")
+    parser.add_argument("--max-side", type=int, default=CropParams.max_side, help="Folder mode: crop long-side cap (match preprocess)")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--device", default="cuda")
+    args = parser.parse_args()
+
+    if args.input_folder:
+        inspect_folder(args)
+    elif args.select_root and args.reject_root:
+        inspect_cache(args)
+    else:
+        raise SystemExit("Provide either --input-folder (acceptance run) or --select-root and --reject-root (cache mode).")
 
 
 if __name__ == "__main__":

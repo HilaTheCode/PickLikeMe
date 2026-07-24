@@ -90,19 +90,41 @@ source path, reusable across model input sizes). Images with no detected bird
 fall back to the full frame. The crop is a true sub-rectangle then
 letterbox-padded to the input size, so the bird is never stretched.
 
-To visually inspect crop quality before training, render contact sheets of
-sampled cached crops (exactly as the model receives them, letterbox padding
-included) plus a detection-rate report and a separate sheet of full-frame
-fallbacks:
+To visually validate detection + cropping, `picklikeme.inspect_crops` has two
+read-only modes (neither changes the cache, detector, preprocessing, or
+training).
+
+**Acceptance-folder mode** — run the live pipeline on a folder of
+representative images (e.g. ~30 covering small/large/flying/perched/occluded
+birds and hard backgrounds):
+
+```bash
+python -m picklikeme.inspect_crops --input-folder "C:\\path\\to\\acceptance_set"
+```
+
+Every run writes a self-contained, timestamped folder under `inspection/`
+(`run_YYYYmmdd_HHMMSS/`) containing:
+- `comparison_sheet_*.png` — rows of **original → final crop** (the crop shown
+  exactly as the model receives it: detected, cropped, aspect-preserving
+  resize, padded), filename beneath each.
+- `bbox_overlay_sheet_*.png` — the originals with the detected box (green) and
+  the expanded crop region (yellow) drawn on top, to check the right bird was
+  found and beak/wings/tail aren't clipped.
+- `images/<name>_compare.png` — the per-image original→crop pair.
+- `report.txt` + `report.csv` — images processed, successful detections,
+  failures, success rate, and per image: confidence, box coordinates, original
+  size, crop size, with fallbacks clearly flagged.
+
+**Cache-sampling mode** — sample an already-built cache instead:
 
 ```bash
 python -m picklikeme.inspect_crops --select-root "..." --reject-root "..."
 ```
 
-Outputs land in `inspection/` (`crops_sheet_*.png`, `fallback_sheet_*.png`,
-`report.txt`). This is read-only — it never changes the cache, detector, or
-training. Detected-vs-fallback is re-derived by running the detector read-only
-on the sampled crops, since preprocessing doesn't record per-image outcomes.
+writing `crops_sheet_*.png`, `fallback_sheet_*.png`, and `report.txt` into
+`inspection/`. Detected-vs-fallback is re-derived by running the detector
+read-only on the sampled crops, since preprocessing doesn't record per-image
+outcomes.
 
 The default backbone is a pretrained **DINOv3-Huge+** ViT (V3, ~840M params),
 used as a frozen feature extractor (linear probe) behind the same
