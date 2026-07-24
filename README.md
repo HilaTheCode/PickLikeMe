@@ -75,14 +75,22 @@ Hugging Face hub cache afterwards).
 
 ### Checkpointing and resuming
 
-- A checkpoint is written to `--checkpoint-path` (default `model_checkpoint.pt`)
-  at the end of every epoch, plus periodically during a long epoch
-  (`--checkpoint-interval-minutes`, default 15). Writes are atomic (temp file
-  + rename), so a checkpoint file is never left half-written.
+- A checkpoint is written to `--checkpoint-path` at the end of every epoch,
+  plus periodically during a long epoch (`--checkpoint-interval-minutes`,
+  default 15). Writes are atomic (temp file + rename), so a checkpoint file is
+  never left half-written.
+- The default checkpoint location is `<project-root>/checkpoints/model_checkpoint.pt`,
+  resolved from the package's own file location — so it is the **same directory
+  no matter which working directory you launch training from**. Pass
+  `--checkpoint-path` to override it.
 - The lowest-average-training-loss epoch is also saved separately to
   `--best-checkpoint-path` (default `<checkpoint-path>_best.pt`).
 - Pressing Ctrl+C saves a checkpoint before the process exits, so at most the
   epoch currently in progress is lost.
+- Every save and load prints a transparent diagnostics block (path, reason,
+  epoch, best loss, SUCCESS/FAILED), so it is always visible in the console
+  exactly what was written where. A failed save is reported but does not abort
+  training.
 - Training resumes automatically from `--checkpoint-path` if it exists (pass
   `--fresh-start` to ignore it, or `--resume` to force resuming). Resuming
   continues from the last **fully completed** epoch toward the same

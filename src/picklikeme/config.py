@@ -1,4 +1,12 @@
 from dataclasses import dataclass
+from pathlib import Path
+
+# Project root resolved from this file's location (src/picklikeme/config.py ->
+# parents[2] == project root), so paths derived from it are deterministic and
+# independent of the directory Python happens to be launched from.
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_CHECKPOINT_DIR = PROJECT_ROOT / "checkpoints"
+DEFAULT_CHECKPOINT_PATH = DEFAULT_CHECKPOINT_DIR / "model_checkpoint.pt"
 
 
 @dataclass(frozen=True)

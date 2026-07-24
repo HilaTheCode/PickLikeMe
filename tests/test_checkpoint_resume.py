@@ -155,7 +155,11 @@ class InterruptTests(unittest.TestCase):
     def test_keyboard_interrupt_saves_checkpoint_before_propagating(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             checkpoint_path = Path(tmpdir) / "checkpoint.pt"
-            config = ProjectConfig(batch_size=1, learning_rate=1e-3, epochs=5, device="cpu")
+            # num_workers=0 so the loader runs in the main process: a real Ctrl+C
+            # interrupts the main training loop, not a DataLoader worker subprocess
+            # (an exception raised in a worker surfaces as a worker-crash error, a
+            # different path than the KeyboardInterrupt handler under test).
+            config = ProjectConfig(batch_size=1, learning_rate=1e-3, epochs=5, device="cpu", num_workers=0)
             model_config = ModelConfig(backbone="cnn")
 
             with self.assertRaises(KeyboardInterrupt):
