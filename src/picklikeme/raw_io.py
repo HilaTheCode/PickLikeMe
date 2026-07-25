@@ -6,6 +6,7 @@ import cv2
 import numpy as np
 
 from .bird_crop import crop_cache_path
+from .profiling import PROFILE
 
 try:
     import rawpy  # type: ignore
@@ -46,15 +47,23 @@ class RawImageLoader:
                 "rawpy is not available. Install rawpy and a compatible libraw backend to load RAW files."
             )
 
-        with rawpy.imread(str(path)) as raw:
-            rgb = raw.postprocess()
+        # Split for profiling: imread is file read + container/metadata parse,
+        # postprocess is the demosaic. They cost very different amounts.
+        with PROFILE.stage("file read"):
+            raw = rawpy.imread(str(path))
+        try:
+            with PROFILE.stage("raw decode"):
+                rgb = raw.postprocess()
+        finally:
+            raw.close()
         return rgb
 
     def _read_standard_image(self, path: Path) -> np.ndarray:
-        image = cv2.imread(str(path), cv2.IMREAD_COLOR)
-        if image is None:
-            raise ValueError(f"Unsupported or unreadable image file: {path}")
-        return cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        with PROFILE.stage("image decode"):
+            image = cv2.imread(str(path), cv2.IMREAD_COLOR)
+            if image is None:
+                raise ValueError(f"Unsupported or unreadable image file: {path}")
+            return cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
     def _letterbox(self, rgb: np.ndarray) -> np.ndarray:
         """Resize preserving aspect ratio, pad the remainder with black.

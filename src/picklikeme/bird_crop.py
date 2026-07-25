@@ -38,6 +38,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from .profiling import PROFILE
+
 # COCO category indices in torchvision's detection weights metadata
 # (FasterRCNN_ResNet50_FPN_V2_Weights.COCO_V1.meta["categories"]). The animal
 # classes are contiguous: bird(16) .. giraffe(25).
@@ -75,6 +77,11 @@ def coco_class_name(label: int) -> str:
 
 CROP_CACHE_VERSION = "v2"
 CROP_PARAMS_FILENAME = "crop_params.json"
+
+# Cache entries live in cache_dir/<first 2 hex chars of digest>/<digest>.png.
+# Two characters gives 256 shards: ~215 files per shard at 55k images, which
+# keeps NTFS directory operations fast without creating a deep tree.
+CACHE_SHARD_CHARS = 2
 
 
 @dataclass(frozen=True)
@@ -142,19 +149,31 @@ def downscale_long_side(image: np.ndarray, max_side: int) -> np.ndarray:
 
 def crop_cache_path(cache_dir: str | Path, source_path: str | Path) -> Path:
     """Deterministic cache file for a source image, keyed by its absolute path.
+
+    THE single place in the codebase that constructs a cache path: every read
+    and every write goes through here, so the layout can never diverge between
+    producer and consumer.
+
+    Sharded into 256 subdirectories by the first two hex characters of the
+    digest, because a flat directory holding 55k+ entries degrades directory
+    operations on NTFS. The path is always *computed* from the digest — the
+    cache is never scanned, globbed, or walked to find an entry.
+
     Independent of crop parameters (those are recorded in crop_params.json);
-    rebuilding the cache overwrites in place."""
+    rebuilding the cache overwrites in place.
+    """
     resolved = str(Path(source_path).resolve())
     digest = hashlib.sha1(resolved.encode("utf-8")).hexdigest()[:20]
-    return Path(cache_dir) / f"{digest}.png"
+    return Path(cache_dir) / digest[:CACHE_SHARD_CHARS] / f"{digest}.png"
 
 
 def write_crop_params(cache_dir: str | Path, params: CropParams) -> Path:
-    cache_dir = Path(cache_dir)
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    path = cache_dir / CROP_PARAMS_FILENAME
-    path.write_text(json.dumps(asdict(params), indent=2), encoding="utf-8")
-    return path
+    with PROFILE.stage("metadata write"):
+        cache_dir = Path(cache_dir)
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        path = cache_dir / CROP_PARAMS_FILENAME
+        path.write_text(json.dumps(asdict(params), indent=2), encoding="utf-8")
+        return path
 
 
 def read_crop_params(cache_dir: str | Path) -> CropParams | None:
@@ -168,10 +187,11 @@ def read_crop_params(cache_dir: str | Path) -> CropParams | None:
 def save_crop_png(cache_path: Path, crop_rgb: np.ndarray) -> None:
     """Write an RGB crop to the cache as PNG (stored BGR so cv2.imread +
     the loader's BGR->RGB conversion round-trips correctly)."""
-    cache_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = cache_path.with_name(cache_path.name + ".tmp.png")
-    cv2.imwrite(str(tmp), cv2.cvtColor(crop_rgb, cv2.COLOR_RGB2BGR))
-    tmp.replace(cache_path)
+    with PROFILE.stage("png encode + write"):
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = cache_path.with_name(cache_path.name + ".tmp.png")
+        cv2.imwrite(str(tmp), cv2.cvtColor(crop_rgb, cv2.COLOR_RGB2BGR))
+        tmp.replace(cache_path)
 
 
 # ---------------------------------------------------------------------------
@@ -257,13 +277,21 @@ class BirdDetector:
         accepted.
         """
         torch = self._torch
-        tensor = torch.from_numpy(image_rgb).permute(2, 0, 1).contiguous().float().div(255.0)
-        with torch.no_grad():
-            output = self.model([tensor.to(self.device)])[0]
+        # Stages are split for profiling only; the operations and their order
+        # are unchanged (the host->device copy is merely named).
+        with PROFILE.stage("detector preprocess"):
+            tensor = torch.from_numpy(image_rgb).permute(2, 0, 1).contiguous().float().div(255.0)
+            device_tensor = tensor.to(self.device)
+            PROFILE.cuda_sync(torch, self.device)
+        with PROFILE.stage("gpu inference"):
+            with torch.no_grad():
+                output = self.model([device_tensor])[0]
+            PROFILE.cuda_sync(torch, self.device)
 
-        boxes = output["boxes"].cpu().numpy()
-        labels = output["labels"].cpu().numpy()
-        scores = output["scores"].cpu().numpy()
+        with PROFILE.stage("detector postprocess"):
+            boxes = output["boxes"].cpu().numpy()
+            labels = output["labels"].cpu().numpy()
+            scores = output["scores"].cpu().numpy()
 
         best: BirdDetection | None = None
         best_score = self.conf_threshold
@@ -294,11 +322,12 @@ def build_crop(
     """
     height, width = image_rgb.shape[:2]
     detection = detector.detect_best_bird(image_rgb)
-    if detection is None:
-        return CropResult(crop=downscale_long_side(image_rgb, params.max_side), detection=None, expanded_box=None)
-    expanded = expand_and_clamp_box(detection.box, params.margin_frac, width, height)
-    crop = downscale_long_side(crop_to_box(image_rgb, expanded), params.max_side)
-    return CropResult(crop=crop, detection=detection, expanded_box=expanded)
+    with PROFILE.stage("crop generation"):
+        if detection is None:
+            return CropResult(crop=downscale_long_side(image_rgb, params.max_side), detection=None, expanded_box=None)
+        expanded = expand_and_clamp_box(detection.box, params.margin_frac, width, height)
+        crop = downscale_long_side(crop_to_box(image_rgb, expanded), params.max_side)
+        return CropResult(crop=crop, detection=detection, expanded_box=expanded)
 
 
 def compute_composition_crop(

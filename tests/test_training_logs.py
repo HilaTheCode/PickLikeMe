@@ -210,7 +210,9 @@ class PreprocessProgressTests(unittest.TestCase):
             cache.mkdir(parents=True)
             paths = [str(Path(tmpdir) / f"img{i}.arw") for i in range(40)]
             for path in paths:
-                crop_cache_path(cache, path).write_bytes(b"cached")
+                entry = crop_cache_path(cache, path)
+                entry.parent.mkdir(parents=True, exist_ok=True)  # sharded layout
+                entry.write_bytes(b"cached")
 
             captured = io.StringIO()
             with redirect_stdout(captured):

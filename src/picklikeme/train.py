@@ -15,6 +15,7 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
 
+from .bird_crop import read_crop_params
 from .config import DEFAULT_CHECKPOINT_PATH, DEFAULT_CROP_CACHE_DIR, ProjectConfig, format_duration
 from .dataset import FolderLabelDataset, LabelDataset, PathSuffixIndex
 from .evaluate import compute_metrics, format_metrics, score_items, write_metrics_json
@@ -690,7 +691,11 @@ def train_and_rank(args) -> None:
     crop_cache_dir = args.crop_cache_dir if args.crop_birds else None
     if args.crop_birds:
         cache_path = Path(crop_cache_dir)
-        if cache_path.exists() and any(cache_path.glob("*.png")):
+        # The cache is sharded (cache_dir/<2 hex>/<digest>.png), so a glob for
+        # "*.png" at the root would find nothing even for a full cache. Presence
+        # is established from crop_params.json, which preprocessing writes for
+        # the directory - no scan of a 55k-entry tree.
+        if read_crop_params(cache_path) is not None:
             print(f"Bird-crop input enabled (default); reading crops from {cache_path.resolve()}")
         else:
             print("=" * 64)

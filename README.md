@@ -167,6 +167,36 @@ If `--crop-birds` is on but the cache is empty, training prints a warning and
 falls back to full frames — so build the cache first, or pass
 `--no-crop-birds` intentionally.
 
+#### How preprocessing spends its time
+
+RAW demosaic dominates: measured at **~80% of wall clock**, with the GPU busy
+only ~5% of it. So preprocessing runs as a three-stage pipeline that overlaps
+decode with detection and writing:
+
+```
+decode pool (8 threads) -> bounded window (12) -> main thread (GPU) -> writer thread
+read + rawpy.postprocess                          detect + crop        save PNG
+```
+
+Threads rather than processes because `rawpy` releases the GIL during
+`postprocess` (measured x2.75 on 8 threads, matching a process pool), so decoded
+frames never cross a process boundary. The window bounds decode-side RAM at
+roughly 700 MB.
+
+**Detection is unchanged by this**: images reach the detector one at a time, in
+source order, with no batching — batched Faster R-CNN is *not* output-identical
+(measured box deltas up to 0.077 px, score deltas up to 0.0067, enough to flip a
+detection at the 0.30 threshold), so it is deliberately not used.
+
+`--decode-workers` tunes the pool (default `min(8, cpu_count)`). More is not
+better: on a 20-core machine with the RAWs on a SATA HDD, 8 workers measured
+3.85 img/s while 12 measured 2.42 — libraw is already ~5.8-core parallel per
+frame, and concurrent readers reduce HDD throughput. Lower it if you need the
+machine for anything else while preprocessing runs; it saturates all cores.
+
+Set `PICKLIKEME_PROFILE=1` for a per-stage timing breakdown (every 500 images
+plus a final report). It is inert otherwise — no added CUDA synchronization.
+
 ### One command: preprocess → train → rank
 
 `picklikeme.run` chains the two steps above in a single process — it builds the
@@ -209,6 +239,22 @@ epoch and never in DataLoader workers. Crops are cached as PNGs under
 with no detected animal fall back to the full frame. The crop is a true
 sub-rectangle then letterbox-padded to the input size, so the animal is never
 stretched.
+
+**Cache layout.** Entries are sharded into 256 subdirectories by the first two
+hex characters of the path digest, so no directory holds 55k files:
+
+```
+cache/crops/
+    3f/3fa81234....png
+    a7/a7d4bc12....png
+    crop_params.json
+```
+
+The path is always *computed* from the digest by the single helper
+`crop_cache_path()` — the cache is never scanned, globbed or walked, so lookup
+cost does not grow with cache size. A cache built before sharding (flat) is not
+found by the current code; move each `<digest>.png` into `<digest[:2]>/` to
+migrate it.
 
 `cache/crops/crop_params.json` records the parameters and a cache version (`v1`
 = bird-only detection, `v2` = all animal classes). Preprocessing refuses to add

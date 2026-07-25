@@ -19,7 +19,7 @@ from __future__ import annotations
 import argparse
 
 from .bird_crop import CropParams
-from .preprocess import preprocess_folders
+from .preprocess import default_decode_workers, preprocess_folders
 from .train import build_arg_parser, train_and_rank
 
 
@@ -34,6 +34,13 @@ def main() -> None:
     group.add_argument("--max-side", type=int, default=CropParams.max_side, help="Max cached crop long side (pixels)")
     group.add_argument("--force-preprocess", action="store_true", help="Rebuild crops even if already cached")
     group.add_argument("--skip-preprocess", action="store_true", help="Skip the preprocess step and reuse the existing crop cache")
+    group.add_argument(
+        "--decode-workers",
+        type=int,
+        default=None,
+        help=f"Decoder threads feeding the GPU during preprocessing (default: min(8, cpu_count) = "
+        f"{default_decode_workers()}). Detection stays sequential regardless.",
+    )
     args = parser.parse_args()
 
     if not args.select_root or not args.reject_root:
@@ -55,6 +62,7 @@ def main() -> None:
             params,
             device=args.device or "cuda",
             force=args.force_preprocess,
+            decode_workers=args.decode_workers,
         )
     elif not args.crop_birds:
         print("Preprocess step skipped (--no-crop-birds: training on full frames).")
