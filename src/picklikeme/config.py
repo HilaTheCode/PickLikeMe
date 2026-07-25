@@ -11,6 +11,20 @@ DEFAULT_CROP_CACHE_DIR = PROJECT_ROOT / "cache" / "crops"
 DEFAULT_INSPECTION_DIR = PROJECT_ROOT / "inspection"
 
 
+def format_duration(seconds: float) -> str:
+    """Compact h/m/s duration for progress and ETA logging. Lives here (a
+    dependency-free module) so training and preprocessing format elapsed times
+    and ETAs identically."""
+    seconds = max(0, int(seconds))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h{minutes:02d}m{seconds:02d}s"
+    if minutes:
+        return f"{minutes}m{seconds:02d}s"
+    return f"{seconds}s"
+
+
 @dataclass(frozen=True)
 class ProjectConfig:
     data_root: str = "data"

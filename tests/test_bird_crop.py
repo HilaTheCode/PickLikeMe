@@ -11,6 +11,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from picklikeme.bird_crop import (
     COCO_BIRD_CLASS,
+    DOMESTIC_ANIMAL_CLASSES,
+    SUPPORTED_ANIMAL_CLASSES,
+    WILDLIFE_CLASSES,
     BirdDetection,
     BirdDetector,
     CropParams,
@@ -25,7 +28,7 @@ from picklikeme.bird_crop import (
 from picklikeme.raw_io import RawImageLoader
 
 
-def _detector_with_fake_model(boxes, labels, scores, conf_threshold=0.3):
+def _detector_with_fake_model(boxes, labels, scores, conf_threshold=0.3, classes=None):
     """A BirdDetector whose torchvision model is replaced by a fixed output, so
     detect_best_bird's real selection logic can be tested without downloading
     or running the actual network."""
@@ -33,6 +36,7 @@ def _detector_with_fake_model(boxes, labels, scores, conf_threshold=0.3):
     detector._torch = torch
     detector.device = "cpu"
     detector.conf_threshold = conf_threshold
+    detector.classes = frozenset(SUPPORTED_ANIMAL_CLASSES if classes is None else classes)
     output = {
         "boxes": torch.tensor(boxes, dtype=torch.float),
         "labels": torch.tensor(labels),
@@ -71,6 +75,69 @@ class DetectBestBirdTests(unittest.TestCase):
         )
         self.assertIsNone(detector.detect_best_bird(self.IMG))
         self.assertIsNone(detector.best_bird_box(self.IMG))
+
+
+class SupportedClassTests(unittest.TestCase):
+    IMG = np.zeros((40, 40, 3), dtype=np.uint8)
+
+    def test_coco_indices_match_torchvision_metadata(self):
+        """Pins our hardcoded indices to torchvision's own category list, so a
+        weights-metadata change can never silently point us at a wrong class."""
+        from torchvision.models.detection import FasterRCNN_ResNet50_FPN_V2_Weights
+
+        categories = FasterRCNN_ResNet50_FPN_V2_Weights.COCO_V1.meta["categories"]
+        for index, name in SUPPORTED_ANIMAL_CLASSES.items():
+            self.assertEqual(categories[index], name)
+
+    def test_required_wildlife_classes_are_supported(self):
+        self.assertEqual(
+            set(WILDLIFE_CLASSES.values()), {"bird", "elephant", "bear", "zebra", "giraffe"}
+        )
+        self.assertTrue(set(WILDLIFE_CLASSES) <= set(SUPPORTED_ANIMAL_CLASSES))
+        self.assertTrue(set(DOMESTIC_ANIMAL_CLASSES) <= set(SUPPORTED_ANIMAL_CLASSES))
+
+    def test_each_supported_class_is_detected_and_its_label_reported(self):
+        for index, name in SUPPORTED_ANIMAL_CLASSES.items():
+            with self.subTest(animal=name):
+                detector = _detector_with_fake_model(
+                    boxes=[[5, 5, 20, 20]], labels=[index], scores=[0.9]
+                )
+                detection = detector.detect_best_bird(self.IMG)
+                self.assertIsNotNone(detection)
+                self.assertEqual(detection.label, index)
+
+    def test_highest_confidence_wins_across_different_animal_classes(self):
+        # An elephant scoring higher than a bird must win: selection is by
+        # confidence only, with no class priority.
+        detector = _detector_with_fake_model(
+            boxes=[[0, 0, 10, 10], [5, 5, 20, 20]],
+            labels=[COCO_BIRD_CLASS, 22],
+            scores=[0.6, 0.85],
+        )
+        detection = detector.detect_best_bird(self.IMG)
+        self.assertEqual(detection.box, (5.0, 5.0, 20.0, 20.0))
+        self.assertEqual(detection.label, 22)
+
+    def test_non_animal_classes_are_still_rejected(self):
+        # person(1), car(3), airplane(5) must never be cropped to, however
+        # confident the detector is.
+        detector = _detector_with_fake_model(
+            boxes=[[0, 0, 10, 10], [1, 1, 5, 5], [2, 2, 8, 8]],
+            labels=[1, 3, 5],
+            scores=[0.99, 0.98, 0.97],
+        )
+        self.assertIsNone(detector.detect_best_bird(self.IMG))
+
+    def test_classes_argument_can_restrict_back_to_birds_only(self):
+        detector = _detector_with_fake_model(
+            boxes=[[0, 0, 10, 10], [5, 5, 20, 20]],
+            labels=[COCO_BIRD_CLASS, 24],  # zebra scores higher but is excluded
+            scores=[0.6, 0.95],
+            classes={COCO_BIRD_CLASS},
+        )
+        detection = detector.detect_best_bird(self.IMG)
+        self.assertEqual(detection.label, COCO_BIRD_CLASS)
+        self.assertEqual(detection.box, (0.0, 0.0, 10.0, 10.0))
 
 
 class BoxGeometryTests(unittest.TestCase):

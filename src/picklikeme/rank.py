@@ -15,6 +15,7 @@ frames instead of bird crops (only sensible if the model was trained that way).
 from __future__ import annotations
 
 import argparse
+from datetime import datetime
 from pathlib import Path
 
 from .auto_crop import resolve_device
@@ -24,14 +25,20 @@ from .dataset import UnlabeledImageDataset
 from .model import DINOV3_BACKBONE, ModelConfig, PreferenceHead
 from .preprocess import build_cache
 from .raw_io import RawImageLoader
-from .train import load_checkpoint, rank_dataset, write_results_csv
+from .train import load_checkpoint, rank_dataset, timestamped_output_path, write_results_csv
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Rank a new, unlabeled folder with a trained checkpoint (no training)")
     parser.add_argument("--input", required=True, help="Folder of RAW images to rank (recursive, model has not seen these)")
     parser.add_argument("--checkpoint", default=str(DEFAULT_CHECKPOINT_PATH), help="Trained checkpoint to load (default: the project's rolling checkpoint)")
-    parser.add_argument("--output-csv", default="rankings.csv", help="Where to write the ranked CSV")
+    parser.add_argument(
+        "--output-csv",
+        default="rankings.csv",
+        help="Base name for the ranked CSV. The run's start date/time is appended "
+        "to the stem so every run gets a unique file and no previous rankings are "
+        "overwritten (e.g. rankings_20260725-143000.csv).",
+    )
     parser.add_argument("--max-rows", type=int, default=1000)
     parser.add_argument("--device", default=None, help="Device (default: auto - CUDA if available, else CPU)")
     parser.add_argument("--resize-mode", default="letterbox", choices=["letterbox", "stretch"])
@@ -43,6 +50,7 @@ def main() -> None:
     parser.add_argument("--max-side", type=int, default=CropParams.max_side)
     parser.add_argument("--force-preprocess", action="store_true", help="Rebuild crops even if already cached")
     args = parser.parse_args()
+    run_started = datetime.now()
 
     input_folder = Path(args.input)
     if not input_folder.exists():
@@ -59,6 +67,11 @@ def main() -> None:
     if len(dataset) == 0:
         raise SystemExit(f"No RAW images (.arw/.nef/.cr3) found under {input_folder.resolve()}")
     print(f"Found {len(dataset)} images to rank under {input_folder.resolve()}")
+
+    # Resolved before the crop-cache build so the destination is known up front,
+    # not only after a long preprocessing + scoring pass.
+    output_csv = timestamped_output_path(args.output_csv, run_started)
+    print(f"Ranked CSV for this run will be written to {output_csv.resolve()}")
 
     device = resolve_device(args.device)
 
@@ -93,7 +106,7 @@ def main() -> None:
     ranked = rank_dataset(model, dataset, loader, device=device)
 
     output_paths = write_results_csv(
-        args.output_csv,
+        output_csv,
         dataset,
         ranked,
         select_root=str(input_folder),

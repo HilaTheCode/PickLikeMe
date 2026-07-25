@@ -65,18 +65,91 @@ saying it is required.)
 
 With `--split`, training uses only train-split images and afterwards reports the
 protocol metrics (Top-1/Top-3 burst accuracy, ROC AUC, precision/recall) on the
-held-out test split, writing them to `evaluation_metrics.json`.
+held-out test split, writing them to a timestamped
+`evaluation_metrics_<date>-<time>.json` (see below).
 
 `--resize-mode stretch` reproduces the V1 baseline preprocessing; the default
 `letterbox` is the V2 aspect-ratio-preserving behavior.
 
-### Bird-cropped input (default)
+### Reading the training log
 
-Training feeds a tight crop around the detected bird, so the model sees a
-bird-centered image (background discarded). This is **on by default**; pass
+Every run opens with a one-screen header recording what it is about to do, so a
+log from a multi-day run is self-explanatory later:
+
+```
+-------------------------------------------------
+Training run
+  mode:            resuming from checkpoint at epoch 20 (best loss so far 0.1509)
+  checkpoint:      C:\Code Projects\PickLikeMe\checkpoints\model_checkpoint.pt
+  best checkpoint: C:\Code Projects\PickLikeMe\checkpoints\model_checkpoint_best.pt
+  epochs:          21-30 (10 this run)
+  labeled images:  54,000 = 21,000 selected / 33,000 rejected
+  training set:    54,000 images, 3,375 batches of 16
+  validation set:  none (pass --split to hold out a test set)
+  backbone:        vit_huge_plus_patch16_dinov3 (1,281 trainable / 632,145,000 params)
+  learning rate:   1.00e-04
+  device:          NVIDIA GeForce RTX 5070 (7.2 GB free / 12.0 GB total)
+  torch:           2.13.0+cu130 (CUDA 13.0)
+-------------------------------------------------
+```
+
+Then, per epoch, a two-line summary — loss, learning rate, how long the epoch
+took, when the run should finish, and where the checkpoint went (`(+best)` marks
+an epoch that also improved the best-loss checkpoint):
+
+```
+[14:32:10] Completed epoch 21/30 | train_loss 0.1483 | best 0.1483 | lr 1.00e-04 | epoch 12m04s | run eta 1h48m32s
+           images 54,000 train / 0 val | checkpoint C:\...\model_checkpoint.pt (+best)
+```
+
+There is no per-epoch validation pass, so no validation loss is reported per
+epoch: with `--split`, the held-out set is scored **once** after the final epoch.
+Within an epoch a progress line prints every `--log-interval-batches` batches
+(default 50, plus always the last batch of the epoch) with the batch loss and an
+in-epoch ETA. Pass `--log-interval-batches 1` for a line per batch, or `0` for
+epoch summaries only.
+
+Preprocessing reports progress on a 30-second timer — position, rate, detections
+so far, and ETA — then a summary with a per-class breakdown of what was found:
+
+```
+[09:14:02] 12,800/54,000 (23.7%) | 3.4 img/s | detected 12,140 | fallback 630 | skipped 30 | errors 0 | elapsed 1h02m35s | eta 3h21m48s
+```
+
+### Every run's output files are timestamped
+
+All per-run result files are named after the run's **start** time, so no run ever
+overwrites an earlier one's results:
+
+| Command | Output |
+| --- | --- |
+| `train` / `run` | `training_results_20260725-143000.csv` (overflow chunks: `…-143000_1.csv`) |
+| `train` / `run` with `--split` | `evaluation_metrics_20260725-143000.json` |
+| `rank` | `rankings_20260725-143000.csv` |
+
+`--output-csv` / `--metrics-json` change the base name; the timestamp is always
+appended to the stem. All outputs of a single run share one stamp (taken at
+startup, so a multi-day run is named for when it began), and the resolved paths
+are printed before the long work starts. The `%Y%m%d-%H%M%S` format sorts
+chronologically, so a plain `ls` lists runs in order.
+
+**Not** timestamped, on purpose: the rolling checkpoint (`checkpoints/`) and
+`training_status.json`. Those live at stable paths because `--resume` and
+progress polling need to find them.
+
+### Animal-cropped input (default)
+
+Training feeds a tight crop around the detected animal, so the model sees a
+subject-centered image (background discarded). This is **on by default**; pass
 `--no-crop-birds` to train on full frames instead (e.g. to A/B-compare).
 
-Build the crop cache once **before training** (detects the bird per image,
+The detector accepts every COCO animal class — the wildlife targets `bird`,
+`elephant`, `bear`, `zebra`, `giraffe`, plus `cat`, `dog`, `horse`, `sheep`,
+`cow`. The highest-confidence detection among those wins, whatever its class;
+images with no supported animal fall back to the full frame. The flags and cache
+keep their historical `bird` names.
+
+Build the crop cache once **before training** (detects the animal per image,
 crops with a small safety margin, aspect ratio preserved, and caches the
 result):
 
@@ -109,7 +182,8 @@ It accepts every `picklikeme.train` flag (the required `--epochs`, `--split`,
 `--margin-frac`, `--conf-threshold`, `--max-side`, and `--force-preprocess`.
 Pass `--no-crop-birds` to train on full frames (the preprocess step is then
 skipped), or `--skip-preprocess` to reuse an already-built cache. The result is
-the same `training_results.csv` the `train` command writes.
+the same timestamped `training_results_<date>-<time>.csv` the `train` command
+writes.
 
 ### Rank a new, unseen folder with a trained model
 
@@ -124,16 +198,22 @@ python -m picklikeme.rank --input "D:\\NewShoot" --checkpoint checkpoints/model_
 
 `--checkpoint` defaults to the project's rolling checkpoint. The `--backbone`
 must match the one the checkpoint was trained with (it defaults to the same
-DINOv3-Huge+ default as training). Output goes to `rankings.csv` by default
-(`--output-csv` to change). Pass `--no-crop-birds` only if the model was
-trained on full frames.
+DINOv3-Huge+ default as training). Output goes to a timestamped
+`rankings_<date>-<time>.csv` by default (`--output-csv` to change the base
+name). Pass `--no-crop-birds` only if the model was trained on full frames.
 
-Detection uses torchvision's COCO-pretrained Faster R-CNN v2 (the "bird" class)
-and runs **once** in this single-process pass — never per epoch and never in
-DataLoader workers. Crops are cached as PNGs under `cache/crops/` (keyed by
-source path, reusable across model input sizes). Images with no detected bird
-fall back to the full frame. The crop is a true sub-rectangle then
-letterbox-padded to the input size, so the bird is never stretched.
+Detection uses torchvision's COCO-pretrained Faster R-CNN v2 (the animal
+classes, see above) and runs **once** in this single-process pass — never per
+epoch and never in DataLoader workers. Crops are cached as PNGs under
+`cache/crops/` (keyed by source path, reusable across model input sizes). Images
+with no detected animal fall back to the full frame. The crop is a true
+sub-rectangle then letterbox-padded to the input size, so the animal is never
+stretched.
+
+`cache/crops/crop_params.json` records the parameters and a cache version (`v1`
+= bird-only detection, `v2` = all animal classes). Preprocessing refuses to add
+to a cache built with different parameters — pass `--force` to rebuild, so a
+training set can never mix crops from two different detector configurations.
 
 To visually validate detection + cropping, `picklikeme.inspect_crops` has two
 read-only modes (neither changes the cache, detector, preprocessing, or

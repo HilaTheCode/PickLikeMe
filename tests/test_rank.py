@@ -1,7 +1,9 @@
+import re
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -58,6 +60,41 @@ class RankCliWiringTests(unittest.TestCase):
                 self.assertIn("Checkpoint not found", str(ctx.exception))
             finally:
                 sys.argv = old
+
+    def test_output_csv_is_timestamped_so_runs_never_overwrite_each_other(self):
+        """The ranked CSV handed to write_results_csv must carry the run's
+        date/time, not the bare --output-csv name."""
+        import picklikeme.rank as rank_module
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "x.nef").write_bytes(b"raw")
+            checkpoint = root / "ckpt.pt"
+            checkpoint.write_bytes(b"fake")
+
+            argv = [
+                "rank",
+                "--input", str(root),
+                "--checkpoint", str(checkpoint),
+                "--output-csv", str(root / "rankings.csv"),
+                "--no-crop-birds",
+                "--device", "cpu",
+            ]
+            old = sys.argv
+            sys.argv = argv
+            try:
+                with mock.patch.object(rank_module, "PreferenceHead"), \
+                        mock.patch.object(rank_module, "load_checkpoint", return_value={"model_state_dict": {}}), \
+                        mock.patch.object(rank_module, "RawImageLoader"), \
+                        mock.patch.object(rank_module, "rank_dataset", return_value=[]), \
+                        mock.patch.object(rank_module, "write_results_csv", return_value=[root / "written.csv"]) as write_csv:
+                    rank_module.main()
+            finally:
+                sys.argv = old
+
+            written_path = Path(write_csv.call_args.args[0])
+            self.assertRegex(written_path.name, r"^rankings_\d{8}-\d{6}\.csv$")
+            self.assertEqual(written_path.parent, root)
 
 
 if __name__ == "__main__":

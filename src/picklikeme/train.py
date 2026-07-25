@@ -6,6 +6,7 @@ import json
 import math
 import time
 import traceback
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -14,7 +15,7 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
 
-from .config import DEFAULT_CHECKPOINT_PATH, DEFAULT_CROP_CACHE_DIR, ProjectConfig
+from .config import DEFAULT_CHECKPOINT_PATH, DEFAULT_CROP_CACHE_DIR, ProjectConfig, format_duration
 from .dataset import FolderLabelDataset, LabelDataset, PathSuffixIndex
 from .evaluate import compute_metrics, format_metrics, score_items, write_metrics_json
 from .model import DINOV3_BACKBONE, ModelConfig, PreferenceHead
@@ -43,33 +44,118 @@ def resolve_device(requested: str) -> str:
     return requested
 
 
-def print_startup_diagnostics(device: str) -> None:
-    if device.startswith("cuda") and torch.cuda.is_available():
-        try:
-            index = int(device.split(":", 1)[1]) if ":" in device else 0
-        except ValueError:
-            index = 0
-        print(f"Using device: {torch.cuda.get_device_name(index)}")
-        print(f"CUDA: {torch.version.cuda}")
+def _gigabytes(num_bytes: int) -> str:
+    return f"{num_bytes / (1024 ** 3):.1f} GB"
+
+
+def describe_device(device: str) -> str:
+    """One-line device description for the run header: GPU name plus free and
+    total memory, or "CPU". Diagnostics only — never affects training."""
+    if not (device.startswith("cuda") and torch.cuda.is_available()):
+        return "CPU"
+    try:
+        index = int(device.split(":", 1)[1]) if ":" in device else 0
+    except ValueError:
+        index = 0
+    name = torch.cuda.get_device_name(index)
+    try:
+        free, total = torch.cuda.mem_get_info(index)
+    except Exception:  # noqa: BLE001 - a memory query failure must not stop a run
+        return name
+    return f"{name} ({_gigabytes(free)} free / {_gigabytes(total)} total)"
+
+
+@dataclass(frozen=True)
+class RunCounts:
+    """Dataset sizes reported in the run header and epoch summaries.
+
+    Logging only. Passed in from train_and_rank because the *totals* it reports
+    (selected/rejected across the whole labeled set, and the held-out count)
+    are known before --split removes the test rows from the training dataset,
+    so train() cannot recover them on its own.
+    """
+
+    selected: int = 0
+    rejected: int = 0
+    validation: int = 0
+
+
+def count_label_split(dataset) -> tuple[int, int]:
+    """(selected, rejected) counts for a labeled dataset, for logging only."""
+    items = getattr(dataset, "items", None)
+    if items is not None:
+        labels = [int(item.label) for item in items]
     else:
-        print("Using device: CPU")
-        print("CUDA: not available")
-    print(f"PyTorch: {torch.__version__}")
+        frame = getattr(dataset, "frame", None)
+        if frame is not None:
+            labels = [int(value) for value in frame["label"]]
+        else:
+            labels = [int(dataset[index].label) for index in range(len(dataset))]
+    selected = sum(1 for label in labels if label == 1)
+    return selected, len(labels) - selected
 
 
-def _format_duration(seconds: float) -> str:
-    seconds = max(0, int(seconds))
-    hours, remainder = divmod(seconds, 3600)
-    minutes, seconds = divmod(remainder, 60)
-    if hours:
-        return f"{hours}h{minutes:02d}m{seconds:02d}s"
-    if minutes:
-        return f"{minutes}m{seconds:02d}s"
-    return f"{seconds}s"
+def print_run_header(
+    *,
+    device: str,
+    resumed: bool,
+    checkpoint_path: Path | None,
+    best_checkpoint_path: Path | None,
+    checkpoint_epoch: int,
+    best_loss: float,
+    start_epoch: int,
+    target_epoch: int,
+    epochs_to_run: int,
+    counts: RunCounts,
+    train_images: int,
+    total_batches: int,
+    batch_size: int,
+    backbone: str,
+    trainable_params: int,
+    total_params: int,
+    learning_rate: float,
+) -> None:
+    """Print the once-per-run summary: where the run resumes from, what it will
+    train on, and what hardware it is on. One screen, no repetition — everything
+    a long run needs recorded at its start."""
+    labeled_total = counts.selected + counts.rejected
+    if resumed:
+        best = "unknown" if best_loss == math.inf else f"{best_loss:.4f}"
+        mode = f"resuming from checkpoint at epoch {checkpoint_epoch} (best loss so far {best})"
+    else:
+        mode = "starting from scratch (no checkpoint loaded)"
+
+    print(_BANNER)
+    print("Training run")
+    print(f"  mode:            {mode}")
+    print(f"  checkpoint:      {checkpoint_path.resolve() if checkpoint_path else 'not saving'}")
+    if best_checkpoint_path is not None:
+        print(f"  best checkpoint: {best_checkpoint_path.resolve()}")
+    print(f"  epochs:          {start_epoch + 1}-{target_epoch} ({epochs_to_run} this run)")
+    print(f"  labeled images:  {labeled_total:,} = {counts.selected:,} selected / {counts.rejected:,} rejected")
+    print(f"  training set:    {train_images:,} images, {total_batches:,} batches of {batch_size}")
+    if counts.validation:
+        # No per-epoch validation pass exists, so no per-epoch val loss is
+        # reported; the held-out set is scored once after the final epoch.
+        print(f"  validation set:  {counts.validation:,} held-out images (scored after the final epoch)")
+    else:
+        print("  validation set:  none (pass --split to hold out a test set)")
+    print(f"  backbone:        {backbone} ({trainable_params:,} trainable / {total_params:,} params)")
+    print(f"  learning rate:   {learning_rate:.2e}")
+    print(f"  device:          {describe_device(device)}")
+    cuda_version = torch.version.cuda if device.startswith("cuda") and torch.cuda.is_available() else "not in use"
+    print(f"  torch:           {torch.__version__} (CUDA {cuda_version})")
+    print(_BANNER)
 
 
 _BANNER = "-" * 49
 _ALERT_BANNER = "!" * 49
+
+# Batch-level progress cadence. Frequent enough to show a stalled run within
+# seconds, sparse enough that a 54k-image epoch (~3,400 batches) produces ~70
+# lines instead of ~3,400 — a multi-day log stays readable. Epoch summaries and
+# the final batch of each epoch print regardless.
+DEFAULT_LOG_INTERVAL_BATCHES = 50
 
 # A save is retried once after this pause, to ride out a transient filesystem
 # hiccup (a briefly-locked file, a momentary network-drive drop) without
@@ -220,14 +306,14 @@ def train(
     checkpoint_interval: timedelta | None = None,
     model_config: ModelConfig | None = None,
     best_checkpoint_path: str | Path | None = None,
-    log_interval_batches: int = 1,
+    log_interval_batches: int = DEFAULT_LOG_INTERVAL_BATCHES,
     epochs_this_run: int | None = None,
+    counts: RunCounts | None = None,
 ) -> PreferenceHead:
     if dataset is None:
         dataset = LabelDataset(config.manifest_path, config.raw_root)
 
     device = resolve_device(config.device)
-    print_startup_diagnostics(device)
 
     # Number of epochs to run in THIS invocation (per-run, not a cumulative
     # target). Falls back to config.epochs only for internal callers that don't
@@ -244,19 +330,23 @@ def train(
         persistent_workers=config.num_workers > 0,
     )
 
-    timestamp = datetime.now().strftime("%H:%M:%S")
-    print(f"[{timestamp}] Starting training with {len(dataset)} relevant images on device={device}")
-    print(f"[{timestamp}] Loaded {len(dataset)} images from the accepted/rejected roots")
+    if counts is None:
+        # Direct/internal callers don't supply counts; derive what we can so the
+        # header is still accurate for them (no validation set in that case).
+        selected, rejected = count_label_split(dataset)
+        counts = RunCounts(selected=selected, rejected=rejected)
 
+    backbone_name = (model_config or ModelConfig()).backbone
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] Loading backbone {backbone_name} on {device} ...")
     model = PreferenceHead(model_config).to(device)
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total = sum(p.numel() for p in model.parameters())
-    print(f"Backbone: {model.config.backbone} (trainable params: {trainable:,} / {total:,})")
     optimizer = torch.optim.Adam((p for p in model.parameters() if p.requires_grad), lr=config.learning_rate)
     criterion = nn.MSELoss()
 
     start_epoch = 0
     best_loss = math.inf
+    resumed = False
     if checkpoint_path is not None:
         checkpoint_path = Path(checkpoint_path)
         if resume and checkpoint_path.exists():
@@ -265,7 +355,7 @@ def train(
             optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
             start_epoch = checkpoint.get("epoch") or 0
             best_loss = checkpoint.get("best_loss", math.inf)
-            print(f"Resumed after epoch {start_epoch}; training {epochs_to_run} more epoch(s) toward epoch {start_epoch + epochs_to_run}; best_loss so far={best_loss}")
+            resumed = True
         elif not resume and checkpoint_path.exists():
             print(f"Overwriting existing checkpoint at {checkpoint_path}")
 
@@ -280,14 +370,36 @@ def train(
         best_checkpoint_path = checkpoint_path.with_name(f"{checkpoint_path.stem}_best{checkpoint_path.suffix}")
 
     total_batches = len(data_loader)
+    print_run_header(
+        device=device,
+        resumed=resumed,
+        checkpoint_path=checkpoint_path,
+        best_checkpoint_path=best_checkpoint_path,
+        checkpoint_epoch=start_epoch,
+        best_loss=best_loss,
+        start_epoch=start_epoch,
+        target_epoch=target_epoch,
+        epochs_to_run=epochs_to_run,
+        counts=counts,
+        train_images=len(dataset),
+        total_batches=total_batches,
+        batch_size=config.batch_size,
+        backbone=model.config.backbone,
+        trainable_params=trainable,
+        total_params=total,
+        learning_rate=config.learning_rate,
+    )
+
     last_status_write = datetime.now()
     last_checkpoint_write = datetime.now()
     last_completed_epoch = start_epoch
+    run_start_time = datetime.now()
+    epochs_completed_this_run = 0
     model.train()
     try:
         for epoch in range(start_epoch, target_epoch):
             current_epoch = epoch + 1
-            print(f"Starting epoch {current_epoch}/{target_epoch} (progress: {current_epoch}/{target_epoch})")
+            print(f"Starting epoch {current_epoch}/{target_epoch}")
             processed_batches = 0
             epoch_loss_sum = 0.0
             epoch_start_time = datetime.now()
@@ -330,11 +442,11 @@ def train(
                     elapsed = (now - epoch_start_time).total_seconds()
                     rate = processed_batches / elapsed if elapsed > 0 else 0.0
                     remaining = total_batches - processed_batches
-                    eta = _format_duration(remaining / rate) if rate > 0 else "n/a"
+                    eta = format_duration(remaining / rate) if rate > 0 else "n/a"
                     print(
                         f"[{now.strftime('%H:%M:%S')}] epoch {current_epoch}/{target_epoch} "
                         f"batch {processed_batches}/{total_batches} loss={loss_value:.4f} "
-                        f"elapsed={_format_duration(elapsed)} eta={eta}"
+                        f"elapsed={format_duration(elapsed)} eta={eta}"
                     )
 
             last_completed_epoch = current_epoch
@@ -351,6 +463,7 @@ def train(
                     f"completed epoch {current_epoch}/{target_epoch}",
                 )
 
+            saved_best = False
             if epoch_avg_loss is not None and epoch_avg_loss < best_loss:
                 best_loss = epoch_avg_loss
                 if best_checkpoint_path is not None:
@@ -359,6 +472,7 @@ def train(
                         epoch=last_completed_epoch, best_loss=best_loss,
                         reason=f"New best loss {best_loss:.4f} (epoch {current_epoch})",
                     )
+                    saved_best = True
 
             if checkpoint_path is not None:
                 # Save after the best_loss update above so a later resume reads
@@ -369,7 +483,28 @@ def train(
                     reason=f"End of epoch {current_epoch}",
                 )
 
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] Completed epoch {current_epoch}/{target_epoch}; {target_epoch - current_epoch} epochs remaining")
+            # Epoch summary: two lines carrying everything a long run needs per
+            # epoch. The run ETA extrapolates from the epochs completed in THIS
+            # invocation, so it stays right when resuming a slower/faster run.
+            epochs_completed_this_run += 1
+            finished_at = datetime.now()
+            epoch_seconds = (finished_at - epoch_start_time).total_seconds()
+            epochs_left = target_epoch - current_epoch
+            mean_epoch_seconds = (finished_at - run_start_time).total_seconds() / epochs_completed_this_run
+            run_eta = format_duration(mean_epoch_seconds * epochs_left) if epochs_left else "done"
+            loss_text = f"{epoch_avg_loss:.4f}" if epoch_avg_loss is not None else "n/a"
+            best_text = "n/a" if best_loss == math.inf else f"{best_loss:.4f}"
+            print(
+                f"[{finished_at.strftime('%H:%M:%S')}] Completed epoch {current_epoch}/{target_epoch}"
+                f" | train_loss {loss_text} | best {best_text}"
+                f" | lr {optimizer.param_groups[0]['lr']:.2e}"
+                f" | epoch {format_duration(epoch_seconds)} | run eta {run_eta}"
+            )
+            saved_to = f"{checkpoint_path}{' (+best)' if saved_best else ''}" if checkpoint_path is not None else "not saved"
+            print(
+                f"{' ' * 11}images {len(dataset):,} train / {counts.validation:,} val"
+                f" | checkpoint {saved_to}"
+            )
     except KeyboardInterrupt:
         print(f"[{datetime.now().strftime('%H:%M:%S')}] KeyboardInterrupt received; saving checkpoint before exiting")
         if checkpoint_path is not None:
@@ -400,6 +535,27 @@ def rank_dataset(model: nn.Module, dataset, loader, device: str = "cpu") -> list
 
     scored.sort(key=lambda entry: entry[1], reverse=True)
     return scored
+
+
+def timestamped_output_path(output_path: str | Path, run_started: datetime) -> Path:
+    """Insert a run timestamp into the filename stem, so consecutive runs write
+    distinct result files instead of silently overwriting the previous ones.
+
+    Used for every per-run *output* of training and ranking (results CSVs, the
+    metrics JSON). Deliberately NOT used for the rolling checkpoint or the
+    status JSON: those are meant to be found and overwritten at a known, stable
+    path — `--resume` and any progress poller depend on it.
+
+    The stamp is the run's *start* time, not the write time: a run that trains
+    for two days should be named for when it began, and the name is known (and
+    printable) before training starts. Applied to the stem so the chunked
+    `_1`/`_2` suffixes from write_results_csv still sort next to the first file:
+    `training_results_20260725-143000_1.csv`. The `%Y%m%d-%H%M%S` format sorts
+    chronologically under a plain lexicographic `ls`.
+    """
+    output_path = Path(output_path)
+    stamp = run_started.strftime("%Y%m%d-%H%M%S")
+    return output_path.with_name(f"{output_path.stem}_{stamp}{output_path.suffix}")
 
 
 def write_results_csv(
@@ -461,7 +617,13 @@ def build_arg_parser(add_help: bool = True) -> argparse.ArgumentParser:
         "epoch numbering from the checkpoint (e.g. resume at epoch 20 with "
         "--epochs 10 trains epochs 21-30).",
     )
-    parser.add_argument("--output-csv", default="training_results.csv")
+    parser.add_argument(
+        "--output-csv",
+        default="training_results.csv",
+        help="Base name for the ranking results CSV. The run's start date/time is "
+        "appended to the stem so every run gets a unique file and no previous "
+        "results are overwritten (e.g. training_results_20260725-143000.csv).",
+    )
     parser.add_argument("--max-rows", type=int, default=1000)
     parser.add_argument("--checkpoint-path", default=str(DEFAULT_CHECKPOINT_PATH), help="Where to save the rolling checkpoint (default: <project-root>/checkpoints/model_checkpoint.pt, independent of the current working directory)")
     parser.add_argument("--best-checkpoint-path", default=None, help="Where to save the lowest-training-loss checkpoint (default: <checkpoint-path>_best.pt)")
@@ -471,14 +633,27 @@ def build_arg_parser(add_help: bool = True) -> argparse.ArgumentParser:
     parser.add_argument("--resume", action="store_true", help="Resume from the existing checkpoint if present")
     parser.add_argument("--fresh-start", action="store_true", help="Start training from scratch instead of resuming")
     parser.add_argument("--split", default=None, help="Frozen split CSV (see picklikeme.split); trains on train rows, evaluates on test rows")
-    parser.add_argument("--metrics-json", default="evaluation_metrics.json", help="Where to write test-set metrics when --split is given")
+    parser.add_argument(
+        "--metrics-json",
+        default="evaluation_metrics.json",
+        help="Base name for the test-set metrics written when --split is given. The "
+        "run's start date/time is appended to the stem, matching the results CSV "
+        "(e.g. evaluation_metrics_20260725-143000.json).",
+    )
     parser.add_argument("--resize-mode", default="letterbox", choices=["letterbox", "stretch"], help="letterbox = V2 aspect-preserving; stretch = V1 baseline behavior")
     parser.add_argument("--backbone", default=DINOV3_BACKBONE, help="V3 pretrained backbone (any timm model name), or 'cnn' to reproduce the V1/V2 baseline backbone")
     parser.add_argument("--no-pretrained", action="store_true", help="Randomly initialize the backbone instead of loading pretrained weights (debugging only)")
     parser.add_argument("--unfreeze-backbone", action="store_true", help="Fine-tune the pretrained backbone instead of the default linear-probe (frozen backbone)")
     parser.add_argument("--device", default=None, help="Override the device (default: cuda if available, else cpu)")
     parser.add_argument("--num-workers", type=int, default=None, help=f"DataLoader worker processes (default: {ProjectConfig.num_workers})")
-    parser.add_argument("--log-interval-batches", type=int, default=1, help="Print training progress every N batches (1 = every batch, the default; higher = less noise; 0 = only at epoch end)")
+    parser.add_argument(
+        "--log-interval-batches",
+        type=int,
+        default=DEFAULT_LOG_INTERVAL_BATCHES,
+        help=f"Print a progress line every N batches (default: {DEFAULT_LOG_INTERVAL_BATCHES}; "
+        "1 = every batch, which floods the log on a large dataset; 0 = epoch summaries only). "
+        "The last batch of every epoch is always logged.",
+    )
     parser.add_argument("--crop-birds", action=argparse.BooleanOptionalAction, default=True, help="Feed pre-computed bird crops from picklikeme.preprocess (default); pass --no-crop-birds to train on full frames")
     parser.add_argument("--crop-cache-dir", default=str(DEFAULT_CROP_CACHE_DIR), help="Directory of the bird-crop cache used by --crop-birds")
     return parser
@@ -489,6 +664,15 @@ def train_and_rank(args) -> None:
     write the results CSV. Shared by `picklikeme.train` and `picklikeme.run`."""
     if not args.select_root or not args.reject_root:
         raise SystemExit("Both --select-root and --reject-root are required.")
+
+    # Stamped once, up front, and shared by every per-run output: the filenames
+    # name the run by its start time, all outputs of one run carry the same
+    # stamp, and the paths are printed before training so they're known for the
+    # whole run.
+    run_started = datetime.now()
+    output_csv = timestamped_output_path(args.output_csv, run_started)
+    metrics_json = timestamped_output_path(args.metrics_json, run_started)
+    print(f"Ranking results for this run will be written to {output_csv.resolve()}")
 
     raw_root = args.raw_root or args.select_root
     config = ProjectConfig(
@@ -525,6 +709,10 @@ def train_and_rank(args) -> None:
         manifest_path=manifest_path,
     )
 
+    # Counted before --split removes the held-out rows, so the header reports
+    # the totals of the whole labeled set, not just the training portion.
+    selected_total, rejected_total = count_label_split(dataset)
+
     test_items = []
     if args.split:
         split_index = PathSuffixIndex.from_table(args.split, "split")
@@ -552,18 +740,23 @@ def train_and_rank(args) -> None:
         best_checkpoint_path=args.best_checkpoint_path,
         log_interval_batches=args.log_interval_batches,
         epochs_this_run=args.epochs,
+        counts=RunCounts(
+            selected=selected_total,
+            rejected=rejected_total,
+            validation=len(test_items),
+        ),
     )
     device = resolve_device(config.device)
     if test_items:
         print(f"Evaluating on {len(test_items)} held-out test images")
         metrics = compute_metrics(score_items(model, test_items, loader, device=device))
         print(format_metrics(metrics))
-        metrics_path = write_metrics_json(metrics, args.metrics_json)
+        metrics_path = write_metrics_json(metrics, metrics_json)
         print(f"Metrics written to {metrics_path}")
 
     ranked = rank_dataset(model, dataset, loader, device=device)
     print(f"Detected sequences: {dataset.count_sequences()}")
-    output_paths = write_results_csv(args.output_csv, dataset, ranked, args.select_root, args.reject_root, max_rows=args.max_rows)
+    output_paths = write_results_csv(output_csv, dataset, ranked, args.select_root, args.reject_root, max_rows=args.max_rows)
     print("Top-ranked images:")
     for rank, entry in enumerate(ranked[:10], start=1):
         image_name = entry[0]

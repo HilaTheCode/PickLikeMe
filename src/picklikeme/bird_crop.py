@@ -1,26 +1,31 @@
-"""Bird detection and crop caching.
+"""Animal detection and crop caching.
 
-This is the "bird-centered input" preprocessing phase: instead of feeding the
-full frame to the model, we detect the bird once per image, crop tightly
+This is the "subject-centered input" preprocessing phase: instead of feeding
+the full frame to the model, we detect the animal once per image, crop tightly
 around it (small safety margin, aspect ratio preserved), and cache the crop so
 training never re-detects or re-decodes RAW.
 
+The module, its classes, and its functions keep "bird" in their names for
+historical reasons (the project started bird-only) — the detector now accepts
+any of the COCO animal classes in SUPPORTED_ANIMAL_CLASSES.
+
 Design notes:
-- Detection uses torchvision's COCO-pretrained Faster R-CNN v2, where "bird"
-  is class 16. It runs once, in a single process (see picklikeme.preprocess) —
-  never inside DataLoader workers, where N workers would each load a detector
-  onto the GPU and contend for memory.
-- The crop is a true sub-rectangle of the source, so the bird's geometry is
+- Detection uses torchvision's COCO-pretrained Faster R-CNN v2. It runs once,
+  in a single process (see picklikeme.preprocess) — never inside DataLoader
+  workers, where N workers would each load a detector onto the GPU and contend
+  for memory.
+- The crop is a true sub-rectangle of the source, so the animal's geometry is
   never distorted; fixed-size model input is produced later by letterbox
   padding in RawImageLoader, not by stretching.
 - Cache entries are keyed by the absolute source path only, so one cache is
   reusable across model input sizes (384/512/640): detect once, letterbox to
   any size at load time.
-- If no bird is detected, the full frame is cached as the fallback, so every
-  image still yields an input and is never re-detected.
+- If no supported animal is detected, the full frame is cached as the fallback,
+  so every image still yields an input and is never re-detected.
 
-Bump CROP_CACHE_VERSION whenever the crop algorithm or its defaults change so a
-stale cache is detected instead of silently reused.
+Bump CROP_CACHE_VERSION whenever the crop algorithm, its defaults, or the set
+of accepted detection classes changes, so a stale cache is detected instead of
+silently reused. v1 = bird only; v2 = SUPPORTED_ANIMAL_CLASSES.
 """
 
 from __future__ import annotations
@@ -33,10 +38,42 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-# COCO category index for "bird" in torchvision's detection weights metadata.
+# COCO category indices in torchvision's detection weights metadata
+# (FasterRCNN_ResNet50_FPN_V2_Weights.COCO_V1.meta["categories"]). The animal
+# classes are contiguous: bird(16) .. giraffe(25).
 COCO_BIRD_CLASS = 16
 
-CROP_CACHE_VERSION = "v1"
+# Wildlife: the primary target of this project (wildlife photography).
+WILDLIFE_CLASSES: dict[int, str] = {
+    COCO_BIRD_CLASS: "bird",
+    22: "elephant",
+    23: "bear",
+    24: "zebra",
+    25: "giraffe",
+}
+
+# The remaining COCO animal classes. Included because supporting them costs
+# nothing beyond these five entries (the selection logic is class-agnostic),
+# and a horse/cow/sheep in frame is the photo's subject just as much as a
+# zebra is. Restrict with BirdDetector(classes=WILDLIFE_CLASSES) if a run
+# should consider wildlife only.
+DOMESTIC_ANIMAL_CLASSES: dict[int, str] = {
+    17: "cat",
+    18: "dog",
+    19: "horse",
+    20: "sheep",
+    21: "cow",
+}
+
+SUPPORTED_ANIMAL_CLASSES: dict[int, str] = {**WILDLIFE_CLASSES, **DOMESTIC_ANIMAL_CLASSES}
+
+
+def coco_class_name(label: int) -> str:
+    """Human-readable name for a supported COCO animal class (for logging)."""
+    return SUPPORTED_ANIMAL_CLASSES.get(int(label), f"class {int(label)}")
+
+
+CROP_CACHE_VERSION = "v2"
 CROP_PARAMS_FILENAME = "crop_params.json"
 
 
@@ -46,7 +83,7 @@ class CropParams:
     the cache so a mismatched configuration can be detected."""
 
     margin_frac: float = 0.05          # small safety margin around the tight box
-    conf_threshold: float = 0.30       # min detection confidence to accept a bird
+    conf_threshold: float = 0.30       # min detection confidence to accept a detection
     max_side: int = 1024               # cap the cached crop's long side (px)
     detector: str = "fasterrcnn_resnet50_fpn_v2"
     version: str = CROP_CACHE_VERSION
@@ -143,9 +180,10 @@ def save_crop_png(cache_path: Path, crop_rgb: np.ndarray) -> None:
 
 @dataclass(frozen=True)
 class BirdDetection:
-    """A single bird detection: its box (x1, y1, x2, y2), confidence score, and
-    COCO class. The rich result other code consumes so nobody re-implements the
-    selection or confidence logic."""
+    """A single animal detection: its box (x1, y1, x2, y2), confidence score,
+    and the COCO class that matched (bird, elephant, zebra, ...). The rich
+    result other code consumes so nobody re-implements the selection or
+    confidence logic."""
 
     box: tuple[float, float, float, float]
     score: float
@@ -178,14 +216,23 @@ class NormalizedCrop:
 
 
 class BirdDetector:
-    """COCO-pretrained Faster R-CNN v2 restricted to the bird class.
+    """COCO-pretrained Faster R-CNN v2 restricted to a set of animal classes.
+
+    Defaults to SUPPORTED_ANIMAL_CLASSES (wildlife + the remaining COCO
+    animals); pass `classes` to restrict it (e.g. WILDLIFE_CLASSES, or
+    {COCO_BIRD_CLASS} to reproduce the original bird-only behavior).
 
     torch/torchvision are imported lazily so that modules which only need the
     bbox math or cache-path helpers (e.g. RawImageLoader) don't pull the heavy
     detection stack.
     """
 
-    def __init__(self, device: str = "cpu", conf_threshold: float = 0.30):
+    def __init__(
+        self,
+        device: str = "cpu",
+        conf_threshold: float = 0.30,
+        classes: "dict[int, str] | set[int] | None" = None,
+    ):
         import torch
         from torchvision.models.detection import (
             FasterRCNN_ResNet50_FPN_V2_Weights,
@@ -195,14 +242,19 @@ class BirdDetector:
         self._torch = torch
         self.device = device
         self.conf_threshold = conf_threshold
+        self.classes = frozenset(SUPPORTED_ANIMAL_CLASSES if classes is None else classes)
         weights = FasterRCNN_ResNet50_FPN_V2_Weights.COCO_V1
         self.model = fasterrcnn_resnet50_fpn_v2(weights=weights).to(device).eval()
 
     def detect_best_bird(self, image_rgb: np.ndarray) -> BirdDetection | None:
-        """Highest-confidence bird detection above the threshold, or None.
+        """Highest-confidence detection of a supported animal class above the
+        threshold, or None.
 
-        This is the single source of truth for bird selection and confidence:
-        everything that needs a box and/or a score goes through here.
+        This is the single source of truth for subject selection and
+        confidence: everything that needs a box and/or a score goes through
+        here. Selection is class-agnostic — the single highest-scoring box among
+        the accepted classes wins, exactly as it did when only birds were
+        accepted.
         """
         torch = self._torch
         tensor = torch.from_numpy(image_rgb).permute(2, 0, 1).contiguous().float().div(255.0)
@@ -216,9 +268,9 @@ class BirdDetector:
         best: BirdDetection | None = None
         best_score = self.conf_threshold
         for box, label, score in zip(boxes, labels, scores):
-            if int(label) == COCO_BIRD_CLASS and score >= best_score:
+            if int(label) in self.classes and score >= best_score:
                 best_score = float(score)
-                best = BirdDetection(box=tuple(float(v) for v in box), score=float(score), label=COCO_BIRD_CLASS)
+                best = BirdDetection(box=tuple(float(v) for v in box), score=float(score), label=int(label))
         return best
 
     def best_bird_box(self, image_rgb: np.ndarray) -> tuple[float, float, float, float] | None:
@@ -236,9 +288,9 @@ def build_crop(
     """Produce the crop for one decoded image, returning the crop plus the
     detection and expanded box it came from.
 
-    When no bird is detected the full frame is returned (downscaled) so the
-    image still yields a usable, bird-agnostic input rather than being dropped;
-    in that case detection and expanded_box are None.
+    When no supported animal is detected the full frame is returned
+    (downscaled) so the image still yields a usable, subject-agnostic input
+    rather than being dropped; in that case detection and expanded_box are None.
     """
     height, width = image_rgb.shape[:2]
     detection = detector.detect_best_bird(image_rgb)

@@ -1,6 +1,6 @@
-"""One-time bird-crop cache builder.
+"""One-time animal-crop cache builder.
 
-Decodes each RAW once, detects the bird, crops tightly (small margin, aspect
+Decodes each RAW once, detects the animal, crops tightly (small margin, aspect
 preserved), and writes the crop to the cache that RawImageLoader reads during
 training. Run this before training with --crop-birds.
 
@@ -14,22 +14,30 @@ single process (default device cuda) — never inside DataLoader workers.
 from __future__ import annotations
 
 import argparse
+import time
+from collections import Counter
+from datetime import datetime
 from pathlib import Path
 
-from tqdm import tqdm
-
 from .bird_crop import (
+    SUPPORTED_ANIMAL_CLASSES,
     BirdDetector,
     CropParams,
     build_crop,
+    coco_class_name,
     crop_cache_path,
     read_crop_params,
     save_crop_png,
     write_crop_params,
 )
-from .config import DEFAULT_CROP_CACHE_DIR
+from .config import DEFAULT_CROP_CACHE_DIR, format_duration
 from .dataset import FolderLabelDataset
 from .raw_io import RawImageLoader
+
+# Preprocessing a 54k-image set takes hours, so progress is reported on a timer
+# rather than every N images: a slow pass logs steadily, and a fast pass over an
+# already-built cache does not flood the log with thousands of lines.
+PROGRESS_INTERVAL_SECONDS = 30.0
 
 
 def _resolve_device(requested: str) -> str:
@@ -68,24 +76,58 @@ def build_cache(
     decoder = RawImageLoader(raw_root=".", resize_mode="letterbox")
     detector = BirdDetector(device=device, conf_threshold=params.conf_threshold)
 
-    stats = {"total": len(image_paths), "cached": 0, "skipped": 0, "birds": 0, "fallbacks": 0, "errors": 0}
-    for image_path in tqdm(image_paths, desc="Building bird-crop cache", unit="img"):
+    total = len(image_paths)
+    stats = {"total": total, "cached": 0, "skipped": 0, "birds": 0, "fallbacks": 0, "errors": 0}
+    class_counts: Counter[str] = Counter()
+
+    print(f"Building crop cache for {total:,} images on device={device}")
+    print(f"  {'cache dir:':<20}{Path(cache_dir).resolve()}")
+    print(f"  {'accepted classes:':<20}{', '.join(sorted(SUPPORTED_ANIMAL_CLASSES.values()))}")
+    print(f"  {'min confidence:':<20}{params.conf_threshold}")
+
+    started = time.monotonic()
+    last_progress = started
+    for processed, image_path in enumerate(image_paths, start=1):
         target = crop_cache_path(cache_dir, image_path)
         if target.exists() and not force:
             stats["skipped"] += 1
-            continue
-        try:
-            # Decode to full-resolution RGB uint8 for detection + cropping.
-            rgb_uint8 = decoder._decode_full_frame(image_path)
-            result = build_crop(rgb_uint8, detector, params)
-            save_crop_png(target, result.crop)
-            stats["cached"] += 1
-            stats["birds" if result.detection is not None else "fallbacks"] += 1
-        except Exception as exc:  # noqa: BLE001 - report and continue, one bad file shouldn't stop the pass
-            stats["errors"] += 1
-            print(f"  ERROR on {image_path}: {type(exc).__name__}: {exc}")
+        else:
+            try:
+                # Decode to full-resolution RGB uint8 for detection + cropping.
+                rgb_uint8 = decoder._decode_full_frame(image_path)
+                result = build_crop(rgb_uint8, detector, params)
+                save_crop_png(target, result.crop)
+                stats["cached"] += 1
+                if result.detection is not None:
+                    stats["birds"] += 1
+                    class_counts[coco_class_name(result.detection.label)] += 1
+                else:
+                    stats["fallbacks"] += 1
+            except Exception as exc:  # noqa: BLE001 - report and continue, one bad file shouldn't stop the pass
+                stats["errors"] += 1
+                print(f"  ERROR on {image_path}: {type(exc).__name__}: {exc}")
 
+        now = time.monotonic()
+        if now - last_progress >= PROGRESS_INTERVAL_SECONDS or processed == total:
+            _print_progress(processed, total, stats, elapsed=now - started)
+            last_progress = now
+
+    stats["class_counts"] = dict(class_counts)
     return stats
+
+
+def _print_progress(processed: int, total: int, stats: dict, elapsed: float) -> None:
+    """One-line progress report: how far along, how fast, what was found, and
+    when it should finish."""
+    percent = (processed / total * 100.0) if total else 100.0
+    rate = processed / elapsed if elapsed > 0 else 0.0
+    eta = format_duration((total - processed) / rate) if rate > 0 else "n/a"
+    print(
+        f"[{datetime.now().strftime('%H:%M:%S')}] {processed:,}/{total:,} ({percent:.1f}%) "
+        f"| {rate:.1f} img/s | detected {stats['birds']:,} | fallback {stats['fallbacks']:,} "
+        f"| skipped {stats['skipped']:,} | errors {stats['errors']:,} "
+        f"| elapsed {format_duration(elapsed)} | eta {eta}"
+    )
 
 
 def preprocess_folders(
@@ -111,13 +153,19 @@ def preprocess_folders(
 
 def _print_cache_summary(cache_dir: str | Path, stats: dict) -> None:
     print("\nCrop cache build complete:")
-    print(f"  cache dir:        {Path(cache_dir).resolve()}")
-    print(f"  total images:     {stats['total']}")
-    print(f"  newly cached:     {stats['cached']}")
-    print(f"  already cached:   {stats['skipped']}")
-    print(f"  bird detected:    {stats['birds']}")
-    print(f"  no-bird fallback: {stats['fallbacks']} (full frame cached)")
-    print(f"  errors:           {stats['errors']}")
+    print(f"  {'cache dir:':<20}{Path(cache_dir).resolve()}")
+    print(f"  {'total images:':<20}{stats['total']:,}")
+    print(f"  {'newly cached:':<20}{stats['cached']:,}")
+    print(f"  {'already cached:':<20}{stats['skipped']:,}")
+    print(f"  {'animal detected:':<20}{stats['birds']:,}")
+    class_counts = stats.get("class_counts") or {}
+    if class_counts:
+        breakdown = ", ".join(
+            f"{name} {count:,}" for name, count in sorted(class_counts.items(), key=lambda kv: -kv[1])
+        )
+        print(f"    {'by class:':<18}{breakdown}")
+    print(f"  {'no-animal fallback:':<20}{stats['fallbacks']:,} (full frame cached)")
+    print(f"  {'errors:':<20}{stats['errors']:,}")
 
 
 def main() -> None:
