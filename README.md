@@ -53,8 +53,15 @@ The command refuses to overwrite an existing split unless `--force` is given.
 ### 4. Train the model
 
 ```bash
-python -m picklikeme.train --select-root "C:\\path\\to\\select" --reject-root "C:\\path\\to\\reject" --manifest data/manifest.parquet --split data/split.csv
+python -m picklikeme.train --epochs 20 --select-root "C:\\path\\to\\select" --reject-root "C:\\path\\to\\reject" --manifest data/manifest.parquet --split data/split.csv
 ```
+
+`--epochs` is **required** and is the number of epochs to run in *this*
+invocation, not a cumulative total. A fresh start (`--fresh-start`) trains
+epochs 1..N; `--resume` trains N *more* epochs, continuing the numbering from
+the checkpoint — resuming a checkpoint left at epoch 20 with `--epochs 10`
+trains epochs 21-30. (If `--epochs` is omitted the command exits with an error
+saying it is required.)
 
 With `--split`, training uses only train-split images and afterwards reports the
 protocol metrics (Top-1/Top-3 burst accuracy, ROC AUC, precision/recall) on the
@@ -80,12 +87,46 @@ python -m picklikeme.preprocess --select-root "C:\\path\\to\\select" --reject-ro
 Then train (cropping is already the default):
 
 ```bash
-python -m picklikeme.train --select-root "..." --reject-root "..."
+python -m picklikeme.train --epochs 20 --select-root "..." --reject-root "..."
 ```
 
 If `--crop-birds` is on but the cache is empty, training prints a warning and
 falls back to full frames — so build the cache first, or pass
 `--no-crop-birds` intentionally.
+
+### One command: preprocess → train → rank
+
+`picklikeme.run` chains the two steps above in a single process — it builds the
+crop cache, then trains (or resumes) and ranks — so you never have to remember
+to preprocess first:
+
+```bash
+python -m picklikeme.run --epochs 20 --select-root "C:\\path\\to\\select" --reject-root "C:\\path\\to\\reject"
+```
+
+It accepts every `picklikeme.train` flag (the required `--epochs`, `--split`,
+`--backbone`, `--resume`/`--fresh-start`, …) plus the preprocessing knobs
+`--margin-frac`, `--conf-threshold`, `--max-side`, and `--force-preprocess`.
+Pass `--no-crop-birds` to train on full frames (the preprocess step is then
+skipped), or `--skip-preprocess` to reuse an already-built cache. The result is
+the same `training_results.csv` the `train` command writes.
+
+### Rank a new, unseen folder with a trained model
+
+Once a model is trained, `picklikeme.rank` scores a directory the model has
+**never** seen — no labels, no training. It builds the bird crops for that
+folder, loads the checkpoint, and writes a ranked CSV (highest predicted "keep"
+score first):
+
+```bash
+python -m picklikeme.rank --input "D:\\NewShoot" --checkpoint checkpoints/model_checkpoint.pt
+```
+
+`--checkpoint` defaults to the project's rolling checkpoint. The `--backbone`
+must match the one the checkpoint was trained with (it defaults to the same
+DINOv3-Huge+ default as training). Output goes to `rankings.csv` by default
+(`--output-csv` to change). Pass `--no-crop-birds` only if the model was
+trained on full frames.
 
 Detection uses torchvision's COCO-pretrained Faster R-CNN v2 (the "bird" class)
 and runs **once** in this single-process pass — never per epoch and never in
@@ -187,8 +228,9 @@ Hugging Face hub cache afterwards).
   training.
 - Training resumes automatically from `--checkpoint-path` if it exists (pass
   `--fresh-start` to ignore it, or `--resume` to force resuming). Resuming
-  continues from the last **fully completed** epoch toward the same
-  `--epochs` target — it does not restart the epoch count or re-run
+  continues from the last **fully completed** epoch and runs `--epochs` *more*
+  epochs (that flag is per-run, not a cumulative target), keeping the epoch
+  numbering continuous — it does not restart the count or re-run
   already-completed epochs.
 - This only protects processes started with this checkpointing logic —
   editing the code has no effect on a training run already in progress.

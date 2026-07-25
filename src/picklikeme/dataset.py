@@ -87,6 +87,20 @@ class LabelDataset:
         )
 
 
+def _count_parent_sequences(items: list[ImageLabel]) -> int:
+    """Count distinct immediate-parent folders across items (a rough proxy for
+    the number of shooting sequences / bursts when no manifest burst IDs exist)."""
+    seen: set[str] = set()
+    for item in items:
+        path = Path(item.image_path)
+        parts = path.parts
+        if len(parts) >= 2:
+            seen.add("/".join(parts[-2:-1]))
+        else:
+            seen.add(path.parent.name)
+    return len(seen)
+
+
 class FolderLabelDataset:
     def __init__(
         self,
@@ -126,12 +140,40 @@ class FolderLabelDataset:
         return self.items[index]
 
     def count_sequences(self) -> int:
-        seen: set[str] = set()
-        for item in self.items:
-            path = Path(item.image_path)
-            parts = path.parts
-            if len(parts) >= 2:
-                seen.add("/".join(parts[-2:-1]))
-            else:
-                seen.add(path.parent.name)
-        return len(seen)
+        return _count_parent_sequences(self.items)
+
+
+ALLOWED_RAW_EXTENSIONS = {".arw", ".nef", ".cr3"}
+
+
+class UnlabeledImageDataset:
+    """A flat folder of RAW images to score with an already-trained model.
+
+    Unlike FolderLabelDataset there are no keep/reject labels — every item is
+    label 0 purely as a placeholder (it is never used for training here, only
+    ranking). Used by picklikeme.rank to score a directory the model has never
+    seen. Exposes the same len/__getitem__/count_sequences surface that
+    rank_dataset and write_results_csv rely on.
+    """
+
+    def __init__(self, image_paths: list[str]):
+        self.items: list[ImageLabel] = [ImageLabel(image_path=str(p), label=0) for p in image_paths]
+
+    @classmethod
+    def from_folder(cls, input_folder: str | Path) -> "UnlabeledImageDataset":
+        root = Path(input_folder)
+        paths = sorted(
+            str(p)
+            for p in root.rglob("*")
+            if p.is_file() and p.suffix.lower() in ALLOWED_RAW_EXTENSIONS
+        )
+        return cls(paths)
+
+    def __len__(self) -> int:
+        return len(self.items)
+
+    def __getitem__(self, index: int) -> ImageLabel:
+        return self.items[index]
+
+    def count_sequences(self) -> int:
+        return _count_parent_sequences(self.items)

@@ -221,12 +221,18 @@ def train(
     model_config: ModelConfig | None = None,
     best_checkpoint_path: str | Path | None = None,
     log_interval_batches: int = 1,
+    epochs_this_run: int | None = None,
 ) -> PreferenceHead:
     if dataset is None:
         dataset = LabelDataset(config.manifest_path, config.raw_root)
 
     device = resolve_device(config.device)
     print_startup_diagnostics(device)
+
+    # Number of epochs to run in THIS invocation (per-run, not a cumulative
+    # target). Falls back to config.epochs only for internal callers that don't
+    # pass it; the CLI always supplies --epochs.
+    epochs_to_run = epochs_this_run if epochs_this_run is not None else config.epochs
 
     use_cuda = device.startswith("cuda")
     data_loader = DataLoader(
@@ -259,9 +265,14 @@ def train(
             optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
             start_epoch = checkpoint.get("epoch") or 0
             best_loss = checkpoint.get("best_loss", math.inf)
-            print(f"Resumed after epoch {start_epoch}/{config.epochs}; best_loss so far={best_loss}")
+            print(f"Resumed after epoch {start_epoch}; training {epochs_to_run} more epoch(s) toward epoch {start_epoch + epochs_to_run}; best_loss so far={best_loss}")
         elif not resume and checkpoint_path.exists():
             print(f"Overwriting existing checkpoint at {checkpoint_path}")
+
+    # Per-run target: fresh start (start_epoch == 0) runs epochs 1..N; resuming
+    # from a checkpoint at epoch K runs K+1..K+N, keeping the epoch numbering
+    # continuous instead of restarting it.
+    target_epoch = start_epoch + epochs_to_run
 
     if best_checkpoint_path is not None:
         best_checkpoint_path = Path(best_checkpoint_path)
@@ -274,9 +285,9 @@ def train(
     last_completed_epoch = start_epoch
     model.train()
     try:
-        for epoch in range(start_epoch, config.epochs):
+        for epoch in range(start_epoch, target_epoch):
             current_epoch = epoch + 1
-            print(f"Starting epoch {current_epoch}/{config.epochs} (progress: {current_epoch}/{config.epochs})")
+            print(f"Starting epoch {current_epoch}/{target_epoch} (progress: {current_epoch}/{target_epoch})")
             processed_batches = 0
             epoch_loss_sum = 0.0
             epoch_start_time = datetime.now()
@@ -298,7 +309,7 @@ def train(
                     write_progress_state(
                         status_path,
                         current_epoch,
-                        config.epochs,
+                        target_epoch,
                         processed_batches,
                         total_batches,
                         loss_value,
@@ -321,7 +332,7 @@ def train(
                     remaining = total_batches - processed_batches
                     eta = _format_duration(remaining / rate) if rate > 0 else "n/a"
                     print(
-                        f"[{now.strftime('%H:%M:%S')}] epoch {current_epoch}/{config.epochs} "
+                        f"[{now.strftime('%H:%M:%S')}] epoch {current_epoch}/{target_epoch} "
                         f"batch {processed_batches}/{total_batches} loss={loss_value:.4f} "
                         f"elapsed={_format_duration(elapsed)} eta={eta}"
                     )
@@ -333,11 +344,11 @@ def train(
                 write_progress_state(
                     status_path,
                     current_epoch,
-                    config.epochs,
+                    target_epoch,
                     processed_batches,
                     total_batches,
                     epoch_avg_loss,
-                    f"completed epoch {current_epoch}/{config.epochs}",
+                    f"completed epoch {current_epoch}/{target_epoch}",
                 )
 
             if epoch_avg_loss is not None and epoch_avg_loss < best_loss:
@@ -358,7 +369,7 @@ def train(
                     reason=f"End of epoch {current_epoch}",
                 )
 
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] Completed epoch {current_epoch}/{config.epochs}; {config.epochs - current_epoch} epochs remaining")
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] Completed epoch {current_epoch}/{target_epoch}; {target_epoch - current_epoch} epochs remaining")
     except KeyboardInterrupt:
         print(f"[{datetime.now().strftime('%H:%M:%S')}] KeyboardInterrupt received; saving checkpoint before exiting")
         if checkpoint_path is not None:
@@ -435,12 +446,21 @@ def write_results_csv(
     return files_written
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Train a personal preference model")
+def build_arg_parser(add_help: bool = True) -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Train a personal preference model", add_help=add_help)
     parser.add_argument("--raw-root", default=None)
     parser.add_argument("--manifest", default="data/manifest.parquet", help="Manifest parquet (from picklikeme.ingest.cli build-manifest); supplies burst IDs")
     parser.add_argument("--select-root", default=None)
     parser.add_argument("--reject-root", default=None)
+    parser.add_argument(
+        "--epochs",
+        type=int,
+        required=True,
+        help="Number of epochs to run in THIS invocation (NOT a cumulative total). "
+        "Fresh start trains epochs 1..N; --resume trains N more, continuing the "
+        "epoch numbering from the checkpoint (e.g. resume at epoch 20 with "
+        "--epochs 10 trains epochs 21-30).",
+    )
     parser.add_argument("--output-csv", default="training_results.csv")
     parser.add_argument("--max-rows", type=int, default=1000)
     parser.add_argument("--checkpoint-path", default=str(DEFAULT_CHECKPOINT_PATH), help="Where to save the rolling checkpoint (default: <project-root>/checkpoints/model_checkpoint.pt, independent of the current working directory)")
@@ -461,8 +481,12 @@ def main() -> None:
     parser.add_argument("--log-interval-batches", type=int, default=1, help="Print training progress every N batches (1 = every batch, the default; higher = less noise; 0 = only at epoch end)")
     parser.add_argument("--crop-birds", action=argparse.BooleanOptionalAction, default=True, help="Feed pre-computed bird crops from picklikeme.preprocess (default); pass --no-crop-birds to train on full frames")
     parser.add_argument("--crop-cache-dir", default=str(DEFAULT_CROP_CACHE_DIR), help="Directory of the bird-crop cache used by --crop-birds")
-    args = parser.parse_args()
+    return parser
 
+
+def train_and_rank(args) -> None:
+    """Train (or resume) on the select/reject folders, then rank every image and
+    write the results CSV. Shared by `picklikeme.train` and `picklikeme.run`."""
     if not args.select_root or not args.reject_root:
         raise SystemExit("Both --select-root and --reject-root are required.")
 
@@ -527,6 +551,7 @@ def main() -> None:
         model_config=model_config,
         best_checkpoint_path=args.best_checkpoint_path,
         log_interval_batches=args.log_interval_batches,
+        epochs_this_run=args.epochs,
     )
     device = resolve_device(config.device)
     if test_items:
@@ -547,6 +572,11 @@ def main() -> None:
     print(f"CSV written to {output_paths[0]}")
     if len(output_paths) > 1:
         print(f"Additional CSV files: {', '.join(str(path) for path in output_paths[1:])}")
+
+
+def main() -> None:
+    args = build_arg_parser().parse_args()
+    train_and_rank(args)
 
 
 if __name__ == "__main__":

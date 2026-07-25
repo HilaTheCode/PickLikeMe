@@ -54,8 +54,10 @@ class FlakyLoader:
 
 
 def _run(tmpdir, epochs, resume, checkpoint_path=None, best_checkpoint_path=None):
+    # `epochs` is the per-run count (train's --epochs): fresh runs 1..N, resume
+    # runs N more continuing the numbering.
     checkpoint_path = checkpoint_path or Path(tmpdir) / "checkpoint.pt"
-    config = ProjectConfig(batch_size=2, learning_rate=1e-3, epochs=epochs, device="cpu")
+    config = ProjectConfig(batch_size=2, learning_rate=1e-3, device="cpu")
     model_config = ModelConfig(backbone="cnn")
     buf = io.StringIO()
     with redirect_stdout(buf):
@@ -67,6 +69,7 @@ def _run(tmpdir, epochs, resume, checkpoint_path=None, best_checkpoint_path=None
             resume=resume,
             model_config=model_config,
             best_checkpoint_path=best_checkpoint_path,
+            epochs_this_run=epochs,
         )
     return model, checkpoint_path, buf.getvalue()
 
@@ -78,26 +81,41 @@ class EpochBookkeepingTests(unittest.TestCase):
             checkpoint = torch.load(checkpoint_path, map_location="cpu")
             self.assertEqual(checkpoint["epoch"], 2)
 
-    def test_resume_at_same_target_epochs_does_no_extra_work(self):
+    def test_resume_epochs_is_per_run_not_cumulative(self):
+        # --epochs is the number of epochs to run THIS invocation. After a fresh
+        # 2-epoch run (ends at epoch 2), resuming with epochs=2 must train 2 MORE
+        # epochs (3 and 4), not treat 2 as a cumulative target that is already met.
         with tempfile.TemporaryDirectory() as tmpdir:
             checkpoint_path = Path(tmpdir) / "checkpoint.pt"
             _run(tmpdir, epochs=2, resume=False, checkpoint_path=checkpoint_path)
-            _, _, output = _run(tmpdir, epochs=2, resume=True, checkpoint_path=checkpoint_path)
-            self.assertNotIn("Starting epoch", output)
-
-    def test_resume_continues_from_last_completed_epoch_not_zero(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            checkpoint_path = Path(tmpdir) / "checkpoint.pt"
-            _run(tmpdir, epochs=2, resume=False, checkpoint_path=checkpoint_path)
-            _, checkpoint_path, output = _run(tmpdir, epochs=4, resume=True, checkpoint_path=checkpoint_path)
+            _, checkpoint_path, output = _run(tmpdir, epochs=2, resume=True, checkpoint_path=checkpoint_path)
 
             self.assertIn("Starting epoch 3/4", output)
             self.assertIn("Starting epoch 4/4", output)
-            self.assertNotIn("Starting epoch 1/4", output)
-            self.assertNotIn("Starting epoch 2/4", output)
-
             checkpoint = torch.load(checkpoint_path, map_location="cpu")
             self.assertEqual(checkpoint["epoch"], 4)
+
+    def test_resume_continues_numbering_for_requested_additional_epochs(self):
+        # Resume at epoch 2 with epochs=3 -> trains epochs 3,4,5 labeled "/5".
+        with tempfile.TemporaryDirectory() as tmpdir:
+            checkpoint_path = Path(tmpdir) / "checkpoint.pt"
+            _run(tmpdir, epochs=2, resume=False, checkpoint_path=checkpoint_path)
+            _, checkpoint_path, output = _run(tmpdir, epochs=3, resume=True, checkpoint_path=checkpoint_path)
+
+            self.assertIn("Starting epoch 3/5", output)
+            self.assertIn("Starting epoch 4/5", output)
+            self.assertIn("Starting epoch 5/5", output)
+            self.assertNotIn("Starting epoch 1/", output)
+            self.assertNotIn("Starting epoch 2/", output)
+
+            checkpoint = torch.load(checkpoint_path, map_location="cpu")
+            self.assertEqual(checkpoint["epoch"], 5)
+
+    def test_fresh_start_numbers_epochs_from_one(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            _, _, output = _run(tmpdir, epochs=2, resume=False)
+            self.assertIn("Starting epoch 1/2", output)
+            self.assertIn("Starting epoch 2/2", output)
 
     def test_legacy_checkpoint_without_epoch_field_resumes_from_zero(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -159,7 +177,7 @@ class InterruptTests(unittest.TestCase):
             # interrupts the main training loop, not a DataLoader worker subprocess
             # (an exception raised in a worker surfaces as a worker-crash error, a
             # different path than the KeyboardInterrupt handler under test).
-            config = ProjectConfig(batch_size=1, learning_rate=1e-3, epochs=5, device="cpu", num_workers=0)
+            config = ProjectConfig(batch_size=1, learning_rate=1e-3, device="cpu", num_workers=0)
             model_config = ModelConfig(backbone="cnn")
 
             with self.assertRaises(KeyboardInterrupt):
@@ -170,6 +188,7 @@ class InterruptTests(unittest.TestCase):
                     checkpoint_path=checkpoint_path,
                     resume=False,
                     model_config=model_config,
+                    epochs_this_run=5,
                 )
 
             self.assertTrue(checkpoint_path.exists())

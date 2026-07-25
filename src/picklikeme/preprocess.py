@@ -88,6 +88,38 @@ def build_cache(
     return stats
 
 
+def preprocess_folders(
+    select_root: str,
+    reject_root: str,
+    cache_dir: str | Path,
+    params: CropParams,
+    device: str = "cuda",
+    force: bool = False,
+) -> dict:
+    """Enumerate the select/reject roots and build the bird-crop cache for them.
+
+    Shared by `picklikeme.preprocess` (standalone) and `picklikeme.run` (the
+    preprocess -> train -> rank pipeline) so both enumerate images identically.
+    """
+    dataset = FolderLabelDataset(select_root=select_root, reject_root=reject_root, raw_root=select_root)
+    image_paths = [item.image_path for item in dataset.items]
+    print(f"Enumerated {len(image_paths)} images from select/reject roots.")
+    stats = build_cache(image_paths, cache_dir, params, device=device, force=force)
+    _print_cache_summary(cache_dir, stats)
+    return stats
+
+
+def _print_cache_summary(cache_dir: str | Path, stats: dict) -> None:
+    print("\nCrop cache build complete:")
+    print(f"  cache dir:        {Path(cache_dir).resolve()}")
+    print(f"  total images:     {stats['total']}")
+    print(f"  newly cached:     {stats['cached']}")
+    print(f"  already cached:   {stats['skipped']}")
+    print(f"  bird detected:    {stats['birds']}")
+    print(f"  no-bird fallback: {stats['fallbacks']} (full frame cached)")
+    print(f"  errors:           {stats['errors']}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Build the bird-crop cache used by training's --crop-birds")
     parser.add_argument("--select-root", required=True)
@@ -100,25 +132,19 @@ def main() -> None:
     parser.add_argument("--force", action="store_true", help="Rebuild crops even if already cached")
     args = parser.parse_args()
 
-    dataset = FolderLabelDataset(select_root=args.select_root, reject_root=args.reject_root, raw_root=args.select_root)
-    image_paths = [item.image_path for item in dataset.items]
-    print(f"Enumerated {len(image_paths)} images from select/reject roots.")
-
     params = CropParams(
         margin_frac=args.margin_frac,
         conf_threshold=args.conf_threshold,
         max_side=args.max_side,
     )
-    stats = build_cache(image_paths, args.cache_dir, params, device=args.device, force=args.force)
-
-    print("\nCrop cache build complete:")
-    print(f"  cache dir:        {Path(args.cache_dir).resolve()}")
-    print(f"  total images:     {stats['total']}")
-    print(f"  newly cached:     {stats['cached']}")
-    print(f"  already cached:   {stats['skipped']}")
-    print(f"  bird detected:    {stats['birds']}")
-    print(f"  no-bird fallback: {stats['fallbacks']} (full frame cached)")
-    print(f"  errors:           {stats['errors']}")
+    preprocess_folders(
+        args.select_root,
+        args.reject_root,
+        args.cache_dir,
+        params,
+        device=args.device,
+        force=args.force,
+    )
 
 
 if __name__ == "__main__":

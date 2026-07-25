@@ -41,17 +41,17 @@ class TrainingCheckpointTests(unittest.TestCase):
     def test_train_can_save_and_resume_checkpoint(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             checkpoint_path = Path(tmpdir) / "checkpoint.pt"
-            config = ProjectConfig(batch_size=2, learning_rate=1e-3, epochs=1, device="cpu")
+            config = ProjectConfig(batch_size=2, learning_rate=1e-3, device="cpu")
             dataset = TinyDataset()
             loader = DummyLoader()
 
             model_config = ModelConfig(backbone="cnn")
 
-            first_model = train(config, loader, dataset=dataset, checkpoint_path=checkpoint_path, resume=False, model_config=model_config)
+            first_model = train(config, loader, dataset=dataset, checkpoint_path=checkpoint_path, resume=False, model_config=model_config, epochs_this_run=1)
             self.assertTrue(checkpoint_path.exists())
             self.assertIsInstance(first_model, PreferenceHead)
 
-            second_model = train(config, loader, dataset=dataset, checkpoint_path=checkpoint_path, resume=True, model_config=model_config)
+            second_model = train(config, loader, dataset=dataset, checkpoint_path=checkpoint_path, resume=True, model_config=model_config, epochs_this_run=1)
             self.assertIsInstance(second_model, PreferenceHead)
             self.assertTrue(torch.equal(second_model.state_dict()["classifier.weight"], second_model.state_dict()["classifier.weight"]))
 
