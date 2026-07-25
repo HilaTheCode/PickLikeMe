@@ -1,3 +1,5 @@
+import traceback
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -9,6 +11,32 @@ DEFAULT_CHECKPOINT_DIR = PROJECT_ROOT / "checkpoints"
 DEFAULT_CHECKPOINT_PATH = DEFAULT_CHECKPOINT_DIR / "model_checkpoint.pt"
 DEFAULT_CROP_CACHE_DIR = PROJECT_ROOT / "cache" / "crops"
 DEFAULT_INSPECTION_DIR = PROJECT_ROOT / "inspection"
+
+
+@contextmanager
+def fatal_errors_logged_to_stdout():
+    """Print an unhandled exception's traceback to **stdout** before re-raising.
+
+    Long runs are piped to a log, and the usual pipe captures stdout only - so a
+    crash previously left a log that simply stopped mid-progress with no
+    diagnosis, while the traceback went to a console that may be long gone. This
+    puts the traceback in the log regardless of how stderr is redirected.
+
+    The exception still propagates, so the exit code and any outer handling are
+    unchanged. Ctrl+C is reported as one line rather than a traceback, since it
+    is a deliberate stop and the training loop already checkpoints on it.
+    """
+    try:
+        yield
+    except KeyboardInterrupt:
+        print("\nInterrupted by user (Ctrl+C).")
+        raise
+    except BaseException:
+        print("\n" + "=" * 64)
+        print("FATAL: run stopped with an unhandled exception")
+        print(traceback.format_exc().rstrip())
+        print("=" * 64)
+        raise
 
 
 def format_duration(seconds: float) -> str:

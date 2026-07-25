@@ -16,7 +16,13 @@ from torch import nn
 from torch.utils.data import DataLoader, Dataset
 
 from .bird_crop import read_crop_params
-from .config import DEFAULT_CHECKPOINT_PATH, DEFAULT_CROP_CACHE_DIR, ProjectConfig, format_duration
+from .config import (
+    DEFAULT_CHECKPOINT_PATH,
+    DEFAULT_CROP_CACHE_DIR,
+    ProjectConfig,
+    fatal_errors_logged_to_stdout,
+    format_duration,
+)
 from .dataset import FolderLabelDataset, LabelDataset, PathSuffixIndex
 from .evaluate import compute_metrics, format_metrics, score_items, write_metrics_json
 from .model import DINOV3_BACKBONE, ModelConfig, PreferenceHead
@@ -778,7 +784,8 @@ def train_and_rank(args) -> None:
 
 def main() -> None:
     args = build_arg_parser().parse_args()
-    train_and_rank(args)
+    with fatal_errors_logged_to_stdout():
+        train_and_rank(args)
 
 
 if __name__ == "__main__":

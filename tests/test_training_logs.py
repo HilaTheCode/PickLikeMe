@@ -185,18 +185,101 @@ class PreprocessProgressTests(unittest.TestCase):
             _print_progress(
                 250,
                 1000,
-                {"birds": 200, "fallbacks": 30, "skipped": 20, "errors": 1},
+                {"cached": 230, "birds": 200, "fallbacks": 30, "skipped": 20, "errors": 1},
                 elapsed=50.0,
+                work_elapsed=46.2,
             )
         line = buf.getvalue()
 
         self.assertIn("250/1,000 (25.0%)", line)
-        self.assertIn("5.0 img/s", line)
+        self.assertIn("5.0 img/s", line)  # 231 built/failed in 46.2s
         self.assertIn("detected 200", line)
         self.assertIn("fallback 30", line)
         self.assertIn("skipped 20", line)
         self.assertIn("errors 1", line)
         self.assertIn("eta 2m30s", line)  # 750 remaining at 5/s
+
+    def test_rate_excludes_skipped_images(self):
+        """A resumed run consumes its cached prefix in seconds. Counting those as
+        throughput made the rate open in the hundreds and the ETA climb instead
+        of fall, so the rate must be over built images only."""
+        from picklikeme.preprocess import _print_progress
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            _print_progress(
+                10_100,
+                55_000,
+                {"cached": 100, "birds": 100, "fallbacks": 0, "skipped": 10_000, "errors": 0},
+                elapsed=90.0,      # includes ~60s of skipping
+                work_elapsed=50.0,  # only the time spent building
+            )
+        line = buf.getvalue()
+
+        self.assertIn("2.0 img/s", line)  # 100 built in 50s, not 10,100 in 90s
+        # 44,900 remaining at 2/s = 22,450s
+        self.assertIn("eta 6h14m10s", line)
+
+    def test_rate_is_not_reported_before_any_work_is_done(self):
+        from picklikeme.preprocess import _print_progress
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            _print_progress(
+                500,
+                1000,
+                {"cached": 0, "birds": 0, "fallbacks": 0, "skipped": 500, "errors": 0},
+                elapsed=3.0,
+                work_elapsed=0.0,
+            )
+        line = buf.getvalue()
+
+        self.assertIn("0.0 img/s", line)
+        self.assertIn("eta n/a", line)  # no basis for an estimate yet
+
+
+class FatalErrorLoggingTests(unittest.TestCase):
+    """Crashes must land in the stdout log: a run piped to a file captures
+    stdout only, so a traceback that goes solely to stderr leaves a log that
+    just stops with no explanation."""
+
+    def test_traceback_is_printed_to_stdout_and_the_error_propagates(self):
+        from picklikeme.config import fatal_errors_logged_to_stdout
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            with self.assertRaises(ValueError):
+                with fatal_errors_logged_to_stdout():
+                    raise ValueError("boom in the middle of a long run")
+        output = buf.getvalue()
+
+        self.assertIn("FATAL", output)
+        self.assertIn("ValueError", output)
+        self.assertIn("boom in the middle of a long run", output)
+        self.assertIn("Traceback (most recent call last)", output)
+
+    def test_keyboard_interrupt_is_one_line_not_a_traceback(self):
+        from picklikeme.config import fatal_errors_logged_to_stdout
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            with self.assertRaises(KeyboardInterrupt):
+                with fatal_errors_logged_to_stdout():
+                    raise KeyboardInterrupt
+        output = buf.getvalue()
+
+        self.assertIn("Interrupted by user", output)
+        self.assertNotIn("FATAL", output)
+        self.assertNotIn("Traceback", output)
+
+    def test_nothing_is_printed_on_success(self):
+        from picklikeme.config import fatal_errors_logged_to_stdout
+
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            with fatal_errors_logged_to_stdout():
+                pass
+        self.assertEqual(buf.getvalue(), "")
 
     def test_progress_is_timer_based_so_a_fast_pass_does_not_flood(self):
         """A pass that only skips already-cached files completes in well under

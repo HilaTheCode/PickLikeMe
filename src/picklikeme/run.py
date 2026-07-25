@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 
 from .bird_crop import CropParams
+from .config import fatal_errors_logged_to_stdout
 from .preprocess import default_decode_workers, preprocess_folders
 from .train import build_arg_parser, train_and_rank
 
@@ -46,33 +47,36 @@ def main() -> None:
     if not args.select_root or not args.reject_root:
         raise SystemExit("Both --select-root and --reject-root are required.")
 
-    if args.crop_birds and not args.skip_preprocess:
-        print("=" * 64)
-        print("STEP 1/2: Building bird-crop cache (preprocessing)")
-        print("=" * 64)
-        params = CropParams(
-            margin_frac=args.margin_frac,
-            conf_threshold=args.conf_threshold,
-            max_side=args.max_side,
-        )
-        preprocess_folders(
-            args.select_root,
-            args.reject_root,
-            args.crop_cache_dir,
-            params,
-            device=args.device or "cuda",
-            force=args.force_preprocess,
-            decode_workers=args.decode_workers,
-        )
-    elif not args.crop_birds:
-        print("Preprocess step skipped (--no-crop-birds: training on full frames).")
-    else:
-        print("Preprocess step skipped (--skip-preprocess: reusing existing crop cache).")
+    # A run here is hours long and is normally piped to a log, so a crash must
+    # leave its traceback in that log rather than only on the console.
+    with fatal_errors_logged_to_stdout():
+        if args.crop_birds and not args.skip_preprocess:
+            print("=" * 64)
+            print("STEP 1/2: Building bird-crop cache (preprocessing)")
+            print("=" * 64)
+            params = CropParams(
+                margin_frac=args.margin_frac,
+                conf_threshold=args.conf_threshold,
+                max_side=args.max_side,
+            )
+            preprocess_folders(
+                args.select_root,
+                args.reject_root,
+                args.crop_cache_dir,
+                params,
+                device=args.device or "cuda",
+                force=args.force_preprocess,
+                decode_workers=args.decode_workers,
+            )
+        elif not args.crop_birds:
+            print("Preprocess step skipped (--no-crop-birds: training on full frames).")
+        else:
+            print("Preprocess step skipped (--skip-preprocess: reusing existing crop cache).")
 
-    print("=" * 64)
-    print("STEP 2/2: Training and ranking")
-    print("=" * 64)
-    train_and_rank(args)
+        print("=" * 64)
+        print("STEP 2/2: Training and ranking")
+        print("=" * 64)
+        train_and_rank(args)
 
 
 if __name__ == "__main__":

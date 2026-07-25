@@ -52,7 +52,7 @@ from .bird_crop import (
     save_crop_png,
     write_crop_params,
 )
-from .config import DEFAULT_CROP_CACHE_DIR, format_duration
+from .config import DEFAULT_CROP_CACHE_DIR, fatal_errors_logged_to_stdout, format_duration
 from .dataset import FolderLabelDataset
 from .profiling import PROFILE
 from .raw_io import RawImageLoader
@@ -282,6 +282,9 @@ def build_cache(
 
     started = time.monotonic()
     last_progress = started
+    # Set when the first image that needs building is finished, so the reported
+    # rate is not diluted by the near-instant skipping of a cached prefix.
+    work_started: float | None = None
     processed = 0
     pool = ThreadPoolExecutor(max_workers=decode_workers, thread_name_prefix="picklikeme-decode")
     writer.start()
@@ -297,6 +300,8 @@ def build_cache(
             if job.future is None:
                 stats["skipped"] += 1
             else:
+                if work_started is None:
+                    work_started = time.monotonic()
                 decoded = job.future.result()
                 if decoded.error is not None:
                     stats["errors"] += 1
@@ -337,7 +342,13 @@ def build_cache(
 
             now = time.monotonic()
             if now - last_progress >= PROGRESS_INTERVAL_SECONDS or processed == total:
-                _print_progress(processed, total, stats, elapsed=now - started)
+                _print_progress(
+                    processed,
+                    total,
+                    stats,
+                    elapsed=now - started,
+                    work_elapsed=0.0 if work_started is None else now - work_started,
+                )
                 last_progress = now
             if PROFILE.enabled and PROFILE.images and PROFILE.images % PROFILE_SUMMARY_INTERVAL_IMAGES == 0:
                 print(PROFILE.progress_line())
@@ -371,11 +382,24 @@ def build_cache(
     return stats
 
 
-def _print_progress(processed: int, total: int, stats: dict, elapsed: float) -> None:
+def _print_progress(processed: int, total: int, stats: dict, elapsed: float, work_elapsed: float) -> None:
     """One-line progress report: how far along, how fast, what was found, and
-    when it should finish."""
+    when it should finish.
+
+    Rate and ETA are measured over images that actually required work, timed
+    from the first such image - not over everything processed. On a resumed run
+    the already-cached prefix is consumed in seconds, and counting those made
+    the rate open at a meaningless several-hundred img/s and the ETA *climb*
+    as the average decayed. `work_elapsed` excludes that skip phase, so the
+    numbers are usable from the first line.
+
+    The ETA assumes the remaining images all need building, which is what a
+    resumed run looks like once past its cached prefix. If a later stretch turns
+    out to be cached too, the estimate is simply pessimistic.
+    """
     percent = (processed / total * 100.0) if total else 100.0
-    rate = processed / elapsed if elapsed > 0 else 0.0
+    worked = stats["cached"] + stats["errors"]
+    rate = worked / work_elapsed if work_elapsed > 0 and worked else 0.0
     eta = format_duration((total - processed) / rate) if rate > 0 else "n/a"
     print(
         f"[{datetime.now().strftime('%H:%M:%S')}] {processed:,}/{total:,} ({percent:.1f}%) "
@@ -450,15 +474,16 @@ def main() -> None:
         conf_threshold=args.conf_threshold,
         max_side=args.max_side,
     )
-    preprocess_folders(
-        args.select_root,
-        args.reject_root,
-        args.cache_dir,
-        params,
-        device=args.device,
-        force=args.force,
-        decode_workers=args.decode_workers,
-    )
+    with fatal_errors_logged_to_stdout():
+        preprocess_folders(
+            args.select_root,
+            args.reject_root,
+            args.cache_dir,
+            params,
+            device=args.device,
+            force=args.force,
+            decode_workers=args.decode_workers,
+        )
 
 
 if __name__ == "__main__":
