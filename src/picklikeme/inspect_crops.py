@@ -30,6 +30,7 @@ from PIL import Image, ImageDraw, ImageFont
 from .bird_crop import (
     CropParams,
     build_crop,
+    coco_class_name,
     crop_cache_path,
     read_crop_params,
 )
@@ -211,6 +212,7 @@ class PipelineResult:
     crop_size: tuple[int, int]                       # (width, height) of the tight crop
     full_rgb: np.ndarray                             # decoded original (uint8 RGB)
     model_input_rgb: np.ndarray                      # exactly what the model receives (uint8 RGB)
+    label: int | None = None                         # COCO class of the detection, for the overlay
 
 
 def run_pipeline(loader: RawImageLoader, detector, source_path: str, params: CropParams) -> PipelineResult:
@@ -242,6 +244,7 @@ def run_pipeline(loader: RawImageLoader, detector, source_path: str, params: Cro
         crop_size=(crop.shape[1], crop.shape[0]),
         full_rgb=full,
         model_input_rgb=model_input,
+        label=detection.label if detection is not None else None,
     )
 
 
@@ -266,7 +269,10 @@ def draw_bbox_overlay(result: PipelineResult) -> Image.Image:
         draw.rectangle(result.box, outline=(0, 255, 0), width=line_w)
         if result.expanded_box is not None:
             draw.rectangle(result.expanded_box, outline=(255, 230, 0), width=max(2, line_w // 2))
-        label = f"bird {result.score:.2f}"
+        # Name the class that was actually detected (zebra, elephant, ...), not
+        # a hardcoded "bird".
+        species = coco_class_name(result.label) if result.label is not None else "object"
+        label = f"{species} {result.score:.2f}"
         draw.text((result.box[0] + 2, max(0, result.box[1] - 12)), label, fill=(0, 255, 0), font=font)
     else:
         draw.text((6, 6), "NO BIRD - full-frame fallback", fill=(255, 60, 60), font=font)

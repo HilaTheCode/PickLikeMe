@@ -180,14 +180,18 @@ def _write_checkpoint_atomic(model, optimizer, checkpoint_path: Path, epoch, bes
 
 
 def _print_save_success(checkpoint_path: Path, reason: str, epoch, best_loss, on_retry: bool) -> None:
-    print(_BANNER)
-    print("Saving checkpoint" + (" (retry SUCCEEDED)" if on_retry else ""))
-    print(f"Path: {checkpoint_path.resolve()}")
-    print(f"Reason: {reason or 'unspecified'}")
-    print(f"Epoch: {epoch}")
-    print(f"Best loss: {best_loss}")
-    print("Status: SUCCESS")
-    print(_BANNER)
+    """One line per successful save. A multi-day run saves every few minutes, so
+    the multi-line block this replaced dominated the log. Failures keep their
+    full diagnostic block (see _print_save_failure) — that output is rare and
+    is exactly what's needed to diagnose a broken save."""
+    epoch_text = "n/a" if epoch is None else str(epoch)
+    best_text = "n/a" if best_loss is None or best_loss == math.inf else f"{best_loss:.4f}"
+    retry = " (retry SUCCEEDED)" if on_retry else ""
+    print(
+        f"[{datetime.now().strftime('%H:%M:%S')}] Checkpoint saved{retry}"
+        f" | epoch {epoch_text} | best loss {best_text}"
+        f" | {reason or 'unspecified'} | {checkpoint_path.resolve()}"
+    )
 
 
 def _print_save_failure(checkpoint_path: Path, reason: str, epoch, exc: Exception) -> None:

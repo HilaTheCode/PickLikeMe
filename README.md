@@ -233,8 +233,9 @@ Every run writes a self-contained, timestamped folder under `inspection/`
   exactly as the model receives it: detected, cropped, aspect-preserving
   resize, padded), filename beneath each.
 - `bbox_overlay_sheet_*.png` — the originals with the detected box (green) and
-  the expanded crop region (yellow) drawn on top, to check the right bird was
-  found and beak/wings/tail aren't clipped.
+  the expanded crop region (yellow) drawn on top, labelled with the detected
+  COCO class and confidence (`zebra 0.91`), to check the right subject was found
+  and nothing is clipped.
 - `images/<name>_compare.png` — the per-image original→crop pair.
 - `report.txt` + `report.csv` — images processed, successful detections,
   failures, success rate, and per image: confidence, box coordinates, original

@@ -23,20 +23,35 @@ def _model_and_opt():
 
 
 class SaveDiagnosticsTests(unittest.TestCase):
-    def test_success_block_printed_and_returns_true(self):
+    def test_success_is_one_line_with_epoch_loss_reason_and_path(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "ckpt.pt"
             model, optimizer = _model_and_opt()
             buf = io.StringIO()
             with redirect_stdout(buf):
                 ok = save_checkpoint(model, optimizer, path, epoch=3, best_loss=0.25, reason="End of epoch 3")
-            output = buf.getvalue()
+            lines = buf.getvalue().splitlines()
 
             self.assertTrue(ok)
-            self.assertIn("Saving checkpoint", output)
-            self.assertIn("Status: SUCCESS", output)
-            self.assertIn("Reason: End of epoch 3", output)
-            self.assertIn(str(path.resolve()), output)
+            # A run saves every few minutes for days: one line, not a block.
+            self.assertEqual(len(lines), 1)
+            self.assertIn("Checkpoint saved", lines[0])
+            self.assertIn("epoch 3", lines[0])
+            self.assertIn("best loss 0.2500", lines[0])
+            self.assertIn("End of epoch 3", lines[0])
+            self.assertIn(str(path.resolve()), lines[0])
+
+    def test_success_line_handles_missing_epoch_and_loss(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "ckpt.pt"
+            model, optimizer = _model_and_opt()
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                save_checkpoint(model, optimizer, path, reason="mid-epoch, no best yet")
+            line = buf.getvalue().strip()
+
+            self.assertIn("epoch n/a", line)
+            self.assertIn("best loss n/a", line)  # None and inf both read as n/a
 
     def test_persistent_failure_retries_once_then_raises(self):
         # Point the checkpoint at a path whose parent is a *file*, so every
@@ -53,6 +68,8 @@ class SaveDiagnosticsTests(unittest.TestCase):
                     save_checkpoint(model, optimizer, path, epoch=1, reason="End of epoch 1", retry_delay_seconds=0)
             output = buf.getvalue()
 
+            # Failure output stays verbose on purpose: it is rare, and it is
+            # what a broken save has to be diagnosed from.
             self.assertIn("Checkpoint save FAILED", output)
             self.assertIn("Full traceback:", output)
             self.assertIn("Waiting", output)
@@ -81,9 +98,10 @@ class SaveDiagnosticsTests(unittest.TestCase):
 
             self.assertTrue(ok)
             self.assertEqual(calls["n"], 2)
+            # The failed first attempt keeps its detailed block; the recovery is
+            # reported on the single success line.
             self.assertIn("Checkpoint save FAILED", output)
-            self.assertIn("retry SUCCEEDED", output)
-            self.assertIn("Status: SUCCESS", output)
+            self.assertIn("Checkpoint saved (retry SUCCEEDED)", output)
             # The file really exists after the successful retry.
             self.assertTrue(path.exists() and path.stat().st_size > 0)
             checkpoint = torch.load(path, map_location="cpu")

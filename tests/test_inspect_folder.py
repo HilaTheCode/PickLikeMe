@@ -12,7 +12,7 @@ from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from picklikeme.bird_crop import BirdDetection, CropParams, build_crop
+from picklikeme.bird_crop import COCO_BIRD_CLASS, BirdDetection, CropParams, build_crop
 from picklikeme.inspect_crops import (
     PipelineResult,
     _build_loader,
@@ -69,11 +69,24 @@ class RunPipelineFaithfulnessTests(unittest.TestCase):
             result = run_pipeline(loader, NoBirdDetector(), path, CropParams())
             self.assertFalse(result.found)
             self.assertIsNone(result.box)
+            self.assertIsNone(result.label)
             self.assertEqual(result.model_input_rgb.shape, (32, 32, 3))
+
+    def test_detected_class_is_carried_through_for_the_overlay(self):
+        class ZebraDetector:
+            def detect_best_bird(self, image_rgb):
+                return BirdDetection(box=FIXED_BOX, score=0.91, label=24)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = str(Path(tmp) / "img.png")
+            cv2.imwrite(path, np.full((60, 80, 3), 100, dtype=np.uint8))
+            loader = RawImageLoader(raw_root=tmp, output_size=(32, 32), resize_mode="letterbox")
+            result = run_pipeline(loader, ZebraDetector(), path, CropParams())
+            self.assertEqual(result.label, 24)  # not silently reported as a bird
 
 
 class RenderingTests(unittest.TestCase):
-    def _result(self, found=True):
+    def _result(self, found=True, label=COCO_BIRD_CLASS):
         full = np.full((60, 80, 3), 120, dtype=np.uint8)
         return PipelineResult(
             source_path="/x/DSC_0001.arw",
@@ -85,11 +98,27 @@ class RenderingTests(unittest.TestCase):
             crop_size=(40, 40) if found else (80, 60),
             full_rgb=full,
             model_input_rgb=np.full((32, 32, 3), 200, dtype=np.uint8),
+            label=label if found else None,
         )
 
     def test_draw_overlay_returns_image(self):
         self.assertIsInstance(draw_bbox_overlay(self._result(True)), Image.Image)
         self.assertIsInstance(draw_bbox_overlay(self._result(False)), Image.Image)
+
+    def test_overlay_text_differs_per_detected_class(self):
+        """The label is drawn text, so a different class name must change the
+        rendered pixels — proof the overlay is no longer a hardcoded "bird"."""
+        bird = np.asarray(draw_bbox_overlay(self._result(label=COCO_BIRD_CLASS)))
+        zebra = np.asarray(draw_bbox_overlay(self._result(label=24)))
+        elephant = np.asarray(draw_bbox_overlay(self._result(label=22)))
+
+        self.assertFalse(np.array_equal(bird, zebra))
+        self.assertFalse(np.array_equal(bird, elephant))
+        self.assertFalse(np.array_equal(zebra, elephant))
+
+    def test_overlay_renders_without_a_label(self):
+        # A result built before the label field existed still renders.
+        self.assertIsInstance(draw_bbox_overlay(self._result(label=None)), Image.Image)
 
     def test_pair_sheet_dimensions(self):
         left = Image.new("RGB", (64, 64))
