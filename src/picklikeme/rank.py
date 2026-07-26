@@ -20,7 +20,7 @@ from pathlib import Path
 
 from .auto_crop import resolve_device
 from .bird_crop import CropParams
-from .config import DEFAULT_CHECKPOINT_PATH, DEFAULT_CROP_CACHE_DIR
+from .config import DEFAULT_CHECKPOINT_PATH, DEFAULT_CROP_CACHE_DIR, DEFAULT_MAX_CSV_ROWS
 from .dataset import UnlabeledImageDataset
 from .model import DINOV3_BACKBONE, ModelConfig, PreferenceHead
 from .preprocess import build_cache
@@ -28,7 +28,9 @@ from .raw_io import RawImageLoader
 from .train import load_checkpoint, rank_dataset, timestamped_output_path, write_results_csv
 
 
-def main() -> None:
+def build_arg_parser() -> argparse.ArgumentParser:
+    """Built separately from main() so the CLI's defaults are inspectable
+    without running a ranking pass (mirrors train.build_arg_parser)."""
     parser = argparse.ArgumentParser(description="Rank a new, unlabeled folder with a trained checkpoint (no training)")
     parser.add_argument("--input", required=True, help="Folder of RAW images to rank (recursive, model has not seen these)")
     parser.add_argument("--checkpoint", default=str(DEFAULT_CHECKPOINT_PATH), help="Trained checkpoint to load (default: the project's rolling checkpoint)")
@@ -39,7 +41,13 @@ def main() -> None:
         "to the stem so every run gets a unique file and no previous rankings are "
         "overwritten (e.g. rankings_20260725-143000.csv).",
     )
-    parser.add_argument("--max-rows", type=int, default=1000)
+    parser.add_argument(
+        "--max-rows",
+        type=int,
+        default=DEFAULT_MAX_CSV_ROWS,
+        help=f"Maximum lines per ranked CSV before it rolls over to name_1.csv, name_2.csv "
+        f"(default: {DEFAULT_MAX_CSV_ROWS:,}). Change the default in picklikeme/config.py.",
+    )
     parser.add_argument("--device", default=None, help="Device (default: auto - CUDA if available, else CPU)")
     parser.add_argument("--resize-mode", default="letterbox", choices=["letterbox", "stretch"])
     parser.add_argument("--backbone", default=DINOV3_BACKBONE, help="Must match the checkpoint's backbone (default: same as training)")
@@ -49,7 +57,11 @@ def main() -> None:
     parser.add_argument("--conf-threshold", type=float, default=CropParams.conf_threshold)
     parser.add_argument("--max-side", type=int, default=CropParams.max_side)
     parser.add_argument("--force-preprocess", action="store_true", help="Rebuild crops even if already cached")
-    args = parser.parse_args()
+    return parser
+
+
+def main() -> None:
+    args = build_arg_parser().parse_args()
     run_started = datetime.now()
 
     input_folder = Path(args.input)

@@ -12,6 +12,15 @@ DEFAULT_CHECKPOINT_PATH = DEFAULT_CHECKPOINT_DIR / "model_checkpoint.pt"
 DEFAULT_CROP_CACHE_DIR = PROJECT_ROOT / "cache" / "crops"
 DEFAULT_INSPECTION_DIR = PROJECT_ROOT / "inspection"
 
+# Maximum lines per results/ranking CSV before it rolls over to a numbered
+# continuation file (`name.csv`, `name_1.csv`, ...). Counts the metrics
+# preamble, not just data rows, so one file never exceeds this many lines.
+#
+# 30,000 keeps a 55k-image run to two files instead of fifty-odd, while staying
+# inside the row limits of older spreadsheet tools that were the reason for
+# splitting at all. Override per run with --max-rows.
+DEFAULT_MAX_CSV_ROWS = 30000
+
 
 @contextmanager
 def fatal_errors_logged_to_stdout():

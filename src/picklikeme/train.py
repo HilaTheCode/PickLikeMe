@@ -19,6 +19,7 @@ from .bird_crop import read_crop_params
 from .config import (
     DEFAULT_CHECKPOINT_PATH,
     DEFAULT_CROP_CACHE_DIR,
+    DEFAULT_MAX_CSV_ROWS,
     ProjectConfig,
     fatal_errors_logged_to_stdout,
     format_duration,
@@ -569,20 +570,29 @@ def timestamped_output_path(output_path: str | Path, run_started: datetime) -> P
     return output_path.with_name(f"{output_path.stem}_{stamp}{output_path.suffix}")
 
 
+# Lines each results CSV spends on its metrics preamble before the data rows:
+# the "metric,value" header, four key/value rows, a blank separator, and the
+# column header. Subtracted from max_rows so the whole file honours the limit.
+CSV_PREAMBLE_LINES = 7
+
+
 def write_results_csv(
     output_path: str | Path,
     dataset,
     ranked: list[tuple[str, float, int, str]],
     select_root: str,
     reject_root: str,
-    max_rows: int = 1000,
+    max_rows: int = DEFAULT_MAX_CSV_ROWS,
 ) -> list[Path]:
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
     detected_sequences = dataset.count_sequences()
 
     files_written: list[Path] = []
-    rows_per_file = max_rows - 7
+    # The preamble occupies part of the budget, so a file never exceeds
+    # max_rows lines in total. A max_rows smaller than the preamble itself
+    # would leave no room for data, so fall back to using it as a data budget.
+    rows_per_file = max_rows - CSV_PREAMBLE_LINES
     if rows_per_file <= 0:
         rows_per_file = max_rows
 
@@ -635,7 +645,14 @@ def build_arg_parser(add_help: bool = True) -> argparse.ArgumentParser:
         "appended to the stem so every run gets a unique file and no previous "
         "results are overwritten (e.g. training_results_20260725-143000.csv).",
     )
-    parser.add_argument("--max-rows", type=int, default=1000)
+    parser.add_argument(
+        "--max-rows",
+        type=int,
+        default=DEFAULT_MAX_CSV_ROWS,
+        help=f"Maximum lines per results CSV before it rolls over to name_1.csv, name_2.csv "
+        f"(default: {DEFAULT_MAX_CSV_ROWS:,}; the {CSV_PREAMBLE_LINES}-line metrics preamble counts "
+        "toward it). Change the default in picklikeme/config.py.",
+    )
     parser.add_argument("--checkpoint-path", default=str(DEFAULT_CHECKPOINT_PATH), help="Where to save the rolling checkpoint (default: <project-root>/checkpoints/model_checkpoint.pt, independent of the current working directory)")
     parser.add_argument("--best-checkpoint-path", default=None, help="Where to save the lowest-training-loss checkpoint (default: <checkpoint-path>_best.pt)")
     parser.add_argument("--status-path", default="training_status.json")
