@@ -215,6 +215,26 @@ skipped), or `--skip-preprocess` to reuse an already-built cache. The result is
 the same timestamped `training_results_<date>-<time>.csv` the `train` command
 writes.
 
+### Evaluate a model against your own decisions
+
+`picklikeme analyze` measures how well a ranking reproduces your keep/reject
+choices, shows where it fails, and recommends what to fix:
+
+```bash
+picklikeme analyze --ranking rankings_20260726-091500.csv \
+    --selected "D:\shoot\keep" --rejected "D:\shoot\drop" --output analysis/
+```
+
+It writes an offline interactive HTML report (light and dark), 9 charts,
+labelled contact sheets of every mistake category, per-category CSVs, and a JSON
+record for CI. `--compare-ranking old.csv` turns it into a regression test
+between two model versions.
+
+The analyzer is strictly read-only: it never touches checkpoints, the crop
+cache, source images or training data. Full documentation, including the
+metrics reference and how to add a metric in one file, is in
+[docs/analyzer.md](docs/analyzer.md).
+
 ### Rank a new, unseen folder with a trained model
 
 Once a model is trained, `picklikeme.rank` scores a directory the model has

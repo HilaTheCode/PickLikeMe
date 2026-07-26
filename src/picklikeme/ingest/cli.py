@@ -96,6 +96,12 @@ def _report_command(args: argparse.Namespace) -> None:
         print(f"\nGap histogram written to {args.gap_histogram_path}")
 
 
+def _analyze_command(args: argparse.Namespace) -> None:
+    from ..analyzer.cli import run
+
+    raise SystemExit(run(args))
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(prog="picklikeme", description="Pick Like Me ingestion pipeline")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -125,6 +131,19 @@ def main(argv: list[str] | None = None) -> None:
     report_parser.add_argument("--manifest-path", default="data/manifest.parquet")
     report_parser.add_argument("--gap-histogram-path", default="data/reports/gap_histogram.png")
     report_parser.set_defaults(func=_report_command)
+
+    # The analyzer owns its own (large) argument set, so it is attached whole
+    # rather than restated here; importing it lazily keeps `picklikeme --help`
+    # from pulling in matplotlib.
+    from ..analyzer.cli import build_parser as build_analyzer_parser
+
+    analyze_parser = sub.add_parser(
+        "analyze",
+        parents=[build_analyzer_parser(add_help=False)],
+        help="Measure model quality against your keep/reject decisions",
+        description="Measure model quality against your keep/reject decisions",
+    )
+    analyze_parser.set_defaults(func=_analyze_command)
 
     args = parser.parse_args(argv)
     args.func(args)
