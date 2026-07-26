@@ -102,6 +102,12 @@ def _analyze_command(args: argparse.Namespace) -> None:
     raise SystemExit(run(args))
 
 
+def _annotate_command(args: argparse.Namespace) -> None:
+    from ..analyzer.cli import run_annotate
+
+    raise SystemExit(run_annotate(args))
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(prog="picklikeme", description="Pick Like Me ingestion pipeline")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -144,6 +150,16 @@ def main(argv: list[str] | None = None) -> None:
         description="Measure model quality against your keep/reject decisions",
     )
     analyze_parser.set_defaults(func=_analyze_command)
+
+    from ..analyzer.cli import build_annotate_parser
+
+    annotate_parser = sub.add_parser(
+        "annotate",
+        parents=[build_annotate_parser(add_help=False)],
+        help="Serve an analysis report so false-negative annotations can be saved",
+        description="Serve an analysis report so false-negative annotations can be saved",
+    )
+    annotate_parser.set_defaults(func=_annotate_command)
 
     args = parser.parse_args(argv)
     args.func(args)

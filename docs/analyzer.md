@@ -245,6 +245,116 @@ Two notes worth knowing when reading the numbers:
 
 ---
 
+## False-negative knowledge base
+
+A false negative is an image you deliberately kept and the model rejected —
+the most valuable failure to understand. The analyzer lets you record **why**,
+in your own words, and accumulates those diagnoses across runs.
+
+**The annotations are yours.** Nothing in the codebase infers, suggests or
+pre-fills a category. There is no model, heuristic or default in the path: the
+report renders what the database holds and stores exactly what you ticked and
+typed. False positives are deliberately *not* annotatable.
+
+**They never touch the metrics.** Annotations load after every metric, threshold
+sweep and suggestion is already computed, and `test_annotations_never_change_any_metric`
+asserts that every metric, the confusion matrix, the recommended threshold and
+the suggestion list are identical with and without a populated database.
+
+### Recording a diagnosis
+
+Saving needs a local endpoint — a `file://` page cannot write to SQLite:
+
+```bash
+picklikeme analyze --ranking rankings.csv --selected keep/ --rejected drop/
+picklikeme annotate --output analysis/          # serves on 127.0.0.1:8756
+```
+
+Or in one step: `picklikeme analyze ... --serve`.
+
+Each false negative gets a panel with its thumbnail, score, confidence, rank and
+displacement, an **Edit** button, the category checklist, a free-text notes box
+and **Save**. Opened straight from disk the report still *shows* existing
+annotations, with a banner explaining that editing needs `annotate`.
+
+Example of a completed annotation:
+
+```
+✓ Action shot
+✓ Artistic choice
+Notes: "Great wing position.
+        The model consistently rejects dynamic poses."
+```
+
+Multiple categories per image are supported, notes are optional, and the
+free-text box next to Save adds a new category that is remembered for later
+runs. Saving an empty panel deletes the record — that is how a mistaken
+annotation is removed.
+
+### Initial categories
+
+Wrong crop · Multiple subjects · Subject too small · Foreground obstruction ·
+Out of focus foreground · Subject not centered · Artistic choice · Distracting
+background · Detector mistake · Pose not appreciated · Action shot · Lighting ·
+Backlit · Animal not in supported categories · Other
+
+They are seeded into the database on first use, so the vocabulary grows without
+a code change.
+
+### False Negative Summary
+
+A report section showing category frequencies, the most common combinations
+(order-insensitive, so `Backlit + Lighting` and `Lighting + Backlit` are one
+entry), recently annotated images, and everything not yet annotated. The panel
+list filters by one category, by several (any or all), and by annotated /
+not annotated.
+
+### Storage
+
+| | |
+| --- | --- |
+| Location | `<project>/annotations/false_negatives.db` (`--annotations-db` to move) |
+| Why there | Outside every output directory — those are per-run and get replaced; a knowledge base must outlive them |
+| Tables | `annotations`, `annotation_categories`, `categories`, `schema_info` |
+| Journal | WAL, so generating a report never blocks the UI writing |
+| Written | Only this database. Never a ranking, checkpoint, dataset, image or report |
+
+Identity across runs is the interesting part. Lookup is by digest of the
+resolved path, falling back to filename when the path misses — so a diagnosis
+survives the archive being reorganised or moved to another drive. The fallback
+**refuses to answer when a filename is ambiguous**: camera counters reset, so
+duplicate basenames are normal in a multi-year archive, and a misattributed
+diagnosis is worse than a missing one. A record found by filename is flagged
+`matched by name` in the report.
+
+### Server
+
+`picklikeme annotate` binds **127.0.0.1 only** — never `0.0.0.0`. It has no
+authentication, so it must not be reachable from the network. It serves only
+files inside the analysis directory (paths are resolved then checked, so `..`
+cannot escape), and the only write endpoint is `POST /api/annotations`.
+
+| Endpoint | Purpose |
+| --- | --- |
+| `GET /api/health` | Probe; the page uses it to decide whether Save is available |
+| `GET /api/categories` | Current vocabulary |
+| `GET /api/annotations` | All records, to refresh the page |
+| `POST /api/annotations` | `{image_path, categories[], notes}` |
+
+Built on `http.server` and `sqlite3` from the standard library — no new
+dependency for a tool that runs for a few minutes at a time.
+
+### Intended use
+
+The knowledge base is a long-term record of *why* valuable images are missed, to
+guide the detector, crop generation, the ranking model and the training set. If
+"Subject too small" dominates, the crop strategy is the problem; if "Detector
+mistake" dominates, detection is; if "Action shot" dominates, the training set
+lacks dynamic poses. That is a judgement for you to make from the evidence — the
+analyzer counts, it does not conclude.
+
+---
+
 ## Extension guide
 
 ### Add a metric

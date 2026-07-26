@@ -60,6 +60,23 @@ def build_parser(add_help: bool = True) -> argparse.ArgumentParser:
     parser.add_argument("--baseline-label", default=None, help="Name for the first run in comparison output")
     parser.add_argument("--compare-label", default=None, help="Name for the second run in comparison output")
 
+    parser.add_argument(
+        "--annotations-db",
+        default=None,
+        help="SQLite knowledge base of false-negative diagnoses "
+        "(default: <project>/annotations/false_negatives.db, outside any output dir so it survives runs)",
+    )
+    parser.add_argument(
+        "--no-annotations",
+        action="store_true",
+        help="Do not read the annotation database",
+    )
+    parser.add_argument(
+        "--serve",
+        action="store_true",
+        help="After analysing, serve the report on 127.0.0.1 so annotations can be saved",
+    )
+    parser.add_argument("--port", type=int, default=None, help="Port for --serve / annotate (default: 8756)")
     parser.add_argument("--no-html", action="store_true", help="Skip the HTML report")
     parser.add_argument("--no-charts", action="store_true", help="Skip chart rendering")
     parser.add_argument("--no-contact-sheets", action="store_true", help="Skip contact sheets (much faster)")
@@ -88,12 +105,15 @@ def config_from_args(args: argparse.Namespace) -> AnalysisConfig:
         "compare_ranking": "compare_ranking_path",
         "baseline_label": "baseline_label",
         "compare_label": "compare_label",
+        "annotations_db": "annotations_db",
     }
     for arg_name, config_name in mapping.items():
         value = getattr(args, arg_name, None)
         if value is not None:
             overrides[config_name] = value
 
+    if getattr(args, "no_annotations", False):
+        overrides["annotations_enabled"] = False
     if args.no_html:
         overrides["html_report"] = False
     if args.no_charts:
@@ -161,6 +181,55 @@ def run(args: argparse.Namespace) -> int:
             print(f"  ... and {len(written) - 12} more")
         if config.html_report:
             print(f"\nOpen: {(output_dir / 'report.html').resolve()}")
+        if config.annotations_enabled and result.annotation_summary is not None:
+            summary = result.annotation_summary
+            print(
+                f"False-negative annotations: {summary.annotated}/{summary.total_false_negatives} "
+                f"annotated, {summary.total_in_database} in {summary.database_path}"
+            )
+            if config.html_report and not getattr(args, "serve", False):
+                print("To record diagnoses, run:")
+                print(f'  picklikeme annotate --output "{output_dir}"')
+
+    if getattr(args, "serve", False) and config.html_report:
+        from .server import DEFAULT_PORT, serve
+
+        serve(config.output_dir, config.annotations_db_path, args.port or DEFAULT_PORT)
+    return 0
+
+
+def build_annotate_parser(add_help: bool = True) -> "argparse.ArgumentParser":
+    """`picklikeme annotate` - serve an existing report so Save works."""
+    parser = argparse.ArgumentParser(
+        prog="picklikeme annotate",
+        description=(
+            "Serve an existing analysis report on 127.0.0.1 so false-negative annotations "
+            "can be saved to the knowledge base. Writes only the annotation database."
+        ),
+        add_help=add_help,
+    )
+    parser.add_argument(
+        "--output",
+        default=str(DEFAULT_ANALYSIS_DIR),
+        help=f"Analysis directory containing report.html (default: {DEFAULT_ANALYSIS_DIR})",
+    )
+    parser.add_argument("--annotations-db", default=None, help="Knowledge-base SQLite file")
+    parser.add_argument("--port", type=int, default=None, help="Port to listen on (default: 8756)")
+    parser.add_argument("--no-browser", action="store_true", help="Do not open a browser")
+    return parser
+
+
+def run_annotate(args: argparse.Namespace) -> int:
+    from .annotations import DEFAULT_ANNOTATIONS_DB
+    from .server import DEFAULT_PORT, serve
+
+    _configure_logging(getattr(args, "verbose", False))
+    serve(
+        Path(args.output),
+        Path(args.annotations_db) if args.annotations_db else DEFAULT_ANNOTATIONS_DB,
+        args.port or DEFAULT_PORT,
+        open_browser=not args.no_browser,
+    )
     return 0
 
 

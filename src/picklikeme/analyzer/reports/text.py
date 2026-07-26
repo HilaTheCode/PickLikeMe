@@ -183,6 +183,15 @@ def render_matching(result: AnalysisResult) -> str:
     return "\n".join(lines)
 
 
+def render_annotations(result: AnalysisResult) -> str:
+    """False-negative knowledge base, if a database was readable."""
+    if result.annotation_summary is None:
+        return ""
+    from ..annotations import render_summary as render_annotation_summary
+
+    return "\n".join(_section("False negative annotations")[:-1] + [render_annotation_summary(result.annotation_summary)])
+
+
 def render_full(result: AnalysisResult) -> str:
     """The complete text report, in the order a reader wants it."""
     parts = [
@@ -196,6 +205,9 @@ def render_full(result: AnalysisResult) -> str:
             render_errors(result),
             render_suggestions(result),
         ]
+        annotations = render_annotations(result)
+        if annotations:
+            parts.append(annotations)
     if result.comparison is not None:
         parts.append("\n" + _RULE + "\n" + result.comparison.render())
     return "\n".join(parts) + "\n"

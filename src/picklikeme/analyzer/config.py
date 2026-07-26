@@ -66,6 +66,12 @@ class AnalysisConfig:
     verbose: bool = False
     thumbnail_workers: int = 8
 
+    # False-negative knowledge base. The database deliberately defaults outside
+    # output_dir: output directories are per-run, and annotations must outlive
+    # every one of them. None means "use the project default".
+    annotations_db: Path | None = None
+    annotations_enabled: bool = True
+
     def __post_init__(self) -> None:
         if not 0.0 <= self.threshold <= 1.0:
             raise ValueError(f"threshold must be in [0, 1], got {self.threshold}")
@@ -97,6 +103,12 @@ class AnalysisConfig:
     def comparison_mode(self) -> bool:
         return self.compare_ranking_path is not None
 
+    @property
+    def annotations_db_path(self) -> Path:
+        from .annotations import DEFAULT_ANNOTATIONS_DB
+
+        return self.annotations_db or DEFAULT_ANNOTATIONS_DB
+
     def to_dict(self) -> dict:
         """JSON-ready form, embedded in reports so a result can always be
         traced back to the settings that produced it."""
@@ -127,7 +139,14 @@ class AnalysisConfig:
         if unknown:
             raise ValueError(f"Unknown configuration keys: {sorted(unknown)}")
 
-        path_fields = {"ranking_path", "selected_root", "rejected_root", "output_dir", "compare_ranking_path"}
+        path_fields = {
+            "ranking_path",
+            "selected_root",
+            "rejected_root",
+            "output_dir",
+            "compare_ranking_path",
+            "annotations_db",
+        }
         kwargs = {}
         for key, value in data.items():
             if key in path_fields and value is not None:

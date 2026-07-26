@@ -42,6 +42,11 @@ class AnalysisResult:
     errors: ErrorAnalysis
     suggestions: list = field(default_factory=list)
     comparison: object | None = None
+    # False-negative annotations: display data only. Loaded after every metric
+    # has been computed, and never read by a metric, a threshold sweep or a
+    # suggestion rule - human knowledge must not move the numbers it explains.
+    annotations: dict = field(default_factory=dict)
+    annotation_summary: object | None = None
     elapsed_seconds: float = 0.0
     generated_at: str = ""
 
@@ -113,7 +118,40 @@ class AnalysisResult:
             "errors": self.errors.as_dict(),
             "suggestions": [s.as_dict() for s in self.suggestions],
             "comparison": self.comparison.as_dict() if self.comparison is not None else None,
+            "false_negative_annotations": {
+                "summary": self.annotation_summary.as_dict() if self.annotation_summary else None,
+                "by_image": {path: a.as_dict() for path, a in self.annotations.items()},
+            },
         }
+
+
+def _attach_annotations(result: AnalysisResult) -> None:
+    """Load false-negative annotations onto a finished result.
+
+    False negatives only, by design: understanding why a deliberately-kept
+    image was rejected is the valuable question, and false positives are not
+    wired up here at all.
+
+    A missing or unreadable database is not an error - the knowledge base is
+    optional, and an analysis must never fail because of it.
+    """
+    from .annotations import AnnotationStore, summarise
+
+    paths = [record.image_path for record in result.errors.false_negatives]
+    try:
+        with AnnotationStore(result.config.annotations_db_path) as store:
+            result.annotations, result.annotation_summary = summarise(store, paths)
+    except Exception as exc:  # noqa: BLE001 - optional feature, never fatal
+        logger.warning("Could not read the annotation database: %s", exc)
+        return
+
+    summary = result.annotation_summary
+    logger.info(
+        "False-negative annotations: %d of %d annotated (%d total in database)",
+        summary.annotated,
+        summary.total_false_negatives,
+        summary.total_in_database,
+    )
 
 
 def run_analysis(config: AnalysisConfig) -> AnalysisResult:
@@ -176,6 +214,12 @@ def run_analysis(config: AnalysisConfig) -> AnalysisResult:
     from .suggestions import generate_suggestions
 
     result.suggestions = generate_suggestions(result)
+
+    # Annotations are loaded LAST, deliberately: by this point every metric,
+    # threshold and suggestion is already fixed, so human notes cannot
+    # influence any of them. They are attached purely for the report to show.
+    if config.annotations_enabled:
+        _attach_annotations(result)
 
     if config.comparison_mode:
         from .comparison import compare_runs
