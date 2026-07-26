@@ -47,6 +47,9 @@ class AnalysisResult:
     # suggestion rule - human knowledge must not move the numbers it explains.
     annotations: dict = field(default_factory=dict)
     annotation_summary: object | None = None
+    # Detector boxes for the false negatives only, for the diagnostic
+    # overlay. Display data: no metric reads them.
+    detections: dict = field(default_factory=dict)
     elapsed_seconds: float = 0.0
     generated_at: str = ""
 
@@ -118,6 +121,9 @@ class AnalysisResult:
             "errors": self.errors.as_dict(),
             "suggestions": [s.as_dict() for s in self.suggestions],
             "comparison": self.comparison.as_dict() if self.comparison is not None else None,
+            "false_negative_detections": {
+                path: record.as_dict() for path, record in self.detections.items()
+            },
             "false_negative_annotations": {
                 "summary": self.annotation_summary.as_dict() if self.annotation_summary else None,
                 "by_image": {path: a.as_dict() for path, a in self.annotations.items()},
@@ -152,6 +158,34 @@ def _attach_annotations(result: AnalysisResult) -> None:
         summary.total_false_negatives,
         summary.total_in_database,
     )
+
+
+def _attach_detections(result: AnalysisResult) -> None:
+    """Resolve detector boxes for this run's false negatives.
+
+    Prefers what preprocessing recorded, then the analyzer's own cache, and only
+    then runs the detector - for the report's handful of false negatives, never
+    for the dataset. Any failure leaves the overlay off rather than losing the
+    report.
+    """
+    from ..config import DEFAULT_CROP_CACHE_DIR
+    from .detections import DetectionCache
+
+    paths = [record.image_path for record in result.errors.false_negatives]
+    if not paths:
+        return
+    config = result.config
+    crop_cache = config.crop_cache_dir or DEFAULT_CROP_CACHE_DIR
+    try:
+        with DetectionCache(config.detections_db_path, crop_cache) as cache:
+            result.detections = cache.get_many(
+                paths,
+                conf_threshold=config.detection_conf_threshold,
+                device=config.detection_device,
+                allow_detect=config.detect_missing_boxes,
+            )
+    except Exception as exc:  # noqa: BLE001 - the overlay is a nicety
+        logger.warning("Could not resolve detector boxes: %s", exc)
 
 
 def run_analysis(config: AnalysisConfig) -> AnalysisResult:
@@ -220,6 +254,11 @@ def run_analysis(config: AnalysisConfig) -> AnalysisResult:
     # influence any of them. They are attached purely for the report to show.
     if config.annotations_enabled:
         _attach_annotations(result)
+
+    # Detector boxes for the false-negative overlay. Loaded after the metrics
+    # for the same reason as annotations: this is diagnosis, not measurement.
+    if config.annotate_detections:
+        _attach_detections(result)
 
     if config.comparison_mode:
         from .comparison import compare_runs

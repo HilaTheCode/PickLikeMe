@@ -517,6 +517,15 @@ def _error_table(records, output_dir: Path, thumbs: dict[str, Path]) -> str:
     )
 
 
+def _annotated_thumb(result: "AnalysisResult", image_path: str) -> Path | None:
+    """The detector-box overlay for a false negative, if one was rendered."""
+    from ..contactsheets import annotated_thumbnail_path
+
+    config = result.config
+    candidate = annotated_thumbnail_path(config.thumbnails_dir, image_path, config.thumbnail_size)
+    return candidate if candidate.exists() else None
+
+
 def _annotation_panels(result: "AnalysisResult", thumbs: dict[str, Path]) -> str:
     """Capability: an annotation panel per false negative.
 
@@ -556,21 +565,45 @@ def _annotation_panels(result: "AnalysisResult", thumbs: dict[str, Path]) -> str
         "</div>"
     )
 
+    legend = (
+        '<p class="sub" style="margin-bottom:12px">Thumbnails show what the detector found: '
+        f'<span style="color:#10b981;font-weight:650">solid green</span> is the box that became '
+        'the crop the model scored, '
+        f'<span style="color:#facc15;font-weight:650">dashed amber</span> are detections it passed '
+        'over, and <span style="color:#ef4444;font-weight:650">red</span> means nothing was '
+        'detected (the model saw the whole frame).</p>'
+    )
+
     panels = []
     for record in records:
         image = record.image
         path = image.image_path
+        detection = (result.detections or {}).get(path)
         annotation = result.annotations.get(path)
         current = annotation.categories if annotation else []
         notes = annotation.notes if annotation else ""
 
-        thumb = thumbs.get(path)
+        # The annotated copy when one exists, the plain thumbnail otherwise.
+        # False negatives only: no other section is given an overlay.
+        thumb = _annotated_thumb(result, path) or thumbs.get(path)
         thumb_html = '<img alt="no preview" style="display:flex">'
         if thumb is not None and thumb.exists():
             rel = asset_url(thumb, output_dir)
             if rel:
                 thumb_html = f'<img src="{_e(rel)}" alt="{_e(image.filename)}" loading="lazy">'
         name = _source_link(path, image.filename)
+        boxes = ""
+        if detection is not None and detection.boxes:
+            selected = detection.selected
+            parts = [
+                f"detector: {len(detection.boxes)} box"
+                + ("es" if len(detection.boxes) != 1 else "")
+            ]
+            if selected is not None:
+                parts.append(f"cropped {selected.class_name} @ {selected.score:.2f}")
+            else:
+                parts.append("nothing detected - full frame used")
+            boxes = f' &middot; {_e(" &middot; ".join(parts))}'.replace("&amp;middot;", "&middot;")
         moved = (
             ' <span class="pill warn" title="matched by content identity; the file is no longer '
             'at the path recorded with the annotation">followed a move</span>'
@@ -601,7 +634,7 @@ def _annotation_panels(result: "AnalysisResult", thumbs: dict[str, Path]) -> str
             f'<div class="fn-meta"><div class="fn-name">{name}{moved}</div>'
             f'<div class="fn-nums">score {image.score:.4f} &middot; confidence '
             f'{_num(image.confidence, "{:.3f}")} &middot; rank {image.rank:,} &middot; '
-            f"displaced {record.rank_displacement:,} &middot; you kept it{captured}</div>"
+            f"displaced {record.rank_displacement:,} &middot; you kept it{captured}{boxes}</div>"
             f'<div class="fn-tags">{tags}</div>'
             f'<div class="fn-note"{"" if notes else " style=display:none"}>{_e(notes)}</div>'
             f"</div>"
@@ -617,7 +650,7 @@ def _annotation_panels(result: "AnalysisResult", thumbs: dict[str, Path]) -> str
             f"</div></div>"
         )
 
-    return filters + offline + "".join(panels)
+    return legend + filters + offline + "".join(panels)
 
 
 def _annotation_summary(result: "AnalysisResult") -> str:

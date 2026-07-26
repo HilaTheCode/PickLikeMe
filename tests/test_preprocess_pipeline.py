@@ -73,6 +73,10 @@ class FakeDetector:
         self._busy = threading.Lock()
         self.seen_values = []
 
+    def detect_with_all(self, image_rgb):
+        best = self.detect_best_bird(image_rgb)
+        return best, ([best] if best is not None else [])
+
     def detect_best_bird(self, image_rgb):
         if not self._busy.acquire(blocking=False):
             self.concurrent = True
@@ -371,6 +375,10 @@ class PipelineContractTests(unittest.TestCase):
                 def detect_best_bird(self, image_rgb):
                     self.calls += 1
                     return None if self.calls == 2 else BirdDetection(box=BOX, score=0.9, label=16)
+
+                def detect_with_all(self, image_rgb):
+                    best = self.detect_best_bird(image_rgb)
+                    return best, ([best] if best is not None else [])
 
             stats, _ = _run_build(paths, cache, decoder, SometimesNothing(decoder))
             self.assertEqual(stats["fallbacks"], 1)

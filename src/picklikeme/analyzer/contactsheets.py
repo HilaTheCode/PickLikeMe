@@ -145,6 +145,136 @@ def generate_thumbnails(
     return results
 
 
+# Overlay colours for the false-negative diagnostic thumbnail.
+SELECTED_BOX = (16, 185, 129)   # the box that produced the crop the model scored
+OTHER_BOX = (250, 204, 21)      # runners-up: visible, clearly not the choice
+NO_DETECTION = (239, 68, 68)
+
+
+def annotate_thumbnail(
+    thumbnail_path: Path,
+    record,
+    output_path: Path,
+    size: int,
+) -> Path | None:
+    """Draw the detector's boxes onto a copy of an existing thumbnail.
+
+    False negatives only. The point is to answer, at a glance, whether the
+    detector contributed to the miss: solid green is the box that became the
+    crop the model actually scored, thin dashed amber are the other candidates it
+    passed over, and a red corner marker means it found nothing at all (so the
+    model saw the whole frame).
+
+    Boxes come from `record` in full-frame coordinates and are scaled by the same
+    letterbox transform the thumbnail already used, so the overlay lands where
+    the subject is. Aspect ratio, thumbnail size and layout are untouched - this
+    writes a same-size sibling image, so the report gets no heavier.
+    """
+    if record is None or not record.boxes or record.source_size is None:
+        return None
+    try:
+        base = Image.open(thumbnail_path).convert("RGB")
+    except OSError:
+        return None
+
+    frame_width, frame_height = record.source_size
+    if frame_width <= 0 or frame_height <= 0:
+        return None
+
+    # The thumbnail is the source letterboxed into a square: one scale factor
+    # plus centring offsets. Recomputing it here (rather than storing it) keeps
+    # the overlay correct even if the thumbnail size changes between runs.
+    scale = min(size / frame_width, size / frame_height)
+    drawn_width, drawn_height = frame_width * scale, frame_height * scale
+    offset_x = (base.width - drawn_width) / 2
+    offset_y = (base.height - drawn_height) / 2
+
+    canvas = base.copy()
+    draw = ImageDraw.Draw(canvas)
+    line = max(1, size // 100)
+
+    def to_thumb(box) -> tuple[float, float, float, float]:
+        return (
+            offset_x + box.x1 * scale,
+            offset_y + box.y1 * scale,
+            offset_x + box.x2 * scale,
+            offset_y + box.y2 * scale,
+        )
+
+    # Runners-up first, so the selected box is never hidden behind one.
+    for box in record.others:
+        x1, y1, x2, y2 = to_thumb(box)
+        _dashed_rectangle(draw, (x1, y1, x2, y2), OTHER_BOX, line)
+
+    selected = record.selected
+    if selected is not None:
+        x1, y1, x2, y2 = to_thumb(selected)
+        draw.rectangle([x1, y1, x2, y2], outline=SELECTED_BOX, width=line + 1)
+        label = f"{selected.class_name} {selected.score:.2f}"
+        draw.text((max(1, x1 + 2), max(1, y1 - 10)), label, fill=SELECTED_BOX, font=_font())
+    else:
+        # Nothing detected: the model was shown the full frame.
+        draw.line([(0, 0), (size // 5, 0)], fill=NO_DETECTION, width=line + 2)
+        draw.line([(0, 0), (0, size // 5)], fill=NO_DETECTION, width=line + 2)
+        draw.text((3, 3), "no detection", fill=NO_DETECTION, font=_font())
+
+    if len(record.others):
+        draw.text(
+            (3, base.height - 12), f"+{len(record.others)} more", fill=OTHER_BOX, font=_font()
+        )
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    canvas.save(output_path, "JPEG", quality=90)
+    return output_path
+
+
+def _dashed_rectangle(draw, box, colour, width: int, dash: int = 4) -> None:
+    """A dashed outline, so a runner-up reads as different from the choice even
+    in a greyscale print or for a colour-blind reader."""
+    x1, y1, x2, y2 = box
+    for x in range(int(x1), int(x2), dash * 2):
+        draw.line([(x, y1), (min(x + dash, x2), y1)], fill=colour, width=width)
+        draw.line([(x, y2), (min(x + dash, x2), y2)], fill=colour, width=width)
+    for y in range(int(y1), int(y2), dash * 2):
+        draw.line([(x1, y), (x1, min(y + dash, y2))], fill=colour, width=width)
+        draw.line([(x2, y), (x2, min(y + dash, y2))], fill=colour, width=width)
+
+
+def annotated_thumbnail_path(thumbnails_dir: Path, image_path: str, size: int) -> Path:
+    """Where the annotated copy lives: beside the plain one, distinct suffix."""
+    plain = _thumbnail_cache_path(thumbnails_dir, image_path, size)
+    return plain.with_name(f"{plain.stem}_boxes{plain.suffix}")
+
+
+def build_false_negative_overlays(
+    result,
+    thumbnails: dict[str, Path],
+    detection_records: dict,
+) -> dict[str, Path]:
+    """Annotated thumbnails for the false negatives, and only those.
+
+    Returns image path -> annotated thumbnail, leaving `thumbnails` untouched so
+    every other report section keeps the plain image.
+    """
+    config = result.config
+    overlays: dict[str, Path] = {}
+    for record in result.errors.false_negatives:
+        path = record.image_path
+        plain = thumbnails.get(path)
+        if plain is None:
+            continue
+        annotated = annotate_thumbnail(
+            plain,
+            detection_records.get(path),
+            annotated_thumbnail_path(config.thumbnails_dir, path, config.thumbnail_size),
+            config.thumbnail_size,
+        )
+        if annotated is not None:
+            overlays[path] = annotated
+    logger.info("Annotated %d false-negative thumbnail(s) with detector boxes", len(overlays))
+    return overlays
+
+
 def _font() -> ImageFont.ImageFont:
     return ImageFont.load_default()
 
@@ -280,12 +410,17 @@ def render_contact_sheets(result: "AnalysisResult", crop_cache_dir: Path | None 
         workers=config.thumbnail_workers,
     )
 
+    # Detector-box overlays, for the false-negative sheet only. Every other
+    # sheet keeps the plain thumbnail.
+    overlays = build_false_negative_overlays(result, thumbnails, getattr(result, "detections", {}))
+
     written: list[Path] = []
     for spec in specs:
+        sheet_thumbs = {**thumbnails, **overlays} if spec.name == "false_negatives" else thumbnails
         written.extend(
             render_sheet(
                 spec,
-                thumbnails,
+                sheet_thumbs,
                 config.sheets_dir / f"{spec.name}.png",
                 config.thumbnail_size,
                 config.contact_sheet_columns,

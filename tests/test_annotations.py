@@ -452,6 +452,7 @@ class IsolationTests(unittest.TestCase):
                     output_dir=root / "out",
                     annotations_db=db,
                     annotations_enabled=False,
+                    annotate_detections=False,
                 )
             )
             self.assertIsNone(result.annotation_summary)

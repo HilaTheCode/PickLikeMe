@@ -32,7 +32,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 import cv2
@@ -184,6 +184,65 @@ def read_crop_params(cache_dir: str | Path) -> CropParams | None:
     return CropParams(**data)
 
 
+DETECTIONS_SUFFIX = ".detections.json"
+
+
+def detections_cache_path(cache_dir: str | Path, source_path: str | Path) -> Path:
+    """Where the detection record for an image lives: beside its cached crop.
+
+    Same digest, so the record is found the same way the crop is - by
+    computation, never by scanning.
+    """
+    crop = crop_cache_path(cache_dir, source_path)
+    return crop.with_name(crop.stem + DETECTIONS_SUFFIX)
+
+
+def save_detections(
+    cache_dir: str | Path,
+    source_path: str | Path,
+    result: "CropResult",
+) -> Path | None:
+    """Record what the detector saw, for later diagnosis.
+
+    Written during preprocessing, when the detector has just run anyway, so no
+    consumer ever needs to re-run inference to draw a box. Failure to write is
+    not fatal: the record is a convenience, the crop is the product.
+    """
+    target = detections_cache_path(cache_dir, source_path)
+    payload = {
+        "version": 1,
+        "source_size": list(result.source_size) if result.source_size else None,
+        "selected": _detection_dict(result.detection),
+        "detections": [_detection_dict(d) for d in result.all_detections],
+        "expanded_box": list(result.expanded_box) if result.expanded_box else None,
+    }
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        tmp = target.with_name(target.name + ".tmp")
+        tmp.write_text(json.dumps(payload), encoding="utf-8")
+        tmp.replace(target)
+    except OSError:
+        return None
+    return target
+
+
+def _detection_dict(detection: "BirdDetection | None") -> dict | None:
+    if detection is None:
+        return None
+    return {"box": list(detection.box), "score": detection.score, "label": int(detection.label)}
+
+
+def read_detections(cache_dir: str | Path, source_path: str | Path) -> dict | None:
+    """The recorded detections for an image, or None if none were recorded."""
+    target = detections_cache_path(cache_dir, source_path)
+    if not target.is_file():
+        return None
+    try:
+        return json.loads(target.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
 def save_crop_png(cache_path: Path, crop_rgb: np.ndarray) -> None:
     """Write an RGB crop to the cache as PNG (stored BGR so cv2.imread +
     the loader's BGR->RGB conversion round-trips correctly)."""
@@ -219,6 +278,11 @@ class CropResult:
     crop: np.ndarray
     detection: BirdDetection | None
     expanded_box: tuple[int, int, int, int] | None
+    # Every accepted detection, winner included. Recorded so a later diagnostic
+    # can show the runners-up without re-running inference; empty when the
+    # caller did not ask for them, which changes no cropping behaviour.
+    all_detections: list[BirdDetection] = field(default_factory=list)
+    source_size: tuple[int, int] | None = None  # (width, height) of the full frame
 
 
 @dataclass(frozen=True)
@@ -266,6 +330,46 @@ class BirdDetector:
         weights = FasterRCNN_ResNet50_FPN_V2_Weights.COCO_V1
         self.model = fasterrcnn_resnet50_fpn_v2(weights=weights).to(device).eval()
 
+    def detect_with_all(self, image_rgb: np.ndarray) -> "tuple[BirdDetection | None, list[BirdDetection]]":
+        """(winner, every accepted detection) from a **single** forward pass.
+
+        Exists so a caller that wants the runners-up - the false-negative
+        diagnostic overlay - does not have to run inference a second time. The
+        winner is chosen by the identical loop `detect_best_bird` has always
+        used, including its tie behaviour, so adding this cannot change which
+        box is cropped.
+        """
+        torch = self._torch
+        with PROFILE.stage("detector preprocess"):
+            tensor = torch.from_numpy(image_rgb).permute(2, 0, 1).contiguous().float().div(255.0)
+            device_tensor = tensor.to(self.device)
+            PROFILE.cuda_sync(torch, self.device)
+        with PROFILE.stage("gpu inference"):
+            with torch.no_grad():
+                output = self.model([device_tensor])[0]
+            PROFILE.cuda_sync(torch, self.device)
+
+        with PROFILE.stage("detector postprocess"):
+            boxes = output["boxes"].cpu().numpy()
+            labels = output["labels"].cpu().numpy()
+            scores = output["scores"].cpu().numpy()
+
+        best: BirdDetection | None = None
+        best_score = self.conf_threshold
+        accepted: list[BirdDetection] = []
+        for box, label, score in zip(boxes, labels, scores):
+            if int(label) not in self.classes or score < self.conf_threshold:
+                continue
+            detection = BirdDetection(
+                box=tuple(float(v) for v in box), score=float(score), label=int(label)
+            )
+            accepted.append(detection)
+            # Unchanged winner selection: >= means a later equal score wins.
+            if score >= best_score:
+                best_score = float(score)
+                best = detection
+        return best, accepted
+
     def detect_best_bird(self, image_rgb: np.ndarray) -> BirdDetection | None:
         """Highest-confidence detection of a supported animal class above the
         threshold, or None.
@@ -312,6 +416,7 @@ def build_crop(
     image_rgb: np.ndarray,
     detector: BirdDetector,
     params: CropParams,
+    collect_detections: bool = False,
 ) -> CropResult:
     """Produce the crop for one decoded image, returning the crop plus the
     detection and expanded box it came from.
@@ -319,15 +424,37 @@ def build_crop(
     When no supported animal is detected the full frame is returned
     (downscaled) so the image still yields a usable, subject-agnostic input
     rather than being dropped; in that case detection and expanded_box are None.
+
+    `collect_detections=True` additionally records every accepted detection, for
+    later diagnosis. It costs nothing - the same forward pass produces them - and
+    changes neither the chosen box nor the crop.
     """
     height, width = image_rgb.shape[:2]
-    detection = detector.detect_best_bird(image_rgb)
+    # Opt-in: `collect_detections` asks for the runners-up too, from the same
+    # single forward pass. Default False keeps the long-standing
+    # `detect_best_bird` contract, which every caller and test double relies on.
+    if collect_detections:
+        detection, accepted = detector.detect_with_all(image_rgb)
+    else:
+        detection, accepted = detector.detect_best_bird(image_rgb), []
     with PROFILE.stage("crop generation"):
         if detection is None:
-            return CropResult(crop=downscale_long_side(image_rgb, params.max_side), detection=None, expanded_box=None)
+            return CropResult(
+                crop=downscale_long_side(image_rgb, params.max_side),
+                detection=None,
+                expanded_box=None,
+                all_detections=accepted,
+                source_size=(width, height),
+            )
         expanded = expand_and_clamp_box(detection.box, params.margin_frac, width, height)
         crop = downscale_long_side(crop_to_box(image_rgb, expanded), params.max_side)
-        return CropResult(crop=crop, detection=detection, expanded_box=expanded)
+        return CropResult(
+            crop=crop,
+            detection=detection,
+            expanded_box=expanded,
+            all_detections=accepted,
+            source_size=(width, height),
+        )
 
 
 def compute_composition_crop(

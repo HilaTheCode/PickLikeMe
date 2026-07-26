@@ -72,6 +72,21 @@ class AnalysisConfig:
     annotations_db: Path | None = None
     annotations_enabled: bool = True
 
+    # False-negative diagnostic overlay: draw the detector's boxes on the FN
+    # thumbnails. Applies to no other report section.
+    annotate_detections: bool = True
+    # Where preprocessing recorded its detections. None means the project default.
+    crop_cache_dir: Path | None = None
+    # Detect only for false negatives that have no recorded boxes (an existing
+    # cache predates the recording). Set False to keep the analyzer strictly
+    # inference-free.
+    detect_missing_boxes: bool = True
+    detection_conf_threshold: float = 0.30
+    detection_device: str = "cpu"
+    # Cache of backfilled boxes; separate from the annotation database so
+    # --no-annotations really does leave that file alone.
+    detections_db: Path | None = None
+
     def __post_init__(self) -> None:
         if not 0.0 <= self.threshold <= 1.0:
             raise ValueError(f"threshold must be in [0, 1], got {self.threshold}")
@@ -102,6 +117,12 @@ class AnalysisConfig:
     @property
     def comparison_mode(self) -> bool:
         return self.compare_ranking_path is not None
+
+    @property
+    def detections_db_path(self) -> Path:
+        from .detections import DEFAULT_DETECTIONS_DB
+
+        return self.detections_db or DEFAULT_DETECTIONS_DB
 
     @property
     def annotations_db_path(self) -> Path:
@@ -146,6 +167,8 @@ class AnalysisConfig:
             "output_dir",
             "compare_ranking_path",
             "annotations_db",
+            "crop_cache_dir",
+            "detections_db",
         }
         kwargs = {}
         for key, value in data.items():

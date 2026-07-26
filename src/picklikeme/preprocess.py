@@ -50,6 +50,7 @@ from .bird_crop import (
     crop_cache_path,
     read_crop_params,
     save_crop_png,
+    save_detections,
     write_crop_params,
 )
 from .config import DEFAULT_CROP_CACHE_DIR, fatal_errors_logged_to_stdout, format_duration
@@ -313,7 +314,10 @@ def build_cache(
                     try:
                         # Identical to the serial version: one image at a time,
                         # same detector call, same crop math, same encoder.
-                        result = build_crop(decoded.rgb, detector, params)
+                        # collect_detections: record the runners-up while the
+                        # detector has just run, so the analyzer never needs
+                        # to re-run inference to draw them.
+                        result = build_crop(decoded.rgb, detector, params, collect_detections=True)
                         class_name = (
                             coco_class_name(result.detection.label)
                             if result.detection is not None
@@ -327,6 +331,9 @@ def build_cache(
                                 class_name=class_name,
                             )
                         )
+                        # Record what the detector saw while it is free: the
+                        # analyzer can then draw the boxes without inference.
+                        save_detections(cache_dir, job.image_path, result)
                         stats["cached"] += 1
                         if class_name is None:
                             stats["fallbacks"] += 1
