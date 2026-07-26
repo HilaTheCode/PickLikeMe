@@ -160,12 +160,24 @@ class UnlabeledImageDataset:
         self.items: list[ImageLabel] = [ImageLabel(image_path=str(p), label=0) for p in image_paths]
 
     @classmethod
-    def from_folder(cls, input_folder: str | Path) -> "UnlabeledImageDataset":
+    def from_folder(
+        cls, input_folder: str | Path, exclude_dirs: set[str] | None = None
+    ) -> "UnlabeledImageDataset":
+        """Enumerate RAW files recursively, optionally skipping named folders.
+
+        `exclude_dirs` matters when the caller writes output back inside the
+        input folder: without it, a second run would enumerate its own results
+        and rank them again. The names are supplied by the caller so this stays
+        independent of whatever produced them.
+        """
         root = Path(input_folder)
+        skip = {name.lower() for name in (exclude_dirs or set())}
         paths = sorted(
             str(p)
             for p in root.rglob("*")
-            if p.is_file() and p.suffix.lower() in ALLOWED_RAW_EXTENSIONS
+            if p.is_file()
+            and p.suffix.lower() in ALLOWED_RAW_EXTENSIONS
+            and not any(part.lower() in skip for part in p.relative_to(root).parts[:-1])
         )
         return cls(paths)
 

@@ -23,9 +23,32 @@ from .bird_crop import CropParams
 from .config import DEFAULT_CHECKPOINT_PATH, DEFAULT_CROP_CACHE_DIR, DEFAULT_MAX_CSV_ROWS
 from .dataset import UnlabeledImageDataset
 from .model import DINOV3_BACKBONE, ModelConfig, PreferenceHead
+from .organize import (
+    DEFAULT_SELECTION_PERCENTAGE,
+    ORGANIZE_DIRNAMES,
+    InvalidSelectionPercentage,
+    organize_ranked_images,
+    validate_selection_percentage,
+)
 from .preprocess import build_cache
 from .raw_io import RawImageLoader
 from .train import load_checkpoint, rank_dataset, timestamped_output_path, write_results_csv
+
+
+def _boolean(value: str) -> bool:
+    """Accept true/false (and the usual synonyms) for --organize-output.
+
+    argparse's store_true cannot express "--organize-output false", and the
+    feature is specified as taking a value.
+    """
+    text = str(value).strip().lower()
+    if text in {"true", "t", "yes", "y", "1", "on"}:
+        return True
+    if text in {"false", "f", "no", "n", "0", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(
+        f"expected true or false, got {value!r}"
+    )
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -57,12 +80,42 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--conf-threshold", type=float, default=CropParams.conf_threshold)
     parser.add_argument("--max-side", type=int, default=CropParams.max_side)
     parser.add_argument("--force-preprocess", action="store_true", help="Rebuild crops even if already cached")
+    parser.add_argument(
+        "--organize-output",
+        type=_boolean,
+        nargs="?",
+        const=True,
+        default=True,
+        metavar="true/false",
+        help="Move the ranked images into selected_by_ai/ and rejected_by_ai/ under the input "
+        "folder (default: true). Pass false to leave every file where it is.",
+    )
+    parser.add_argument(
+        "--selection-percentage",
+        type=float,
+        default=DEFAULT_SELECTION_PERCENTAGE,
+        help=f"Percentage of the highest-ranked images to place in selected_by_ai "
+        f"(default: {DEFAULT_SELECTION_PERCENTAGE:g}; 0-100).",
+    )
+    parser.add_argument(
+        "--organize-dir",
+        default=None,
+        help="Where selected_by_ai/ and rejected_by_ai/ are created (default: the --input folder)",
+    )
     return parser
 
 
 def main() -> None:
     args = build_arg_parser().parse_args()
     run_started = datetime.now()
+
+    # Validated before any work: a bad percentage must not surface after an
+    # hour of ranking.
+    if args.organize_output:
+        try:
+            validate_selection_percentage(args.selection_percentage)
+        except InvalidSelectionPercentage as exc:
+            raise SystemExit(str(exc)) from exc
 
     input_folder = Path(args.input)
     if not input_folder.exists():
@@ -75,7 +128,9 @@ def main() -> None:
             "Train a model first (python -m picklikeme.run ...), or pass --checkpoint."
         )
 
-    dataset = UnlabeledImageDataset.from_folder(input_folder)
+    # Skip our own output folders: without this, a second run would rank the
+    # images a previous run had already filed and shuffle them again.
+    dataset = UnlabeledImageDataset.from_folder(input_folder, exclude_dirs=set(ORGANIZE_DIRNAMES))
     if len(dataset) == 0:
         raise SystemExit(f"No RAW images (.arw/.nef/.cr3) found under {input_folder.resolve()}")
     print(f"Found {len(dataset)} images to rank under {input_folder.resolve()}")
