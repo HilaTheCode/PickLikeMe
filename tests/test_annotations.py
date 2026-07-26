@@ -19,10 +19,10 @@ from picklikeme.analyzer.annotations import (
     DEFAULT_ANNOTATIONS_DB,
     INITIAL_CATEGORIES,
     AnnotationStore,
-    image_key,
     render_summary,
     summarise,
 )
+from picklikeme.identity import IdentityUnavailable, cache_key, image_identity
 from picklikeme.analyzer.config import AnalysisConfig
 from test_analyzer import build_dataset, write_ranking  # reuse the analyzer fixtures
 
@@ -52,7 +52,7 @@ def build_fn_dataset(tmp: Path):
     rows = []
     for index, (keep, score) in enumerate(FN_SCORES):
         target = (selected if keep else rejected) / f"IMG_{index:04d}.NEF"
-        target.write_bytes(b"x")
+        target.write_bytes(f"frame {index} score {score}".encode())
         rows.append([str(target), score, 1 if keep else 0])
 
     rows.sort(key=lambda row: -row[1])
@@ -61,6 +61,95 @@ def build_fn_dataset(tmp: Path):
 
 
 EXPECTED_FALSE_NEGATIVES = sum(1 for keep, score in FN_SCORES if keep and score < 0.5)
+
+
+def make_image(path: Path, content: bytes | None = None) -> Path:
+    """A real file, since identity is derived from content."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(content if content is not None else f"pixels:{path.name}".encode())
+    return path
+
+
+class IdentityTests(unittest.TestCase):
+    """The canonical identity must depend on content and nothing else."""
+
+    def test_identity_is_independent_of_name_and_location(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            original = make_image(root / "shoot" / "IMG_1.NEF", b"same pixels")
+            renamed = make_image(root / "archive" / "2026" / "wing_shot.NEF", b"same pixels")
+            self.assertEqual(image_identity(original), image_identity(renamed))
+
+    def test_different_content_gives_different_identity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.assertNotEqual(
+                image_identity(make_image(root / "a.NEF", b"pixels A")),
+                image_identity(make_image(root / "b.NEF", b"pixels B")),
+            )
+
+    def test_same_name_different_content_is_not_confused(self):
+        """Camera counters reset, so two shoots hold DSC_0001.NEF. The old
+        filename fallback could mix these up; content identity cannot."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            a = make_image(root / "shootA" / "DSC_0001.NEF", b"frame from shoot A")
+            b = make_image(root / "shootB" / "DSC_0001.NEF", b"frame from shoot B")
+            self.assertNotEqual(image_identity(a), image_identity(b))
+
+    def test_identity_carries_a_scheme_prefix(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertTrue(image_identity(make_image(Path(tmp) / "a.NEF")).startswith("p1:"))
+
+    def test_size_participates_so_truncation_changes_identity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = make_image(Path(tmp) / "a.NEF", b"0123456789")
+            before = image_identity(path)
+            path.write_bytes(b"01234")
+            self.assertNotEqual(before, image_identity(path))
+
+    def test_large_files_use_head_and_tail(self):
+        """Beyond the threshold only the ends are read, but a change at either
+        end must still be detected."""
+        from picklikeme.identity import WHOLE_FILE_THRESHOLD
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            body = bytes(WHOLE_FILE_THRESHOLD + 5000)
+            base = make_image(root / "big.NEF", b"HEAD" + body + b"TAIL")
+            head_changed = make_image(root / "big2.NEF", b"HEAx" + body + b"TAIL")
+            tail_changed = make_image(root / "big3.NEF", b"HEAD" + body + b"TAIx")
+            self.assertNotEqual(image_identity(base), image_identity(head_changed))
+            self.assertNotEqual(image_identity(base), image_identity(tail_changed))
+
+    def test_missing_and_empty_files_are_explicit_failures(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with self.assertRaises(IdentityUnavailable):
+                image_identity(root / "nope.NEF")
+            empty = root / "empty.NEF"
+            empty.write_bytes(b"")
+            with self.assertRaises(IdentityUnavailable) as ctx:
+                image_identity(empty)
+            self.assertIn("empty", ctx.exception.reason)
+
+    def test_cache_key_remains_path_derived_and_distinct_from_identity(self):
+        """The crop cache legitimately keys on location; identity does not.
+        Keeping both in one module makes the difference explicit."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            a = make_image(root / "one" / "x.NEF", b"same pixels")
+            b = make_image(root / "two" / "x.NEF", b"same pixels")
+            self.assertNotEqual(cache_key(a), cache_key(b))          # location differs
+            self.assertEqual(image_identity(a), image_identity(b))   # content does not
+
+    def test_cache_key_matches_the_crop_cache(self):
+        """One implementation, not two: bird_crop must use this exact key."""
+        from picklikeme.bird_crop import crop_cache_path
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = make_image(Path(tmp) / "a.NEF")
+            self.assertEqual(crop_cache_path(tmp, path).stem, cache_key(path))
 
 
 class StorageTests(unittest.TestCase):
@@ -74,34 +163,35 @@ class StorageTests(unittest.TestCase):
 
     def test_save_and_reload_multiple_categories_and_notes(self):
         with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "IMG_0001.NEF"
+            path = make_image(Path(tmp) / "IMG_0001.NEF")
             with store_in(tmp) as store:
-                store.save(path, ["Action shot", "Artistic choice"], "Great wing position.\nSecond line.")
+                saved = store.save(
+                    path, ["Action shot", "Artistic choice"], "Great wing position.\nSecond line."
+                )
+                self.assertTrue(saved.image_hash.startswith("p1:"))
 
-            # A fresh store must see it: the point is surviving future runs.
             with AnnotationStore(Path(tmp) / "kb" / "fn.db") as reopened:
                 annotation = reopened.get(path)
                 self.assertIsNotNone(annotation)
                 self.assertEqual(annotation.categories, ["Action shot", "Artistic choice"])
                 self.assertIn("Great wing position.", annotation.notes)
                 self.assertIn("\n", annotation.notes, "multi-line notes must round-trip")
+                self.assertEqual(annotation.filename, "IMG_0001.NEF")
 
     def test_saving_again_replaces_categories_and_keeps_created_at(self):
         with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "a.NEF"
+            path = make_image(Path(tmp) / "a.NEF")
             with store_in(tmp) as store:
                 first = store.save(path, ["Backlit"], "one")
                 second = store.save(path, ["Lighting", "Out of focus foreground"], "two")
 
                 self.assertEqual(second.created_at, first.created_at)
-                self.assertEqual(
-                    store.get(path).categories, ["Lighting", "Out of focus foreground"]
-                )
+                self.assertEqual(store.get(path).categories, ["Lighting", "Out of focus foreground"])
                 self.assertEqual(store.get(path).notes, "two")
 
     def test_clearing_everything_deletes_the_record(self):
         with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "a.NEF"
+            path = make_image(Path(tmp) / "a.NEF")
             with store_in(tmp) as store:
                 store.save(path, ["Backlit"], "note")
                 self.assertEqual(store.count(), 1)
@@ -112,104 +202,185 @@ class StorageTests(unittest.TestCase):
     def test_custom_category_is_remembered_for_next_time(self):
         with tempfile.TemporaryDirectory() as tmp:
             with store_in(tmp) as store:
-                store.save(Path(tmp) / "a.NEF", ["Wing blur I like"], "")
+                store.save(make_image(Path(tmp) / "a.NEF"), ["Wing blur I like"], "")
                 self.assertIn("Wing blur I like", store.categories())
 
-    def test_annotation_survives_the_file_moving(self):
-        """The archive gets reorganised; a diagnosis must not be orphaned."""
+    def test_annotation_follows_a_renamed_file(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            original = root / "old" / "shoot" / "IMG_9.NEF"
-            moved = root / "new" / "elsewhere" / "IMG_9.NEF"
+            original = make_image(root / "IMG_9.NEF", b"the same bird")
             with store_in(tmp) as store:
                 store.save(original, ["Subject too small"], "tiny bird")
+                original.unlink()
+                renamed = make_image(root / "best_of_shoot.NEF", b"the same bird")
 
-                found = store.get(moved)
-                self.assertIsNotNone(found, "should be found by filename after the move")
-                self.assertTrue(found.matched_by_filename)
+                found = store.get(renamed)
+                self.assertIsNotNone(found, "identity must survive a rename")
                 self.assertEqual(found.categories, ["Subject too small"])
+                self.assertTrue(found.relocated)
 
-    def test_ambiguous_filename_is_never_guessed(self):
-        """Camera counters reset, so duplicate basenames are normal in a
-        multi-year archive. A wrong diagnosis is worse than a missing one."""
+    def test_annotation_follows_a_reorganised_archive(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            original = make_image(root / "D_drive" / "2026" / "india" / "a.NEF", b"elephant frame")
+            with store_in(tmp) as store:
+                store.save(original, ["Wrong crop"], "")
+                moved = make_image(root / "E_drive" / "archive" / "asia" / "a.NEF", b"elephant frame")
+                self.assertEqual(store.get(moved).categories, ["Wrong crop"])
+
+    def test_duplicate_filenames_are_never_confused(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             with store_in(tmp) as store:
-                store.save(root / "shootA" / "DSC_0001.NEF", ["Backlit"], "")
-                store.save(root / "shootB" / "DSC_0001.NEF", ["Wrong crop"], "")
+                a = make_image(root / "shootA" / "DSC_0001.NEF", b"frame A")
+                b = make_image(root / "shootB" / "DSC_0001.NEF", b"frame B")
+                store.save(a, ["Backlit"], "")
 
-                self.assertIsNone(store.get(root / "shootC" / "DSC_0001.NEF"))
-                # Exact paths still resolve unambiguously.
-                self.assertEqual(store.get(root / "shootA" / "DSC_0001.NEF").categories, ["Backlit"])
+                self.assertEqual(store.get(a).categories, ["Backlit"])
+                self.assertIsNone(store.get(b), "a same-named different image must not match")
 
-    def test_image_key_is_stable_and_path_derived(self):
-        self.assertEqual(image_key("/a/b.nef"), image_key("/a/b.nef"))
-        self.assertNotEqual(image_key("/a/b.nef"), image_key("/a/c.nef"))
+    def test_unreadable_image_is_an_explicit_failure_not_a_guess(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with store_in(tmp) as store:
+                missing = Path(tmp) / "gone.NEF"
+                with self.assertRaises(IdentityUnavailable):
+                    store.get(missing)
+                with self.assertRaises(IdentityUnavailable):
+                    store.save(missing, ["Backlit"], "")
+
+    def test_get_many_separates_unresolved_from_unannotated(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            good = make_image(root / "good.NEF")
+            plain = make_image(root / "plain.NEF")
+            missing = root / "missing.NEF"
+            with store_in(tmp) as store:
+                store.save(good, ["Backlit"], "")
+                found, unresolved = store.get_many([str(good), str(plain), str(missing)])
+
+            self.assertEqual(list(found), [str(good)])
+            self.assertEqual([item.filename for item in unresolved], ["missing.NEF"])
+
+    def test_identity_is_memoised_against_size_and_mtime(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = make_image(Path(tmp) / "a.NEF", b"original")
+            with store_in(tmp) as store:
+                first = store.identity_of(path)
+                self.assertEqual(first, store.identity_of(path))  # cache hit
+
+                # Rewriting changes size, so the cache entry must be invalidated.
+                path.write_bytes(b"completely different content")
+                self.assertNotEqual(first, store.identity_of(path))
 
     def test_default_database_lives_outside_any_output_directory(self):
-        # Output dirs are per-run and get replaced; the knowledge base must not
-        # be inside one.
         self.assertNotIn("analysis", DEFAULT_ANNOTATIONS_DB.parts[-2:])
         self.assertEqual(DEFAULT_ANNOTATIONS_DB.name, "false_negatives.db")
 
 
-class SummaryTests(unittest.TestCase):
-    def test_frequencies_combinations_and_coverage(self):
+class MigrationTests(unittest.TestCase):
+    """v1 keyed on a path digest; those records must be re-keyed automatically."""
+
+    def _make_v1_db(self, db_path: Path, entries):
+        """Build a database in the old path-keyed shape."""
+        import hashlib
+        import sqlite3
+
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(db_path)
+        conn.executescript(
+            """
+            CREATE TABLE schema_info (version INTEGER NOT NULL);
+            CREATE TABLE categories (name TEXT PRIMARY KEY, ordering INTEGER, builtin INTEGER);
+            CREATE TABLE annotations (
+                image_key TEXT PRIMARY KEY, image_path TEXT NOT NULL, filename TEXT NOT NULL,
+                notes TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+            CREATE TABLE annotation_categories (
+                image_key TEXT NOT NULL, category TEXT NOT NULL, PRIMARY KEY (image_key, category));
+            """
+        )
+        conn.execute("INSERT INTO schema_info(version) VALUES (1)")
+        for path, categories, notes in entries:
+            key = hashlib.sha1(str(Path(path).resolve()).encode()).hexdigest()[:20]
+            conn.execute(
+                "INSERT INTO annotations VALUES (?,?,?,?,?,?)",
+                (key, str(path), Path(path).name, notes, "2026-01-01T00:00:00", "2026-01-02T00:00:00"),
+            )
+            for category in categories:
+                conn.execute("INSERT INTO annotation_categories VALUES (?,?)", (key, category))
+        conn.commit()
+        conn.close()
+
+    def test_existing_annotations_are_rekeyed_preserving_everything(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            paths = [root / f"i{i}.NEF" for i in range(5)]
-            with store_in(tmp) as store:
-                store.save(paths[0], ["Action shot", "Artistic choice"], "a")
-                store.save(paths[1], ["Action shot", "Artistic choice"], "b")
-                store.save(paths[2], ["Action shot"], "")
-                store.save(paths[3], ["Backlit"], "")
+            image = make_image(root / "a.NEF", b"bird")
+            db = root / "kb.db"
+            self._make_v1_db(db, [(image, ["Action shot", "Backlit"], "keep this note")])
 
-                found, summary = summarise(store, [str(p) for p in paths])
+            with AnnotationStore(db) as store:
+                self.assertEqual(store.migration.migrated, 1)
+                self.assertEqual(store.count(), 1)
+                annotation = store.get(image)
+                self.assertEqual(annotation.categories, ["Action shot", "Backlit"])
+                self.assertEqual(annotation.notes, "keep this note")
+                self.assertEqual(annotation.created_at, "2026-01-01T00:00:00")
+                self.assertTrue(annotation.image_hash.startswith("p1:"))
 
-            self.assertEqual(summary.total_false_negatives, 5)
-            self.assertEqual(summary.annotated, 4)
-            self.assertEqual(summary.unannotated_count, 1)
-            self.assertAlmostEqual(summary.coverage, 0.8)
-            self.assertEqual(summary.category_counts[0], ("Action shot", 3))
-            self.assertEqual(
-                summary.combination_counts[0], (("Action shot", "Artistic choice"), 2)
+    def test_migration_is_idempotent_and_creates_no_duplicates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            image = make_image(root / "a.NEF", b"bird")
+            db = root / "kb.db"
+            self._make_v1_db(db, [(image, ["Backlit"], "note")])
+
+            for _ in range(3):
+                with AnnotationStore(db) as store:
+                    self.assertEqual(store.count(), 1)
+
+    def test_two_old_records_for_the_same_image_are_merged(self):
+        """The same file copied to two paths was two v1 records; it is one image."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            first = make_image(root / "one" / "a.NEF", b"identical pixels")
+            second = make_image(root / "two" / "b.NEF", b"identical pixels")
+            db = root / "kb.db"
+            self._make_v1_db(
+                db, [(first, ["Backlit"], "from one"), (second, ["Wrong crop"], "from two")]
             )
 
-    def test_combination_order_does_not_create_two_entries(self):
+            with AnnotationStore(db) as store:
+                self.assertEqual(store.count(), 1, "must not duplicate the same image")
+                self.assertEqual(store.migration.merged, 1)
+                annotation = store.get(first)
+                self.assertEqual(annotation.categories, ["Backlit", "Wrong crop"])
+                self.assertIn("from one", annotation.notes)
+                self.assertIn("from two", annotation.notes)
+
+    def test_unresolvable_records_are_kept_not_lost(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            with store_in(tmp) as store:
-                store.save(root / "a.NEF", ["Lighting", "Backlit"], "")
-                store.save(root / "b.NEF", ["Backlit", "Lighting"], "")
-                _, summary = summarise(store, [str(root / "a.NEF"), str(root / "b.NEF")])
-            self.assertEqual(len(summary.combination_counts), 1)
-            self.assertEqual(summary.combination_counts[0][1], 2)
+            db = root / "kb.db"
+            self._make_v1_db(db, [(root / "vanished.NEF", ["Backlit"], "precious note")])
 
-    def test_single_category_is_not_a_combination(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            with store_in(tmp) as store:
-                store.save(root / "a.NEF", ["Backlit"], "")
-                _, summary = summarise(store, [str(root / "a.NEF")])
-            self.assertEqual(summary.combination_counts, [])
+            with AnnotationStore(db) as store:
+                self.assertEqual(store.count(), 0)
+                self.assertEqual(len(store.migration.unmigrated), 1)
+                self.assertEqual(store.unmigrated()[0].filename, "vanished.NEF")
 
-    def test_recent_is_ordered_newest_first(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            with store_in(tmp) as store:
-                store.save(root / "old.NEF", ["Backlit"], "")
-                store.save(root / "new.NEF", ["Lighting"], "")
-                _, summary = summarise(store, [str(root / "old.NEF"), str(root / "new.NEF")])
-            self.assertEqual(len(summary.recent), 2)
-            self.assertGreaterEqual(summary.recent[0].updated_at, summary.recent[1].updated_at)
+            # The note survives in the parked table, so nothing was destroyed.
+            import sqlite3
 
-    def test_text_summary_explains_an_empty_knowledge_base(self):
+            conn = sqlite3.connect(db)
+            row = conn.execute("SELECT notes, categories FROM unmigrated_v1").fetchone()
+            conn.close()
+            self.assertEqual(row[0], "precious note")
+            self.assertEqual(row[1], "Backlit")
+
+    def test_a_fresh_database_reports_no_migration(self):
         with tempfile.TemporaryDirectory() as tmp:
             with store_in(tmp) as store:
-                _, summary = summarise(store, ["/a.NEF"])
-            text = render_summary(summary)
-            self.assertIn("No annotations yet", text)
-            self.assertIn("picklikeme annotate", text)
+                self.assertFalse(store.migration.ran)
+                self.assertEqual(store.migration.render(), "")
 
 
 class IsolationTests(unittest.TestCase):
@@ -395,9 +566,11 @@ class ServerTests(unittest.TestCase):
                 with urllib.request.urlopen(f"{base}/api/categories") as response:
                     self.assertIn("Action shot", json.load(response)["categories"])
 
+                image = root / "IMG_1.NEF"
+                image.write_bytes(b"real pixels")
                 payload = json.dumps(
                     {
-                        "image_path": str(root / "IMG_1.NEF"),
+                        "image_path": str(image),
                         "categories": ["Action shot", "Lighting"],
                         "notes": "posted from the report",
                     }
@@ -414,7 +587,7 @@ class ServerTests(unittest.TestCase):
                 self.assertEqual(body["annotation"]["categories"], ["Action shot", "Lighting"])
 
                 # Persisted, not just echoed.
-                self.assertEqual(store.get(root / "IMG_1.NEF").notes, "posted from the report")
+                self.assertEqual(store.get(image).notes, "posted from the report")
 
                 with urllib.request.urlopen(f"{base}/api/annotations") as response:
                     self.assertEqual(len(json.load(response)["annotations"]), 1)
@@ -437,6 +610,33 @@ class ServerTests(unittest.TestCase):
                 with self.assertRaises(urllib.error.HTTPError) as ctx:
                     urllib.request.urlopen(request)
                 self.assertEqual(ctx.exception.code, 400)
+            finally:
+                server.shutdown()
+                server.server_close()
+                store.close()
+
+    def test_saving_without_identity_is_refused_explicitly(self):
+        """No fallback: an unreadable image cannot be annotated, and the UI is
+        told why rather than silently attaching the note to a guess."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            server, store, base = self._serve(self._prepare(root), root / "kb.db")
+            try:
+                request = urllib.request.Request(
+                    f"{base}/api/annotations",
+                    data=json.dumps(
+                        {"image_path": str(root / "not_on_disk.NEF"), "categories": ["Backlit"]}
+                    ).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with self.assertRaises(urllib.error.HTTPError) as ctx:
+                    urllib.request.urlopen(request)
+                self.assertEqual(ctx.exception.code, 409)
+                body = json.load(ctx.exception)
+                self.assertTrue(body["identity_unavailable"])
+                self.assertIn("identity", body["error"])
+                self.assertEqual(store.count(), 0, "nothing may be stored without identity")
             finally:
                 server.shutdown()
                 server.server_close()

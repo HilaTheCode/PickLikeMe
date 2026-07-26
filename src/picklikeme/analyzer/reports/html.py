@@ -266,10 +266,15 @@ document.addEventListener('DOMContentLoaded', async ()=>{
     try{
       const r=await fetch('api/annotations',{cache:'no-store'});
       const j=await r.json();
-      const byPath={}; (j.annotations||[]).forEach(a=>{byPath[a.image_path]=a;});
+      // Match on image_hash first: it is the identity and survives the file
+      // having moved since the annotation was written. Path is only a fallback
+      // for panels that have never been annotated (and so carry no hash).
+      const byHash={}, byPath={};
+      (j.annotations||[]).forEach(a=>{byHash[a.image_hash]=a; byPath[a.original_path]=a;});
       document.querySelectorAll('.fn').forEach(el=>{
-        const a=byPath[el.dataset.path];
+        const a=byHash[el.dataset.hash]||byPath[el.dataset.path];
         if(a){
+          el.dataset.hash=a.image_hash;
           plmRenderTags(el,a.categories,a.notes);
           el.querySelectorAll('.cat input').forEach(i=>{i.checked=a.categories.includes(i.value);});
           el.querySelector('textarea').value=a.notes||'';
@@ -549,8 +554,14 @@ def _annotation_panels(result: "AnalysisResult", thumbs: dict[str, Path]) -> str
             else f'<span title="{_e(path)}">{_e(image.filename)}</span>'
         )
         moved = (
-            ' <span class="pill warn" title="annotated before the file moved">matched by name</span>'
-            if annotation and annotation.matched_by_filename
+            ' <span class="pill warn" title="matched by content identity; the file is no longer '
+            'at the path recorded with the annotation">followed a move</span>'
+            if annotation and annotation.relocated
+            else ""
+        )
+        captured = (
+            f" &middot; shot {_e(annotation.capture_datetime)}"
+            if annotation and annotation.capture_datetime
             else ""
         )
         tags = (
@@ -564,13 +575,15 @@ def _annotation_panels(result: "AnalysisResult", thumbs: dict[str, Path]) -> str
         )
 
         panels.append(
-            f'<div class="fn" data-path="{_e(path)}" data-categories="{_e("|".join(current))}" '
+            f'<div class="fn" data-path="{_e(path)}" '
+            f'data-hash="{_e(annotation.image_hash if annotation else "")}" '
+            f'data-categories="{_e("|".join(current))}" '
             f'data-annotated="{"1" if (current or notes) else "0"}">'
             f'<div class="fn-top">{thumb_html}'
             f'<div class="fn-meta"><div class="fn-name">{name}{moved}</div>'
             f'<div class="fn-nums">score {image.score:.4f} &middot; confidence '
             f'{_num(image.confidence, "{:.3f}")} &middot; rank {image.rank:,} &middot; '
-            f"displaced {record.rank_displacement:,} &middot; you kept it</div>"
+            f"displaced {record.rank_displacement:,} &middot; you kept it{captured}</div>"
             f'<div class="fn-tags">{tags}</div>'
             f'<div class="fn-note"{"" if notes else " style=display:none"}>{_e(notes)}</div>'
             f"</div>"
@@ -669,12 +682,48 @@ def _annotation_summary(result: "AnalysisResult") -> str:
             f"({summary.unannotated_count:,})</h3><ul>{items}</ul>{more}"
         )
 
+    # Identity conditions worth surfacing rather than hiding.
+    notices = ""
+    if summary.unresolved:
+        items = "".join(
+            f"<li>{_e(item.filename)} &mdash; <span class='muted'>{_e(item.reason)}</span></li>"
+            for item in summary.unresolved[:20]
+        )
+        notices += (
+            '<div class="sug critical"><div class="t">'
+            f"{len(summary.unresolved):,} image(s) have no establishable identity</div>"
+            '<div class="d">These cannot be annotated: without a content hash an annotation could '
+            "only be attached to a guess, and a wrong diagnosis is worse than a missing one. "
+            f"Make the files readable and re-run.</div><ul>{items}</ul></div>"
+        )
+    if summary.relocated:
+        notices += (
+            '<div class="sug"><div class="t">'
+            f"{summary.relocated:,} annotation(s) followed a moved file</div>"
+            '<div class="d">Matched by content identity even though the file is no longer at the '
+            "path recorded when it was annotated - which is the point of hashing content rather "
+            "than location.</div></div>"
+        )
+    if summary.migration is not None and summary.migration.ran:
+        notices += (
+            '<div class="sug"><div class="t">Identity migration ran</div>'
+            f'<div class="d">{_e(summary.migration.render())}</div></div>'
+        )
+    if summary.pending_migration:
+        notices += (
+            '<div class="sug warning"><div class="t">'
+            f"{len(summary.pending_migration):,} older path-keyed annotation(s) not yet re-keyed</div>"
+            '<div class="d">Their files were not found, so they are kept as-is and retried on every '
+            "run. Nothing has been lost.</div></div>"
+        )
+
     footer = (
         f'<p class="sub" style="margin-top:18px">Database: <code>{_e(summary.database_path)}</code>. '
-        "Annotations are recorded by you, never generated, and never affect any metric in this "
-        "report.</p>"
+        "Annotations are keyed on the image's content hash, so a diagnosis follows the image "
+        "through renames, reorganisation and moves between drives. They are recorded by you, never "
+        "generated, and never affect any metric in this report.</p>"
     )
-    return cards + frequencies + combinations + recent + unannotated + footer
+    return cards + notices + frequencies + combinations + recent + unannotated + footer
 
 
 def _suggestions(result: "AnalysisResult") -> str:

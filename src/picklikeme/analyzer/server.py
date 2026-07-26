@@ -28,6 +28,7 @@ from http.server import HTTPServer, SimpleHTTPRequestHandler, ThreadingHTTPServe
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
+from ..identity import IdentityUnavailable
 from .annotations import AnnotationStore
 
 logger = logging.getLogger(__name__)
@@ -137,6 +138,22 @@ class AnnotationRequestHandler(SimpleHTTPRequestHandler):
 
         try:
             annotation = self.store.save(image_path, categories, payload.get("notes") or "")
+        except IdentityUnavailable as exc:
+            # Explicit, not a fallback: without identity the annotation could
+            # only be attached to a guess, and a wrong diagnosis is worse than
+            # no diagnosis.
+            logger.warning("Refusing to save without identity: %s", exc)
+            self._send_json(
+                {
+                    "error": (
+                        f"Cannot establish this image's identity ({exc.reason}), so the "
+                        "annotation was not saved. The file must be readable to be annotated."
+                    ),
+                    "identity_unavailable": True,
+                },
+                status=409,
+            )
+            return
         except Exception as exc:  # noqa: BLE001 - reported to the UI, never fatal
             logger.exception("Failed to save annotation")
             self._send_json({"error": f"{type(exc).__name__}: {exc}"}, status=500)

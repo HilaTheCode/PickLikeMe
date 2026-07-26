@@ -315,17 +315,72 @@ not annotated.
 | --- | --- |
 | Location | `<project>/annotations/false_negatives.db` (`--annotations-db` to move) |
 | Why there | Outside every output directory — those are per-run and get replaced; a knowledge base must outlive them |
-| Tables | `annotations`, `annotation_categories`, `categories`, `schema_info` |
+| Tables | `annotations_v2`, `annotation_categories_v2`, `categories`, `identity_cache`, `unmigrated_v1`, `schema_info` |
+| Per record | `image_hash` (identity), filename, original path, capture datetime if readable, timestamps, categories, notes |
 | Journal | WAL, so generating a report never blocks the UI writing |
 | Written | Only this database. Never a ranking, checkpoint, dataset, image or report |
 
-Identity across runs is the interesting part. Lookup is by digest of the
-resolved path, falling back to filename when the path misses — so a diagnosis
-survives the archive being reorganised or moved to another drive. The fallback
-**refuses to answer when a filename is ambiguous**: camera counters reset, so
-duplicate basenames are normal in a multi-year archive, and a misattributed
-diagnosis is worse than a missing one. A record found by filename is flagged
-`matched by name` in the report.
+### Identity
+
+Annotations are keyed on **content identity** — `identity.image_identity()`,
+which returns `"p1:<sha1>"` computed from the file's size plus its first and last
+512 KB. Filename, original path and capture time are stored as display metadata
+and are **never** matched on.
+
+That is what makes a diagnosis follow the image through:
+
+| | Path digest | Content identity |
+| --- | --- | --- |
+| folder renamed | ✗ lost | ✓ follows |
+| archive reorganised | ✗ lost | ✓ follows |
+| moved to another drive | ✗ lost | ✓ follows |
+| dataset relocated *and* file renamed | ✗ lost | ✓ follows |
+| same filename, different image | ✗ could mismatch | ✓ correctly distinct |
+
+There is **no fallback**. If identity cannot be established (the file is
+missing, unreadable or empty) the analyzer reports the condition, the report
+lists those images as un-annotatable, and the API answers `409` with
+`identity_unavailable`. Nothing is stored against a guess: attaching a diagnosis
+to the wrong image is worse than losing it.
+
+Identity is memoised in the database against `(path, size, mtime)`, so a repeat
+run over an unchanged archive does no I/O to resolve it.
+
+#### Why a partial digest
+
+A 45 MB NEF takes ~0.15 s to hash in full, and identity is resolved for every
+false negative in a report. Size plus 512 KB from each end is ~1 MB per image and
+is effectively collision-free for camera files: the head carries EXIF (body
+serial, frame counter, capture timestamp) and the tail carries image data, so two
+distinct frames cannot agree on all three. The `p1:` prefix makes the scheme
+explicit so a future change (full-file, or perceptual hashing that survives
+re-encoding) is migratable rather than silently incompatible.
+
+#### Two kinds of key, one module
+
+`picklikeme/identity.py` holds both, so the distinction cannot be missed:
+
+- `cache_key(path)` — digest of the **resolved path**. Correct for *derived
+  artifacts*: a crop belongs to the file as found, and if the file moves the crop
+  is simply rebuilt. This is what the crop cache has always used, unchanged.
+- `image_identity(path)` — digest of the **content**. The canonical answer to
+  "which image is this", for anything that must outlive a filesystem layout.
+
+Nothing else in the codebase should introduce a third scheme.
+
+### Migration from path-keyed annotations
+
+Databases written before this change keyed annotations on a path digest. Opening
+one with the current code migrates it **automatically**:
+
+- every v1 record whose file can be found is re-keyed to content identity, with
+  categories, notes and `created_at` preserved;
+- two v1 records that turn out to be the same image are **merged** (categories
+  unioned, both notes kept) rather than duplicated;
+- records whose file cannot be found are **parked**, not dropped — they are kept
+  verbatim in `unmigrated_v1` with the reason, reported in every run, so nothing
+  is lost;
+- it is idempotent: migrated rows leave the v1 table, so reopening is a no-op.
 
 ### Server
 
