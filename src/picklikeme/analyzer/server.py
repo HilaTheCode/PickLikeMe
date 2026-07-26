@@ -26,7 +26,7 @@ import mimetypes
 import threading
 from http.server import HTTPServer, SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 from ..identity import IdentityUnavailable
 from .annotations import AnnotationStore
@@ -46,6 +46,9 @@ class AnnotationRequestHandler(SimpleHTTPRequestHandler):
 
     store: AnnotationStore
     root: Path
+    # Roots the /source endpoint may read from, taken from the report's own
+    # analysis.json. Empty means originals are not served at all.
+    source_roots: tuple[Path, ...] = ()
     protocol_version = "HTTP/1.1"
 
     # -- helpers ------------------------------------------------------------
@@ -85,8 +88,53 @@ class AnnotationRequestHandler(SimpleHTTPRequestHandler):
 
     # -- routes -------------------------------------------------------------
 
+    def _serve_source_image(self) -> None:
+        """Stream an original image from the dataset this report describes.
+
+        Exists because browsers refuse to follow a `file://` link from an
+        `http://` page, so a served report cannot open originals any other way.
+
+        Confined to the dataset: the requested path must resolve inside one of
+        the roots recorded in the report's own analysis.json. Anything else is
+        403, so this endpoint cannot be turned into a general file reader.
+        """
+        params = parse_qs(urlparse(self.path).query)
+        raw = (params.get("path") or [""])[0]
+        if not raw:
+            self._send_json({"error": "path is required"}, status=400)
+            return
+
+        try:
+            target = Path(raw).resolve()
+        except OSError:
+            self._send_json({"error": "unusable path"}, status=400)
+            return
+
+        if not any(_is_within(target, root) for root in self.source_roots):
+            logger.warning("Refused source outside the dataset roots: %s", target)
+            self._send_json(
+                {"error": "path is outside this report's dataset"}, status=403
+            )
+            return
+        if not target.is_file():
+            self._send_json({"error": "file not found (has the dataset moved?)"}, status=404)
+            return
+
+        data = target.read_bytes()
+        content_type = mimetypes.guess_type(str(target))[0] or "application/octet-stream"
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(data)))
+        # Let the browser offer a sensible filename for formats it cannot render.
+        self.send_header("Content-Disposition", f'inline; filename="{target.name}"')
+        self.end_headers()
+        self.wfile.write(data)
+
     def do_GET(self) -> None:  # noqa: N802 - stdlib signature
         route = urlparse(self.path).path
+        if route == "/source":
+            self._serve_source_image()
+            return
         if route == "/api/health":
             self._send_json({"ok": True, "database": str(self.store.db_path)})
             return
@@ -162,6 +210,60 @@ class AnnotationRequestHandler(SimpleHTTPRequestHandler):
         self._send_json({"ok": True, "annotation": annotation.as_dict(), "deleted": annotation.is_empty})
 
 
+def _is_within(candidate: Path, root: Path) -> bool:
+    """True when `candidate` is inside `root`, both already resolved."""
+    try:
+        candidate.relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
+def dataset_roots(report_dir: Path) -> tuple[Path, ...]:
+    """Folders the report's images legitimately live in.
+
+    Read from the report's own analysis.json rather than configured separately,
+    so the allowlist can never drift from the report being served. Falls back to
+    an empty tuple - and therefore to serving no originals - if the file is
+    missing or unreadable.
+    """
+    payload_path = report_dir / "analysis.json"
+    if not payload_path.is_file():
+        logger.info("No analysis.json in %s; original images will not be served", report_dir)
+        return ()
+    try:
+        payload = json.loads(payload_path.read_text(encoding="utf-8"))
+        config = payload.get("config") or {}
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning("Could not read %s: %s", payload_path, exc)
+        return ()
+
+    roots: list[Path] = []
+    for key in ("selected_root", "rejected_root"):
+        value = config.get(key)
+        if value:
+            try:
+                resolved = Path(value).resolve()
+            except OSError:
+                continue
+            if resolved.is_dir():
+                roots.append(resolved)
+    # No ground-truth folders (labels came from the ranking file): fall back to
+    # the folders the ranked images actually sit in, which is still a bounded set.
+    if not roots:
+        seen: set[Path] = set()
+        for group in ("false_negatives", "false_positives", "borderline"):
+            for record in (payload.get("errors") or {}).get(group, []) or []:
+                parent = Path(record.get("image_path", "")).parent
+                if parent.parts:
+                    try:
+                        seen.add(parent.resolve())
+                    except OSError:
+                        continue
+        roots.extend(sorted(seen))
+    return tuple(roots)
+
+
 def make_server(report_dir: Path, store: AnnotationStore, port: int = DEFAULT_PORT) -> HTTPServer:
     """Build (but do not start) the loopback server."""
     report_dir = Path(report_dir).resolve()
@@ -172,10 +274,12 @@ def make_server(report_dir: Path, store: AnnotationStore, port: int = DEFAULT_PO
             f"No report.html in {report_dir}. Run `picklikeme analyze --output {report_dir}` first."
         )
 
+    roots = dataset_roots(report_dir)
+    logger.info("Serving originals from %d dataset root(s)", len(roots))
     handler = type(
         "BoundAnnotationRequestHandler",
         (AnnotationRequestHandler,),
-        {"store": store, "root": report_dir},
+        {"store": store, "root": report_dir, "source_roots": roots},
     )
     return ThreadingHTTPServer((HOST, port), handler)
 

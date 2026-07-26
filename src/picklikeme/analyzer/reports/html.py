@@ -21,6 +21,7 @@ import logging
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from ..links import asset_url, source_api_url, source_file_uri
 from ..suggestions import CRITICAL, WARNING
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -262,6 +263,12 @@ document.addEventListener('DOMContentLoaded', async ()=>{
   const banner=document.getElementById('fn-offline');
   if(PLM.online){
     if(banner) banner.style.display='none';
+    // Browsers refuse to navigate from a served page to a local-file URL, so a
+    // served report must reach originals through the server. Rewrite them once.
+    document.querySelectorAll('a[data-source]').forEach(a=>{
+      a.href='source?path='+encodeURIComponent(a.dataset.source);
+      a.target='_blank';
+    });
     // Refresh from the database in case it changed since the report was written.
     try{
       const r=await fetch('api/annotations',{cache:'no-store'});
@@ -315,6 +322,23 @@ def _e(value) -> str:
 
 def _num(value: float | None, spec: str = "{:.4f}") -> str:
     return '<span class="muted">n/a</span>' if value is None else spec.format(value)
+
+
+def _source_link(image_path: str, label: str) -> str:
+    """Anchor to an original image, usable in both report modes.
+
+    `href` is a file:// URI so the link works when the report is opened from
+    disk. `data-source` carries the absolute path so the served page can rewrite
+    the href to the server's /source endpoint - browsers block http:// -> file://
+    navigation outright, which is why a served report's links appeared broken.
+    """
+    uri = source_file_uri(image_path)
+    if uri is None:
+        return f'<span title="{_e(image_path)}" class="muted">{_e(label)}</span>'
+    return (
+        f'<a href="{_e(uri)}" data-source="{_e(image_path)}" '
+        f'title="{_e(image_path)}">{_e(label)}</a>'
+    )
 
 
 def _section(title: str, body: str, subtitle: str = "", collapsed: bool = False) -> str:
@@ -447,7 +471,9 @@ def _charts(result: "AnalysisResult", charts_dir: Path, output_dir: Path) -> str
         path = charts_dir / name
         if not path.exists():
             continue
-        rel = path.relative_to(output_dir).as_posix()
+        rel = asset_url(path, output_dir)
+        if rel is None:
+            continue
         tiles.append(
             f'<div class="chart"><a href="{_e(rel)}" target="_blank">'
             f'<img src="{_e(rel)}" alt="{_e(caption)}" loading="lazy"></a>'
@@ -465,14 +491,13 @@ def _error_table(records, output_dir: Path, thumbs: dict[str, Path]) -> str:
         thumb = thumbs.get(image.image_path)
         cell = ""
         if thumb is not None and thumb.exists():
-            rel = thumb.relative_to(output_dir).as_posix()
-            cell = f'<img src="{_e(rel)}" style="width:52px;height:52px;object-fit:cover;border-radius:5px" loading="lazy">'
-        file_url = Path(image.image_path).as_uri() if Path(image.image_path).exists() else None
-        name = (
-            f'<a href="{_e(file_url)}" title="{_e(image.image_path)}">{_e(image.filename)}</a>'
-            if file_url
-            else f'<span title="{_e(image.image_path)}">{_e(image.filename)}</span>'
-        )
+            rel = asset_url(thumb, output_dir)
+            if rel:
+                cell = (
+                    f'<img src="{_e(rel)}" style="width:52px;height:52px;object-fit:cover;'
+                    'border-radius:5px" loading="lazy">'
+                )
+        name = _source_link(image.image_path, image.filename)
         confidence = image.confidence
         rows.append(
             f"<tr><td>{cell}</td><td>{name}</td>"
@@ -540,19 +565,12 @@ def _annotation_panels(result: "AnalysisResult", thumbs: dict[str, Path]) -> str
         notes = annotation.notes if annotation else ""
 
         thumb = thumbs.get(path)
-        thumb_html = ""
+        thumb_html = '<img alt="no preview" style="display:flex">'
         if thumb is not None and thumb.exists():
-            rel = thumb.relative_to(output_dir).as_posix()
-            thumb_html = f'<img src="{_e(rel)}" alt="{_e(image.filename)}" loading="lazy">'
-        else:
-            thumb_html = '<img alt="no preview" style="display:flex">'
-
-        file_url = Path(path).as_uri() if Path(path).exists() else None
-        name = (
-            f'<a href="{_e(file_url)}" title="{_e(path)}">{_e(image.filename)}</a>'
-            if file_url
-            else f'<span title="{_e(path)}">{_e(image.filename)}</span>'
-        )
+            rel = asset_url(thumb, output_dir)
+            if rel:
+                thumb_html = f'<img src="{_e(rel)}" alt="{_e(image.filename)}" loading="lazy">'
+        name = _source_link(path, image.filename)
         moved = (
             ' <span class="pill warn" title="matched by content identity; the file is no longer '
             'at the path recorded with the annotation">followed a move</span>'
@@ -828,8 +846,9 @@ def build_html(result: "AnalysisResult", thumbs: dict[str, Path] | None = None) 
     sheets = sorted(config.sheets_dir.glob("*.png")) if config.sheets_dir.exists() else []
     if sheets:
         links = "".join(
-            f'<li><a href="{_e(p.relative_to(output_dir).as_posix())}" target="_blank">{_e(p.stem)}</a></li>'
+            f'<li><a href="{_e(asset_url(p, output_dir))}" target="_blank">{_e(p.stem)}</a></li>'
             for p in sheets
+            if asset_url(p, output_dir)
         )
         sections.append(_section("Contact sheets", f"<ul>{links}</ul>", f"{len(sheets)} sheet(s)", collapsed=True))
 
