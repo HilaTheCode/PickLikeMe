@@ -17,7 +17,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from picklikeme.analyzer.annotations import (
     DEFAULT_ANNOTATIONS_DB,
-    INITIAL_CATEGORIES,
     AnnotationStore,
     render_summary,
     summarise,
@@ -153,70 +152,58 @@ class IdentityTests(unittest.TestCase):
 
 
 class StorageTests(unittest.TestCase):
-    def test_database_is_created_with_the_initial_vocabulary(self):
+    def test_database_is_created_ready_to_use(self):
         with tempfile.TemporaryDirectory() as tmp:
             with store_in(tmp) as store:
                 self.assertTrue(store.db_path.exists())
-                self.assertEqual(store.categories()[: len(INITIAL_CATEGORIES)], list(INITIAL_CATEGORIES))
-                self.assertIn("Action shot", store.categories())
-                self.assertIn("Animal not in supported categories", store.categories())
+                self.assertEqual(store.count(), 0)
 
-    def test_save_and_reload_multiple_categories_and_notes(self):
+    def test_save_and_reload_keeps_display_metadata(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = make_image(Path(tmp) / "IMG_0001.NEF")
             with store_in(tmp) as store:
-                saved = store.save(
-                    path, ["Action shot", "Artistic choice"], "Great wing position.\nSecond line."
-                )
+                saved = store.save(path, crop_quality="Too Small", image_quality="Out of Focus")
                 self.assertTrue(saved.image_hash.startswith("p1:"))
 
             with AnnotationStore(Path(tmp) / "kb" / "fn.db") as reopened:
                 annotation = reopened.get(path)
                 self.assertIsNotNone(annotation)
-                self.assertEqual(annotation.categories, ["Action shot", "Artistic choice"])
-                self.assertIn("Great wing position.", annotation.notes)
-                self.assertIn("\n", annotation.notes, "multi-line notes must round-trip")
+                self.assertEqual(annotation.crop_quality, "Too Small")
                 self.assertEqual(annotation.filename, "IMG_0001.NEF")
 
-    def test_saving_again_replaces_categories_and_keeps_created_at(self):
+    def test_saving_again_replaces_the_answers_and_keeps_created_at(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = make_image(Path(tmp) / "a.NEF")
             with store_in(tmp) as store:
-                first = store.save(path, ["Backlit"], "one")
-                second = store.save(path, ["Lighting", "Out of focus foreground"], "two")
+                first = store.save(path, crop_quality="Good")
+                second = store.save(path, crop_quality="Too Large", image_quality="Missing Eye")
 
                 self.assertEqual(second.created_at, first.created_at)
-                self.assertEqual(store.get(path).categories, ["Lighting", "Out of focus foreground"])
-                self.assertEqual(store.get(path).notes, "two")
+                self.assertEqual(store.get(path).crop_quality, "Too Large")
+                self.assertEqual(store.get(path).image_quality, "Missing Eye")
 
     def test_clearing_everything_deletes_the_record(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = make_image(Path(tmp) / "a.NEF")
             with store_in(tmp) as store:
-                store.save(path, ["Backlit"], "note")
+                store.save(path, crop_quality="Good")
                 self.assertEqual(store.count(), 1)
-                store.save(path, [], "")
+                store.save(path)
                 self.assertEqual(store.count(), 0)
                 self.assertIsNone(store.get(path))
-
-    def test_custom_category_is_remembered_for_next_time(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            with store_in(tmp) as store:
-                store.save(make_image(Path(tmp) / "a.NEF"), ["Wing blur I like"], "")
-                self.assertIn("Wing blur I like", store.categories())
 
     def test_annotation_follows_a_renamed_file(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             original = make_image(root / "IMG_9.NEF", b"the same bird")
             with store_in(tmp) as store:
-                store.save(original, ["Subject too small"], "tiny bird")
+                store.save(original, crop_quality="Too Small")
                 original.unlink()
                 renamed = make_image(root / "best_of_shoot.NEF", b"the same bird")
 
                 found = store.get(renamed)
                 self.assertIsNotNone(found, "identity must survive a rename")
-                self.assertEqual(found.categories, ["Subject too small"])
+                self.assertEqual(found.crop_quality, "Too Small")
                 self.assertTrue(found.relocated)
 
     def test_annotation_follows_a_reorganised_archive(self):
@@ -224,9 +211,9 @@ class StorageTests(unittest.TestCase):
             root = Path(tmp)
             original = make_image(root / "D_drive" / "2026" / "india" / "a.NEF", b"elephant frame")
             with store_in(tmp) as store:
-                store.save(original, ["Wrong crop"], "")
+                store.save(original, crop_quality="Wrong Location")
                 moved = make_image(root / "E_drive" / "archive" / "asia" / "a.NEF", b"elephant frame")
-                self.assertEqual(store.get(moved).categories, ["Wrong crop"])
+                self.assertEqual(store.get(moved).crop_quality, "Wrong Location")
 
     def test_duplicate_filenames_are_never_confused(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -234,9 +221,9 @@ class StorageTests(unittest.TestCase):
             with store_in(tmp) as store:
                 a = make_image(root / "shootA" / "DSC_0001.NEF", b"frame A")
                 b = make_image(root / "shootB" / "DSC_0001.NEF", b"frame B")
-                store.save(a, ["Backlit"], "")
+                store.save(a, image_quality="Good")
 
-                self.assertEqual(store.get(a).categories, ["Backlit"])
+                self.assertEqual(store.get(a).image_quality, "Good")
                 self.assertIsNone(store.get(b), "a same-named different image must not match")
 
     def test_unreadable_image_is_an_explicit_failure_not_a_guess(self):
@@ -246,7 +233,7 @@ class StorageTests(unittest.TestCase):
                 with self.assertRaises(IdentityUnavailable):
                     store.get(missing)
                 with self.assertRaises(IdentityUnavailable):
-                    store.save(missing, ["Backlit"], "")
+                    store.save(missing, crop_quality="Good")
 
     def test_get_many_separates_unresolved_from_unannotated(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -255,7 +242,7 @@ class StorageTests(unittest.TestCase):
             plain = make_image(root / "plain.NEF")
             missing = root / "missing.NEF"
             with store_in(tmp) as store:
-                store.save(good, ["Backlit"], "")
+                store.save(good, crop_quality="Good")
                 found, unresolved = store.get_many([str(good), str(plain), str(missing)])
 
             self.assertEqual(list(found), [str(good)])
@@ -321,8 +308,9 @@ class MigrationTests(unittest.TestCase):
                 self.assertEqual(store.migration.migrated, 1)
                 self.assertEqual(store.count(), 1)
                 annotation = store.get(image)
-                self.assertEqual(annotation.categories, ["Action shot", "Backlit"])
-                self.assertEqual(annotation.notes, "keep this note")
+                # Re-keyed, not re-interpreted: v1 content stays legacy content.
+                self.assertEqual(annotation.legacy_categories, ["Action shot", "Backlit"])
+                self.assertEqual(annotation.legacy_notes, "keep this note")
                 self.assertEqual(annotation.created_at, "2026-01-01T00:00:00")
                 self.assertTrue(annotation.image_hash.startswith("p1:"))
 
@@ -352,9 +340,9 @@ class MigrationTests(unittest.TestCase):
                 self.assertEqual(store.count(), 1, "must not duplicate the same image")
                 self.assertEqual(store.migration.merged, 1)
                 annotation = store.get(first)
-                self.assertEqual(annotation.categories, ["Backlit", "Wrong crop"])
-                self.assertIn("from one", annotation.notes)
-                self.assertIn("from two", annotation.notes)
+                self.assertEqual(annotation.legacy_categories, ["Backlit", "Wrong crop"])
+                self.assertIn("from one", annotation.legacy_notes)
+                self.assertIn("from two", annotation.legacy_notes)
 
     def test_unresolvable_records_are_kept_not_lost(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -415,7 +403,12 @@ class IsolationTests(unittest.TestCase):
             # Annotate every false negative, then re-run.
             with AnnotationStore(db) as store:
                 for record in clean.errors.false_negatives:
-                    store.save(record.image_path, ["Action shot", "Backlit"], "human note")
+                    store.save(
+                        record.image_path,
+                        crop_quality="Too Small",
+                        image_quality="Out of Focus",
+                        agree_with_model_decision="No",
+                    )
             self.assertGreater(len(clean.errors.false_negatives), 0, "fixture must produce FNs")
 
             annotated = self._run(root, db)
@@ -490,7 +483,7 @@ class HtmlIntegrationTests(unittest.TestCase):
             )
         )
 
-    def test_panels_include_edit_save_checklist_and_notes(self):
+    def test_panels_include_edit_save_and_the_field_editors(self):
         from picklikeme.analyzer.reports.html import build_html
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -500,13 +493,13 @@ class HtmlIntegrationTests(unittest.TestCase):
 
             self.assertIn("btn-edit", html)
             self.assertIn("btn-save", html)
-            self.assertIn("<textarea", html)
-            for category in ("Action shot", "Artistic choice", "Detector mistake"):
-                self.assertIn(category, html)
+            self.assertIn("ann-field", html)
+            for label in ("Crop Quality", "Image Quality", "Agree with Model Decision"):
+                self.assertIn(label, html)
             self.assertIn("False negative summary", html)
             # Filters
             self.assertIn('id="f-state"', html)
-            self.assertIn('id="f-cats"', html)
+            self.assertIn('class="f-field"', html)
             self.assertIn("not annotated", html)
 
     def test_existing_annotations_are_reloaded_into_the_page(self):
@@ -518,16 +511,18 @@ class HtmlIntegrationTests(unittest.TestCase):
             first = self._result(root, db)
             target = first.errors.false_negatives[0].image_path
             with AnnotationStore(db) as store:
-                store.save(target, ["Backlit", "Subject too small"], "reloaded note")
+                store.save(target, crop_quality="Too Small", agree_with_model_decision="No")
 
             again = self._result(root, db)
             html = build_html(again)
 
-            self.assertIn("reloaded note", html)
-            self.assertIn("checked", html, "a stored category must render pre-ticked")
+            self.assertIn('<option value="Too Small" selected>', html)
             # Inlined so a file:// report still shows what is known.
             self.assertIn("window.PLM_ANNOTATIONS=", html)
-            self.assertIn("reloaded note", json.dumps(again.annotations[target].as_dict()))
+            self.assertEqual(
+                json.loads(json.dumps(again.annotations[target].as_dict()))["crop_quality"],
+                "Too Small",
+            )
 
     def test_report_stays_offline_with_the_annotation_ui(self):
         from picklikeme.analyzer.reports.html import build_html
@@ -555,7 +550,7 @@ class ServerTests(unittest.TestCase):
         (report_dir / "report.html").write_text("<html>report</html>", encoding="utf-8")
         return report_dir
 
-    def test_health_categories_and_save_round_trip(self):
+    def test_health_fields_and_save_round_trip(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             report_dir = self._prepare(root)
@@ -564,16 +559,17 @@ class ServerTests(unittest.TestCase):
                 with urllib.request.urlopen(f"{base}/api/health") as response:
                     self.assertTrue(json.load(response)["ok"])
 
-                with urllib.request.urlopen(f"{base}/api/categories") as response:
-                    self.assertIn("Action shot", json.load(response)["categories"])
+                with urllib.request.urlopen(f"{base}/api/fields") as response:
+                    self.assertIn("crop_quality", json.load(response)["fields"])
 
                 image = root / "IMG_1.NEF"
                 image.write_bytes(b"real pixels")
                 payload = json.dumps(
                     {
                         "image_path": str(image),
-                        "categories": ["Action shot", "Lighting"],
-                        "notes": "posted from the report",
+                        "crop_quality": "Good",
+                        "image_quality": "Missing Eye",
+                        "agree_with_model_decision": "Yes",
                     }
                 ).encode("utf-8")
                 request = urllib.request.Request(
@@ -585,10 +581,10 @@ class ServerTests(unittest.TestCase):
                 with urllib.request.urlopen(request) as response:
                     body = json.load(response)
                 self.assertTrue(body["ok"])
-                self.assertEqual(body["annotation"]["categories"], ["Action shot", "Lighting"])
+                self.assertEqual(body["annotation"]["image_quality"], "Missing Eye")
 
                 # Persisted, not just echoed.
-                self.assertEqual(store.get(image).notes, "posted from the report")
+                self.assertEqual(store.get(image).agree_with_model_decision, "Yes")
 
                 with urllib.request.urlopen(f"{base}/api/annotations") as response:
                     self.assertEqual(len(json.load(response)["annotations"]), 1)
@@ -604,7 +600,7 @@ class ServerTests(unittest.TestCase):
             try:
                 request = urllib.request.Request(
                     f"{base}/api/annotations",
-                    data=json.dumps({"categories": []}).encode("utf-8"),
+                    data=json.dumps({"crop_quality": "Good"}).encode("utf-8"),
                     headers={"Content-Type": "application/json"},
                     method="POST",
                 )
@@ -626,7 +622,7 @@ class ServerTests(unittest.TestCase):
                 request = urllib.request.Request(
                     f"{base}/api/annotations",
                     data=json.dumps(
-                        {"image_path": str(root / "not_on_disk.NEF"), "categories": ["Backlit"]}
+                        {"image_path": str(root / "not_on_disk.NEF"), "crop_quality": "Good"}
                     ).encode("utf-8"),
                     headers={"Content-Type": "application/json"},
                     method="POST",

@@ -2,20 +2,31 @@
 
 Why an image the photographer deliberately kept was rejected by the model is
 knowledge only the photographer has. This module stores that knowledge and
-nothing else:
+nothing else.
+
+A diagnosis is three independent fixed-vocabulary fields - Crop Quality, Image
+Quality, and whether you Agree with the Model Decision. Closed vocabularies with
+no free-text option, because the purpose is data that can be counted: a growable
+tag list (which the superseded `categories` field was) makes frequencies
+incomparable over time, since "Backlit" and "backlighting" become two rows in a
+breakdown but one phenomenon.
 
 - **Never generated.** No heuristic, no model, nothing in this file infers a
-  category or writes a note. Every field comes from a human via the report UI.
+  value. Every field comes from a human via the report UI. That extends to the
+  redesign itself: pre-redesign records are preserved verbatim and are *not*
+  auto-mapped onto the new fields, because guessing that (say) an old "Subject
+  too small" tag meant Crop Quality "Too Small" would invent data the
+  photographer never entered - and it would then be counted as if they had.
 - **Never influences metrics.** Annotations are attached to an AnalysisResult
   for display only. A test asserts every metric is bit-identical with and
   without an annotation database present.
 - **Long-lived.** The database lives outside the analyzer's output directory,
   because output directories are per-run and get replaced; a knowledge base
   accumulated over months must not be inside one.
-- **False negatives only**, by request. The annotation workflow (categories,
-  primary failure cause, notes) is wired to false negatives and nothing else;
-  the detector-box thumbnail overlay is a separate, unrelated feature
-  (analyzer.detections / analyzer.contactsheets) that does apply report-wide.
+- **False negatives only**, by request. The annotation workflow is wired to
+  false negatives and nothing else; the detector-box thumbnail overlay is a
+  separate, unrelated feature (analyzer.detections / analyzer.contactsheets)
+  that does apply report-wide.
 
 Identity is the one genuinely hard problem: a diagnosis must follow the image
 through a rename, a reorganisation, or a move to another drive. Annotations are
@@ -47,10 +58,66 @@ logger = logging.getLogger(__name__)
 # overwritten, and this database is meant to outlive every one of them.
 DEFAULT_ANNOTATIONS_DB = PROJECT_ROOT / "annotations" / "false_negatives.db"
 
-# The starting vocabulary. Stored in the database on first use so it can grow
-# without a code change; `builtin` marks these so a future UI could separate
-# them from ones the photographer added.
-INITIAL_CATEGORIES: tuple[str, ...] = (
+# ---------------------------------------------------------------------------
+# The annotation vocabulary: three independent fixed-value fields.
+#
+# Every field is a closed set with no free-text escape hatch, because the point
+# is data that can be counted. A growable vocabulary (which the superseded
+# `categories` field had) makes frequencies incomparable across time: "Backlit"
+# and "backlighting" are two rows in a breakdown but one phenomenon.
+#
+# The three axes are deliberately independent - a technically fine crop of an
+# out-of-focus bird, or a badly placed crop of a perfectly sharp one, are
+# different diagnoses and must be recordable separately.
+# ---------------------------------------------------------------------------
+
+# How good was the crop the detector chose? Judged on its own, independent of
+# whether the underlying photograph is any good.
+CROP_QUALITY_VALUES: tuple[str, ...] = (
+    "Good",
+    "Too Small",
+    "Wrong Location",
+    "Too Large",
+)
+
+# How good is the photograph itself? Judged on its own, independent of how the
+# crop was placed.
+#   Good                - image quality is acceptable
+#   Missing Eye         - the bird's eye is not visible
+#   Out of Focus        - the bird is not sufficiently sharp
+#   No Relevant Subject - nothing meaningful to evaluate (bird too small,
+#                         heavily occluded, or effectively absent)
+IMAGE_QUALITY_VALUES: tuple[str, ...] = (
+    "Good",
+    "Missing Eye",
+    "Out of Focus",
+    "No Relevant Subject",
+)
+
+# Having looked at it: was the model right to reject this image?
+AGREE_WITH_MODEL_VALUES: tuple[str, ...] = ("Yes", "No")
+
+# field name -> allowed values, so validation, the API and the UI all read the
+# same source and cannot drift apart.
+ANNOTATION_FIELDS: dict[str, tuple[str, ...]] = {
+    "crop_quality": CROP_QUALITY_VALUES,
+    "image_quality": IMAGE_QUALITY_VALUES,
+    "agree_with_model_decision": AGREE_WITH_MODEL_VALUES,
+}
+
+# Human labels for the report UI, keyed the same way.
+ANNOTATION_FIELD_LABELS: dict[str, str] = {
+    "crop_quality": "Crop Quality",
+    "image_quality": "Image Quality",
+    "agree_with_model_decision": "Agree with Model Decision",
+}
+
+# --- superseded vocabularies, retained for reading old records only ---------
+# The growable category checklist and the single primary-cause radio that the
+# three fields above replaced. Nothing writes these any more; they are kept so
+# a database annotated before the change still renders its history instead of
+# appearing empty.
+LEGACY_CATEGORIES: tuple[str, ...] = (
     "Wrong crop",
     "Multiple subjects",
     "Subject too small",
@@ -67,14 +134,7 @@ INITIAL_CATEGORIES: tuple[str, ...] = (
     "Animal not in supported categories",
     "Other",
 )
-
-# A second, distinct dimension: the general categories above are multi-select
-# tags ("what else was going on"), while this is a single primary root cause
-# ("what mainly broke it") - one radio choice, not a checklist. Kept as its own
-# fixed vocabulary (not grown from free text the way `categories` is) because
-# it is meant to stay a small, comparable set for the frequency breakdown to
-# mean something across many annotations.
-PRIMARY_FAILURE_CAUSES: tuple[str, ...] = (
+LEGACY_PRIMARY_FAILURE_CAUSES: tuple[str, ...] = (
     "Detection crop too small",
     "Head outside crop",
     "Multiple birds",
@@ -88,23 +148,47 @@ PRIMARY_FAILURE_CAUSES: tuple[str, ...] = (
 SCHEMA_VERSION = 2
 
 
+class InvalidAnnotationValue(ValueError):
+    """Raised when a field is given a value outside its fixed vocabulary.
+
+    Rejected rather than stored, because a stray value would quietly corrupt
+    exactly the frequency counts this schema exists to make trustworthy.
+    """
+
+
+def validate_field(field_name: str, value: str | None) -> str | None:
+    """Check one field against its vocabulary. None/blank means 'not set'."""
+    if field_name not in ANNOTATION_FIELDS:
+        raise InvalidAnnotationValue(f"unknown annotation field {field_name!r}")
+    cleaned = (value or "").strip()
+    if not cleaned:
+        return None
+    allowed = ANNOTATION_FIELDS[field_name]
+    if cleaned not in allowed:
+        raise InvalidAnnotationValue(
+            f"{ANNOTATION_FIELD_LABELS[field_name]} must be one of {list(allowed)}, got {cleaned!r}"
+        )
+    return cleaned
+
+
 @dataclass
 class Annotation:
     """One photographer diagnosis for one false negative.
 
     `image_hash` is the identity. `filename`, `original_path` and
     `capture_datetime` are metadata for display and are never matched on.
+
+    The three diagnostic fields are each optional and independent: a
+    photographer may judge the crop without judging the photograph, or record
+    only whether they agree with the model.
     """
 
     image_hash: str
     filename: str
     original_path: str
-    categories: list[str] = field(default_factory=list)
-    # The single primary root cause, from PRIMARY_FAILURE_CAUSES - distinct
-    # from `categories` (multi-select tags) and optional: a photographer may
-    # tag categories without committing to one primary cause, or vice versa.
-    primary_failure_cause: str | None = None
-    notes: str = ""
+    crop_quality: str | None = None
+    image_quality: str | None = None
+    agree_with_model_decision: str | None = None
     capture_datetime: str | None = None
     created_at: str = ""
     updated_at: str = ""
@@ -112,10 +196,31 @@ class Annotation:
     # identity still matched, so the diagnosis followed the image. Surfaced so
     # the report can say the archive moved.
     relocated: bool = False
+    # --- superseded fields, read-only ---------------------------------------
+    # Whatever a pre-redesign database recorded. Never written any more and
+    # never counted in the new breakdowns, but carried through so a report can
+    # show that a record has history rather than silently rendering it blank.
+    legacy_categories: list[str] = field(default_factory=list)
+    legacy_primary_failure_cause: str | None = None
+    legacy_notes: str = ""
 
     @property
     def is_empty(self) -> bool:
-        return not self.categories and not self.notes.strip() and not self.primary_failure_cause
+        """True when nothing is recorded, counting only the live fields.
+
+        Legacy content deliberately does not keep a record alive: clearing all
+        three dropdowns is how a mistaken annotation is deleted, and a leftover
+        old note must not silently block that.
+        """
+        return not any(
+            (self.crop_quality, self.image_quality, self.agree_with_model_decision)
+        )
+
+    @property
+    def has_legacy_content(self) -> bool:
+        return bool(
+            self.legacy_categories or self.legacy_primary_failure_cause or self.legacy_notes.strip()
+        )
 
     def as_dict(self) -> dict:
         return {
@@ -125,12 +230,16 @@ class Annotation:
             # Kept for the report JS, which indexes panels by their current path.
             "image_path": self.original_path,
             "capture_datetime": self.capture_datetime,
-            "categories": list(self.categories),
-            "primary_failure_cause": self.primary_failure_cause,
-            "notes": self.notes,
+            "crop_quality": self.crop_quality,
+            "image_quality": self.image_quality,
+            "agree_with_model_decision": self.agree_with_model_decision,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "relocated": self.relocated,
+            "legacy_categories": list(self.legacy_categories),
+            "legacy_primary_failure_cause": self.legacy_primary_failure_cause,
+            "legacy_notes": self.legacy_notes,
+            "has_legacy_content": self.has_legacy_content,
         }
 
 
@@ -274,12 +383,20 @@ class AnnotationStore:
             )
             if not self._conn.execute("SELECT 1 FROM schema_info").fetchone():
                 self._conn.execute("INSERT INTO schema_info(version) VALUES (?)", (SCHEMA_VERSION,))
-            for ordering, name in enumerate(INITIAL_CATEGORIES):
-                self._conn.execute(
-                    "INSERT OR IGNORE INTO categories(name, ordering, builtin) VALUES (?, ?, 1)",
-                    (name, ordering),
-                )
-        self._ensure_column("annotations_v2", "primary_failure_cause", "TEXT")
+            # The `categories` table is no longer seeded: that vocabulary is
+            # superseded, and populating a fresh database with names nothing can
+            # write would be misleading. The table itself stays so an existing
+            # database keeps its history readable.
+        # Additive, guarded upgrades for databases created by earlier versions.
+        # The superseded columns are listed too: a database that never had them
+        # still needs them to exist so the read path can select uniformly.
+        for column in (
+            "primary_failure_cause",  # superseded, read-only
+            "crop_quality",
+            "image_quality",
+            "agree_with_model_decision",
+        ):
+            self._ensure_column("annotations_v2", column, "TEXT")
         self.migration = self._migrate_v1()
 
     def _ensure_column(self, table: str, column: str, sql_type: str) -> None:
@@ -456,27 +573,27 @@ class AnnotationStore:
     def __exit__(self, *exc_info) -> None:
         self.close()
 
-    # -- categories ---------------------------------------------------------
+    # -- vocabularies -------------------------------------------------------
 
-    def categories(self) -> list[str]:
+    @staticmethod
+    def field_vocabularies() -> dict[str, list[str]]:
+        """The allowed values for each diagnostic field.
+
+        A method on the store (rather than the UI importing the constants
+        directly) so that whatever validates a save is exactly what the report
+        offers, and the two cannot drift.
+        """
+        return {name: list(values) for name, values in ANNOTATION_FIELDS.items()}
+
+    def legacy_categories(self) -> list[str]:
+        """Category names a pre-redesign database recorded. Read-only."""
         rows = self._conn.execute("SELECT name FROM categories ORDER BY ordering, name").fetchall()
         return [row["name"] for row in rows]
-
-    def add_category(self, name: str) -> None:
-        """Register a category the photographer invented, so it appears in the
-        checklist on later runs."""
-        name = name.strip()
-        if not name:
-            return
-        with self._conn:
-            self._conn.execute(
-                "INSERT OR IGNORE INTO categories(name, ordering, builtin) VALUES (?, 500, 0)", (name,)
-            )
 
     # -- reads --------------------------------------------------------------
 
     def _row_to_annotation(self, row: sqlite3.Row, current_path: str | None = None) -> Annotation:
-        categories = [
+        legacy_categories = [
             item["category"]
             for item in self._conn.execute(
                 "SELECT category FROM annotation_categories_v2 WHERE image_hash = ? ORDER BY category",
@@ -490,15 +607,18 @@ class AnnotationStore:
             image_hash=row["image_hash"],
             filename=row["filename"],
             original_path=row["original_path"],
-            categories=categories,
-            # _ensure_column guarantees this column exists by the time any read
-            # runs, even for a database created before this field existed.
-            primary_failure_cause=row["primary_failure_cause"],
-            notes=row["notes"],
+            # _ensure_column guarantees every column exists by the time any read
+            # runs, even for a database created before these fields existed.
+            crop_quality=row["crop_quality"],
+            image_quality=row["image_quality"],
+            agree_with_model_decision=row["agree_with_model_decision"],
             capture_datetime=row["capture_datetime"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
             relocated=relocated,
+            legacy_categories=legacy_categories,
+            legacy_primary_failure_cause=row["primary_failure_cause"],
+            legacy_notes=row["notes"] or "",
         )
 
     def get(self, image_path: str | Path) -> Annotation | None:
@@ -552,27 +672,27 @@ class AnnotationStore:
     def save(
         self,
         image_path: str | Path,
-        categories: Sequence[str],
-        notes: str = "",
-        primary_failure_cause: str | None = None,
+        crop_quality: str | None = None,
+        image_quality: str | None = None,
+        agree_with_model_decision: str | None = None,
     ) -> Annotation:
         """Create or replace one annotation.
 
-        Saving with no categories, no notes and no primary cause deletes the
-        record, so clearing the panel in the UI is how a mistaken annotation is
-        removed - there is no separate delete gesture to discover.
+        Each field is validated against its fixed vocabulary and an unknown
+        value raises rather than being stored - the whole point of the closed
+        vocabularies is that the resulting counts can be trusted.
 
-        `primary_failure_cause` is not validated against PRIMARY_FAILURE_CAUSES:
-        like the free-text category box, whatever the caller sends is stored
-        verbatim (an empty string is treated as "not set", same as None).
+        Saving with all three fields empty deletes the record, so clearing the
+        dropdowns in the UI is how a mistaken annotation is removed; there is no
+        separate delete gesture to discover.
         """
         digest = self._identity_of(image_path)  # raises IdentityUnavailable
-        cleaned = [c.strip() for c in categories if c and c.strip()]
-        notes = notes.strip()
-        cause = (primary_failure_cause or "").strip() or None
+        crop = validate_field("crop_quality", crop_quality)
+        image = validate_field("image_quality", image_quality)
+        agree = validate_field("agree_with_model_decision", agree_with_model_decision)
         filename = Path(image_path).name
 
-        if not cleaned and not notes and not cause:
+        if not any((crop, image, agree)):
             self.delete(image_path)
             return Annotation(image_hash=digest, filename=filename, original_path=str(image_path))
 
@@ -589,40 +709,38 @@ class AnnotationStore:
             self._conn.execute(
                 """
                 INSERT INTO annotations_v2
-                    (image_hash, filename, original_path, capture_datetime, notes,
-                     primary_failure_cause, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    (image_hash, filename, original_path, capture_datetime,
+                     crop_quality, image_quality, agree_with_model_decision,
+                     notes, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, '', ?, ?)
                 ON CONFLICT(image_hash) DO UPDATE SET
-                    filename               = excluded.filename,
-                    capture_datetime       = COALESCE(excluded.capture_datetime, annotations_v2.capture_datetime),
-                    notes                  = excluded.notes,
-                    primary_failure_cause  = excluded.primary_failure_cause,
-                    updated_at             = excluded.updated_at
+                    filename                  = excluded.filename,
+                    capture_datetime          = COALESCE(excluded.capture_datetime, annotations_v2.capture_datetime),
+                    crop_quality              = excluded.crop_quality,
+                    image_quality             = excluded.image_quality,
+                    agree_with_model_decision = excluded.agree_with_model_decision,
+                    updated_at                = excluded.updated_at
                 """,
-                (digest, filename, original, captured, notes, cause, created, now),
+                (digest, filename, original, captured, crop, image, agree, created, now),
             )
-            self._conn.execute("DELETE FROM annotation_categories_v2 WHERE image_hash = ?", (digest,))
-            for category in cleaned:
-                self._conn.execute(
-                    "INSERT OR IGNORE INTO annotation_categories_v2(image_hash, category) VALUES (?, ?)",
-                    (digest, category),
-                )
-                # Free-text categories are remembered so they show up next time.
-                self._conn.execute(
-                    "INSERT OR IGNORE INTO categories(name, ordering, builtin) VALUES (?, 500, 0)",
-                    (category,),
-                )
+            # Superseded columns are deliberately left untouched by the UPDATE
+            # above: an old note or category set stays readable as history.
 
         logger.info(
-            "Annotation saved for %s (%d categories, primary cause %s)", filename, len(cleaned), cause or "none"
+            "Annotation saved for %s (crop=%s, image=%s, agree=%s)",
+            filename,
+            crop or "unset",
+            image or "unset",
+            agree or "unset",
         )
-        return Annotation(
+        saved = self.get(image_path)
+        return saved if saved is not None else Annotation(
             image_hash=digest,
             filename=filename,
             original_path=original,
-            categories=sorted(cleaned),
-            primary_failure_cause=cause,
-            notes=notes,
+            crop_quality=crop,
+            image_quality=image,
+            agree_with_model_decision=agree,
             capture_datetime=captured,
             created_at=created,
             updated_at=now,
@@ -647,16 +765,21 @@ class AnnotationSummary:
 
     total_false_negatives: int = 0
     annotated: int = 0
-    category_counts: list[tuple[str, int]] = field(default_factory=list)
-    combination_counts: list[tuple[tuple[str, ...], int]] = field(default_factory=list)
-    # Frequency of the single primary root cause, across annotations that set
-    # one. A separate breakdown from category_counts because it answers a
-    # different question: not "what tags apply" but "what mainly broke it".
-    primary_cause_counts: list[tuple[str, int]] = field(default_factory=list)
+    # field name -> [(value, count)], one breakdown per diagnostic field, each
+    # ordered most frequent first. Only annotations that set that particular
+    # field are counted in it, so the three need not sum to the same total.
+    field_counts: dict[str, list[tuple[str, int]]] = field(default_factory=dict)
+    # The distinct (crop, image, agree) triples actually observed, most common
+    # first - the cross-field pattern a single-field breakdown cannot show.
+    combination_counts: list[tuple[tuple[str, str, str], int]] = field(default_factory=list)
     recent: list[Annotation] = field(default_factory=list)
     unannotated: list[str] = field(default_factory=list)
-    known_categories: list[str] = field(default_factory=list)
-    known_primary_causes: list[str] = field(default_factory=list)
+    # The fixed vocabularies, so the UI renders the same options the store
+    # validates against.
+    field_vocabularies: dict[str, list[str]] = field(default_factory=dict)
+    # Records still carrying pre-redesign content, so it can be reported rather
+    # than silently ignored.
+    with_legacy_content: int = 0
     database_path: str = ""
     total_in_database: int = 0
     # Images whose identity could not be established: reported explicitly,
@@ -682,16 +805,22 @@ class AnnotationSummary:
             "annotated": self.annotated,
             "unannotated": self.unannotated_count,
             "coverage": self.coverage,
-            "category_counts": [{"category": name, "count": count} for name, count in self.category_counts],
+            "field_counts": {
+                name: [{"value": value, "count": count} for value, count in counts]
+                for name, counts in self.field_counts.items()
+            },
             "combination_counts": [
-                {"categories": list(combo), "count": count} for combo, count in self.combination_counts
-            ],
-            "primary_cause_counts": [
-                {"cause": name, "count": count} for name, count in self.primary_cause_counts
+                {
+                    "crop_quality": combo[0],
+                    "image_quality": combo[1],
+                    "agree_with_model_decision": combo[2],
+                    "count": count,
+                }
+                for combo, count in self.combination_counts
             ],
             "recent": [annotation.as_dict() for annotation in self.recent],
-            "known_categories": self.known_categories,
-            "known_primary_causes": self.known_primary_causes,
+            "field_vocabularies": self.field_vocabularies,
+            "with_legacy_content": self.with_legacy_content,
             "database_path": self.database_path,
             "total_in_database": self.total_in_database,
             "unresolved": [item.as_dict() for item in self.unresolved],
@@ -714,17 +843,22 @@ def summarise(
     """
     found, unresolved = store.get_many(false_negative_paths)
 
-    category_counter: Counter[str] = Counter()
-    combination_counter: Counter[tuple[str, ...]] = Counter()
-    primary_cause_counter: Counter[str] = Counter()
+    field_counters: dict[str, Counter[str]] = {name: Counter() for name in ANNOTATION_FIELDS}
+    combination_counter: Counter[tuple[str, str, str]] = Counter()
     for annotation in found.values():
-        category_counter.update(annotation.categories)
-        if len(annotation.categories) > 1:
-            # Sorted so {Action shot, Lighting} and {Lighting, Action shot} are
-            # counted as the same combination.
-            combination_counter[tuple(sorted(annotation.categories))] += 1
-        if annotation.primary_failure_cause:
-            primary_cause_counter[annotation.primary_failure_cause] += 1
+        for name in ANNOTATION_FIELDS:
+            value = getattr(annotation, name)
+            if value:
+                field_counters[name][value] += 1
+        # Unset fields participate as an explicit placeholder rather than being
+        # dropped, so a combination row always describes the whole record.
+        combination_counter[
+            (
+                annotation.crop_quality or "(unset)",
+                annotation.image_quality or "(unset)",
+                annotation.agree_with_model_decision or "(unset)",
+            )
+        ] += 1
 
     recent = sorted(found.values(), key=lambda a: a.updated_at, reverse=True)[:recent_limit]
     unresolved_paths = {item.image_path for item in unresolved}
@@ -735,13 +869,12 @@ def summarise(
     return found, AnnotationSummary(
         total_false_negatives=len(false_negative_paths),
         annotated=len(found),
-        category_counts=category_counter.most_common(),
+        field_counts={name: counter.most_common() for name, counter in field_counters.items()},
         combination_counts=combination_counter.most_common(combination_limit),
-        primary_cause_counts=primary_cause_counter.most_common(),
         recent=recent,
         unannotated=unannotated,
-        known_categories=store.categories(),
-        known_primary_causes=list(PRIMARY_FAILURE_CAUSES),
+        field_vocabularies={name: list(values) for name, values in ANNOTATION_FIELDS.items()},
+        with_legacy_content=sum(1 for a in found.values() if a.has_legacy_content),
         database_path=str(store.db_path),
         total_in_database=store.count(),
         unresolved=unresolved,
@@ -780,25 +913,36 @@ def render_summary(summary: AnnotationSummary) -> str:
         lines.append(
             f"  {len(summary.pending_migration):,} old path-keyed record(s) await a resolvable file"
         )
-    if summary.category_counts:
-        lines += ["", "  Category frequencies:"]
-        for name, count in summary.category_counts:
-            share = count / summary.annotated * 100 if summary.annotated else 0.0
-            lines.append(f"    {name:<38}{count:>5,}  ({share:.0f}% of annotated)")
+    for field_name, counts in summary.field_counts.items():
+        if not counts:
+            continue
+        lines += ["", f"  {ANNOTATION_FIELD_LABELS[field_name]}:"]
+        answered = sum(count for _, count in counts)
+        for value, count in counts:
+            share = count / answered * 100 if answered else 0.0
+            lines.append(f"    {value:<28}{count:>5,}  ({share:.0f}% of {answered} answered)")
     if summary.combination_counts:
-        lines += ["", "  Most common combinations:"]
+        lines += ["", "  Most common combinations (crop / image / agree):"]
         for combo, count in summary.combination_counts:
-            lines.append(f"    {count:>4,}x  {' + '.join(combo)}")
-    if summary.primary_cause_counts:
-        lines += ["", "  Primary failure cause frequencies:"]
-        for name, count in summary.primary_cause_counts:
-            share = count / summary.annotated * 100 if summary.annotated else 0.0
-            lines.append(f"    {name:<38}{count:>5,}  ({share:.0f}% of annotated)")
+            lines.append(f"    {count:>4,}x  {' / '.join(combo)}")
+    if summary.with_legacy_content:
+        lines += [
+            "",
+            f"  {summary.with_legacy_content:,} record(s) also carry pre-redesign notes or",
+            "  categories, kept read-only and not counted above.",
+        ]
     if summary.recent:
         lines += ["", "  Recently annotated:"]
         for annotation in summary.recent[:8]:
-            categories = ", ".join(annotation.categories) or "(notes only)"
-            lines.append(f"    {annotation.updated_at[:16]}  {annotation.filename:<28}{categories}")
+            fields = " / ".join(
+                value or "-"
+                for value in (
+                    annotation.crop_quality,
+                    annotation.image_quality,
+                    annotation.agree_with_model_decision,
+                )
+            )
+            lines.append(f"    {annotation.updated_at[:16]}  {annotation.filename:<28}{fields}")
     if not summary.annotated:
         lines += [
             "",

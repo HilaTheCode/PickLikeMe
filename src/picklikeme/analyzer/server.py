@@ -29,7 +29,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
 from ..identity import IdentityUnavailable
-from .annotations import AnnotationStore
+from .annotations import AnnotationStore, InvalidAnnotationValue
 
 logger = logging.getLogger(__name__)
 
@@ -138,13 +138,15 @@ class AnnotationRequestHandler(SimpleHTTPRequestHandler):
         if route == "/api/health":
             self._send_json({"ok": True, "database": str(self.store.db_path)})
             return
-        if route == "/api/categories":
-            self._send_json({"categories": self.store.categories()})
-            return
-        if route == "/api/primary-causes":
-            from .annotations import PRIMARY_FAILURE_CAUSES
+        if route == "/api/fields":
+            from .annotations import ANNOTATION_FIELD_LABELS
 
-            self._send_json({"primary_causes": list(PRIMARY_FAILURE_CAUSES)})
+            self._send_json(
+                {
+                    "fields": self.store.field_vocabularies(),
+                    "labels": ANNOTATION_FIELD_LABELS,
+                }
+            )
             return
         if route == "/api/annotations":
             self._send_json({"annotations": [a.as_dict() for a in self.store.all()]})
@@ -184,18 +186,20 @@ class AnnotationRequestHandler(SimpleHTTPRequestHandler):
             self._send_json({"error": "image_path is required"}, status=400)
             return
 
-        categories = payload.get("categories") or []
-        if not isinstance(categories, list):
-            self._send_json({"error": "categories must be a list"}, status=400)
-            return
-
         try:
             annotation = self.store.save(
                 image_path,
-                categories,
-                payload.get("notes") or "",
-                primary_failure_cause=payload.get("primary_failure_cause") or None,
+                crop_quality=payload.get("crop_quality") or None,
+                image_quality=payload.get("image_quality") or None,
+                agree_with_model_decision=payload.get("agree_with_model_decision") or None,
             )
+        except InvalidAnnotationValue as exc:
+            # A value outside the fixed vocabulary is a bug in the caller, not a
+            # user mistake - the UI only ever offers valid options. Rejected
+            # rather than stored, so the counts stay trustworthy.
+            logger.warning("Refusing an out-of-vocabulary annotation value: %s", exc)
+            self._send_json({"error": str(exc), "invalid_value": True}, status=400)
+            return
         except IdentityUnavailable as exc:
             # Explicit, not a fallback: without identity the annotation could
             # only be attached to a guess, and a wrong diagnosis is worse than

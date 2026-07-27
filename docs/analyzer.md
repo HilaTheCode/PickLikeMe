@@ -273,13 +273,12 @@ Two notes worth knowing when reading the numbers:
 
 A false negative is an image you deliberately kept and the model rejected —
 the most valuable failure to understand. The analyzer lets you record **why**,
-in your own words, and accumulates those diagnoses across runs.
+and accumulates those diagnoses across runs.
 
 **The annotations are yours.** Nothing in the codebase infers, suggests or
-pre-fills a category or a primary cause. There is no model, heuristic or default
-in the path: the report renders what the database holds and stores exactly what
-you ticked and typed. The annotation workflow itself (categories, primary
-failure cause, notes) is deliberately false-negative-only — false positives are
+pre-fills a value. There is no model, heuristic or default in the path: the
+report renders what the database holds and stores exactly what you selected. The
+annotation workflow is deliberately false-negative-only — false positives are
 not annotatable. The separate detector-box thumbnail overlay (below) is *not*
 scoped that way and does draw on false positives and every other category; the
 two features are independent.
@@ -304,51 +303,59 @@ copy-paste in one step: `picklikeme analyze ... --serve`.
 
 Each false negative gets a panel with its thumbnail (with detector boxes drawn
 on it, if any were resolved — see [Detector-box thumbnail overlay](#detector-box-thumbnail-overlay)
-below), score, confidence, rank and displacement, an **Edit** button, a primary
-failure cause radio group, the category checklist, a free-text notes box and
-**Save**. Opened straight from disk the report still *shows* existing
-annotations, with a banner explaining that editing needs `annotate`.
+below), score, confidence, rank and displacement, an **Edit** button, three
+dropdowns and **Save**. Opened straight from disk the report still *shows*
+existing annotations, with a banner explaining that editing needs `annotate`.
 
 Example of a completed annotation:
 
 ```
-Primary cause: ○ Head outside crop  ● Occlusion  ○ Multiple birds  ○ ...
-✓ Action shot
-✓ Artistic choice
-Notes: "Great wing position.
-        The model consistently rejects dynamic poses."
+Crop Quality:              [ Too Small          ▾ ]
+Image Quality:             [ Good               ▾ ]
+Agree with Model Decision: [ No                 ▾ ]
 ```
 
-### Two independent dimensions
+### Three independent fields
 
-- **Primary failure cause** — a single choice from a fixed vocabulary, answering
-  "what mainly broke it": `Detection crop too small`, `Head outside crop`,
-  `Multiple birds`, `Occlusion`, `Classifier disagreement`, `Other`. This
-  vocabulary is fixed (not grown from free text) so the frequency breakdown
-  stays comparable across many annotations. Optional — an annotation can set a
-  category without a primary cause, or a primary cause with no categories; either
-  one alone is enough to keep the record (it is only deleted when categories,
-  cause and notes are all cleared).
-- **Categories** — the original multi-select tag list, for anything else worth
-  recording:
+Every field is a **closed vocabulary with no free-text option**, because the
+point of the knowledge base is data that can be counted. A growable tag list
+makes frequencies incomparable over time: "Backlit" and "backlighting" become
+two rows in a breakdown but one phenomenon.
 
-  Wrong crop · Multiple subjects · Subject too small · Foreground obstruction ·
-  Out of focus foreground · Subject not centered · Artistic choice · Distracting
-  background · Detector mistake · Pose not appreciated · Action shot · Lighting ·
-  Backlit · Animal not in supported categories · Other
+The three axes are independent — a technically fine crop of an out-of-focus
+bird and a badly placed crop of a perfectly sharp one are different diagnoses.
 
-  Unlike primary cause, this vocabulary **does** grow: the free-text box next to
-  Save adds a new category that is remembered for later runs. Seeded into the
-  database on first use, so it grows without a code change.
+| Field | Values | Question it answers |
+| --- | --- | --- |
+| **Crop Quality** | `Good`, `Too Small`, `Wrong Location`, `Too Large` | How good is the crop the detector chose, regardless of the image quality |
+| **Image Quality** | `Good`, `Missing Eye`, `Out of Focus`, `No Relevant Subject` | How good is the photograph itself, regardless of the crop |
+| **Agree with Model Decision** | `Yes`, `No` | Having looked at it, was the model right to reject this |
+
+`No Relevant Subject` means there is nothing meaningful to evaluate — the bird
+is too small, heavily occluded, or effectively absent.
+
+Every field is optional and independent: any one of them alone is enough to keep
+the record, which is deleted only when all three are cleared. A value outside a
+vocabulary is **refused** (`InvalidAnnotationValue`, HTTP 400), never stored, so
+the counts stay trustworthy.
+
+### Records written before this redesign
+
+Databases annotated under the earlier scheme (a growable category checklist, a
+primary-failure-cause radio and a free-text notes box) keep everything they held.
+That content is shown read-only beside the image and reported as a count in the
+summary, but it is **not** auto-mapped onto the three fields and never enters a
+breakdown: guessing that an old `Subject too small` tag meant Crop Quality
+`Too Small` would invent an answer you never gave and then count it. Re-annotate
+those images to bring them into the statistics.
 
 ### False Negative Summary
 
-A report section showing category frequencies, the most common combinations
-(order-insensitive, so `Backlit + Lighting` and `Lighting + Backlit` are one
-entry), **primary failure cause frequencies** and the single most common cause as
-a summary card, recently annotated images, and everything not yet annotated. The
-panel list filters by one category, by several (any or all), by primary cause,
-and by annotated / not annotated.
+A report section showing one frequency breakdown per field, the most common
+whole-record combinations (`crop / image / agree`, with `(unset)` for unanswered
+fields), a card counting how often you disagreed with the model, recently
+annotated images, and everything not yet annotated. The panel list filters by an
+exact value on any field and by annotated / not annotated.
 
 ### Storage
 
@@ -357,7 +364,7 @@ and by annotated / not annotated.
 | Location | `<project>/annotations/false_negatives.db` (`--annotations-db` to move) |
 | Why there | Outside every output directory — those are per-run and get replaced; a knowledge base must outlive them |
 | Tables | `annotations_v2`, `annotation_categories_v2`, `categories`, `identity_cache`, `unmigrated_v1`, `schema_info` |
-| Per record | `image_hash` (identity), filename, original path, capture datetime if readable, timestamps, categories, primary failure cause, notes |
+| Per record | `image_hash` (identity), filename, original path, capture datetime if readable, timestamps, the three fields, plus any pre-redesign categories / cause / notes |
 | Journal | WAL, so generating a report never blocks the UI writing |
 | Written | Only this database. Never a ranking, checkpoint, dataset, image or report |
 
@@ -443,7 +450,8 @@ Databases written before this change keyed annotations on a path digest. Opening
 one with the current code migrates it **automatically**:
 
 - every v1 record whose file can be found is re-keyed to content identity, with
-  categories, notes and `created_at` preserved;
+  categories, notes and `created_at` preserved (as legacy content — see
+  [Records written before this redesign](#records-written-before-this-redesign));
 - two v1 records that turn out to be the same image are **merged** (categories
   unioned, both notes kept) rather than duplicated;
 - records whose file cannot be found are **parked**, not dropped — they are kept
@@ -451,11 +459,11 @@ one with the current code migrates it **automatically**:
   is lost;
 - it is idempotent: migrated rows leave the v1 table, so reopening is a no-op.
 
-A second, unrelated kind of upgrade also runs automatically on open: an
-existing v2 database from before the primary-failure-cause field existed gains
-that column via a guarded `ALTER TABLE` (checked with `PRAGMA table_info` first,
-so it is silent and idempotent) — every existing row simply reads back with
-`primary_failure_cause = NULL` until you set one.
+A second, unrelated kind of upgrade also runs automatically on open: an existing
+v2 database from before the three fields existed gains each missing column via a
+guarded `ALTER TABLE` (checked with `PRAGMA table_info` first, so it is silent
+and idempotent) — every existing row simply reads back with all three unset until
+you answer them.
 
 ### Server
 
@@ -467,10 +475,9 @@ cannot escape), and the only write endpoint is `POST /api/annotations`.
 | Endpoint | Purpose |
 | --- | --- |
 | `GET /api/health` | Probe; the page uses it to decide whether Save is available |
-| `GET /api/categories` | Current category vocabulary |
-| `GET /api/primary-causes` | The fixed primary-failure-cause vocabulary |
+| `GET /api/fields` | The three fixed vocabularies and their display labels |
 | `GET /api/annotations` | All records, to refresh the page |
-| `POST /api/annotations` | `{image_path, categories[], primary_failure_cause, notes}` |
+| `POST /api/annotations` | `{image_path, crop_quality, image_quality, agree_with_model_decision}`; an out-of-vocabulary value is `400`, not stored |
 | `GET /source?path=...` | Streams an original image; used so a *served* report can still open source files (browsers block navigating from a served page straight to a `file://` link). Confined to the dataset roots recorded in this report's own `analysis.json` — nothing outside it is reachable |
 
 Built on `http.server` and `sqlite3` from the standard library — no new

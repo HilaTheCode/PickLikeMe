@@ -21,7 +21,7 @@ import logging
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from ..annotations import PRIMARY_FAILURE_CAUSES
+from ..annotations import ANNOTATION_FIELD_LABELS, ANNOTATION_FIELDS
 from ..links import asset_url, source_api_url, source_file_uri
 from ..suggestions import CRITICAL, WARNING
 
@@ -109,17 +109,16 @@ border-left:2px solid var(--border);padding-left:9px}
 .fn-editor{display:none;padding:0 13px 13px}
 .fn.editing .fn-editor{display:block}
 .fn.editing{border-color:var(--accent)}
-.cat-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(215px,1fr));gap:3px 14px;
-margin:9px 0 11px}
-.cause-grid{background:var(--panel);border:1px solid var(--border);border-radius:8px;
-padding:9px 12px;margin-bottom:4px}
-.cat{display:flex;gap:7px;align-items:center;font-size:13.5px;cursor:pointer;padding:2px 0}
-.cat input{cursor:pointer;width:15px;height:15px;accent-color:var(--accent)}
-.tag.cause-tag{background:var(--warn);color:#1a1206}
-textarea{width:100%;min-height:78px;resize:vertical;font:inherit;font-size:13.5px;padding:8px 10px;
-border-radius:7px;border:1px solid var(--border);background:var(--panel);color:var(--text)}
-input[type=text].newcat{font:inherit;font-size:13px;padding:6px 9px;border-radius:7px;
-border:1px solid var(--border);background:var(--panel);color:var(--text);width:230px}
+.field-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px;
+margin:11px 0 4px}
+.field{display:flex;flex-direction:column;gap:5px}
+.field-label{font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;
+font-weight:600}
+.field select{width:100%}
+.tag.field-tag{background:var(--panel);color:var(--text);border:1px solid var(--border);
+font-weight:600}
+.fn-legacy{margin-top:7px;font-size:12px;color:var(--muted);font-style:italic;
+border-left:2px dashed var(--border);padding-left:9px}
 .row{display:flex;gap:9px;align-items:center;flex-wrap:wrap;margin-top:9px}
 .status{font-size:12.5px;color:var(--muted)}
 .status.saved{color:var(--good)}.status.error{color:var(--bad)}
@@ -130,7 +129,6 @@ margin-bottom:14px;font-size:13.5px}
 padding-bottom:13px;border-bottom:1px solid var(--border)}
 select,.filters select{font:inherit;font-size:13px;padding:6px 9px;border-radius:7px;
 border:1px solid var(--border);background:var(--panel);color:var(--text)}
-.filters select[multiple]{min-width:215px;min-height:80px}
 .freq{display:flex;align-items:center;gap:10px;margin-bottom:5px}
 .freq .n{font-variant-numeric:tabular-nums;color:var(--muted);font-size:12.5px;width:44px;text-align:right}
 .freq .bar{height:15px;background:var(--accent);border-radius:4px;min-width:2px}
@@ -172,19 +170,28 @@ async function plmProbe(){
   }catch(e){ return false; }
 }
 
-function plmRenderTags(el, categories, cause, notes){
+// The three diagnostic fields, and their display labels. Kept in one place so
+// save, render and filter all agree; the server validates the same set.
+const PLM_FIELDS = ['crop_quality','image_quality','agree_with_model_decision'];
+const PLM_LABELS = {
+  crop_quality:'Crop Quality',
+  image_quality:'Image Quality',
+  agree_with_model_decision:'Agree with Model Decision'
+};
+const plmAttr = f => 'data-'+f.replace(/_/g,'-');
+
+function plmRenderTags(el, annotation){
   const tags = el.querySelector('.fn-tags');
-  const note = el.querySelector('.fn-note');
+  const values = {};
+  PLM_FIELDS.forEach(f=>{ values[f] = (annotation && annotation[f]) || ''; });
   if(tags){
-    const causeTag = cause ? `<span class="tag cause-tag">Cause: ${plmEsc(cause)}</span>` : '';
-    const catTags = (categories||[]).map(c=>`<span class="tag">${plmEsc(c)}</span>`).join('');
-    tags.innerHTML = causeTag + catTags;
-    if(!tags.innerHTML){ tags.innerHTML = '<span class="status">not yet annotated</span>'; }
+    const html = PLM_FIELDS.filter(f=>values[f])
+      .map(f=>`<span class="tag field-tag">${plmEsc(PLM_LABELS[f])}: ${plmEsc(values[f])}</span>`)
+      .join('');
+    tags.innerHTML = html || '<span class="status">not yet annotated</span>';
   }
-  if(note){ note.textContent = notes || ''; note.style.display = notes ? '' : 'none'; }
-  el.dataset.categories = (categories||[]).join('|');
-  el.dataset.cause = cause || '';
-  el.dataset.annotated = (categories&&categories.length)||notes||cause ? '1' : '0';
+  PLM_FIELDS.forEach(f=>{ el.setAttribute(plmAttr(f), values[f]); });
+  el.dataset.annotated = PLM_FIELDS.some(f=>values[f]) ? '1' : '0';
 }
 
 function plmEsc(s){const d=document.createElement('div');d.textContent=s;return d.innerHTML;}
@@ -194,16 +201,10 @@ function plmToggleEdit(el){ el.classList.toggle('editing'); }
 async function plmSave(el){
   const status = el.querySelector('.status');
   const path = el.dataset.path;
-  // Categories are checkboxes in the general grid; the primary cause is a
-  // separate radio group (.cause-grid) - selectors must not mix the two, or a
-  // chosen cause would be saved as an extra "category" tag.
-  const checked = [...el.querySelectorAll('.cat-grid:not(.cause-grid) input[type=checkbox]:checked')]
-    .map(i=>i.value);
-  const causeInput = el.querySelector('.cause-grid input[type=radio]:checked');
-  const cause = causeInput ? causeInput.value : '';
-  const custom = el.querySelector('.newcat');
-  if(custom && custom.value.trim()){ checked.push(custom.value.trim()); }
-  const notes = el.querySelector('textarea').value;
+  const payload = {image_path:path};
+  el.querySelectorAll('select.ann-field').forEach(sel=>{
+    payload[sel.dataset.field] = sel.value;   // '' means "not set"
+  });
 
   if(!PLM.online){
     status.textContent = 'Read-only: start `picklikeme annotate` to save.';
@@ -214,16 +215,16 @@ async function plmSave(el){
   try{
     const r = await fetch('api/annotations',{
       method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({image_path:path, categories:checked, notes:notes, primary_failure_cause:cause})
+      body: JSON.stringify(payload)
     });
     const j = await r.json();
     if(!r.ok || j.error){ throw new Error(j.error || ('HTTP '+r.status)); }
-    plmRenderTags(el, j.annotation.categories, j.annotation.primary_failure_cause, j.annotation.notes);
-    if(custom) custom.value='';
+    plmRenderTags(el, j.annotation);
     status.textContent = j.deleted ? 'Annotation cleared.' : 'Saved.';
     status.className = 'status saved';
     el.classList.remove('editing');
     plmUpdateCounts();
+    plmApplyFilters();
   }catch(e){
     status.textContent = 'Save failed: '+e.message;
     status.className = 'status error';
@@ -237,25 +238,25 @@ function plmUpdateCounts(){
   if(el) el.textContent = `${done} of ${all.length} annotated`;
 }
 
-// Filtering: by one or several categories, and by annotated / not annotated.
+// Filtering: by annotated / not annotated, and by an exact value per field.
 function plmApplyFilters(){
   const mode=document.getElementById('f-state')?.value||'all';
-  const select=document.getElementById('f-cats');
-  const wanted=select?[...select.selectedOptions].map(o=>o.value):[];
-  const matchAll=document.getElementById('f-all')?.checked;
-  const wantedCause=document.getElementById('f-cause')?.value||'';
+  // One optional value filter per field; blank means "any".
+  const wanted={};
+  document.querySelectorAll('select.f-field').forEach(sel=>{
+    if(sel.value) wanted[sel.dataset.field]=sel.value;
+  });
   let shown=0;
   document.querySelectorAll('.fn').forEach(el=>{
-    const cats=(el.dataset.categories||'').split('|').filter(Boolean);
-    const cause=el.dataset.cause||'';
     const annotated=el.dataset.annotated==='1';
     let ok=true;
     if(mode==='annotated'&&!annotated) ok=false;
     if(mode==='unannotated'&&annotated) ok=false;
-    if(ok&&wanted.length){
-      ok = matchAll ? wanted.every(w=>cats.includes(w)) : wanted.some(w=>cats.includes(w));
+    if(ok){
+      for(const f of Object.keys(wanted)){
+        if((el.getAttribute(plmAttr(f))||'') !== wanted[f]){ ok=false; break; }
+      }
     }
-    if(ok&&wantedCause){ ok = (cause===wantedCause); }
     el.style.display = ok ? '' : 'none';
     if(ok) shown++;
   });
@@ -269,8 +270,9 @@ document.addEventListener('DOMContentLoaded', async ()=>{
     el.querySelector('.btn-save')?.addEventListener('click',()=>plmSave(el));
     el.querySelector('.btn-cancel')?.addEventListener('click',()=>el.classList.remove('editing'));
   });
-  ['f-state','f-cats','f-all','f-cause'].forEach(id=>
-    document.getElementById(id)?.addEventListener('change',plmApplyFilters));
+  document.getElementById('f-state')?.addEventListener('change',plmApplyFilters);
+  document.querySelectorAll('select.f-field').forEach(sel=>
+    sel.addEventListener('change',plmApplyFilters));
   plmUpdateCounts();
 
   PLM.online = await plmProbe();
@@ -296,14 +298,10 @@ document.addEventListener('DOMContentLoaded', async ()=>{
         const a=byHash[el.dataset.hash]||byPath[el.dataset.path];
         if(a){
           el.dataset.hash=a.image_hash;
-          plmRenderTags(el,a.categories,a.primary_failure_cause,a.notes);
-          el.querySelectorAll('.cat-grid:not(.cause-grid) input[type=checkbox]').forEach(i=>{
-            i.checked=(a.categories||[]).includes(i.value);
+          plmRenderTags(el,a);
+          el.querySelectorAll('select.ann-field').forEach(sel=>{
+            sel.value=a[sel.dataset.field]||'';
           });
-          el.querySelectorAll('.cause-grid input[type=radio]').forEach(i=>{
-            i.checked=(i.value===a.primary_failure_cause);
-          });
-          el.querySelector('textarea').value=a.notes||'';
         }
       });
       plmUpdateCounts();
@@ -561,27 +559,56 @@ DETECTOR_BOX_LEGEND = (
 )
 
 
-def _annotation_panels(result: "AnalysisResult", thumbs: dict[str, Path]) -> str:
-    """Capability: an annotation panel per false negative.
+def _field_select(field_name: str, values: list[str], current: str | None) -> str:
+    """One labelled dropdown for a fixed-vocabulary annotation field.
 
-    Annotation (the category checklist, primary failure cause and notes) is
-    false-negative-only by design - that is the deliberate diagnostic question
-    this feature answers. The detector-box overlay drawn on the thumbnail is
-    not scoped that way; it is whatever `thumbs` already carries, which
-    build_html() has pre-merged with overlays for every image in the report.
-    The checklist itself is rendered unchecked unless the database already
-    holds a diagnosis for that image - nothing is ever pre-selected on the
-    model's behalf.
+    A `<select>` rather than radios: three fields of four options each would be
+    twelve radio targets per panel, which crowds a list meant to be scanned
+    quickly. The blank option is what "not answered yet" looks like, and is what
+    a photographer picks to clear a field.
+    """
+    options = '<option value="">- not set -</option>' + "".join(
+        f'<option value="{_e(value)}"{" selected" if value == current else ""}>{_e(value)}</option>'
+        for value in values
+    )
+    return (
+        f'<label class="field"><span class="field-label">{_e(ANNOTATION_FIELD_LABELS[field_name])}</span>'
+        f'<select class="ann-field" data-field="{_e(field_name)}">{options}</select></label>'
+    )
+
+
+def _annotation_panels(result: "AnalysisResult", thumbs: dict[str, Path]) -> str:
+    """An annotation panel per false negative.
+
+    Annotation is false-negative-only by design - that is the deliberate
+    diagnostic question this feature answers. The detector-box overlay drawn on
+    the thumbnail is not scoped that way; it is whatever `thumbs` already
+    carries, which build_html() has pre-merged with overlays for every image in
+    the report.
+
+    Every field renders unset unless the database already holds a value for
+    that image - nothing is ever pre-selected on the model's behalf.
     """
     records = result.errors.false_negatives
     if not records:
         return '<p class="sub">No false negatives - nothing to annotate.</p>'
 
     summary = result.annotation_summary
-    categories = list(summary.known_categories) if summary else []
-    primary_causes = list(summary.known_primary_causes) if summary else list(PRIMARY_FAILURE_CAUSES)
+    vocabularies = (
+        summary.field_vocabularies
+        if summary and summary.field_vocabularies
+        else {name: list(values) for name, values in ANNOTATION_FIELDS.items()}
+    )
     output_dir = result.config.output_dir
 
+    field_filters = "".join(
+        f'<label>{_e(ANNOTATION_FIELD_LABELS[name])} '
+        f'<select class="f-field" data-field="{_e(name)}">'
+        '<option value="">any</option>'
+        + "".join(f'<option value="{_e(v)}">{_e(v)}</option>' for v in values)
+        + "</select></label>"
+        for name, values in vocabularies.items()
+    )
     filters = (
         '<div class="filters">'
         '<label>Show <select id="f-state">'
@@ -589,15 +616,8 @@ def _annotation_panels(result: "AnalysisResult", thumbs: dict[str, Path]) -> str
         '<option value="unannotated">not annotated</option>'
         '<option value="annotated">annotated only</option>'
         "</select></label>"
-        '<label>Categories <select id="f-cats" multiple size="4">'
-        + "".join(f'<option value="{_e(name)}">{_e(name)}</option>' for name in categories)
-        + "</select></label>"
-        '<label class="cat"><input type="checkbox" id="f-all"> match <em>all</em> selected</label>'
-        '<label>Primary cause <select id="f-cause">'
-        '<option value="">any</option>'
-        + "".join(f'<option value="{_e(name)}">{_e(name)}</option>' for name in primary_causes)
-        + "</select></label>"
-        '<span class="status" id="f-count"></span>'
+        + field_filters
+        + '<span class="status" id="f-count"></span>'
         '<span class="status" id="fn-coverage"></span>'
         "</div>"
     )
@@ -611,14 +631,15 @@ def _annotation_panels(result: "AnalysisResult", thumbs: dict[str, Path]) -> str
     )
 
     panels = []
-    for panel_index, record in enumerate(records, start=1):
+    for record in records:
         image = record.image
         path = image.image_path
         detection = (result.detections or {}).get(path)
         annotation = result.annotations.get(path)
-        current = annotation.categories if annotation else []
-        current_cause = annotation.primary_failure_cause if annotation else None
-        notes = annotation.notes if annotation else ""
+        values = {
+            name: (getattr(annotation, name) if annotation else None) for name in ANNOTATION_FIELDS
+        }
+        answered = [v for v in values.values() if v]
 
         # `thumbs` is pre-merged with overlays in build_html(), so this is
         # already the annotated copy when one exists.
@@ -653,44 +674,57 @@ def _annotation_panels(result: "AnalysisResult", thumbs: dict[str, Path]) -> str
             else ""
         )
         tags = (
-            (f'<span class="tag cause-tag">Cause: {_e(current_cause)}</span>' if current_cause else "")
-            + "".join(f'<span class="tag">{_e(c)}</span>' for c in current)
-        ) or '<span class="status">not yet annotated</span>'
-        checklist = "".join(
-            f'<label class="cat"><input type="checkbox" value="{_e(name_)}"'
-            f'{" checked" if name_ in current else ""}> {_e(name_)}</label>'
-            for name_ in categories
+            "".join(
+                f'<span class="tag field-tag">{_e(ANNOTATION_FIELD_LABELS[field_name])}: '
+                f"{_e(value)}</span>"
+                for field_name, value in values.items()
+                if value
+            )
+            or '<span class="status">not yet annotated</span>'
         )
-        cause_radios = "".join(
-            f'<label class="cat"><input type="radio" name="cause-{panel_index}" value="{_e(cause_name)}"'
-            f'{" checked" if cause_name == current_cause else ""}> {_e(cause_name)}</label>'
-            for cause_name in primary_causes
+        # Pre-redesign content, shown read-only so a record's history is
+        # visible rather than silently dropped. Never editable, never counted.
+        legacy = ""
+        if annotation is not None and annotation.has_legacy_content:
+            bits = []
+            if annotation.legacy_primary_failure_cause:
+                bits.append(f"cause: {annotation.legacy_primary_failure_cause}")
+            if annotation.legacy_categories:
+                bits.append(", ".join(annotation.legacy_categories))
+            if annotation.legacy_notes.strip():
+                bits.append(annotation.legacy_notes.strip())
+            legacy = (
+                '<div class="fn-legacy" title="recorded before the current three fields; '
+                'kept for reference, not counted">'
+                f"earlier annotation &middot; {_e(' &middot; '.join(bits))}</div>"
+            ).replace("&amp;middot;", "&middot;")
+
+        selects = "".join(
+            _field_select(field_name, vocabularies.get(field_name, []), values[field_name])
+            for field_name in ANNOTATION_FIELDS
         )
 
         panels.append(
             f'<div class="fn" data-path="{_e(path)}" '
             f'data-hash="{_e(annotation.image_hash if annotation else "")}" '
-            f'data-categories="{_e("|".join(current))}" '
-            f'data-cause="{_e(current_cause or "")}" '
-            f'data-annotated="{"1" if (current or notes or current_cause) else "0"}">'
+            + "".join(
+                f'data-{field_name.replace("_", "-")}="{_e(values[field_name] or "")}" '
+                for field_name in ANNOTATION_FIELDS
+            )
+            + f'data-annotated="{"1" if answered else "0"}">'
             f'<div class="fn-top">{thumb_html}'
             f'<div class="fn-meta"><div class="fn-name">{name}{moved}</div>'
             f'<div class="fn-nums">score {image.score:.4f} &middot; confidence '
             f'{_num(image.confidence, "{:.3f}")} &middot; rank {image.rank:,} &middot; '
             f"displaced {record.rank_displacement:,} &middot; you kept it{captured}{boxes}</div>"
-            f'<div class="fn-tags">{tags}</div>'
-            f'<div class="fn-note"{"" if notes else " style=display:none"}>{_e(notes)}</div>'
+            f'<div class="fn-tags">{tags}</div>{legacy}'
             f"</div>"
             f'<div class="fn-actions"><button class="btn-edit">Edit</button></div></div>'
             f'<div class="fn-editor">'
-            f'<div class="sub">Primary failure cause - what mainly broke it?</div>'
-            f'<div class="cat-grid cause-grid">{cause_radios}</div>'
-            f'<div class="sub" style="margin-top:10px">Other categories that applied</div>'
-            f'<div class="cat-grid">{checklist}</div>'
-            f'<textarea placeholder="Notes (optional)">{_e(notes)}</textarea>'
+            f'<div class="sub">Your diagnosis - judge the crop and the photograph separately.</div>'
+            f'<div class="field-grid">{selects}</div>'
             f'<div class="row"><button class="btn-save primary">Save</button>'
             f'<button class="btn-cancel">Cancel</button>'
-            f'<input type="text" class="newcat" placeholder="add a new category...">'
             f'<span class="status"></span></div>'
             f"</div></div>"
         )
@@ -708,6 +742,10 @@ def _annotation_summary(result: "AnalysisResult") -> str:
         f"{summary.annotated:,} of {summary.total_false_negatives:,} annotated"
         + (f" ({summary.coverage * 100:.1f}%)" if summary.coverage is not None else "")
     )
+    # The headline number: how often you looked at a rejection and disagreed
+    # with it. None when nobody has answered that field yet.
+    agree_counts = dict(summary.field_counts.get("agree_with_model_decision") or [])
+    disagreements = agree_counts.get("No", 0) if agree_counts else None
     cards = (
         '<div class="cards">'
         f'<div class="card"><div class="label">False negatives</div>'
@@ -722,77 +760,81 @@ def _annotation_summary(result: "AnalysisResult") -> str:
         f'<div class="value">{summary.total_in_database:,}</div>'
         f'<div class="note">records across all runs</div></div>'
         + (
-            f'<div class="card"><div class="label">Top primary cause</div>'
-            f'<div class="value" style="font-size:17px">{_e(summary.primary_cause_counts[0][0])}</div>'
-            f'<div class="note">{summary.primary_cause_counts[0][1]:,} of {summary.annotated:,} annotated</div></div>'
-            if summary.primary_cause_counts
+            f'<div class="card"><div class="label">Disagree with model</div>'
+            f'<div class="value">{disagreements:,}</div>'
+            f'<div class="note">of {summary.annotated:,} annotated</div></div>'
+            if disagreements is not None
             else ""
         )
         + "</div>"
     )
 
-    if summary.category_counts:
-        biggest = summary.category_counts[0][1]
+    # One breakdown per field: the fields are independent judgements, so they get
+    # independent charts rather than being pooled into a single tag frequency.
+    blocks = []
+    for field_name, label in ANNOTATION_FIELD_LABELS.items():
+        counts = summary.field_counts.get(field_name) or []
+        if not counts:
+            continue
+        biggest = counts[0][1]
         bars = "".join(
             f'<div class="freq"><span class="n">{count:,}</span>'
             f'<span class="bar" style="width:{count / biggest * 260:.0f}px"></span>'
             f'<span class="lbl">{_e(name)}</span></div>'
-            for name, count in summary.category_counts
+            for name, count in counts
         )
-        frequencies = f"<h3 style='margin:16px 0 8px;font-size:15px'>Category frequencies</h3>{bars}"
+        blocks.append(f"<h3 style='margin:18px 0 8px;font-size:15px'>{_e(label)}</h3>{bars}")
+    if blocks:
+        frequencies = "".join(blocks)
     else:
         frequencies = (
             "<p class=\"sub\">No annotations yet. Open the False negatives section, click "
-            "<strong>Edit</strong> on an image and record why the model missed it.</p>"
+            "<strong>Edit</strong> on an image and record your diagnosis.</p>"
         )
 
     combinations = ""
     if summary.combination_counts:
         rows = "".join(
-            f'<tr><td class="num">{count:,}</td><td>{_e(" + ".join(combo))}</td></tr>'
+            f'<tr><td class="num">{count:,}</td>'
+            + "".join(f"<td>{_e(value)}</td>" for value in combo)
+            + "</tr>"
             for combo, count in summary.combination_counts
         )
+        headers = "".join(f"<th>{_e(label)}</th>" for label in ANNOTATION_FIELD_LABELS.values())
         combinations = (
             "<h3 style='margin:18px 0 6px;font-size:15px'>Most common combinations</h3>"
-            '<table><thead><tr><th class="num">Count</th><th>Categories</th></tr></thead>'
+            f'<table><thead><tr><th class="num">Count</th>{headers}</tr></thead>'
             f"<tbody>{rows}</tbody></table>"
         )
 
-    primary_causes = ""
-    if summary.primary_cause_counts:
-        biggest = summary.primary_cause_counts[0][1]
-        bars = "".join(
-            f'<div class="freq"><span class="n">{count:,}</span>'
-            f'<span class="bar" style="width:{count / biggest * 260:.0f}px;background:var(--warn)"></span>'
-            f'<span class="lbl">{_e(name)}</span></div>'
-            for name, count in summary.primary_cause_counts
-        )
-        primary_causes = (
-            "<h3 style='margin:18px 0 8px;font-size:15px'>Primary failure cause frequencies</h3>"
-            f"{bars}"
+    legacy_note = ""
+    if summary.with_legacy_content:
+        legacy_note = (
+            '<div class="sug"><div class="t">'
+            f"{summary.with_legacy_content:,} record(s) carry pre-redesign notes or categories</div>"
+            '<div class="d">Kept verbatim and shown read-only beside the image. They are not '
+            "counted above: mapping a free-text note onto a fixed field would invent a judgement "
+            "you never made. Re-annotate those images to bring them into the counts.</div></div>"
         )
 
     def _recent_tags(a) -> str:
-        cause_tag = (
-            f'<span class="tag cause-tag">{_e(a.primary_failure_cause)}</span> '
-            if a.primary_failure_cause
-            else ""
+        return "".join(
+            f'<span class="tag field-tag">{_e(value)}</span> '
+            for value in (a.crop_quality, a.image_quality, a.agree_with_model_decision)
+            if value
         )
-        category_tags = "".join(f'<span class="tag">{_e(c)}</span> ' for c in a.categories)
-        return cause_tag + category_tags
 
     recent = ""
     if summary.recent:
         rows = "".join(
             f"<tr><td>{_e(a.updated_at[:16])}</td><td>{_e(a.filename)}</td>"
-            f"<td>{_recent_tags(a)}</td>"
-            f'<td class="muted">{_e(a.notes[:90])}</td></tr>'
+            f"<td>{_recent_tags(a)}</td></tr>"
             for a in summary.recent
         )
         recent = (
             "<h3 style='margin:18px 0 6px;font-size:15px'>Recently annotated</h3>"
             '<div class="scroll"><table><thead><tr><th>Updated</th><th>File</th>'
-            f"<th>Categories</th><th>Notes</th></tr></thead><tbody>{rows}</tbody></table></div>"
+            f"<th>Diagnosis</th></tr></thead><tbody>{rows}</tbody></table></div>"
         )
 
     unannotated = ""
@@ -849,7 +891,16 @@ def _annotation_summary(result: "AnalysisResult") -> str:
         "through renames, reorganisation and moves between drives. They are recorded by you, never "
         "generated, and never affect any metric in this report.</p>"
     )
-    return cards + notices + frequencies + combinations + primary_causes + recent + unannotated + footer
+    return (
+        cards
+        + notices
+        + legacy_note
+        + frequencies
+        + combinations
+        + recent
+        + unannotated
+        + footer
+    )
 
 
 def _suggestions(result: "AnalysisResult") -> str:
