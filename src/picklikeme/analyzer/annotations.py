@@ -57,7 +57,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Sequence
 
-from ..config import PROJECT_ROOT
+from ..config import PROJECT_ROOT, cli_prefix
 from ..identity import IdentityUnavailable, cache_key, capture_datetime, image_identity
 
 logger = logging.getLogger(__name__)
@@ -973,7 +973,7 @@ def render_summary(
     if not summary.annotated:
         lines += [
             "",
-            "  No annotations yet. Run `picklikeme annotate --output <dir>` and open the",
-            "  report to record your diagnosis of these images.",
+            f"  No annotations yet. Run `{cli_prefix()} annotate --output <dir>` and open",
+            "  the report to record your diagnosis of these images.",
         ]
     return "\n".join(lines)

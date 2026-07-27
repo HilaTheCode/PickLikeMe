@@ -1,3 +1,4 @@
+import sys
 import traceback
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -46,6 +47,22 @@ def fatal_errors_logged_to_stdout():
         print(traceback.format_exc().rstrip())
         print("=" * 64)
         raise
+
+
+def cli_prefix() -> str:
+    """The always-correct way to invoke this CLI, for instructions printed at
+    runtime (e.g. "run this next" hints).
+
+    `picklikeme <command>` only works if the console script installed by
+    `pip install -e .` happens to be on PATH - not guaranteed even when the
+    package *is* installed, since this project keeps two virtualenvs
+    (`.venv` CUDA, `.venv-1` CPU-only) and only one's Scripts/bin directory can
+    be active at a time. `sys.executable -m picklikeme` instead names the exact
+    interpreter already running this process, which by construction has the
+    package importable, so a copy-pasted instruction can never point at an
+    inactive environment or a script that was never put on PATH.
+    """
+    return f'"{sys.executable}" -m picklikeme'
 
 
 def format_duration(seconds: float) -> str:

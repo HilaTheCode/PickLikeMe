@@ -17,7 +17,7 @@ from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 
-from ..config import fatal_errors_logged_to_stdout, format_duration
+from ..config import cli_prefix, fatal_errors_logged_to_stdout, format_duration
 from .config import DEFAULT_ANALYSIS_DIR, OPTIMIZATION_TARGETS, AnalysisConfig, timestamped_output_dir
 
 logger = logging.getLogger("picklikeme.analyzer")
@@ -222,7 +222,7 @@ def run(args: argparse.Namespace) -> int:
             print(f"Annotations: {', '.join(bits)} annotated, {db.total_in_database} in {db.database_path}")
             if config.html_report and not getattr(args, "serve", False):
                 print("To record diagnoses, run:")
-                print(f'  picklikeme annotate --output "{output_dir}"')
+                print(f'  {cli_prefix()} annotate --output "{output_dir}"')
 
     if getattr(args, "serve", False) and config.html_report:
         from .server import DEFAULT_PORT, serve

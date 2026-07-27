@@ -28,6 +28,7 @@ from http.server import HTTPServer, SimpleHTTPRequestHandler, ThreadingHTTPServe
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
+from ..config import cli_prefix
 from ..identity import IdentityUnavailable
 from .annotations import AnnotationStore, InvalidAnnotationValue
 
@@ -285,7 +286,7 @@ def make_server(report_dir: Path, store: AnnotationStore, port: int = DEFAULT_PO
         raise SystemExit(f"Report directory not found: {report_dir}")
     if not (report_dir / "report.html").is_file():
         raise SystemExit(
-            f"No report.html in {report_dir}. Run `picklikeme analyze --output {report_dir}` first."
+            f'No report.html in {report_dir}. Run `{cli_prefix()} analyze --output "{report_dir}"` first.'
         )
 
     roots = dataset_roots(report_dir)

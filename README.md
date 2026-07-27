@@ -15,6 +15,7 @@ Pick Like Me is a personal machine-learning project for learning an individual w
 
 ```bash
 pip install -r requirements.txt
+pip install -e .
 ```
 
 `requirements.txt` pulls whatever CPU/CUDA build of torch pip resolves by
@@ -29,6 +30,18 @@ pip install --index-url https://download.pytorch.org/whl/cu130 torch torchvision
 Verify with `python -c "import torch; print(torch.cuda.is_available())"`.
 Training defaults to `cuda` (see `ProjectConfig.device`) and falls back to
 CPU automatically, with a warning, if CUDA isn't available.
+
+`pip install -e .` is what makes the package importable and registers the
+`picklikeme` console script (from `[project.scripts]` in `pyproject.toml`).
+Without it, `picklikeme ...` (and every `python -m picklikeme...` command
+below) fails with "command not found" / "No module named picklikeme".
+
+Every command in this README also works as `python -m picklikeme <command>
+...` instead of the bare `picklikeme <command> ...` shown - useful if the
+`picklikeme` console script isn't on `PATH` (for example if you keep more
+than one virtualenv and only one is active), since `-m` only needs the
+*interpreter you run it with* to have the package installed, not `PATH`. Both
+forms run the identical code.
 
 ### 2. Build a manifest from a Select/Reject folder pair
 
@@ -238,6 +251,13 @@ The analyzer is strictly read-only: it never touches checkpoints, the crop
 cache, source images or training data. Full documentation, including the
 metrics reference and how to add a metric in one file, is in
 [docs/analyzer.md](docs/analyzer.md).
+
+`picklikeme analyze` prints the exact follow-up command for recording *why* a
+mistake happened - `picklikeme annotate --output "<the timestamped dir>"` -
+which serves the report on `127.0.0.1` so the HTML page's Save button has
+something to write to (a report opened straight from disk can display
+annotations but can't save new ones - there's no browser API for writing to
+SQLite). Or skip the copy-paste with `picklikeme analyze ... --serve`.
 
 ### Rank a new, unseen folder with a trained model
 

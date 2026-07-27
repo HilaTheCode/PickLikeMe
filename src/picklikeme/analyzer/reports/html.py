@@ -21,6 +21,7 @@ import logging
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from ...config import cli_prefix
 from ..annotations import ANNOTATION_FIELD_LABELS, ANNOTATION_FIELDS
 from ..links import asset_url, source_api_url, source_file_uri
 from ..suggestions import CRITICAL, WARNING
@@ -213,7 +214,7 @@ async function plmSave(el){
   });
 
   if(!PLM.online){
-    status.textContent = 'Read-only: start `picklikeme annotate` to save.';
+    status.textContent = 'Read-only: see the banner above for the command that enables Save.';
     status.className = 'status error';
     return;
   }
@@ -643,7 +644,7 @@ def _annotation_panels(
         '<div class="offline ann-offline" style="display:none">'
         "<strong>Read-only.</strong> This report was opened directly from disk, so Save cannot reach "
         "the annotation database. Existing annotations are shown. To edit, run "
-        f"<code>picklikeme annotate --output {_e(output_dir)}</code> and open the address it prints."
+        f'<code>{_e(cli_prefix())} annotate --output "{_e(output_dir)}"</code> and open the address it prints.'
         "</div>"
     )
 

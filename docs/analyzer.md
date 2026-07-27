@@ -22,9 +22,10 @@ Open `analysis/report.html` when it finishes.
 - [Inputs](#inputs)
 - [What it produces](#what-it-produces)
 - [CLI reference](#cli-reference)
+  - [Entry points](#entry-points)
 - [Configuration files](#configuration-files)
 - [Metrics reference](#metrics-reference)
-- [False-negative knowledge base](#false-negative-knowledge-base)
+- [Annotation knowledge base](#annotation-knowledge-base)
 - [Detector-box thumbnail overlay](#detector-box-thumbnail-overlay)
 - [Extension guide](#extension-guide)
 - [Usage examples](#usage-examples)
@@ -189,6 +190,32 @@ analysis_20260727-093015/
 
 ## CLI reference
 
+### Entry points
+
+Three equivalent ways to run any subcommand (`analyze`, `annotate`,
+`build-manifest`, ...):
+
+| Form | Requires | Notes |
+| --- | --- | --- |
+| `picklikeme <command> ...` | `pip install -e .` **and** that environment's `Scripts`/`bin` directory on `PATH` | The installed console script (`[project.scripts]` in `pyproject.toml`) |
+| `python -m picklikeme <command> ...` | The package importable by whichever `python` you run | Works regardless of `PATH`; the form every command printed by the tool itself uses |
+| `python -m picklikeme.analyzer ...` | Same | Older alias for `analyze` specifically (predates the unified `picklikeme` dispatcher); does not cover `annotate` |
+
+`picklikeme <command>` is the shortest to type once set up, but it silently
+stops working the moment the console script isn't on `PATH` - easy to hit in
+this project, which keeps two virtualenvs (`.venv` CUDA, `.venv-1` CPU-only),
+each with its own `picklikeme.exe`, only one of which can be active at a time.
+`python -m picklikeme` sidesteps that: it only needs the interpreter you
+invoke to have the package installed, never `PATH`.
+
+For that reason, every command this tool prints for you to run next (the
+`annotate` follow-up after `analyze`, error messages that suggest a fix) is
+generated with `sys.executable -m picklikeme ...` - the exact interpreter
+already running, named explicitly - rather than the bare `picklikeme` form.
+Copy it as printed; it is guaranteed to be the right one for the environment
+that produced it, even if that is `.venv-1` and your shell's `PATH` currently
+points at `.venv`.
+
 | Flag | Default | Meaning |
 | --- | --- | --- |
 | `--ranking` | required | Ranking CSV (chunks auto-discovered) |
@@ -305,9 +332,12 @@ picklikeme analyze --ranking rankings.csv --selected keep/ --rejected drop/
 picklikeme annotate --output "analysis_20260727-093015/"   # serves on 127.0.0.1:8756
 ```
 
-The `analyze` command prints the exact `picklikeme annotate --output ...` line
-to run, with the real (timestamped) directory already filled in. Or skip the
-copy-paste in one step: `picklikeme analyze ... --serve`.
+The `analyze` command prints the exact command to run, with the real
+(timestamped) directory already filled in — copy that line rather than
+retyping it, since it also uses whichever invocation is guaranteed to work in
+*your* environment (see [Entry points](#entry-points) below: it is not always
+literally `picklikeme annotate ...`). Or skip the copy-paste in one step:
+`picklikeme analyze ... --serve`.
 
 Each false negative and each false positive gets a panel with its thumbnail
 (with detector boxes drawn on it, if any were resolved — see
