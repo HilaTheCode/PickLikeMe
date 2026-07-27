@@ -209,7 +209,8 @@ def annotate_thumbnail(
 
     canvas = base.copy()
     draw = ImageDraw.Draw(canvas)
-    line = max(1, size // 100)
+    font = _font()
+    line = max(1, round(size / 200))
 
     def to_thumb(box) -> tuple[float, float, float, float]:
         return (
@@ -222,34 +223,70 @@ def annotate_thumbnail(
     # Runners-up first, so the selected box is never hidden behind one.
     for box in record.others:
         x1, y1, x2, y2 = to_thumb(box)
-        _dashed_rectangle(draw, (x1, y1, x2, y2), OTHER_BOX, line)
+        _dashed_rectangle(draw, (x1, y1, x2, y2), OTHER_BOX, _stroke(line, x2 - x1, y2 - y1))
 
     selected = record.selected
     if selected is not None:
         x1, y1, x2, y2 = to_thumb(selected)
-        draw.rectangle([x1, y1, x2, y2], outline=SELECTED_BOX, width=line + 1)
-        label = f"{selected.class_name} {selected.score:.2f}"
-        draw.text((max(1, x1 + 2), max(1, y1 - 10)), label, fill=SELECTED_BOX, font=_font())
+        draw.rectangle([x1, y1, x2, y2], outline=SELECTED_BOX, width=_stroke(line + 1, x2 - x1, y2 - y1))
+        _draw_label(
+            draw, f"{selected.class_name} {selected.score:.2f}", (x1, y1, x2, y2),
+            SELECTED_BOX, font, base.size,
+        )
     else:
         # Nothing detected: the model was shown the full frame.
         draw.line([(0, 0), (size // 5, 0)], fill=NO_DETECTION, width=line + 2)
         draw.line([(0, 0), (0, size // 5)], fill=NO_DETECTION, width=line + 2)
-        draw.text((3, 3), "no detection", fill=NO_DETECTION, font=_font())
+        draw.text((3, 3), "no detection", fill=NO_DETECTION, font=font)
 
     if len(record.others):
-        draw.text(
-            (3, base.height - 12), f"+{len(record.others)} more", fill=OTHER_BOX, font=_font()
-        )
+        draw.text((3, base.height - 12), f"+{len(record.others)} more", fill=OTHER_BOX, font=font)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     canvas.save(output_path, "JPEG", quality=90)
     return output_path
 
 
-def _dashed_rectangle(draw, box, colour, width: int, dash: int = 4) -> None:
-    """A dashed outline, so a runner-up reads as different from the choice even
-    in a greyscale print or for a colour-blind reader."""
+def _stroke(preferred: int, box_width: float, box_height: float) -> int:
+    """Outline width that cannot swallow the box it outlines.
+
+    A full frame puts a distant bird in ten or twenty pixels. At the canvas-wide
+    stroke that suits a large box, both edges plus the gap between them exceed
+    the box, so it renders as a filled blob and the reader learns nothing about
+    where the detector actually drew it. Capped at a quarter of the shorter side.
+    """
+    return max(1, min(preferred, int(min(box_width, box_height) / 4)))
+
+
+def _draw_label(draw, text: str, box, colour, font, canvas_size) -> None:
+    """Label the box, but only where the label can be read as belonging to it.
+
+    A label wider than its box points at the wrong thing: on a small box the
+    text sprawls across neighbouring detections and reads as labelling those
+    instead. Better to leave a small box unlabelled - its colour already says
+    which one it is, and the report lists the class and score in text.
+    """
     x1, y1, x2, y2 = box
+    try:
+        width = draw.textlength(text, font=font)
+    except AttributeError:  # pragma: no cover - very old Pillow
+        width = len(text) * 6
+    if width > (x2 - x1) * 1.6 or y1 < 11:
+        return
+    draw.text((max(1, x1 + 1), y1 - 10), text, fill=colour, font=font)
+
+
+def _dashed_rectangle(draw, box, colour, width: int, dash: int | None = None) -> None:
+    """A dashed outline, so a runner-up reads as different from the choice even
+    in a greyscale print or for a colour-blind reader.
+
+    The dash length follows the box: a fixed one long enough to read on a large
+    box leaves a small box with a single dash per edge, which is just a solid
+    outline wearing the wrong colour.
+    """
+    x1, y1, x2, y2 = box
+    if dash is None:
+        dash = max(2, int(min(x2 - x1, y2 - y1) / 6))
     for x in range(int(x1), int(x2), dash * 2):
         draw.line([(x, y1), (min(x + dash, x2), y1)], fill=colour, width=width)
         draw.line([(x, y2), (min(x + dash, x2), y2)], fill=colour, width=width)

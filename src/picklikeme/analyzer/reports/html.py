@@ -87,7 +87,7 @@ padding:12px 15px;margin-bottom:11px}
 .sug .a{font-size:13px;margin-top:6px}
 .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px}
 .tile{background:var(--panel-2);border:1px solid var(--border);border-radius:8px;overflow:hidden}
-.tile img{width:100%;aspect-ratio:1;object-fit:cover;display:block;background:#0b0f17}
+.tile img{width:100%;aspect-ratio:1;object-fit:contain;display:block;background:#0b0f17}
 .tile .m{padding:6px 8px;font-size:11.5px;line-height:1.4}
 .tile .fn{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 a{color:var(--accent)}
@@ -96,7 +96,10 @@ footer{color:var(--muted);font-size:12.5px;text-align:center;margin-top:34px}
 /* --- False-negative annotation panels --- */
 .fn{border:1px solid var(--border);border-radius:10px;margin-bottom:12px;background:var(--panel-2)}
 .fn-top{display:flex;gap:13px;padding:11px 13px;align-items:flex-start}
-.fn-top img{width:104px;height:104px;object-fit:cover;border-radius:7px;background:#0b0f17;flex:none}
+/* Large enough to judge a detector box on a whole-frame preview; `contain`
+   because the preview is already letterboxed and must never be cropped again. */
+.fn-top img{width:232px;height:232px;object-fit:contain;border-radius:7px;background:#0b0f17;flex:none}
+@media (max-width:640px){.fn-top img{width:160px;height:160px}}
 .fn-meta{flex:1;min-width:0}
 .fn-name{font-weight:650;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .fn-nums{color:var(--muted);font-size:12.5px;margin-top:3px;font-variant-numeric:tabular-nums}
@@ -511,8 +514,8 @@ def _error_table(records, output_dir: Path, thumbs: dict[str, Path]) -> str:
             rel = asset_url(thumb, output_dir)
             if rel:
                 cell = (
-                    f'<img src="{_e(rel)}" style="width:52px;height:52px;object-fit:cover;'
-                    'border-radius:5px" loading="lazy">'
+                    f'<img src="{_e(rel)}" style="width:96px;height:96px;object-fit:contain;'
+                    'border-radius:5px;background:#0b0f17" loading="lazy">'
                 )
         name = _source_link(image.image_path, image.filename)
         confidence = image.confidence

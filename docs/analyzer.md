@@ -201,7 +201,7 @@ analysis_20260727-093015/
 | `--threshold-steps` | `101` | Points in the sweep |
 | `--borderline-low` / `--borderline-high` | `0.45` / `0.55` | Uncertainty band |
 | `--max-examples` | `60` | Rows per table / sheet |
-| `--thumbnail-size` | `200` | Thumbnail edge (px) |
+| `--thumbnail-size` | `400` | Preview edge (px); previews show the whole frame, so this is also the contact-sheet tile size |
 | `--thumbnail-workers` | `8` | Parallel thumbnail threads |
 | `--compare-ranking` | none | Second ranking → comparison mode |
 | `--baseline-label` / `--compare-label` | `baseline` / `candidate` | Names in comparison output |
@@ -526,6 +526,26 @@ demosaic only for the rare RAW that has none. Thumbnails are then cached under
 `thumbnails/`, keyed by source path, size **and a cache version** — bumping that
 version is how a change like this retires every stale entry without deleting
 anything.
+
+### Box geometry
+
+Boxes are recorded in full-frame pixel coordinates against the `source_size`
+stored with them, and the preview is that same frame scaled by
+`min(size/width, size/height)` and centred in a square. So a box is drawn at
+`offset + coordinate × scale` and nothing else — there is no second crop, resize
+or normalisation anywhere in the chain to get out of step.
+
+Measured on the 58 false negatives of a real run: every edge of every selected
+box lands within 3 px of that formula on a 400 px preview, and the residual is
+the stroke width itself. `tests/test_fn_overlay.py::BoxGeometryTests` pins the
+transform for landscape, portrait and corner cases.
+
+Because the subject is now a small fraction of the frame, the drawing adapts to
+the box rather than the canvas: the outline is capped at a quarter of the box's
+shorter side, dash length scales with the box, and a label wider than its box is
+dropped (on a small box the text sprawls over neighbouring detections and reads
+as labelling those). `--thumbnail-size` defaults to **400** for the same reason —
+at the old 200 a distant bird landed in ~10 px and its box was a solid blob.
 
 ### Where the boxes come from
 

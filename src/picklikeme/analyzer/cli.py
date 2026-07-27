@@ -61,7 +61,7 @@ def build_parser(add_help: bool = True) -> argparse.ArgumentParser:
     parser.add_argument("--borderline-low", type=float, default=None, help="Lower edge of the uncertainty band (default: 0.45)")
     parser.add_argument("--borderline-high", type=float, default=None, help="Upper edge of the uncertainty band (default: 0.55)")
     parser.add_argument("--max-examples", type=int, default=None, help="Rows per error table / contact sheet (default: 60)")
-    parser.add_argument("--thumbnail-size", type=int, default=None, help="Contact-sheet thumbnail edge in pixels (default: 200)")
+    parser.add_argument("--thumbnail-size", type=int, default=None, help="Preview thumbnail edge in pixels (default: 400)")
     parser.add_argument("--thumbnail-workers", type=int, default=None, help="Threads generating thumbnails (default: 8)")
 
     parser.add_argument("--compare-ranking", default=None, help="Second ranking file to compare against")

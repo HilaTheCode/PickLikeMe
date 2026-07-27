@@ -263,6 +263,134 @@ class FullFramePreviewTests(unittest.TestCase):
             self.assertEqual(greenish(drawn[60:100, 60:100]), 0, "a box was drawn far from the subject")
 
 
+class BoxGeometryTests(unittest.TestCase):
+    """The coordinate transformation, pinned numerically.
+
+    Boxes are recorded in full-frame pixels; the preview is that frame scaled by
+    `min(size/w, size/h)` and centred in a square. Every box must land at
+    `offset + coordinate * scale`. Verified by drawing on a flat base, so any
+    changed pixel is unambiguously part of the overlay.
+    """
+
+    FLAT = (128, 128, 128)
+
+    def _drawn_extent(self, root: Path, boxes, frame, size, labels: bool = False):
+        """Bounding box of everything annotate_thumbnail changed.
+
+        Labels are off by default: they are drawn above the box in the same
+        colour, so leaving them on would measure the text rather than the box.
+        """
+        from unittest.mock import patch
+
+        base_path = root / "flat.png"
+        base_path.parent.mkdir(parents=True, exist_ok=True)
+        Image.fromarray(np.full((size, size, 3), self.FLAT, dtype=np.uint8)).save(base_path)
+        before = np.asarray(Image.open(base_path).convert("RGB")).astype(int)
+
+        record = record_of(boxes, size=frame)
+        if labels:
+            out = annotate_thumbnail(base_path, record, root / "o.jpg", size)
+        else:
+            with patch("PIL.ImageDraw.ImageDraw.text"):
+                out = annotate_thumbnail(base_path, record, root / "o.jpg", size)
+        after = np.asarray(Image.open(out).convert("RGB")).astype(int)
+        ys, xs = np.nonzero(np.abs(after - before).sum(2) > 25)
+        return None if len(xs) == 0 else (int(xs.min()), int(ys.min()), int(xs.max()), int(ys.max()))
+
+    def _expected(self, box, frame, size):
+        scale = min(size / frame[0], size / frame[1])
+        ox, oy = (size - frame[0] * scale) / 2, (size - frame[1] * scale) / 2
+        return (ox + box.x1 * scale, oy + box.y1 * scale, ox + box.x2 * scale, oy + box.y2 * scale)
+
+    def test_a_box_lands_where_the_transform_says_it_should(self):
+        """A landscape frame letterboxed into a square: the box must be offset
+        by the bars and scaled by the fit factor, both."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            frame, size = (8000, 4000), 400          # 2:1 -> 400x200 content, 100px bars
+            box = Box(4000, 2000, 6000, 3000, 0.9, 16, selected=True)
+
+            got = self._drawn_extent(root, [box], frame, size)
+            exp = self._expected(box, frame, size)   # (200, 200) - (300, 250)
+            self.assertEqual(tuple(round(v) for v in exp), (200, 200, 300, 250))
+            self.assertIsNotNone(got)
+            for measured, expected in zip(got, exp):
+                self.assertLessEqual(
+                    abs(measured - expected), 3,
+                    f"box drawn at {got}, transform says {tuple(round(v, 1) for v in exp)}",
+                )
+
+    def test_a_box_in_a_frame_corner_stays_in_that_corner(self):
+        """Catches a transform that drops the letterbox offset: without it a
+        top-left box would still look right, so test a bottom-right one."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            frame, size = (6000, 3000), 300
+            box = Box(5400, 2700, 6000, 3000, 0.9, 16, selected=True)
+
+            got = self._drawn_extent(root, [box], frame, size)
+            exp = self._expected(box, frame, size)   # bottom-right of the content band
+            self.assertIsNotNone(got)
+            for measured, expected in zip(got, exp):
+                self.assertLessEqual(abs(measured - expected), 3)
+            # Inside the content band, never on the letterbox bar.
+            self.assertGreater(got[1], (size - size / 2) / 2 - 4)
+
+    def test_relative_box_sizes_are_preserved(self):
+        """A box covering a tenth of the frame width must cover a tenth of the
+        drawn content - the property a wrong scale factor would break."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            frame, size = (5000, 2500), 400
+            box = Box(1000, 1000, 1500, 1500, 0.9, 16, selected=True)
+
+            got = self._drawn_extent(root, [box], frame, size)
+            content_width = size                       # 2:1 frame fills the width
+            self.assertAlmostEqual((got[2] - got[0]) / content_width, 0.10, delta=0.02)
+
+    def test_a_tiny_box_is_not_swallowed_by_its_own_outline(self):
+        """A distant bird is a handful of pixels on a whole-frame preview. The
+        outline must stay thin enough that the box still reads as a box."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            frame, size = (8000, 4000), 400
+            box = Box(4000, 2000, 4160, 2160, 0.9, 16, selected=True)   # 8x8 px drawn
+
+            got = self._drawn_extent(root, [box], frame, size)
+            self.assertIsNotNone(got, "nothing was drawn for a small box")
+            self.assertLessEqual(got[2] - got[0], 16, "the outline is wider than the box it marks")
+
+    def test_a_label_wider_than_its_box_is_suppressed(self):
+        """A label sprawling past a small box points at its neighbours instead,
+        so it is dropped - while a box with room for it keeps it."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            frame, size = (8000, 4000), 400
+
+            tiny = self._drawn_extent(
+                root, [Box(4000, 2000, 4160, 2160, 0.9, 16, selected=True)], frame, size, labels=True
+            )
+            self.assertLessEqual(tiny[2] - tiny[0], 20, "a label leaked past a small box")
+
+            roomy = self._drawn_extent(
+                root, [Box(3000, 2000, 5000, 3000, 0.9, 16, selected=True)], frame, size, labels=True
+            )
+            box_top = self._expected(Box(3000, 2000, 5000, 3000, 0.9, 16, True), frame, size)[1]
+            self.assertLess(roomy[1], box_top - 3, "a box with room for a label did not get one")
+
+    def test_the_transform_holds_for_a_portrait_frame(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            frame, size = (3000, 6000), 300          # bars on the left and right
+            box = Box(1500, 3000, 2250, 4500, 0.9, 16, selected=True)
+
+            got = self._drawn_extent(root, [box], frame, size)
+            exp = self._expected(box, frame, size)
+            self.assertIsNotNone(got)
+            for measured, expected in zip(got, exp):
+                self.assertLessEqual(abs(measured - expected), 3)
+
+
 class OverlayDrawingTests(unittest.TestCase):
     def test_boxes_are_drawn_onto_the_thumbnail(self):
         with tempfile.TemporaryDirectory() as tmp:

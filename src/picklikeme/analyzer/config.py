@@ -70,7 +70,10 @@ class AnalysisConfig:
 
     # How many rows each per-category report and contact sheet shows.
     max_examples: int = 60
-    thumbnail_size: int = 200
+    # Sized for a whole-frame preview, not a crop of one. A distant bird is a
+    # few percent of the frame, so at the old 200px it landed in ~10 pixels and
+    # its detector box was unreadable.
+    thumbnail_size: int = 400
     contact_sheet_columns: int = 6
 
     html_report: bool = True
