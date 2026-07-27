@@ -225,7 +225,12 @@ class ReportLinkTests(unittest.TestCase):
             render_contact_sheets(result)
             html = write_html_report(result).read_text(encoding="utf-8")
 
-            panels = re.findall(r'<div class="fn" data-path="([^"]*)".*?<img src="([^"]*)"', html, re.S)
+            # The false-positive category now gets `.fn` panels too (same
+            # markup, same class - see analyzer.reports.html), so restrict the
+            # check to panels whose path is actually a false negative.
+            all_panels = re.findall(r'<div class="fn" data-path="([^"]*)".*?<img src="([^"]*)"', html, re.S)
+            fn_paths = {r.image_path for r in result.errors.false_negatives}
+            panels = [(path, src) for path, src in all_panels if path in fn_paths]
             self.assertEqual(len(panels), len(result.errors.false_negatives))
             for path, src in panels:
                 expected = _thumbnail_cache_path(

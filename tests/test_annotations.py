@@ -451,8 +451,10 @@ class IsolationTests(unittest.TestCase):
             self.assertIsNone(result.annotation_summary)
             self.assertFalse(db.exists(), "the database must not be created when disabled")
 
-    def test_only_false_negatives_are_annotated(self):
-        """False positives are deliberately out of scope."""
+    def test_false_negatives_and_false_positives_are_both_annotated_but_kept_separate(self):
+        """Both categories are in scope (same schema, same fields), but each
+        summary is scoped to its own images - a false positive must never
+        appear in the false-negative breakdown or vice versa."""
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             db = root / "kb.db"
@@ -460,11 +462,14 @@ class IsolationTests(unittest.TestCase):
             fn_paths = {r.image_path for r in result.errors.false_negatives}
             fp_paths = {r.image_path for r in result.errors.false_positives}
 
-            self.assertEqual(
-                result.annotation_summary.total_false_negatives, len(fn_paths)
-            )
+            self.assertGreater(len(fn_paths), 0)
+            self.assertGreater(len(fp_paths), 0)
+            self.assertEqual(result.annotation_summary.total_images, len(fn_paths))
+            self.assertEqual(result.fp_annotation_summary.total_images, len(fp_paths))
             for path in result.annotation_summary.unannotated:
                 self.assertNotIn(path, fp_paths)
+            for path in result.fp_annotation_summary.unannotated:
+                self.assertNotIn(path, fn_paths)
 
 
 class HtmlIntegrationTests(unittest.TestCase):
@@ -498,7 +503,7 @@ class HtmlIntegrationTests(unittest.TestCase):
                 self.assertIn(label, html)
             self.assertIn("False negative summary", html)
             # Filters
-            self.assertIn('id="f-state"', html)
+            self.assertIn('class="f-state"', html)
             self.assertIn('class="f-field"', html)
             self.assertIn("not annotated", html)
 

@@ -184,12 +184,31 @@ def render_matching(result: AnalysisResult) -> str:
 
 
 def render_annotations(result: AnalysisResult) -> str:
-    """False-negative knowledge base, if a database was readable."""
-    if result.annotation_summary is None:
-        return ""
+    """Annotation knowledge base for both mistake categories, if a database was
+    readable. Same fields and vocabulary for false negatives and false
+    positives, rendered as two independent blocks so they read side by side."""
     from ..annotations import render_summary as render_annotation_summary
 
-    return "\n".join(_section("False negative annotations")[:-1] + [render_annotation_summary(result.annotation_summary)])
+    blocks = []
+    if result.annotation_summary is not None:
+        blocks.append(
+            render_annotation_summary(
+                result.annotation_summary,
+                title="False negative annotations",
+                item_label="false negatives",
+            )
+        )
+    if result.fp_annotation_summary is not None:
+        blocks.append(
+            render_annotation_summary(
+                result.fp_annotation_summary,
+                title="False positive annotations",
+                item_label="false positives",
+            )
+        )
+    if not blocks:
+        return ""
+    return "\n".join(_section("Annotations")[:-1]) + "\n" + "\n\n".join(blocks)
 
 
 def render_full(result: AnalysisResult) -> str:

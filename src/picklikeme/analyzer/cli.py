@@ -208,12 +208,18 @@ def run(args: argparse.Namespace) -> int:
             print(f"  ... and {len(written) - 12} more")
         if config.html_report:
             print(f"\nOpen: {(output_dir / 'report.html').resolve()}")
-        if config.annotations_enabled and result.annotation_summary is not None:
-            summary = result.annotation_summary
-            print(
-                f"False-negative annotations: {summary.annotated}/{summary.total_false_negatives} "
-                f"annotated, {summary.total_in_database} in {summary.database_path}"
-            )
+        if config.annotations_enabled and (
+            result.annotation_summary is not None or result.fp_annotation_summary is not None
+        ):
+            bits = []
+            if result.annotation_summary is not None:
+                s = result.annotation_summary
+                bits.append(f"false negatives {s.annotated}/{s.total_images}")
+            if result.fp_annotation_summary is not None:
+                s = result.fp_annotation_summary
+                bits.append(f"false positives {s.annotated}/{s.total_images}")
+            db = (result.annotation_summary or result.fp_annotation_summary)
+            print(f"Annotations: {', '.join(bits)} annotated, {db.total_in_database} in {db.database_path}")
             if config.html_report and not getattr(args, "serve", False):
                 print("To record diagnoses, run:")
                 print(f'  picklikeme annotate --output "{output_dir}"')

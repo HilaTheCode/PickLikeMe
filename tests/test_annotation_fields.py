@@ -37,7 +37,7 @@ class VocabularyTests(unittest.TestCase):
         self.assertEqual(CROP_QUALITY_VALUES, ("Good", "Too Small", "Wrong Location", "Too Large"))
         self.assertEqual(
             IMAGE_QUALITY_VALUES,
-            ("Good", "Missing Eye", "Out of Focus", "No Relevant Subject"),
+            ("Good", "Missing Eye", "Out of Focus", "No Relevant Subject", "Group Scene"),
         )
         self.assertEqual(AGREE_WITH_MODEL_VALUES, ("Yes", "No"))
 
@@ -575,6 +575,191 @@ class MetricIsolationTests(unittest.TestCase):
             after = run()
             self.assertEqual(metrics_before, {v.name: v.value for v in after.metrics.values})
             self.assertGreater(after.annotation_summary.annotated, 0)
+
+
+class FalsePositiveAnnotationTests(unittest.TestCase):
+    """False positives get the same three fields as false negatives - same
+    schema, same vocabulary, same editor - so the two are directly comparable.
+    """
+
+    def _result(self, tmp: Path, db: Path):
+        from picklikeme.analyzer.analysis import run_analysis
+        from picklikeme.analyzer.config import AnalysisConfig
+        from test_annotations import build_fn_dataset
+
+        ranking, selected, rejected = build_fn_dataset(tmp)
+        return run_analysis(
+            AnalysisConfig(
+                ranking_path=ranking,
+                selected_root=selected,
+                rejected_root=rejected,
+                output_dir=tmp / "out",
+                annotations_db=db,
+                charts=False,
+                contact_sheets=False,
+                max_examples=10,
+            )
+        )
+
+    def test_a_false_positive_can_be_saved_with_the_same_fields_as_a_false_negative(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            result = self._result(root, root / "kb.db")
+            self.assertGreater(len(result.errors.false_positives), 0, "fixture must produce FPs")
+            target = result.errors.false_positives[0].image_path
+
+            with store_in(tmp) as store:
+                saved = store.save(
+                    target,
+                    crop_quality="Too Large",
+                    image_quality="Group Scene",
+                    agree_with_model_decision="No",
+                )
+            self.assertEqual(saved.crop_quality, "Too Large")
+            self.assertEqual(saved.image_quality, "Group Scene")
+
+    def test_the_report_renders_an_annotation_panel_for_false_positives(self):
+        from picklikeme.analyzer.reports.html import build_html
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            result = self._result(root, root / "kb.db")
+            html = build_html(result)
+
+            self.assertIn('data-scope="false_negative"', html)
+            self.assertIn('data-scope="false_positive"', html)
+            self.assertIn("False positives - annotate why they were kept", html)
+            self.assertIn("False positive summary", html)
+            # The decision label differs by direction: FN images were kept by
+            # the photographer, FP images were rejected.
+            self.assertIn("you kept it", html)
+            self.assertIn("you rejected it", html)
+
+    def test_every_false_positive_gets_its_own_panel(self):
+        from picklikeme.analyzer.reports.html import build_html
+        import re
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            result = self._result(root, root / "kb.db")
+            html = build_html(result)
+
+            fp_paths = {r.image_path for r in result.errors.false_positives}
+            panels = re.findall(r'<div class="fn" data-path="([^"]*)"', html)
+            for path in fp_paths:
+                self.assertIn(path, panels)
+
+    def test_group_scene_is_offered_as_an_image_quality_option(self):
+        from picklikeme.analyzer.reports.html import build_html
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            html = build_html(self._result(root, root / "kb.db"))
+            self.assertIn('<option value="Group Scene">Group Scene</option>', html)
+
+    def test_false_negative_and_false_positive_filters_do_not_cross_contaminate(self):
+        """Each category has its own filter bar; saving/filtering one must not
+        touch the other's panels. Checked at the markup level: each `.ann-scope`
+        contains only panels for its own category's paths."""
+        from picklikeme.analyzer.reports.html import build_html
+        import re
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            result = self._result(root, root / "kb.db")
+            html = build_html(result)
+
+            fn_paths = {r.image_path for r in result.errors.false_negatives}
+            fp_paths = {r.image_path for r in result.errors.false_positives}
+
+            scopes = re.findall(
+                r'<div class="ann-scope" data-scope="([^"]+)">(.*?)</div>\s*</div>\s*</section>',
+                html,
+                re.S,
+            )
+            found = {name: body for name, body in scopes}
+            self.assertIn("false_negative", found)
+            self.assertIn("false_positive", found)
+            for path in fn_paths:
+                self.assertIn(path, found["false_negative"])
+                self.assertNotIn(path, found["false_positive"])
+            for path in fp_paths:
+                self.assertIn(path, found["false_positive"])
+                self.assertNotIn(path, found["false_negative"])
+
+    def test_summary_sections_are_scoped_to_their_own_category(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db = root / "kb.db"
+            first = self._result(root, db)
+            fn_target = first.errors.false_negatives[0].image_path
+            fp_target = first.errors.false_positives[0].image_path
+            with AnnotationStore(db) as store:
+                store.save(fn_target, crop_quality="Good")
+                store.save(fp_target, crop_quality="Wrong Location")
+
+            again = self._result(root, db)
+            self.assertEqual(dict(again.annotation_summary.field_counts["crop_quality"]), {"Good": 1})
+            self.assertEqual(
+                dict(again.fp_annotation_summary.field_counts["crop_quality"]), {"Wrong Location": 1}
+            )
+
+    def test_json_report_carries_both_categories_separately(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db = root / "kb.db"
+            first = self._result(root, db)
+            fn_target = first.errors.false_negatives[0].image_path
+            fp_target = first.errors.false_positives[0].image_path
+            with AnnotationStore(db) as store:
+                store.save(fn_target, crop_quality="Good")
+                store.save(fp_target, crop_quality="Wrong Location")
+
+            payload = json.loads(json.dumps(self._result(root, db).as_dict()))
+            self.assertEqual(
+                payload["false_negative_annotations"]["by_image"][fn_target]["crop_quality"], "Good"
+            )
+            self.assertNotIn(fp_target, payload["false_negative_annotations"]["by_image"])
+            self.assertEqual(
+                payload["false_positive_annotations"]["by_image"][fp_target]["crop_quality"],
+                "Wrong Location",
+            )
+            self.assertNotIn(fn_target, payload["false_positive_annotations"]["by_image"])
+
+    def test_server_saves_a_false_positive_annotation(self):
+        from picklikeme.analyzer.reports import write_json_report
+        from picklikeme.analyzer.reports.html import write_html_report
+        from picklikeme.analyzer.server import make_server
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db = root / "kb.db"
+            result = self._result(root, db)
+            write_json_report(result, result.config.output_dir / "analysis.json")
+            write_html_report(result)
+
+            target = result.errors.false_positives[0].image_path
+            store = AnnotationStore(db)
+            server = make_server(result.config.output_dir, store, port=0)
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            base = f"http://127.0.0.1:{server.server_address[1]}"
+            try:
+                request = urllib.request.Request(
+                    f"{base}/api/annotations",
+                    data=json.dumps(
+                        {"image_path": target, "image_quality": "Group Scene"}
+                    ).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(request) as response:
+                    body = json.load(response)
+                self.assertEqual(body["annotation"]["image_quality"], "Group Scene")
+                self.assertEqual(store.get(target).image_quality, "Group Scene")
+            finally:
+                server.shutdown()
+                server.server_close()
+                store.close()
 
 
 if __name__ == "__main__":

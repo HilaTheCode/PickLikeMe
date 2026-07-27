@@ -269,19 +269,27 @@ Two notes worth knowing when reading the numbers:
 
 ---
 
-## False-negative knowledge base
+## Annotation knowledge base
 
-A false negative is an image you deliberately kept and the model rejected —
-the most valuable failure to understand. The analyzer lets you record **why**,
-and accumulates those diagnoses across runs.
+A false negative is an image you deliberately kept and the model rejected; a
+false positive is the reverse — the model kept an image you rejected. Both are
+the model disagreeing with you, and both are the most valuable failures to
+understand, so the analyzer lets you record **why** for either, using the same
+three fields, the same fixed vocabulary and the same editor. That symmetry is
+deliberate: it is what makes a false-negative diagnosis and a false-positive
+diagnosis directly comparable, not two different measurements.
 
 **The annotations are yours.** Nothing in the codebase infers, suggests or
 pre-fills a value. There is no model, heuristic or default in the path: the
-report renders what the database holds and stores exactly what you selected. The
-annotation workflow is deliberately false-negative-only — false positives are
-not annotatable. The separate detector-box thumbnail overlay (below) is *not*
-scoped that way and does draw on false positives and every other category; the
-two features are independent.
+report renders what the database holds and stores exactly what you selected.
+The schema itself does not record which category an annotation came from - a
+record is a diagnosis of the image, not of the run that flagged it, so the
+false-negative/false-positive split shown in a report is computed by asking the
+store about two path lists, one per category, not by a stored label. (An image
+cannot be both at once: false negative and false positive are mutually
+exclusive by definition against the ground truth, so there is never an
+ambiguous record to split.) The separate detector-box thumbnail overlay (below)
+applies more broadly still — report-wide, not just to annotatable images.
 
 **They never touch the metrics.** Annotations load after every metric, threshold
 sweep and suggestion is already computed, and `test_annotations_never_change_any_metric`
@@ -301,11 +309,18 @@ The `analyze` command prints the exact `picklikeme annotate --output ...` line
 to run, with the real (timestamped) directory already filled in. Or skip the
 copy-paste in one step: `picklikeme analyze ... --serve`.
 
-Each false negative gets a panel with its thumbnail (with detector boxes drawn
-on it, if any were resolved — see [Detector-box thumbnail overlay](#detector-box-thumbnail-overlay)
-below), score, confidence, rank and displacement, an **Edit** button, three
+Each false negative and each false positive gets a panel with its thumbnail
+(with detector boxes drawn on it, if any were resolved — see
+[Detector-box thumbnail overlay](#detector-box-thumbnail-overlay) below),
+score, confidence, rank, displacement and which way you and the model
+disagreed (`you kept it` / `you rejected it`), an **Edit** button, three
 dropdowns and **Save**. Opened straight from disk the report still *shows*
 existing annotations, with a banner explaining that editing needs `annotate`.
+
+The two categories get their own report sections - "False negatives -
+annotate why they were missed" and "False positives - annotate why they were
+kept" - each with its own filter bar and its own annotated-count. Filtering one
+category never affects the other's panels.
 
 Example of a completed annotation:
 
@@ -328,11 +343,13 @@ bird and a badly placed crop of a perfectly sharp one are different diagnoses.
 | Field | Values | Question it answers |
 | --- | --- | --- |
 | **Crop Quality** | `Good`, `Too Small`, `Wrong Location`, `Too Large` | How good is the crop the detector chose, regardless of the image quality |
-| **Image Quality** | `Good`, `Missing Eye`, `Out of Focus`, `No Relevant Subject` | How good is the photograph itself, regardless of the crop |
-| **Agree with Model Decision** | `Yes`, `No` | Having looked at it, was the model right to reject this |
+| **Image Quality** | `Good`, `Missing Eye`, `Out of Focus`, `No Relevant Subject`, `Group Scene` | How good is the photograph itself, regardless of the crop |
+| **Agree with Model Decision** | `Yes`, `No` | Having looked at it, was the model right about this image |
 
 `No Relevant Subject` means there is nothing meaningful to evaluate — the bird
-is too small, heavily occluded, or effectively absent.
+is too small, heavily occluded, or effectively absent. `Group Scene` is for
+several subjects together, judged as a scene rather than a single bird's pose
+or sharpness.
 
 Every field is optional and independent: any one of them alone is enough to keep
 the record, which is deleted only when all three are cleared. A value outside a
@@ -349,13 +366,20 @@ breakdown: guessing that an old `Subject too small` tag meant Crop Quality
 `Too Small` would invent an answer you never gave and then count it. Re-annotate
 those images to bring them into the statistics.
 
-### False Negative Summary
+### False Negative Summary / False Positive Summary
 
-A report section showing one frequency breakdown per field, the most common
-whole-record combinations (`crop / image / agree`, with `(unset)` for unanswered
-fields), a card counting how often you disagreed with the model, recently
-annotated images, and everything not yet annotated. The panel list filters by an
-exact value on any field and by annotated / not annotated.
+One report section per category, identical in layout, each showing one
+frequency breakdown per field, the most common whole-record combinations
+(`crop / image / agree`, with `(unset)` for unanswered fields), a card counting
+how often you disagreed with the model, recently annotated images, and
+everything not yet annotated. Each panel list filters by an exact value on any
+field and by annotated / not annotated - scoped to its own category, so a
+false-negative filter never hides a false-positive panel or vice versa.
+
+Because the two summaries are computed identically (same `summarise()` call,
+once per category), the numbers are directly comparable: if false positives
+show far more `Crop Quality: Too Large` than false negatives, that is a real
+signal about the detector's behaviour, not an artefact of different counting.
 
 ### Storage
 

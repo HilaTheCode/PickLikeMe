@@ -42,11 +42,17 @@ class AnalysisResult:
     errors: ErrorAnalysis
     suggestions: list = field(default_factory=list)
     comparison: object | None = None
-    # False-negative annotations: display data only. Loaded after every metric
-    # has been computed, and never read by a metric, a threshold sweep or a
-    # suggestion rule - human knowledge must not move the numbers it explains.
+    # Annotations: display data only. Loaded after every metric has been
+    # computed, and never read by a metric, a threshold sweep or a suggestion
+    # rule - human knowledge must not move the numbers it explains.
+    #
+    # `annotations` is keyed by path and holds both categories together (a
+    # given image is never both, so there is no collision); `annotation_summary`
+    # and `fp_annotation_summary` are the per-category breakdowns, computed
+    # identically so the two are directly comparable.
     annotations: dict = field(default_factory=dict)
     annotation_summary: object | None = None
+    fp_annotation_summary: object | None = None
     # Detector boxes for the false negatives only, for the diagnostic
     # overlay. Display data: no metric reads them.
     detections: dict = field(default_factory=dict)
@@ -126,37 +132,55 @@ class AnalysisResult:
             },
             "false_negative_annotations": {
                 "summary": self.annotation_summary.as_dict() if self.annotation_summary else None,
-                "by_image": {path: a.as_dict() for path, a in self.annotations.items()},
+                "by_image": {
+                    path: a.as_dict()
+                    for path, a in self.annotations.items()
+                    if path in {r.image_path for r in self.errors.false_negatives}
+                },
+            },
+            "false_positive_annotations": {
+                "summary": self.fp_annotation_summary.as_dict() if self.fp_annotation_summary else None,
+                "by_image": {
+                    path: a.as_dict()
+                    for path, a in self.annotations.items()
+                    if path in {r.image_path for r in self.errors.false_positives}
+                },
             },
         }
 
 
 def _attach_annotations(result: AnalysisResult) -> None:
-    """Load false-negative annotations onto a finished result.
+    """Load annotations onto a finished result, for both mistake categories.
 
-    False negatives only, by design: understanding why a deliberately-kept
-    image was rejected is the valuable question, and false positives are not
-    wired up here at all.
+    False negatives and false positives are both annotatable, with the same
+    fields and vocabulary, so a photographer can compare the two directly.
+    `summarise()` is called once per category against the same store, giving
+    two independently-computed breakdowns; the per-image annotations are then
+    merged into one dict since an image is never in both categories at once.
 
     A missing or unreadable database is not an error - the knowledge base is
     optional, and an analysis must never fail because of it.
     """
     from .annotations import AnnotationStore, summarise
 
-    paths = [record.image_path for record in result.errors.false_negatives]
+    fn_paths = [record.image_path for record in result.errors.false_negatives]
+    fp_paths = [record.image_path for record in result.errors.false_positives]
     try:
         with AnnotationStore(result.config.annotations_db_path) as store:
-            result.annotations, result.annotation_summary = summarise(store, paths)
+            fn_annotations, result.annotation_summary = summarise(store, fn_paths)
+            fp_annotations, result.fp_annotation_summary = summarise(store, fp_paths)
     except Exception as exc:  # noqa: BLE001 - optional feature, never fatal
         logger.warning("Could not read the annotation database: %s", exc)
         return
 
-    summary = result.annotation_summary
+    result.annotations = {**fn_annotations, **fp_annotations}
     logger.info(
-        "False-negative annotations: %d of %d annotated (%d total in database)",
-        summary.annotated,
-        summary.total_false_negatives,
-        summary.total_in_database,
+        "Annotations: %d of %d false negatives, %d of %d false positives (%d total in database)",
+        result.annotation_summary.annotated,
+        result.annotation_summary.total_images,
+        result.fp_annotation_summary.annotated,
+        result.fp_annotation_summary.total_images,
+        result.annotation_summary.total_in_database,
     )
 
 

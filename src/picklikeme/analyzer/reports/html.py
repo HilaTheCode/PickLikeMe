@@ -152,11 +152,14 @@ document.getElementById('theme-btn').addEventListener('click',()=>
   setTheme(document.documentElement.getAttribute('data-theme')==='dark'?'light':'dark'));
 
 // ---------------------------------------------------------------------------
-// False-negative annotations.
+// Annotations - false negatives and false positives, identically.
 //
 // Annotations are written by the photographer only. Nothing here derives,
 // suggests or pre-fills a category - the page renders what the database holds
-// and posts back exactly what was ticked and typed.
+// and posts back exactly what was selected. `.fn` names one annotation panel
+// (kept from when this was false-negative-only); `.ann-scope` wraps one
+// category's filter bar and panels, so the two categories filter and count
+// independently while sharing every other function below.
 //
 // Saving needs the local server (a file:// page cannot reach SQLite), so the
 // page probes /api/health once: online enables Save, offline shows the existing
@@ -226,31 +229,35 @@ async function plmSave(el){
     status.textContent = j.deleted ? 'Annotation cleared.' : 'Saved.';
     status.className = 'status saved';
     el.classList.remove('editing');
-    plmUpdateCounts();
-    plmApplyFilters();
+    // Each category (false negatives, false positives) has its own filter bar
+    // and count, so only the panel's own scope needs refreshing.
+    const scope = el.closest('.ann-scope');
+    if(scope){ plmUpdateCounts(scope); plmApplyFilters(scope); }
   }catch(e){
     status.textContent = 'Save failed: '+e.message;
     status.className = 'status error';
   }
 }
 
-function plmUpdateCounts(){
-  const all=[...document.querySelectorAll('.fn')];
+function plmUpdateCounts(scope){
+  const all=[...scope.querySelectorAll('.fn')];
   const done=all.filter(e=>e.dataset.annotated==='1').length;
-  const el=document.getElementById('fn-coverage');
+  const el=scope.querySelector('.ann-coverage');
   if(el) el.textContent = `${done} of ${all.length} annotated`;
 }
 
 // Filtering: by annotated / not annotated, and by an exact value per field.
-function plmApplyFilters(){
-  const mode=document.getElementById('f-state')?.value||'all';
+// Scoped to one `.ann-scope` container so the false-negative and false-positive
+// filter bars never affect each other's panels.
+function plmApplyFilters(scope){
+  const mode=scope.querySelector('.f-state')?.value||'all';
   // One optional value filter per field; blank means "any".
   const wanted={};
-  document.querySelectorAll('select.f-field').forEach(sel=>{
+  scope.querySelectorAll('select.f-field').forEach(sel=>{
     if(sel.value) wanted[sel.dataset.field]=sel.value;
   });
   let shown=0;
-  document.querySelectorAll('.fn').forEach(el=>{
+  scope.querySelectorAll('.fn').forEach(el=>{
     const annotated=el.dataset.annotated==='1';
     let ok=true;
     if(mode==='annotated'&&!annotated) ok=false;
@@ -263,7 +270,7 @@ function plmApplyFilters(){
     el.style.display = ok ? '' : 'none';
     if(ok) shown++;
   });
-  const out=document.getElementById('f-count');
+  const out=scope.querySelector('.f-count');
   if(out) out.textContent = `${shown} shown`;
 }
 
@@ -273,15 +280,17 @@ document.addEventListener('DOMContentLoaded', async ()=>{
     el.querySelector('.btn-save')?.addEventListener('click',()=>plmSave(el));
     el.querySelector('.btn-cancel')?.addEventListener('click',()=>el.classList.remove('editing'));
   });
-  document.getElementById('f-state')?.addEventListener('change',plmApplyFilters);
-  document.querySelectorAll('select.f-field').forEach(sel=>
-    sel.addEventListener('change',plmApplyFilters));
-  plmUpdateCounts();
+  document.querySelectorAll('.ann-scope').forEach(scope=>{
+    scope.querySelector('.f-state')?.addEventListener('change',()=>plmApplyFilters(scope));
+    scope.querySelectorAll('select.f-field').forEach(sel=>
+      sel.addEventListener('change',()=>plmApplyFilters(scope)));
+    plmUpdateCounts(scope);
+  });
 
   PLM.online = await plmProbe();
-  const banner=document.getElementById('fn-offline');
+  const banners=[...document.querySelectorAll('.ann-offline')];
   if(PLM.online){
-    if(banner) banner.style.display='none';
+    banners.forEach(b=>b.style.display='none');
     // Browsers refuse to navigate from a served page to a local-file URL, so a
     // served report must reach originals through the server. Rewrite them once.
     document.querySelectorAll('a[data-source]').forEach(a=>{
@@ -307,10 +316,10 @@ document.addEventListener('DOMContentLoaded', async ()=>{
           });
         }
       });
-      plmUpdateCounts();
+      document.querySelectorAll('.ann-scope').forEach(scope=>plmUpdateCounts(scope));
     }catch(e){}
-  }else if(banner){
-    banner.style.display='';
+  }else{
+    banners.forEach(b=>b.style.display='');
   }
 });
 
@@ -580,28 +589,33 @@ def _field_select(field_name: str, values: list[str], current: str | None) -> st
     )
 
 
-def _annotation_panels(result: "AnalysisResult", thumbs: dict[str, Path]) -> str:
-    """An annotation panel per false negative.
-
-    Annotation is false-negative-only by design - that is the deliberate
-    diagnostic question this feature answers. The detector-box overlay drawn on
-    the thumbnail is not scoped that way; it is whatever `thumbs` already
-    carries, which build_html() has pre-merged with overlays for every image in
-    the report.
+def _annotation_panels(
+    records: list,
+    result: "AnalysisResult",
+    thumbs: dict[str, Path],
+    *,
+    scope: str,
+    decision_label: str,
+    empty_message: str,
+) -> str:
+    """Annotation panels for one outcome category - false negatives or false
+    positives - identical fields, vocabulary and markup for both, so the two
+    are directly comparable. The detector-box overlay drawn on the thumbnail is
+    not scoped to either category; it is whatever `thumbs` already carries,
+    which build_html() has pre-merged with overlays for every image in the
+    report.
 
     Every field renders unset unless the database already holds a value for
     that image - nothing is ever pre-selected on the model's behalf.
-    """
-    records = result.errors.false_negatives
-    if not records:
-        return '<p class="sub">No false negatives - nothing to annotate.</p>'
 
-    summary = result.annotation_summary
-    vocabularies = (
-        summary.field_vocabularies
-        if summary and summary.field_vocabularies
-        else {name: list(values) for name, values in ANNOTATION_FIELDS.items()}
-    )
+    Wrapped in a `.ann-scope` container so its filter bar only ever filters its
+    own panels: this function is called once per category, and the two sets of
+    filters must not interfere with each other.
+    """
+    if not records:
+        return f'<p class="sub">{_e(empty_message)}</p>'
+
+    vocabularies = {name: list(values) for name, values in ANNOTATION_FIELDS.items()}
     output_dir = result.config.output_dir
 
     field_filters = "".join(
@@ -614,19 +628,19 @@ def _annotation_panels(result: "AnalysisResult", thumbs: dict[str, Path]) -> str
     )
     filters = (
         '<div class="filters">'
-        '<label>Show <select id="f-state">'
+        '<label>Show <select class="f-state">'
         '<option value="all">all</option>'
         '<option value="unannotated">not annotated</option>'
         '<option value="annotated">annotated only</option>'
         "</select></label>"
         + field_filters
-        + '<span class="status" id="f-count"></span>'
-        '<span class="status" id="fn-coverage"></span>'
+        + '<span class="status f-count"></span>'
+        '<span class="status ann-coverage"></span>'
         "</div>"
     )
 
     offline = (
-        '<div class="offline" id="fn-offline" style="display:none">'
+        '<div class="offline ann-offline" style="display:none">'
         "<strong>Read-only.</strong> This report was opened directly from disk, so Save cannot reach "
         "the annotation database. Existing annotations are shown. To edit, run "
         f"<code>picklikeme annotate --output {_e(output_dir)}</code> and open the address it prints."
@@ -719,7 +733,7 @@ def _annotation_panels(result: "AnalysisResult", thumbs: dict[str, Path]) -> str
             f'<div class="fn-meta"><div class="fn-name">{name}{moved}</div>'
             f'<div class="fn-nums">score {image.score:.4f} &middot; confidence '
             f'{_num(image.confidence, "{:.3f}")} &middot; rank {image.rank:,} &middot; '
-            f"displaced {record.rank_displacement:,} &middot; you kept it{captured}{boxes}</div>"
+            f"displaced {record.rank_displacement:,} &middot; {_e(decision_label)}{captured}{boxes}</div>"
             f'<div class="fn-tags">{tags}</div>{legacy}'
             f"</div>"
             f'<div class="fn-actions"><button class="btn-edit">Edit</button></div></div>'
@@ -732,27 +746,34 @@ def _annotation_panels(result: "AnalysisResult", thumbs: dict[str, Path]) -> str
             f"</div></div>"
         )
 
-    return filters + offline + "".join(panels)
+    return (
+        f'<div class="ann-scope" data-scope="{_e(scope)}">'
+        + filters
+        + offline
+        + "".join(panels)
+        + "</div>"
+    )
 
 
-def _annotation_summary(result: "AnalysisResult") -> str:
-    """The False Negative Summary section."""
-    summary = result.annotation_summary
+def _annotation_summary(summary, *, category_label: str, section_hint: str) -> str:
+    """One category's summary section (false negatives, or false positives) -
+    same layout for both, so the numbers can be compared side by side.
+    """
     if summary is None:
         return '<p class="sub">Annotation database unavailable.</p>'
 
     coverage = (
-        f"{summary.annotated:,} of {summary.total_false_negatives:,} annotated"
+        f"{summary.annotated:,} of {summary.total_images:,} annotated"
         + (f" ({summary.coverage * 100:.1f}%)" if summary.coverage is not None else "")
     )
-    # The headline number: how often you looked at a rejection and disagreed
-    # with it. None when nobody has answered that field yet.
+    # The headline number: how often you looked at a mistake and disagreed with
+    # the model's call. None when nobody has answered that field yet.
     agree_counts = dict(summary.field_counts.get("agree_with_model_decision") or [])
     disagreements = agree_counts.get("No", 0) if agree_counts else None
     cards = (
         '<div class="cards">'
-        f'<div class="card"><div class="label">False negatives</div>'
-        f'<div class="value">{summary.total_false_negatives:,}</div>'
+        f'<div class="card"><div class="label">{_e(category_label)}</div>'
+        f'<div class="value">{summary.total_images:,}</div>'
         f'<div class="note">in this analysis</div></div>'
         f'<div class="card"><div class="label">Annotated</div>'
         f'<div class="value">{summary.annotated:,}</div><div class="note">{_e(coverage)}</div></div>'
@@ -791,7 +812,7 @@ def _annotation_summary(result: "AnalysisResult") -> str:
         frequencies = "".join(blocks)
     else:
         frequencies = (
-            "<p class=\"sub\">No annotations yet. Open the False negatives section, click "
+            f"<p class=\"sub\">No annotations yet. Open the {_e(section_hint)} section, click "
             "<strong>Edit</strong> on an image and record your diagnosis.</p>"
         )
 
@@ -976,22 +997,52 @@ def build_html(result: "AnalysisResult", thumbs: dict[str, Path] | None = None) 
         _section("All metrics", _metrics_table(result), f"{len(result.metrics.values)} metrics", collapsed=True),
         _section("Threshold analysis", _thresholds(result), f"optimising {config.optimize_for}", collapsed=True),
         _section(
-            "False positives",
-            _error_table(errors.false_positives, output_dir, thumbs),
-            f"{len(errors.false_positives)} shown",
-            collapsed=True,
-        ),
-        _section(
             "False negatives - annotate why they were missed",
-            _annotation_panels(result, thumbs),
+            _annotation_panels(
+                errors.false_negatives,
+                result,
+                thumbs,
+                scope="false_negative",
+                decision_label="you kept it",
+                empty_message="No false negatives - nothing to annotate.",
+            ),
             f"{len(errors.false_negatives)} shown",
         ),
         _section(
             "False negative summary",
-            _annotation_summary(result),
+            _annotation_summary(
+                result.annotation_summary,
+                category_label="False negatives",
+                section_hint="False negatives",
+            ),
             (
                 f"{result.annotation_summary.annotated} annotated"
                 if result.annotation_summary
+                else "no database"
+            ),
+        ),
+        _section(
+            "False positives - annotate why they were kept",
+            _annotation_panels(
+                errors.false_positives,
+                result,
+                thumbs,
+                scope="false_positive",
+                decision_label="you rejected it",
+                empty_message="No false positives - nothing to annotate.",
+            ),
+            f"{len(errors.false_positives)} shown",
+        ),
+        _section(
+            "False positive summary",
+            _annotation_summary(
+                result.fp_annotation_summary,
+                category_label="False positives",
+                section_hint="False positives",
+            ),
+            (
+                f"{result.fp_annotation_summary.annotated} annotated"
+                if result.fp_annotation_summary
                 else "no database"
             ),
         ),

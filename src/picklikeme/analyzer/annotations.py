@@ -1,8 +1,11 @@
-"""False-negative knowledge base: the photographer's own diagnoses, persisted.
+"""Photographer diagnosis knowledge base, for the model's two kinds of mistake.
 
-Why an image the photographer deliberately kept was rejected by the model is
-knowledge only the photographer has. This module stores that knowledge and
-nothing else.
+Why an image the photographer deliberately kept was rejected by the model - or
+deliberately rejected was kept by it - is knowledge only the photographer has.
+This module stores that knowledge and nothing else, using the same schema for
+both mistakes so the two are directly comparable: a false negative and a false
+positive get the same three questions, the same fixed answers, and the same
+statistics.
 
 A diagnosis is three independent fixed-vocabulary fields - Crop Quality, Image
 Quality, and whether you Agree with the Model Decision. Closed vocabularies with
@@ -23,10 +26,15 @@ breakdown but one phenomenon.
 - **Long-lived.** The database lives outside the analyzer's output directory,
   because output directories are per-run and get replaced; a knowledge base
   accumulated over months must not be inside one.
-- **False negatives only**, by request. The annotation workflow is wired to
-  false negatives and nothing else; the detector-box thumbnail overlay is a
-  separate, unrelated feature (analyzer.detections / analyzer.contactsheets)
-  that does apply report-wide.
+- **False negatives and false positives, identically.** Both are the model
+  disagreeing with the photographer; both get the same panel, the same three
+  fields, the same vocabulary. Nothing in the schema or this module records
+  which category an annotation came from - the record is a diagnosis of the
+  image, not of the run that flagged it - so the split shown in a report is
+  computed by asking the store about two path lists, one per category, not by
+  a stored label. The detector-box thumbnail overlay is a separate, unrelated
+  feature (analyzer.detections / analyzer.contactsheets) that applies more
+  broadly still - report-wide, not just to annotatable images.
 
 Identity is the one genuinely hard problem: a diagnosis must follow the image
 through a rename, a reorganisation, or a move to another drive. Annotations are
@@ -87,14 +95,18 @@ CROP_QUALITY_VALUES: tuple[str, ...] = (
 #   Out of Focus        - the bird is not sufficiently sharp
 #   No Relevant Subject - nothing meaningful to evaluate (bird too small,
 #                         heavily occluded, or effectively absent)
+#   Group Scene         - several subjects together; judged as a scene rather
+#                         than a single bird's pose or sharpness
 IMAGE_QUALITY_VALUES: tuple[str, ...] = (
     "Good",
     "Missing Eye",
     "Out of Focus",
     "No Relevant Subject",
+    "Group Scene",
 )
 
-# Having looked at it: was the model right to reject this image?
+# Having looked at it: was the model right about this image - rejecting a false
+# negative, or keeping a false positive?
 AGREE_WITH_MODEL_VALUES: tuple[str, ...] = ("Yes", "No")
 
 # field name -> allowed values, so validation, the API and the UI all read the
@@ -173,7 +185,8 @@ def validate_field(field_name: str, value: str | None) -> str | None:
 
 @dataclass
 class Annotation:
-    """One photographer diagnosis for one false negative.
+    """One photographer diagnosis for one image - a false negative or a false
+    positive; the record itself does not say which, see the module docstring.
 
     `image_hash` is the identity. `filename`, `original_path` and
     `capture_datetime` are metadata for display and are never matched on.
@@ -755,15 +768,18 @@ class AnnotationStore:
 
 
 # ---------------------------------------------------------------------------
-# Summary (the "False Negative Summary" report section)
+# Summary (the "False Negative summary" / "False Positive summary" report
+# sections - one AnnotationSummary per category, built by calling summarise()
+# once per path list, so the two are directly comparable field for field.
 # ---------------------------------------------------------------------------
 
 @dataclass
 class AnnotationSummary:
-    """Aggregates over the knowledge base, restricted to the false negatives of
-    the current run so the numbers describe this analysis, not the whole DB."""
+    """Aggregates over the knowledge base, restricted to one outcome category
+    (the false negatives, or the false positives, of the current run) so the
+    numbers describe this analysis, not the whole DB."""
 
-    total_false_negatives: int = 0
+    total_images: int = 0
     annotated: int = 0
     # field name -> [(value, count)], one breakdown per diagnostic field, each
     # ordered most frequent first. Only annotations that set that particular
@@ -795,13 +811,13 @@ class AnnotationSummary:
 
     @property
     def coverage(self) -> float | None:
-        if not self.total_false_negatives:
+        if not self.total_images:
             return None
-        return self.annotated / self.total_false_negatives
+        return self.annotated / self.total_images
 
     def as_dict(self) -> dict:
         return {
-            "total_false_negatives": self.total_false_negatives,
+            "total_images": self.total_images,
             "annotated": self.annotated,
             "unannotated": self.unannotated_count,
             "coverage": self.coverage,
@@ -832,16 +848,20 @@ class AnnotationSummary:
 
 def summarise(
     store: AnnotationStore,
-    false_negative_paths: Sequence[str],
+    image_paths: Sequence[str],
     *,
     recent_limit: int = 15,
     combination_limit: int = 10,
 ) -> tuple[dict[str, Annotation], AnnotationSummary]:
-    """Load annotations for this run's false negatives and aggregate them.
+    """Load annotations for one outcome category's images and aggregate them.
+
+    `image_paths` is whichever set the caller wants a breakdown for - the
+    false negatives of this run, or the false positives, called once each so
+    the two summaries are computed identically and are directly comparable.
 
     Returns (path -> annotation, summary) so the caller does one pass.
     """
-    found, unresolved = store.get_many(false_negative_paths)
+    found, unresolved = store.get_many(image_paths)
 
     field_counters: dict[str, Counter[str]] = {name: Counter() for name in ANNOTATION_FIELDS}
     combination_counter: Counter[tuple[str, str, str]] = Counter()
@@ -863,11 +883,11 @@ def summarise(
     recent = sorted(found.values(), key=lambda a: a.updated_at, reverse=True)[:recent_limit]
     unresolved_paths = {item.image_path for item in unresolved}
     unannotated = [
-        path for path in false_negative_paths if path not in found and path not in unresolved_paths
+        path for path in image_paths if path not in found and path not in unresolved_paths
     ]
 
     return found, AnnotationSummary(
-        total_false_negatives=len(false_negative_paths),
+        total_images=len(image_paths),
         annotated=len(found),
         field_counts={name: counter.most_common() for name, counter in field_counters.items()},
         combination_counts=combination_counter.most_common(combination_limit),
@@ -884,13 +904,20 @@ def summarise(
     )
 
 
-def render_summary(summary: AnnotationSummary) -> str:
-    """Text form, for report.txt and the console."""
+def render_summary(
+    summary: AnnotationSummary, *, title: str = "Annotations", item_label: str = "images"
+) -> str:
+    """Text form, for report.txt and the console.
+
+    `title` and `item_label` let the same renderer serve either category
+    ("False negative annotations" / "false negatives", or "False positive
+    annotations" / "false positives") without duplicating this function.
+    """
     lines = [
-        "False negative annotations",
-        "==========================",
+        title,
+        "=" * len(title),
         f"  database:            {summary.database_path}",
-        f"  false negatives:     {summary.total_false_negatives:,}",
+        f"  {item_label + ':':<21}{summary.total_images:,}",
         f"  annotated:           {summary.annotated:,}"
         + (f" ({summary.coverage * 100:.1f}%)" if summary.coverage is not None else ""),
         f"  not yet annotated:   {summary.unannotated_count:,}",
@@ -947,6 +974,6 @@ def render_summary(summary: AnnotationSummary) -> str:
         lines += [
             "",
             "  No annotations yet. Run `picklikeme annotate --output <dir>` and open the",
-            "  report to record why these images were missed.",
+            "  report to record your diagnosis of these images.",
         ]
     return "\n".join(lines)
