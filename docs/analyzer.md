@@ -346,15 +346,43 @@ to the wrong image is worse than losing it.
 Identity is memoised in the database against `(path, size, mtime)`, so a repeat
 run over an unchanged archive does no I/O to resolve it.
 
-#### Why a partial digest
+#### Why a partial digest — design review
 
-A 45 MB NEF takes ~0.15 s to hash in full, and identity is resolved for every
-false negative in a report. Size plus 512 KB from each end is ~1 MB per image and
-is effectively collision-free for camera files: the head carries EXIF (body
-serial, frame counter, capture timestamp) and the tail carries image data, so two
-distinct frames cannot agree on all three. The `p1:` prefix makes the scheme
-explicit so a future change (full-file, or perceptual hashing that survives
-re-encoding) is migratable rather than silently incompatible.
+Measured on this project's own archive (52 MB mean NEF, images on the SATA HDD):
+
+| | |
+| --- | --- |
+| Hash throughput in RAM | sha1 2280 MB/s · **sha256 4184 MB/s** · blake2b 1011 MB/s |
+| Current scheme | 17.6 ms/image → **0.27 h** for 55k images |
+| Hypothetical full-file sha1 | 262.6 ms/image → **4.01 h** for 55k images |
+| Split of the full-file cost | **6.2% hashing, 93.8% reading** |
+
+**Identity is I/O-bound, not CPU-bound**, and that settles the algorithm
+question. A faster primitive optimises the 6% and leaves the 94% alone. The 15x
+saving comes from reading 1 MB instead of 52 MB — the amount read, not the hash.
+
+On BLAKE3 specifically: it is not installed, so adopting it means a new
+dependency; its advantage is raw throughput, which is the part that does not
+matter here; and it would require re-keying every stored annotation. Note also
+that sha256 is already *faster* than sha1 on this CPU (SHA extensions), so even
+"use something stronger" is not a performance argument.
+
+Collision resistance is not the binding constraint either. There is no adversary
+crafting a RAW to collide, and 160 bits over 55k items is astronomically safe.
+The residual risk belongs to the *partial read*, not the primitive: two files
+would have to agree on size **and** the first 512 KB **and** the last 512 KB, and
+a camera RAW's head carries a unique EXIF timestamp, body serial and frame
+counter. Swapping in sha256 would not reduce that risk by any amount.
+
+**The one real weakness**, stated plainly: a tool that rewrites metadata *inside*
+the RAW rather than into a sidecar `.xmp` changes the head, changes the identity,
+and orphans that image's annotation. Uncommon — Lightroom writes sidecars for
+NEF/ARW — and the alternatives are worse: hashing only the tail weakens identity,
+and extracting just the image payload needs format-specific parsing per camera.
+The `p1:` prefix plus the store's migration machinery means this is revisitable
+without data loss.
+
+**Conclusion: left unchanged**, on the measurements above rather than on inertia.
 
 #### Two kinds of key, one module
 

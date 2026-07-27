@@ -18,14 +18,38 @@ store was keying long-lived human knowledge with it - so a folder rename would
 have orphaned every diagnosis. `image_identity` is the single canonical answer
 to the second question; nothing else in the codebase should invent another.
 
-Why a partial digest rather than the whole file: a 45 MB NEF takes ~0.15 s to
-read fully, and identity is resolved for every image in a report. Size plus the
-first and last 512 KB is ~1 MB per image and is effectively collision-free for
-camera files - the head holds EXIF (body serial, frame counter, capture
-timestamp) and the tail holds image data, so two distinct frames cannot agree on
-all three. The digest carries a scheme prefix so a future change (full-file, or
-perceptual hashing that survives re-encoding) is distinguishable and migratable
-rather than silently incompatible.
+Design review (measured on this project's own archive, 52 MB mean NEF):
+
+    hash throughput, in RAM        sha1 2280 MB/s, sha256 4184 MB/s, blake2b 1011 MB/s
+    current scheme                 17.6 ms/image  ->  0.27 h for 55k images
+    hypothetical full-file sha1   262.6 ms/image  ->  4.01 h for 55k images
+    of that full-file cost         6.2% is hashing, 93.8% is reading the file
+
+**Identity is I/O-bound, not CPU-bound.** That single fact settles the algorithm
+question: a faster hash (BLAKE3, and note sha256 is already *faster* than sha1
+here thanks to CPU SHA extensions) would optimise the 6% and leave the 94%
+untouched. What buys the 15x is reading 1 MB instead of 52 MB - the amount read,
+not the primitive. BLAKE3 would also add a dependency to a project that
+currently needs none for this, and re-keying every stored annotation, in
+exchange for no measurable gain.
+
+Collision resistance is likewise not the binding constraint. There is no
+adversary - nobody is crafting a RAW to collide with another - and 160 bits over
+55k items is astronomically safe. The residual risk is inherent to the *partial*
+read, not the primitive: two distinct files would have to agree on size AND the
+first 512 KB AND the last 512 KB. For camera files the head carries EXIF (body
+serial, frame counter, capture timestamp), so two different frames cannot.
+Swapping sha1 for sha256 would not reduce that risk at all.
+
+The one real weakness: a tool that rewrites metadata *inside* the RAW (rather
+than into a sidecar .xmp) changes the head and therefore the identity, orphaning
+that image's annotation. Uncommon - Lightroom writes sidecars for NEF/ARW - and
+the alternatives are worse (hashing only the tail weakens identity; parsing out
+the image payload means format-specific code for every camera). The `p1:` prefix
+plus the migration machinery in the annotation store means this can be revisited
+without data loss if it ever bites.
+
+Conclusion: unchanged, on evidence rather than inertia.
 """
 
 from __future__ import annotations
