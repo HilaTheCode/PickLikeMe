@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict, dataclass, field, fields
+from datetime import datetime
 from pathlib import Path
 
 from ..config import PROJECT_ROOT
@@ -18,6 +19,27 @@ DEFAULT_ANALYSIS_DIR = PROJECT_ROOT / "analysis"
 # Percentile cut-offs for top-K ranking quality. These are the fractions a
 # photographer actually culls at: "show me the best 1%..30% of the shoot".
 DEFAULT_TOP_PERCENTS: tuple[float, ...] = (1.0, 2.0, 5.0, 10.0, 20.0, 30.0)
+
+
+def timestamped_output_dir(base: str | Path, run_started: datetime) -> Path:
+    """Append a run timestamp to an output directory's name.
+
+    Mirrors `train.timestamped_output_path`, which does the same thing for
+    per-run CSVs: the stamp goes on the directory's own name rather than adding
+    a nesting level, so `analysis` becomes `analysis_20260727-093015` and
+    `analysis/epoch40_vs_epoch20` becomes
+    `analysis/epoch40_vs_epoch20_20260727-093015` - a meaningful base name is
+    preserved, just made unique. The `%Y%m%d-%H%M%S` format sorts
+    chronologically under a plain `ls`.
+
+    Only called from the CLI (`analyzer.cli.run`), not from `AnalysisConfig` or
+    `run_analysis` themselves: a library caller (tests, notebooks, a script)
+    that builds a config with an explicit `output_dir` gets exactly that
+    directory, no surprises.
+    """
+    base = Path(base)
+    stamp = run_started.strftime("%Y%m%d-%H%M%S")
+    return base.with_name(f"{base.name}_{stamp}")
 
 
 @dataclass(frozen=True)

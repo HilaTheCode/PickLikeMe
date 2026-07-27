@@ -12,8 +12,10 @@ nothing else:
 - **Long-lived.** The database lives outside the analyzer's output directory,
   because output directories are per-run and get replaced; a knowledge base
   accumulated over months must not be inside one.
-- **False negatives only**, by request. Nothing here is wired to false
-  positives.
+- **False negatives only**, by request. The annotation workflow (categories,
+  primary failure cause, notes) is wired to false negatives and nothing else;
+  the detector-box thumbnail overlay is a separate, unrelated feature
+  (analyzer.detections / analyzer.contactsheets) that does apply report-wide.
 
 Identity is the one genuinely hard problem: a diagnosis must follow the image
 through a rename, a reorganisation, or a move to another drive. Annotations are
@@ -66,6 +68,21 @@ INITIAL_CATEGORIES: tuple[str, ...] = (
     "Other",
 )
 
+# A second, distinct dimension: the general categories above are multi-select
+# tags ("what else was going on"), while this is a single primary root cause
+# ("what mainly broke it") - one radio choice, not a checklist. Kept as its own
+# fixed vocabulary (not grown from free text the way `categories` is) because
+# it is meant to stay a small, comparable set for the frequency breakdown to
+# mean something across many annotations.
+PRIMARY_FAILURE_CAUSES: tuple[str, ...] = (
+    "Detection crop too small",
+    "Head outside crop",
+    "Multiple birds",
+    "Occlusion",
+    "Classifier disagreement",
+    "Other",
+)
+
 # v1 keyed annotations on a digest of the resolved path, which a rename would
 # have orphaned. v2 keys them on content identity and migrates v1 rows across.
 SCHEMA_VERSION = 2
@@ -83,6 +100,10 @@ class Annotation:
     filename: str
     original_path: str
     categories: list[str] = field(default_factory=list)
+    # The single primary root cause, from PRIMARY_FAILURE_CAUSES - distinct
+    # from `categories` (multi-select tags) and optional: a photographer may
+    # tag categories without committing to one primary cause, or vice versa.
+    primary_failure_cause: str | None = None
     notes: str = ""
     capture_datetime: str | None = None
     created_at: str = ""
@@ -94,7 +115,7 @@ class Annotation:
 
     @property
     def is_empty(self) -> bool:
-        return not self.categories and not self.notes.strip()
+        return not self.categories and not self.notes.strip() and not self.primary_failure_cause
 
     def as_dict(self) -> dict:
         return {
@@ -105,6 +126,7 @@ class Annotation:
             "image_path": self.original_path,
             "capture_datetime": self.capture_datetime,
             "categories": list(self.categories),
+            "primary_failure_cause": self.primary_failure_cause,
             "notes": self.notes,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
@@ -257,7 +279,23 @@ class AnnotationStore:
                     "INSERT OR IGNORE INTO categories(name, ordering, builtin) VALUES (?, ?, 1)",
                     (name, ordering),
                 )
+        self._ensure_column("annotations_v2", "primary_failure_cause", "TEXT")
         self.migration = self._migrate_v1()
+
+    def _ensure_column(self, table: str, column: str, sql_type: str) -> None:
+        """Add a column to an existing table if it is not already there.
+
+        Guarded, additive schema changes for a database that already exists on
+        disk from before a feature was added - `CREATE TABLE IF NOT EXISTS`
+        alone does not retrofit a column onto a table that was created by an
+        older version of this module. Checked via PRAGMA rather than attempted
+        and caught, so it is silent and idempotent on every open.
+        """
+        columns = {row["name"] for row in self._conn.execute(f"PRAGMA table_info({table})")}
+        if column not in columns:
+            with self._conn:
+                self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {sql_type}")
+            logger.info("Added column %s.%s (upgrading an existing database)", table, column)
 
     # -- migration ----------------------------------------------------------
 
@@ -453,6 +491,9 @@ class AnnotationStore:
             filename=row["filename"],
             original_path=row["original_path"],
             categories=categories,
+            # _ensure_column guarantees this column exists by the time any read
+            # runs, even for a database created before this field existed.
+            primary_failure_cause=row["primary_failure_cause"],
             notes=row["notes"],
             capture_datetime=row["capture_datetime"],
             created_at=row["created_at"],
@@ -508,19 +549,30 @@ class AnnotationStore:
 
     # -- writes -------------------------------------------------------------
 
-    def save(self, image_path: str | Path, categories: Sequence[str], notes: str = "") -> Annotation:
+    def save(
+        self,
+        image_path: str | Path,
+        categories: Sequence[str],
+        notes: str = "",
+        primary_failure_cause: str | None = None,
+    ) -> Annotation:
         """Create or replace one annotation.
 
-        Saving with no categories and no notes deletes the record, so clearing
-        the panel in the UI is how a mistaken annotation is removed - there is
-        no separate delete gesture to discover.
+        Saving with no categories, no notes and no primary cause deletes the
+        record, so clearing the panel in the UI is how a mistaken annotation is
+        removed - there is no separate delete gesture to discover.
+
+        `primary_failure_cause` is not validated against PRIMARY_FAILURE_CAUSES:
+        like the free-text category box, whatever the caller sends is stored
+        verbatim (an empty string is treated as "not set", same as None).
         """
         digest = self._identity_of(image_path)  # raises IdentityUnavailable
         cleaned = [c.strip() for c in categories if c and c.strip()]
         notes = notes.strip()
+        cause = (primary_failure_cause or "").strip() or None
         filename = Path(image_path).name
 
-        if not cleaned and not notes:
+        if not cleaned and not notes and not cause:
             self.delete(image_path)
             return Annotation(image_hash=digest, filename=filename, original_path=str(image_path))
 
@@ -537,15 +589,17 @@ class AnnotationStore:
             self._conn.execute(
                 """
                 INSERT INTO annotations_v2
-                    (image_hash, filename, original_path, capture_datetime, notes, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                    (image_hash, filename, original_path, capture_datetime, notes,
+                     primary_failure_cause, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(image_hash) DO UPDATE SET
-                    filename         = excluded.filename,
-                    capture_datetime = COALESCE(excluded.capture_datetime, annotations_v2.capture_datetime),
-                    notes            = excluded.notes,
-                    updated_at       = excluded.updated_at
+                    filename               = excluded.filename,
+                    capture_datetime       = COALESCE(excluded.capture_datetime, annotations_v2.capture_datetime),
+                    notes                  = excluded.notes,
+                    primary_failure_cause  = excluded.primary_failure_cause,
+                    updated_at             = excluded.updated_at
                 """,
-                (digest, filename, original, captured, notes, created, now),
+                (digest, filename, original, captured, notes, cause, created, now),
             )
             self._conn.execute("DELETE FROM annotation_categories_v2 WHERE image_hash = ?", (digest,))
             for category in cleaned:
@@ -559,12 +613,15 @@ class AnnotationStore:
                     (category,),
                 )
 
-        logger.info("Annotation saved for %s (%d categories)", filename, len(cleaned))
+        logger.info(
+            "Annotation saved for %s (%d categories, primary cause %s)", filename, len(cleaned), cause or "none"
+        )
         return Annotation(
             image_hash=digest,
             filename=filename,
             original_path=original,
             categories=sorted(cleaned),
+            primary_failure_cause=cause,
             notes=notes,
             capture_datetime=captured,
             created_at=created,
@@ -592,9 +649,14 @@ class AnnotationSummary:
     annotated: int = 0
     category_counts: list[tuple[str, int]] = field(default_factory=list)
     combination_counts: list[tuple[tuple[str, ...], int]] = field(default_factory=list)
+    # Frequency of the single primary root cause, across annotations that set
+    # one. A separate breakdown from category_counts because it answers a
+    # different question: not "what tags apply" but "what mainly broke it".
+    primary_cause_counts: list[tuple[str, int]] = field(default_factory=list)
     recent: list[Annotation] = field(default_factory=list)
     unannotated: list[str] = field(default_factory=list)
     known_categories: list[str] = field(default_factory=list)
+    known_primary_causes: list[str] = field(default_factory=list)
     database_path: str = ""
     total_in_database: int = 0
     # Images whose identity could not be established: reported explicitly,
@@ -624,8 +686,12 @@ class AnnotationSummary:
             "combination_counts": [
                 {"categories": list(combo), "count": count} for combo, count in self.combination_counts
             ],
+            "primary_cause_counts": [
+                {"cause": name, "count": count} for name, count in self.primary_cause_counts
+            ],
             "recent": [annotation.as_dict() for annotation in self.recent],
             "known_categories": self.known_categories,
+            "known_primary_causes": self.known_primary_causes,
             "database_path": self.database_path,
             "total_in_database": self.total_in_database,
             "unresolved": [item.as_dict() for item in self.unresolved],
@@ -650,12 +716,15 @@ def summarise(
 
     category_counter: Counter[str] = Counter()
     combination_counter: Counter[tuple[str, ...]] = Counter()
+    primary_cause_counter: Counter[str] = Counter()
     for annotation in found.values():
         category_counter.update(annotation.categories)
         if len(annotation.categories) > 1:
             # Sorted so {Action shot, Lighting} and {Lighting, Action shot} are
             # counted as the same combination.
             combination_counter[tuple(sorted(annotation.categories))] += 1
+        if annotation.primary_failure_cause:
+            primary_cause_counter[annotation.primary_failure_cause] += 1
 
     recent = sorted(found.values(), key=lambda a: a.updated_at, reverse=True)[:recent_limit]
     unresolved_paths = {item.image_path for item in unresolved}
@@ -668,9 +737,11 @@ def summarise(
         annotated=len(found),
         category_counts=category_counter.most_common(),
         combination_counts=combination_counter.most_common(combination_limit),
+        primary_cause_counts=primary_cause_counter.most_common(),
         recent=recent,
         unannotated=unannotated,
         known_categories=store.categories(),
+        known_primary_causes=list(PRIMARY_FAILURE_CAUSES),
         database_path=str(store.db_path),
         total_in_database=store.count(),
         unresolved=unresolved,
@@ -718,6 +789,11 @@ def render_summary(summary: AnnotationSummary) -> str:
         lines += ["", "  Most common combinations:"]
         for combo, count in summary.combination_counts:
             lines.append(f"    {count:>4,}x  {' + '.join(combo)}")
+    if summary.primary_cause_counts:
+        lines += ["", "  Primary failure cause frequencies:"]
+        for name, count in summary.primary_cause_counts:
+            share = count / summary.annotated * 100 if summary.annotated else 0.0
+            lines.append(f"    {name:<38}{count:>5,}  ({share:.0f}% of annotated)")
     if summary.recent:
         lines += ["", "  Recently annotated:"]
         for annotation in summary.recent[:8]:

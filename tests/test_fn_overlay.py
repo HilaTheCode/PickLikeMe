@@ -1,9 +1,12 @@
-"""Part 2: annotated false-negative thumbnails.
+"""Part 2 (and its later extension): detector-box thumbnail overlays.
 
 The point of the feature is that one thumbnail answers "did the detector
-contribute to this miss?", so the tests check that the boxes are actually drawn,
-that they land in the right place, and - just as importantly - that no other
-report section is touched.
+contribute to this result?", so the tests check that the boxes are actually
+drawn, that they land in the right place, and that every report section shows
+them for any image with a resolved detection record - the overlay was
+originally scoped to false negatives only, then explicitly widened by the user
+to every thumbnail in the report. What still matters is that an image with NO
+detection record is never given a fabricated one.
 """
 
 import json
@@ -20,7 +23,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from picklikeme.analyzer.contactsheets import (
     annotate_thumbnail,
     annotated_thumbnail_path,
-    build_false_negative_overlays,
+    build_thumbnail_overlays,
     render_contact_sheets,
     _thumbnail_cache_path,
 )
@@ -265,88 +268,125 @@ class OverlayDrawingTests(unittest.TestCase):
 
 
 class ScopeTests(unittest.TestCase):
-    """Only false negatives get the overlay."""
+    """Every image with a resolved detection record gets the overlay -
+    false negatives, false positives, true positives/negatives, whatever
+    category it appears in. The only thing that decides whether an image is
+    annotated is whether a detection record with boxes exists for it, never
+    which report section it is shown in."""
 
-    def _result(self, root: Path):
+    def _result(self, root: Path, categories=("false_negatives",)):
         from test_report_links import analyse
 
         result, config = analyse(root, root / "out")
-        # Give every image a detection record so scope, not availability, decides.
+        # Give only the requested categories a detection record, so the test
+        # can prove overlays follow the record, not the category.
         frame_boxes = [
             Box(5, 5, 30, 30, 0.9, 16, selected=True),
             Box(40, 5, 55, 20, 0.4, 24, selected=False),
         ]
+        wanted = set(categories)
+        pools = {
+            "false_negatives": [r.image_path for r in result.errors.false_negatives],
+            "false_positives": [r.image_path for r in result.errors.false_positives],
+            "top_ranked": [i.image_path for i in result.errors.top_ranked],
+        }
         result.detections = {
-            record.image_path: record_of(frame_boxes, size=(60, 40))
-            for record in result.errors.false_negatives
+            path: record_of(frame_boxes, size=(60, 40))
+            for name in wanted
+            for path in pools.get(name, [])
         }
         return result, config
 
-    def test_only_false_negative_thumbnails_are_annotated(self):
+    def test_a_false_positive_with_a_detection_record_is_annotated(self):
+        """The behaviour the old FN-only scope explicitly forbade."""
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            result, config = self._result(root)
+            result, config = self._result(root, categories=("false_positives",))
             from picklikeme.analyzer.contactsheets import generate_thumbnails
 
-            everything = [
-                image
-                for spec_images in (
-                    [r.image for r in result.errors.false_negatives],
-                    [r.image for r in result.errors.false_positives],
-                    result.errors.top_ranked,
+            fp_images = [r.image for r in result.errors.false_positives]
+            thumbs = generate_thumbnails(
+                fp_images, config.thumbnail_size, config.thumbnails_dir, root / "no_crops", workers=2
+            )
+            overlays = build_thumbnail_overlays(result, thumbs, result.detections)
+
+            fp_paths_with_records = set(result.detections)
+            self.assertTrue(fp_paths_with_records, "fixture must produce false positives")
+            self.assertEqual(set(overlays), fp_paths_with_records)
+            for path in fp_paths_with_records:
+                self.assertTrue(
+                    annotated_thumbnail_path(
+                        config.thumbnails_dir, path, config.thumbnail_size
+                    ).exists(),
+                    "false positive did not get an overlay file",
                 )
-                for image in spec_images
+
+    def test_images_with_no_detection_record_stay_plain_in_any_category(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            # Only false_negatives get records; false_positives must stay plain.
+            result, config = self._result(root, categories=("false_negatives",))
+            from picklikeme.analyzer.contactsheets import generate_thumbnails
+
+            everything = [r.image for r in result.errors.false_negatives] + [
+                r.image for r in result.errors.false_positives
             ]
             thumbs = generate_thumbnails(
                 everything, config.thumbnail_size, config.thumbnails_dir, root / "no_crops", workers=2
             )
-            overlays = build_false_negative_overlays(result, thumbs, result.detections)
+            overlays = build_thumbnail_overlays(result, thumbs, result.detections)
 
             fn_paths = {r.image_path for r in result.errors.false_negatives}
-            self.assertTrue(overlays)
-            self.assertTrue(set(overlays) <= fn_paths, "a non-false-negative was annotated")
-
             fp_paths = {r.image_path for r in result.errors.false_positives}
+            self.assertTrue(overlays)
+            self.assertEqual(set(overlays), fn_paths)
             for path in fp_paths:
                 self.assertNotIn(path, overlays)
                 self.assertFalse(
                     annotated_thumbnail_path(
                         config.thumbnails_dir, path, config.thumbnail_size
                     ).exists(),
-                    "a false positive got an overlay file",
+                    "an image with no detection record got an overlay file",
                 )
 
-    def test_the_report_uses_the_annotated_thumbnail_for_false_negatives(self):
+    def test_the_report_shows_the_annotated_thumbnail_wherever_a_record_exists(self):
+        """False positives get boxes in the HTML report too, not only the
+        false-negative annotation panels."""
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            result, config = self._result(root)
+            result, config = self._result(
+                root, categories=("false_negatives", "false_positives")
+            )
+            render_contact_sheets(result, crop_cache_dir=root / "no_crops")
+
+            from picklikeme.analyzer.reports.html import write_html_report
+
+            html = write_html_report(result).read_text(encoding="utf-8")
+            self.assertIn("_boxes.jpg", html, "no annotated thumbnail rendered anywhere")
+            self.assertIn("solid green", html, "the shared detector-box legend is missing")
+            # The false-positives table must be showing an overlay, not just
+            # the false-negative panels.
+            fp_path = result.errors.false_positives[0].image_path
+            fp_overlay = annotated_thumbnail_path(
+                config.thumbnails_dir, fp_path, config.thumbnail_size
+            )
+            self.assertTrue(fp_overlay.exists())
+            rel_name = fp_overlay.name
+            self.assertIn(rel_name, html, "the false-positive overlay file is not linked in the report")
+
+    def test_no_legend_when_nothing_has_a_detection_record(self):
+        """An unevidenced legend would be misleading; it only appears once
+        at least one overlay actually exists."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            result, config = self._result(root, categories=())
+            self.assertEqual(result.detections, {})
             render_contact_sheets(result, crop_cache_dir=root / "no_crops")
 
             from picklikeme.analyzer.reports.html import build_html
 
             html = build_html(result)
-            self.assertIn("_boxes.jpg", html, "the panel is not showing the annotated thumbnail")
-            self.assertIn("solid green", html, "the legend explaining the overlay is missing")
-            # The overlay is described in the panel metadata too.
-            self.assertIn("detector:", html)
-
-    def test_other_sections_still_use_the_plain_thumbnail(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            result, config = self._result(root)
-            render_contact_sheets(result, crop_cache_dir=root / "no_crops")
-
-            from picklikeme.analyzer.reports.html import _error_table, write_html_report
-
-            write_html_report(result)
-            thumbs = {
-                r.image_path: _thumbnail_cache_path(
-                    config.thumbnails_dir, r.image_path, config.thumbnail_size
-                )
-                for r in result.errors.false_positives
-            }
-            table = _error_table(result.errors.false_positives, config.output_dir, thumbs)
-            self.assertNotIn("_boxes", table)
+            self.assertNotIn("solid green", html)
 
     def test_disabling_the_overlay_leaves_the_report_working(self):
         from picklikeme.analyzer.analysis import run_analysis

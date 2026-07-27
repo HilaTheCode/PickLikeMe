@@ -246,32 +246,35 @@ def annotated_thumbnail_path(thumbnails_dir: Path, image_path: str, size: int) -
     return plain.with_name(f"{plain.stem}_boxes{plain.suffix}")
 
 
-def build_false_negative_overlays(
+def build_thumbnail_overlays(
     result,
     thumbnails: dict[str, Path],
     detection_records: dict,
 ) -> dict[str, Path]:
-    """Annotated thumbnails for the false negatives, and only those.
+    """Annotated (detector-box) thumbnails for every image with a resolved
+    detection record - every contact sheet and every HTML thumbnail table, not
+    only false negatives.
 
-    Returns image path -> annotated thumbnail, leaving `thumbnails` untouched so
-    every other report section keeps the plain image.
+    Returns image path -> annotated thumbnail. An image with no detection
+    record (nothing preprocessing recorded, nothing cached, and detection was
+    disabled or failed for it) is simply absent from the result, so its plain
+    thumbnail is used wherever it appears - there is no forced fallback.
     """
     config = result.config
     overlays: dict[str, Path] = {}
-    for record in result.errors.false_negatives:
-        path = record.image_path
-        plain = thumbnails.get(path)
-        if plain is None:
+    for path, plain in thumbnails.items():
+        record = detection_records.get(path)
+        if record is None or not record.boxes:
             continue
         annotated = annotate_thumbnail(
             plain,
-            detection_records.get(path),
+            record,
             annotated_thumbnail_path(config.thumbnails_dir, path, config.thumbnail_size),
             config.thumbnail_size,
         )
         if annotated is not None:
             overlays[path] = annotated
-    logger.info("Annotated %d false-negative thumbnail(s) with detector boxes", len(overlays))
+    logger.info("Annotated %d thumbnail(s) with detector boxes", len(overlays))
     return overlays
 
 
@@ -410,13 +413,13 @@ def render_contact_sheets(result: "AnalysisResult", crop_cache_dir: Path | None 
         workers=config.thumbnail_workers,
     )
 
-    # Detector-box overlays, for the false-negative sheet only. Every other
-    # sheet keeps the plain thumbnail.
-    overlays = build_false_negative_overlays(result, thumbnails, getattr(result, "detections", {}))
+    # Detector-box overlays, applied to every sheet: any image with a resolved
+    # detection record shows its boxes, whichever category it appears in.
+    overlays = build_thumbnail_overlays(result, thumbnails, getattr(result, "detections", {}))
+    sheet_thumbs = {**thumbnails, **overlays}
 
     written: list[Path] = []
     for spec in specs:
-        sheet_thumbs = {**thumbnails, **overlays} if spec.name == "false_negatives" else thumbnails
         written.extend(
             render_sheet(
                 spec,

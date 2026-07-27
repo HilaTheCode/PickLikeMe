@@ -161,17 +161,28 @@ def _attach_annotations(result: AnalysisResult) -> None:
 
 
 def _attach_detections(result: AnalysisResult) -> None:
-    """Resolve detector boxes for this run's false negatives.
+    """Resolve detector boxes for every image this run will show a thumbnail
+    for - every contact sheet and every HTML thumbnail table, not just false
+    negatives (the overlay used to be scoped to false negatives only; it now
+    covers the whole report).
+
+    `sheet_specs()` already enumerates exactly that universe (it is also what
+    decides which images get a thumbnail generated at all), so it is reused
+    here rather than re-deriving the same set a second way.
 
     Prefers what preprocessing recorded, then the analyzer's own cache, and only
-    then runs the detector - for the report's handful of false negatives, never
-    for the dataset. Any failure leaves the overlay off rather than losing the
-    report.
+    then runs the detector - never for images outside this report. A failure
+    leaves the overlay off rather than losing the report. Reporting a much
+    larger image set than the old false-negatives-only scope can mean detecting
+    on a proportionally larger un-recorded backlog the first time this runs
+    against an older crop cache; every result is cached by content identity, so
+    later runs over the same images are free regardless.
     """
     from ..config import DEFAULT_CROP_CACHE_DIR
+    from .contactsheets import sheet_specs
     from .detections import DetectionCache
 
-    paths = [record.image_path for record in result.errors.false_negatives]
+    paths = sorted({image.image_path for spec in sheet_specs(result) for image in spec.images})
     if not paths:
         return
     config = result.config

@@ -24,6 +24,8 @@ Open `analysis/report.html` when it finishes.
 - [CLI reference](#cli-reference)
 - [Configuration files](#configuration-files)
 - [Metrics reference](#metrics-reference)
+- [False-negative knowledge base](#false-negative-knowledge-base)
+- [Detector-box thumbnail overlay](#detector-box-thumbnail-overlay)
 - [Extension guide](#extension-guide)
 - [Usage examples](#usage-examples)
 
@@ -156,8 +158,24 @@ specificity with images you never judged.
 
 ## What it produces
 
+Every CLI run (`picklikeme analyze` / `python -m picklikeme.analyzer`) writes to
+its own timestamped folder, so consecutive full analysis reports never
+overwrite each other: `analysis` becomes `analysis_20260727-093015` (the run's
+*start* time, stamped once, before any file is written). A meaningful `--output`
+name is preserved as a prefix: `--output analysis/nightly` becomes
+`analysis/nightly_20260727-093015`. On the rare chance two runs would compute the
+identical stamp (both finish parsing args within the same second), a numbered
+suffix (`_1`, `_2`, ...) is added rather than colliding. The resolved path is
+printed as the first line of output, and the `picklikeme annotate --output ...`
+command printed afterward already has it filled in — nothing to note down.
+
+This stamping happens only in the CLI. A library caller that builds
+`AnalysisConfig` directly (tests, notebooks, a script calling `run_analysis()`)
+gets exactly the `output_dir` it specified, unstamped — see
+[Configuration files](#configuration-files) below.
+
 ```
-analysis/
+analysis_20260727-093015/
     report.html                 interactive, offline, light + dark
     report.txt                  full text report
     analysis.json               machine-readable, for CI diffing
@@ -175,7 +193,7 @@ analysis/
 | --- | --- | --- |
 | `--ranking` | required | Ranking CSV (chunks auto-discovered) |
 | `--selected` / `--rejected` | none | Ground-truth folders |
-| `--output` | `<repo>/analysis` | Where reports go |
+| `--output` | `<repo>/analysis` | Base directory for this run's reports; the run's start date/time is appended (see [What it produces](#what-it-produces)) |
 | `--config` | none | JSON config; explicit flags override it |
 | `--title` | "PickLikeMe model analysis" | Report title |
 | `--threshold` | `0.5` | Decision threshold |
@@ -219,6 +237,12 @@ picklikeme analyze --config nightly.json --threshold 0.6   # flag wins
 
 Unknown keys are rejected rather than ignored, so a typo fails loudly.
 
+`output_dir` here is still just a base name when reached through the CLI — the
+run timestamp is appended on top of whatever this file or `--output` says, the
+same as any other CLI invocation. It is only taken literally, unstamped, when
+`AnalysisConfig` is built directly by library code (`run_analysis(config)`
+called from Python without going through `analyzer.cli.run()`).
+
 ---
 
 ## Metrics reference
@@ -252,9 +276,13 @@ the most valuable failure to understand. The analyzer lets you record **why**,
 in your own words, and accumulates those diagnoses across runs.
 
 **The annotations are yours.** Nothing in the codebase infers, suggests or
-pre-fills a category. There is no model, heuristic or default in the path: the
-report renders what the database holds and stores exactly what you ticked and
-typed. False positives are deliberately *not* annotatable.
+pre-fills a category or a primary cause. There is no model, heuristic or default
+in the path: the report renders what the database holds and stores exactly what
+you ticked and typed. The annotation workflow itself (categories, primary
+failure cause, notes) is deliberately false-negative-only — false positives are
+not annotatable. The separate detector-box thumbnail overlay (below) is *not*
+scoped that way and does draw on false positives and every other category; the
+two features are independent.
 
 **They never touch the metrics.** Annotations load after every metric, threshold
 sweep and suggestion is already computed, and `test_annotations_never_change_any_metric`
@@ -267,47 +295,60 @@ Saving needs a local endpoint — a `file://` page cannot write to SQLite:
 
 ```bash
 picklikeme analyze --ranking rankings.csv --selected keep/ --rejected drop/
-picklikeme annotate --output analysis/          # serves on 127.0.0.1:8756
+picklikeme annotate --output "analysis_20260727-093015/"   # serves on 127.0.0.1:8756
 ```
 
-Or in one step: `picklikeme analyze ... --serve`.
+The `analyze` command prints the exact `picklikeme annotate --output ...` line
+to run, with the real (timestamped) directory already filled in. Or skip the
+copy-paste in one step: `picklikeme analyze ... --serve`.
 
-Each false negative gets a panel with its thumbnail, score, confidence, rank and
-displacement, an **Edit** button, the category checklist, a free-text notes box
-and **Save**. Opened straight from disk the report still *shows* existing
+Each false negative gets a panel with its thumbnail (with detector boxes drawn
+on it, if any were resolved — see [Detector-box thumbnail overlay](#detector-box-thumbnail-overlay)
+below), score, confidence, rank and displacement, an **Edit** button, a primary
+failure cause radio group, the category checklist, a free-text notes box and
+**Save**. Opened straight from disk the report still *shows* existing
 annotations, with a banner explaining that editing needs `annotate`.
 
 Example of a completed annotation:
 
 ```
+Primary cause: ○ Head outside crop  ● Occlusion  ○ Multiple birds  ○ ...
 ✓ Action shot
 ✓ Artistic choice
 Notes: "Great wing position.
         The model consistently rejects dynamic poses."
 ```
 
-Multiple categories per image are supported, notes are optional, and the
-free-text box next to Save adds a new category that is remembered for later
-runs. Saving an empty panel deletes the record — that is how a mistaken
-annotation is removed.
+### Two independent dimensions
 
-### Initial categories
+- **Primary failure cause** — a single choice from a fixed vocabulary, answering
+  "what mainly broke it": `Detection crop too small`, `Head outside crop`,
+  `Multiple birds`, `Occlusion`, `Classifier disagreement`, `Other`. This
+  vocabulary is fixed (not grown from free text) so the frequency breakdown
+  stays comparable across many annotations. Optional — an annotation can set a
+  category without a primary cause, or a primary cause with no categories; either
+  one alone is enough to keep the record (it is only deleted when categories,
+  cause and notes are all cleared).
+- **Categories** — the original multi-select tag list, for anything else worth
+  recording:
 
-Wrong crop · Multiple subjects · Subject too small · Foreground obstruction ·
-Out of focus foreground · Subject not centered · Artistic choice · Distracting
-background · Detector mistake · Pose not appreciated · Action shot · Lighting ·
-Backlit · Animal not in supported categories · Other
+  Wrong crop · Multiple subjects · Subject too small · Foreground obstruction ·
+  Out of focus foreground · Subject not centered · Artistic choice · Distracting
+  background · Detector mistake · Pose not appreciated · Action shot · Lighting ·
+  Backlit · Animal not in supported categories · Other
 
-They are seeded into the database on first use, so the vocabulary grows without
-a code change.
+  Unlike primary cause, this vocabulary **does** grow: the free-text box next to
+  Save adds a new category that is remembered for later runs. Seeded into the
+  database on first use, so it grows without a code change.
 
 ### False Negative Summary
 
 A report section showing category frequencies, the most common combinations
 (order-insensitive, so `Backlit + Lighting` and `Lighting + Backlit` are one
-entry), recently annotated images, and everything not yet annotated. The panel
-list filters by one category, by several (any or all), and by annotated /
-not annotated.
+entry), **primary failure cause frequencies** and the single most common cause as
+a summary card, recently annotated images, and everything not yet annotated. The
+panel list filters by one category, by several (any or all), by primary cause,
+and by annotated / not annotated.
 
 ### Storage
 
@@ -316,7 +357,7 @@ not annotated.
 | Location | `<project>/annotations/false_negatives.db` (`--annotations-db` to move) |
 | Why there | Outside every output directory — those are per-run and get replaced; a knowledge base must outlive them |
 | Tables | `annotations_v2`, `annotation_categories_v2`, `categories`, `identity_cache`, `unmigrated_v1`, `schema_info` |
-| Per record | `image_hash` (identity), filename, original path, capture datetime if readable, timestamps, categories, notes |
+| Per record | `image_hash` (identity), filename, original path, capture datetime if readable, timestamps, categories, primary failure cause, notes |
 | Journal | WAL, so generating a report never blocks the UI writing |
 | Written | Only this database. Never a ranking, checkpoint, dataset, image or report |
 
@@ -410,6 +451,12 @@ one with the current code migrates it **automatically**:
   is lost;
 - it is idempotent: migrated rows leave the v1 table, so reopening is a no-op.
 
+A second, unrelated kind of upgrade also runs automatically on open: an
+existing v2 database from before the primary-failure-cause field existed gains
+that column via a guarded `ALTER TABLE` (checked with `PRAGMA table_info` first,
+so it is silent and idempotent) — every existing row simply reads back with
+`primary_failure_cause = NULL` until you set one.
+
 ### Server
 
 `picklikeme annotate` binds **127.0.0.1 only** — never `0.0.0.0`. It has no
@@ -420,9 +467,11 @@ cannot escape), and the only write endpoint is `POST /api/annotations`.
 | Endpoint | Purpose |
 | --- | --- |
 | `GET /api/health` | Probe; the page uses it to decide whether Save is available |
-| `GET /api/categories` | Current vocabulary |
+| `GET /api/categories` | Current category vocabulary |
+| `GET /api/primary-causes` | The fixed primary-failure-cause vocabulary |
 | `GET /api/annotations` | All records, to refresh the page |
-| `POST /api/annotations` | `{image_path, categories[], notes}` |
+| `POST /api/annotations` | `{image_path, categories[], primary_failure_cause, notes}` |
+| `GET /source?path=...` | Streams an original image; used so a *served* report can still open source files (browsers block navigating from a served page straight to a `file://` link). Confined to the dataset roots recorded in this report's own `analysis.json` — nothing outside it is reachable |
 
 Built on `http.server` and `sqlite3` from the standard library — no new
 dependency for a tool that runs for a few minutes at a time.
@@ -435,6 +484,50 @@ guide the detector, crop generation, the ranking model and the training set. If
 mistake" dominates, detection is; if "Action shot" dominates, the training set
 lacks dynamic poses. That is a judgement for you to make from the evidence — the
 analyzer counts, it does not conclude.
+
+---
+
+## Detector-box thumbnail overlay
+
+Every thumbnail in the report — contact sheets and HTML tables alike, whatever
+category the image falls in (false negative, false positive, true positive,
+top-ranked, ...) — is drawn with the detector's boxes when a detection record
+was resolved for it: **solid green** is the box that became the crop the model
+actually scored, **dashed amber** are other detections the model passed over,
+and **red** means nothing was detected at all (the model saw the whole frame).
+A legend explaining this appears once near the top of the report, only when at
+least one overlay actually exists. An image with no resolved detection record
+keeps its plain thumbnail — there is no fallback that invents a box.
+
+This is diagnostic display only, like the annotations: `--no-detect-missing-boxes`
+and comparing metrics with and without it enabled are both covered by tests
+that assert every metric stays bit-identical either way.
+
+### Where the boxes come from
+
+1. **The record `picklikeme preprocess` wrote** beside the cached crop, if the
+   detector already ran during preprocessing — free, no extra inference.
+2. **The analyzer's own cache** (`analyzer.detections.DetectionCache`, a
+   separate SQLite database from the annotation knowledge base — so
+   `--no-annotations` never touches it and vice versa), keyed by content
+   identity so it survives a moved file.
+3. **One detection pass**, only for images in neither of the above, and only for
+   the images actually shown in this report (bounded by `--max-examples` and the
+   number of contact-sheet categories) — never for the whole dataset. Every
+   result is cached, so it costs once per image, ever.
+
+`--no-detect-missing-boxes` restricts the analyzer to steps 1 and 2, so it never
+runs the detector itself.
+
+### Cost
+
+Extending the overlay from false negatives only to every thumbnail means step 3
+can now run for a proportionally larger set of images the first time this is
+used against a crop cache built before preprocessing recorded detections (an
+older cache). Re-runs over the same images are free regardless — the cache in
+step 2 is permanent. `--no-detect-missing-boxes` is the escape hatch if the
+first-run cost matters more than the boxes for images preprocessing never
+recorded.
 
 ---
 

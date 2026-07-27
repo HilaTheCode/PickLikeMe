@@ -222,13 +222,17 @@ choices, shows where it fails, and recommends what to fix:
 
 ```bash
 picklikeme analyze --ranking rankings_20260726-091500.csv \
-    --selected "D:\shoot\keep" --rejected "D:\shoot\drop" --output analysis/
+    --selected "D:\shoot\keep" --rejected "D:\shoot\drop"
 ```
 
-It writes an offline interactive HTML report (light and dark), 9 charts,
-labelled contact sheets of every mistake category, per-category CSVs, and a JSON
-record for CI. `--compare-ranking old.csv` turns it into a regression test
-between two model versions.
+Every run writes to its own timestamped folder (`analysis_<date>-<time>/` by
+default, or `<your --output>_<date>-<time>/`) so consecutive reports never
+overwrite each other; the exact path is printed as the first line of output. It
+writes an offline interactive HTML report (light and dark) with detector-box
+overlays on every thumbnail that has one, 9 charts, labelled contact sheets of
+every mistake category, per-category CSVs, and a JSON record for CI.
+`--compare-ranking old.csv` turns it into a regression test between two model
+versions.
 
 The analyzer is strictly read-only: it never touches checkpoints, the crop
 cache, source images or training data. Full documentation, including the

@@ -141,6 +141,11 @@ class AnnotationRequestHandler(SimpleHTTPRequestHandler):
         if route == "/api/categories":
             self._send_json({"categories": self.store.categories()})
             return
+        if route == "/api/primary-causes":
+            from .annotations import PRIMARY_FAILURE_CAUSES
+
+            self._send_json({"primary_causes": list(PRIMARY_FAILURE_CAUSES)})
+            return
         if route == "/api/annotations":
             self._send_json({"annotations": [a.as_dict() for a in self.store.all()]})
             return
@@ -185,7 +190,12 @@ class AnnotationRequestHandler(SimpleHTTPRequestHandler):
             return
 
         try:
-            annotation = self.store.save(image_path, categories, payload.get("notes") or "")
+            annotation = self.store.save(
+                image_path,
+                categories,
+                payload.get("notes") or "",
+                primary_failure_cause=payload.get("primary_failure_cause") or None,
+            )
         except IdentityUnavailable as exc:
             # Explicit, not a fallback: without identity the annotation could
             # only be attached to a guess, and a wrong diagnosis is worse than

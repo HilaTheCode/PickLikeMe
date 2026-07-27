@@ -13,10 +13,12 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+from dataclasses import replace
+from datetime import datetime
 from pathlib import Path
 
 from ..config import fatal_errors_logged_to_stdout, format_duration
-from .config import DEFAULT_ANALYSIS_DIR, OPTIMIZATION_TARGETS, AnalysisConfig
+from .config import DEFAULT_ANALYSIS_DIR, OPTIMIZATION_TARGETS, AnalysisConfig, timestamped_output_dir
 
 logger = logging.getLogger("picklikeme.analyzer")
 
@@ -38,7 +40,13 @@ def build_parser(add_help: bool = True) -> argparse.ArgumentParser:
     parser.add_argument("--ranking", help="Ranking CSV from picklikeme rank / train (chunks are picked up automatically)")
     parser.add_argument("--selected", default=None, help="Folder of images you kept (ground-truth positives)")
     parser.add_argument("--rejected", default=None, help="Folder of images you rejected (ground-truth negatives)")
-    parser.add_argument("--output", default=None, help=f"Where reports are written (default: {DEFAULT_ANALYSIS_DIR})")
+    parser.add_argument(
+        "--output",
+        default=None,
+        help=f"Base directory for this run's reports (default: {DEFAULT_ANALYSIS_DIR}). The run's "
+        "start date/time is appended to the folder name so consecutive analyses never overwrite "
+        "each other (e.g. analysis_20260727-093015/).",
+    )
     parser.add_argument("--config", default=None, help="JSON config file; explicit flags override it")
     parser.add_argument("--title", default=None, help="Report title")
 
@@ -146,11 +154,30 @@ def run(args: argparse.Namespace) -> int:
     config = config_from_args(args)
     _configure_logging(config.verbose)
 
-    with fatal_errors_logged_to_stdout():
-        result = run_analysis(config)
+    # Every CLI run gets its own timestamped folder, so two analyses never
+    # overwrite each other's reports - stamped here, not inside AnalysisConfig
+    # or run_analysis, so a library caller that builds a config directly (tests,
+    # notebooks, a script) keeps exact control over where its output lands.
+    #
+    # The %Y%m%d-%H%M%S stamp has 1-second resolution, so two runs that both
+    # finish parsing args within the same second (a small ranking, no charts,
+    # or a tight test/automation loop) would otherwise collide. If the stamped
+    # directory already exists, a numbered suffix is added - the same
+    # never-overwrite guarantee the ranking/CSV outputs already give, just
+    # applied to a directory instead of a file.
+    stamped = timestamped_output_dir(config.output_dir, datetime.now())
+    output_dir = stamped
+    suffix = 1
+    while output_dir.exists():
+        output_dir = stamped.with_name(f"{stamped.name}_{suffix}")
+        suffix += 1
+    config = replace(config, output_dir=output_dir)
 
-        output_dir = config.output_dir
+    with fatal_errors_logged_to_stdout():
         output_dir.mkdir(parents=True, exist_ok=True)
+        print(f"Analysis output: {output_dir.resolve()}")
+
+        result = run_analysis(config)
         written: list[Path] = [
             write_text_report(result, output_dir / "report.txt"),
             write_json_report(result, output_dir / "analysis.json"),

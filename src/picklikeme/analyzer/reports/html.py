@@ -21,6 +21,7 @@ import logging
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from ..annotations import PRIMARY_FAILURE_CAUSES
 from ..links import asset_url, source_api_url, source_file_uri
 from ..suggestions import CRITICAL, WARNING
 
@@ -110,8 +111,11 @@ border-left:2px solid var(--border);padding-left:9px}
 .fn.editing{border-color:var(--accent)}
 .cat-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(215px,1fr));gap:3px 14px;
 margin:9px 0 11px}
+.cause-grid{background:var(--panel);border:1px solid var(--border);border-radius:8px;
+padding:9px 12px;margin-bottom:4px}
 .cat{display:flex;gap:7px;align-items:center;font-size:13.5px;cursor:pointer;padding:2px 0}
 .cat input{cursor:pointer;width:15px;height:15px;accent-color:var(--accent)}
+.tag.cause-tag{background:var(--warn);color:#1a1206}
 textarea{width:100%;min-height:78px;resize:vertical;font:inherit;font-size:13.5px;padding:8px 10px;
 border-radius:7px;border:1px solid var(--border);background:var(--panel);color:var(--text)}
 input[type=text].newcat{font:inherit;font-size:13px;padding:6px 9px;border-radius:7px;
@@ -168,18 +172,19 @@ async function plmProbe(){
   }catch(e){ return false; }
 }
 
-function plmRenderTags(el, categories, notes){
+function plmRenderTags(el, categories, cause, notes){
   const tags = el.querySelector('.fn-tags');
   const note = el.querySelector('.fn-note');
   if(tags){
-    tags.innerHTML = (categories||[]).map(c=>`<span class="tag">${plmEsc(c)}</span>`).join('');
-    if(!categories || !categories.length){
-      tags.innerHTML = '<span class="status">not yet annotated</span>';
-    }
+    const causeTag = cause ? `<span class="tag cause-tag">Cause: ${plmEsc(cause)}</span>` : '';
+    const catTags = (categories||[]).map(c=>`<span class="tag">${plmEsc(c)}</span>`).join('');
+    tags.innerHTML = causeTag + catTags;
+    if(!tags.innerHTML){ tags.innerHTML = '<span class="status">not yet annotated</span>'; }
   }
   if(note){ note.textContent = notes || ''; note.style.display = notes ? '' : 'none'; }
   el.dataset.categories = (categories||[]).join('|');
-  el.dataset.annotated = (categories&&categories.length)||notes ? '1' : '0';
+  el.dataset.cause = cause || '';
+  el.dataset.annotated = (categories&&categories.length)||notes||cause ? '1' : '0';
 }
 
 function plmEsc(s){const d=document.createElement('div');d.textContent=s;return d.innerHTML;}
@@ -189,7 +194,13 @@ function plmToggleEdit(el){ el.classList.toggle('editing'); }
 async function plmSave(el){
   const status = el.querySelector('.status');
   const path = el.dataset.path;
-  const checked = [...el.querySelectorAll('.cat input:checked')].map(i=>i.value);
+  // Categories are checkboxes in the general grid; the primary cause is a
+  // separate radio group (.cause-grid) - selectors must not mix the two, or a
+  // chosen cause would be saved as an extra "category" tag.
+  const checked = [...el.querySelectorAll('.cat-grid:not(.cause-grid) input[type=checkbox]:checked')]
+    .map(i=>i.value);
+  const causeInput = el.querySelector('.cause-grid input[type=radio]:checked');
+  const cause = causeInput ? causeInput.value : '';
   const custom = el.querySelector('.newcat');
   if(custom && custom.value.trim()){ checked.push(custom.value.trim()); }
   const notes = el.querySelector('textarea').value;
@@ -203,11 +214,11 @@ async function plmSave(el){
   try{
     const r = await fetch('api/annotations',{
       method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({image_path:path, categories:checked, notes:notes})
+      body: JSON.stringify({image_path:path, categories:checked, notes:notes, primary_failure_cause:cause})
     });
     const j = await r.json();
     if(!r.ok || j.error){ throw new Error(j.error || ('HTTP '+r.status)); }
-    plmRenderTags(el, j.annotation.categories, j.annotation.notes);
+    plmRenderTags(el, j.annotation.categories, j.annotation.primary_failure_cause, j.annotation.notes);
     if(custom) custom.value='';
     status.textContent = j.deleted ? 'Annotation cleared.' : 'Saved.';
     status.className = 'status saved';
@@ -232,9 +243,11 @@ function plmApplyFilters(){
   const select=document.getElementById('f-cats');
   const wanted=select?[...select.selectedOptions].map(o=>o.value):[];
   const matchAll=document.getElementById('f-all')?.checked;
+  const wantedCause=document.getElementById('f-cause')?.value||'';
   let shown=0;
   document.querySelectorAll('.fn').forEach(el=>{
     const cats=(el.dataset.categories||'').split('|').filter(Boolean);
+    const cause=el.dataset.cause||'';
     const annotated=el.dataset.annotated==='1';
     let ok=true;
     if(mode==='annotated'&&!annotated) ok=false;
@@ -242,6 +255,7 @@ function plmApplyFilters(){
     if(ok&&wanted.length){
       ok = matchAll ? wanted.every(w=>cats.includes(w)) : wanted.some(w=>cats.includes(w));
     }
+    if(ok&&wantedCause){ ok = (cause===wantedCause); }
     el.style.display = ok ? '' : 'none';
     if(ok) shown++;
   });
@@ -255,7 +269,7 @@ document.addEventListener('DOMContentLoaded', async ()=>{
     el.querySelector('.btn-save')?.addEventListener('click',()=>plmSave(el));
     el.querySelector('.btn-cancel')?.addEventListener('click',()=>el.classList.remove('editing'));
   });
-  ['f-state','f-cats','f-all'].forEach(id=>
+  ['f-state','f-cats','f-all','f-cause'].forEach(id=>
     document.getElementById(id)?.addEventListener('change',plmApplyFilters));
   plmUpdateCounts();
 
@@ -282,8 +296,13 @@ document.addEventListener('DOMContentLoaded', async ()=>{
         const a=byHash[el.dataset.hash]||byPath[el.dataset.path];
         if(a){
           el.dataset.hash=a.image_hash;
-          plmRenderTags(el,a.categories,a.notes);
-          el.querySelectorAll('.cat input').forEach(i=>{i.checked=a.categories.includes(i.value);});
+          plmRenderTags(el,a.categories,a.primary_failure_cause,a.notes);
+          el.querySelectorAll('.cat-grid:not(.cause-grid) input[type=checkbox]').forEach(i=>{
+            i.checked=(a.categories||[]).includes(i.value);
+          });
+          el.querySelectorAll('.cause-grid input[type=radio]').forEach(i=>{
+            i.checked=(i.value===a.primary_failure_cause);
+          });
           el.querySelector('textarea').value=a.notes||'';
         }
       });
@@ -518,7 +537,12 @@ def _error_table(records, output_dir: Path, thumbs: dict[str, Path]) -> str:
 
 
 def _annotated_thumb(result: "AnalysisResult", image_path: str) -> Path | None:
-    """The detector-box overlay for a false negative, if one was rendered."""
+    """The detector-box overlay for an image, if one was rendered.
+
+    Generic - applies to any image in the report, not only false negatives.
+    Whether an overlay exists at all depends on whether a detection record with
+    boxes was resolved for that image (see analysis._attach_detections).
+    """
     from ..contactsheets import annotated_thumbnail_path
 
     config = result.config
@@ -526,12 +550,28 @@ def _annotated_thumb(result: "AnalysisResult", image_path: str) -> Path | None:
     return candidate if candidate.exists() else None
 
 
+DETECTOR_BOX_LEGEND = (
+    '<p class="sub" style="margin:0 0 16px">Thumbnails throughout this report show what the '
+    'detector found, when known: '
+    '<span style="color:#10b981;font-weight:650">solid green</span> is the box that became the '
+    'crop the model actually scored, '
+    '<span style="color:#facc15;font-weight:650">dashed amber</span> are detections it passed over, '
+    'and <span style="color:#ef4444;font-weight:650">red</span> means nothing was detected (the '
+    "model saw the whole frame). An image with no overlay has no resolved detection record.</p>"
+)
+
+
 def _annotation_panels(result: "AnalysisResult", thumbs: dict[str, Path]) -> str:
     """Capability: an annotation panel per false negative.
 
-    False negatives only. The checklist is rendered unchecked unless the
-    database already holds a diagnosis for that image - nothing is ever
-    pre-selected on the model's behalf.
+    Annotation (the category checklist, primary failure cause and notes) is
+    false-negative-only by design - that is the deliberate diagnostic question
+    this feature answers. The detector-box overlay drawn on the thumbnail is
+    not scoped that way; it is whatever `thumbs` already carries, which
+    build_html() has pre-merged with overlays for every image in the report.
+    The checklist itself is rendered unchecked unless the database already
+    holds a diagnosis for that image - nothing is ever pre-selected on the
+    model's behalf.
     """
     records = result.errors.false_negatives
     if not records:
@@ -539,6 +579,7 @@ def _annotation_panels(result: "AnalysisResult", thumbs: dict[str, Path]) -> str
 
     summary = result.annotation_summary
     categories = list(summary.known_categories) if summary else []
+    primary_causes = list(summary.known_primary_causes) if summary else list(PRIMARY_FAILURE_CAUSES)
     output_dir = result.config.output_dir
 
     filters = (
@@ -552,6 +593,10 @@ def _annotation_panels(result: "AnalysisResult", thumbs: dict[str, Path]) -> str
         + "".join(f'<option value="{_e(name)}">{_e(name)}</option>' for name in categories)
         + "</select></label>"
         '<label class="cat"><input type="checkbox" id="f-all"> match <em>all</em> selected</label>'
+        '<label>Primary cause <select id="f-cause">'
+        '<option value="">any</option>'
+        + "".join(f'<option value="{_e(name)}">{_e(name)}</option>' for name in primary_causes)
+        + "</select></label>"
         '<span class="status" id="f-count"></span>'
         '<span class="status" id="fn-coverage"></span>'
         "</div>"
@@ -565,27 +610,19 @@ def _annotation_panels(result: "AnalysisResult", thumbs: dict[str, Path]) -> str
         "</div>"
     )
 
-    legend = (
-        '<p class="sub" style="margin-bottom:12px">Thumbnails show what the detector found: '
-        f'<span style="color:#10b981;font-weight:650">solid green</span> is the box that became '
-        'the crop the model scored, '
-        f'<span style="color:#facc15;font-weight:650">dashed amber</span> are detections it passed '
-        'over, and <span style="color:#ef4444;font-weight:650">red</span> means nothing was '
-        'detected (the model saw the whole frame).</p>'
-    )
-
     panels = []
-    for record in records:
+    for panel_index, record in enumerate(records, start=1):
         image = record.image
         path = image.image_path
         detection = (result.detections or {}).get(path)
         annotation = result.annotations.get(path)
         current = annotation.categories if annotation else []
+        current_cause = annotation.primary_failure_cause if annotation else None
         notes = annotation.notes if annotation else ""
 
-        # The annotated copy when one exists, the plain thumbnail otherwise.
-        # False negatives only: no other section is given an overlay.
-        thumb = _annotated_thumb(result, path) or thumbs.get(path)
+        # `thumbs` is pre-merged with overlays in build_html(), so this is
+        # already the annotated copy when one exists.
+        thumb = thumbs.get(path)
         thumb_html = '<img alt="no preview" style="display:flex">'
         if thumb is not None and thumb.exists():
             rel = asset_url(thumb, output_dir)
@@ -616,20 +653,26 @@ def _annotation_panels(result: "AnalysisResult", thumbs: dict[str, Path]) -> str
             else ""
         )
         tags = (
-            "".join(f'<span class="tag">{_e(c)}</span>' for c in current)
-            or '<span class="status">not yet annotated</span>'
-        )
+            (f'<span class="tag cause-tag">Cause: {_e(current_cause)}</span>' if current_cause else "")
+            + "".join(f'<span class="tag">{_e(c)}</span>' for c in current)
+        ) or '<span class="status">not yet annotated</span>'
         checklist = "".join(
             f'<label class="cat"><input type="checkbox" value="{_e(name_)}"'
             f'{" checked" if name_ in current else ""}> {_e(name_)}</label>'
             for name_ in categories
+        )
+        cause_radios = "".join(
+            f'<label class="cat"><input type="radio" name="cause-{panel_index}" value="{_e(cause_name)}"'
+            f'{" checked" if cause_name == current_cause else ""}> {_e(cause_name)}</label>'
+            for cause_name in primary_causes
         )
 
         panels.append(
             f'<div class="fn" data-path="{_e(path)}" '
             f'data-hash="{_e(annotation.image_hash if annotation else "")}" '
             f'data-categories="{_e("|".join(current))}" '
-            f'data-annotated="{"1" if (current or notes) else "0"}">'
+            f'data-cause="{_e(current_cause or "")}" '
+            f'data-annotated="{"1" if (current or notes or current_cause) else "0"}">'
             f'<div class="fn-top">{thumb_html}'
             f'<div class="fn-meta"><div class="fn-name">{name}{moved}</div>'
             f'<div class="fn-nums">score {image.score:.4f} &middot; confidence '
@@ -640,7 +683,9 @@ def _annotation_panels(result: "AnalysisResult", thumbs: dict[str, Path]) -> str
             f"</div>"
             f'<div class="fn-actions"><button class="btn-edit">Edit</button></div></div>'
             f'<div class="fn-editor">'
-            f'<div class="sub">Your diagnosis - why did the model miss this one?</div>'
+            f'<div class="sub">Primary failure cause - what mainly broke it?</div>'
+            f'<div class="cat-grid cause-grid">{cause_radios}</div>'
+            f'<div class="sub" style="margin-top:10px">Other categories that applied</div>'
             f'<div class="cat-grid">{checklist}</div>'
             f'<textarea placeholder="Notes (optional)">{_e(notes)}</textarea>'
             f'<div class="row"><button class="btn-save primary">Save</button>'
@@ -650,7 +695,7 @@ def _annotation_panels(result: "AnalysisResult", thumbs: dict[str, Path]) -> str
             f"</div></div>"
         )
 
-    return legend + filters + offline + "".join(panels)
+    return filters + offline + "".join(panels)
 
 
 def _annotation_summary(result: "AnalysisResult") -> str:
@@ -676,7 +721,14 @@ def _annotation_summary(result: "AnalysisResult") -> str:
         f'<div class="card"><div class="label">Knowledge base</div>'
         f'<div class="value">{summary.total_in_database:,}</div>'
         f'<div class="note">records across all runs</div></div>'
-        "</div>"
+        + (
+            f'<div class="card"><div class="label">Top primary cause</div>'
+            f'<div class="value" style="font-size:17px">{_e(summary.primary_cause_counts[0][0])}</div>'
+            f'<div class="note">{summary.primary_cause_counts[0][1]:,} of {summary.annotated:,} annotated</div></div>'
+            if summary.primary_cause_counts
+            else ""
+        )
+        + "</div>"
     )
 
     if summary.category_counts:
@@ -706,11 +758,34 @@ def _annotation_summary(result: "AnalysisResult") -> str:
             f"<tbody>{rows}</tbody></table>"
         )
 
+    primary_causes = ""
+    if summary.primary_cause_counts:
+        biggest = summary.primary_cause_counts[0][1]
+        bars = "".join(
+            f'<div class="freq"><span class="n">{count:,}</span>'
+            f'<span class="bar" style="width:{count / biggest * 260:.0f}px;background:var(--warn)"></span>'
+            f'<span class="lbl">{_e(name)}</span></div>'
+            for name, count in summary.primary_cause_counts
+        )
+        primary_causes = (
+            "<h3 style='margin:18px 0 8px;font-size:15px'>Primary failure cause frequencies</h3>"
+            f"{bars}"
+        )
+
+    def _recent_tags(a) -> str:
+        cause_tag = (
+            f'<span class="tag cause-tag">{_e(a.primary_failure_cause)}</span> '
+            if a.primary_failure_cause
+            else ""
+        )
+        category_tags = "".join(f'<span class="tag">{_e(c)}</span> ' for c in a.categories)
+        return cause_tag + category_tags
+
     recent = ""
     if summary.recent:
         rows = "".join(
             f"<tr><td>{_e(a.updated_at[:16])}</td><td>{_e(a.filename)}</td>"
-            f'<td>{"".join(f"<span class=tag>{_e(c)}</span> " for c in a.categories)}</td>'
+            f"<td>{_recent_tags(a)}</td>"
             f'<td class="muted">{_e(a.notes[:90])}</td></tr>'
             for a in summary.recent
         )
@@ -774,7 +849,7 @@ def _annotation_summary(result: "AnalysisResult") -> str:
         "through renames, reorganisation and moves between drives. They are recorded by you, never "
         "generated, and never affect any metric in this report.</p>"
     )
-    return cards + notices + frequencies + combinations + recent + unannotated + footer
+    return cards + notices + frequencies + combinations + primary_causes + recent + unannotated + footer
 
 
 def _suggestions(result: "AnalysisResult") -> str:
@@ -830,8 +905,15 @@ def _comparison(result: "AnalysisResult") -> str:
 def build_html(result: "AnalysisResult", thumbs: dict[str, Path] | None = None) -> str:
     config = result.config
     output_dir = config.output_dir
-    thumbs = thumbs or {}
     errors = result.errors
+
+    # Every thumbnail in the report prefers its detector-box overlay when one
+    # was rendered, computed once here so every section below (error tables,
+    # annotation panels) reads a plain dict and needs no overlay awareness of
+    # its own.
+    plain_thumbs = thumbs or {}
+    thumbs = {path: (_annotated_thumb(result, path) or plain) for path, plain in plain_thumbs.items()}
+    has_any_overlay = any(record.boxes for record in (result.detections or {}).values())
 
     sections = [
         _section("Recommendations", _suggestions(result), f"{len(result.suggestions)} item(s)"),
@@ -901,6 +983,7 @@ def build_html(result: "AnalysisResult", thumbs: dict[str, Path] | None = None) 
 &middot; threshold {config.threshold:.3f} &middot; ranking: {_e(config.ranking_path.name)}</div></div>
 <button id="theme-btn">Dark mode</button></header>
 {_cards(result)}
+{DETECTOR_BOX_LEGEND if has_any_overlay else ''}
 {''.join(sections)}
 <footer>Generated by picklikeme analyze &middot; read-only: no model, cache or source image was modified
 &middot; annotations are yours, never generated, and never affect any metric</footer>
