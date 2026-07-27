@@ -3,19 +3,27 @@
 Looking at the mistakes is how a photographer actually diagnoses a model, so
 this turns each error category into a labelled grid.
 
+Every preview shows the **whole original frame**, never a crop of it. That is
+what makes the detector-box overlay meaningful: boxes are recorded in full-frame
+coordinates, so drawing them on anything but the full frame puts them in the
+wrong place. It is also what a photographer needs in order to judge a miss -
+seeing only the region the detector already chose cannot show you that it chose
+the wrong region.
+
 Performance is the hard part: full-resolution RAWs are 20-60 MB and cost about
 a second each to demosaic, so a naive sheet of 60 images would take a minute.
 Three things prevent that:
 
-- **the crop cache is preferred over the RAW.** The cached crop is a small PNG
-  that also shows what the model actually saw - both faster and more truthful.
+- **RAWs use their embedded preview.** Cameras store a full-frame JPEG inside
+  the file; extracting it costs milliseconds instead of a second, and it covers
+  the same field of view. A full demosaic is the fallback for the rare RAW that
+  has no embedded preview.
 - **thumbnails are cached on disk** under the output directory, keyed by source
   path and size, so re-running an analysis is nearly free.
 - **generation is parallel**, using threads because the decoders release the
   GIL (the same property measured for the preprocessing pipeline).
 
-Read-only: the crop cache is only ever read, and thumbnails are written only
-under the analyzer's own output directory.
+Read-only: nothing outside the analyzer's own output directory is written.
 """
 
 from __future__ import annotations
@@ -29,8 +37,6 @@ from typing import TYPE_CHECKING, Sequence
 
 from PIL import Image, ImageDraw, ImageFont
 
-from ..bird_crop import crop_cache_path
-from ..config import DEFAULT_CROP_CACHE_DIR
 from .model import MatchedImage, Outcome
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -66,37 +72,47 @@ class SheetSpec:
     images: list[MatchedImage]
 
 
+# Bumped whenever a change makes previously cached thumbnails wrong, so stale
+# entries are simply never looked up again. v2: previews are built from the full
+# frame; every v1 entry was built from the cached bird crop.
+THUMBNAIL_CACHE_VERSION = 2
+
+STANDARD_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".webp", ".bmp"}
+
+
 def _thumbnail_cache_path(cache_dir: Path, source: str, size: int) -> Path:
-    digest = hashlib.sha1(f"{Path(source).resolve()}|{size}".encode("utf-8")).hexdigest()[:20]
+    key = f"{Path(source).resolve()}|{size}|v{THUMBNAIL_CACHE_VERSION}"
+    digest = hashlib.sha1(key.encode("utf-8")).hexdigest()[:20]
     return cache_dir / digest[:2] / f"{digest}.jpg"
 
 
-def _load_source_image(image_path: str, crop_cache_dir: Path) -> Image.Image:
-    """Prefer the cached crop, fall back to the original file.
+def _load_source_image(image_path: str) -> Image.Image:
+    """The whole original frame, as cheaply as the format allows.
 
-    The crop is what the model was actually shown, so a mistake is far easier
-    to understand from it than from the full frame - and it avoids a RAW
-    demosaic entirely.
+    Never the cached bird crop. Detector boxes are recorded in full-frame
+    coordinates, so a crop-based preview would put every box in the wrong place;
+    and a crop cannot show what a photographer most needs to see, which is
+    whether the detector picked the wrong region in the first place.
     """
-    cached = crop_cache_path(crop_cache_dir, image_path)
-    if cached.exists():
-        return Image.open(cached).convert("RGB")
-
     source = Path(image_path)
     if not source.exists():
         raise FileNotFoundError(image_path)
-    if source.suffix.lower() in {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".webp", ".bmp"}:
+    if source.suffix.lower() in STANDARD_IMAGE_SUFFIXES:
         return Image.open(source).convert("RGB")
 
-    # A RAW with no cached crop: use the embedded preview rather than a full
-    # demosaic - it costs milliseconds instead of a second.
+    # A RAW: the embedded preview is the full frame and costs milliseconds,
+    # where a demosaic costs about a second.
     import rawpy
 
     with rawpy.imread(str(source)) as raw:
         try:
             thumb = raw.extract_thumb()
-        except (rawpy.LibRawNoThumbnailError, rawpy.LibRawUnsupportedThumbnailError) as exc:
-            raise ValueError(f"no embedded preview in {source.name}") from exc
+        except (rawpy.LibRawNoThumbnailError, rawpy.LibRawUnsupportedThumbnailError):
+            # No embedded preview: pay for the demosaic rather than drop the
+            # image from the report. Rare, and only for the images a report
+            # actually shows.
+            logger.debug("No embedded preview in %s; demosaicing instead", source.name)
+            return Image.fromarray(raw.postprocess(use_camera_wb=True)).convert("RGB")
         if thumb.format == rawpy.ThumbFormat.JPEG:
             import io
 
@@ -104,13 +120,13 @@ def _load_source_image(image_path: str, crop_cache_dir: Path) -> Image.Image:
         return Image.fromarray(thumb.data).convert("RGB")
 
 
-def build_thumbnail(image_path: str, size: int, cache_dir: Path, crop_cache_dir: Path) -> Path | None:
-    """Return a cached square thumbnail, generating it if needed."""
+def build_thumbnail(image_path: str, size: int, cache_dir: Path) -> Path | None:
+    """Return a cached square thumbnail of the full frame, generating it if needed."""
     target = _thumbnail_cache_path(cache_dir, image_path, size)
     if target.exists():
         return target
     try:
-        image = _load_source_image(image_path, crop_cache_dir)
+        image = _load_source_image(image_path)
     except Exception as exc:  # noqa: BLE001 - a missing source must not stop the sheet
         logger.debug("No thumbnail for %s: %s", image_path, exc)
         return None
@@ -127,7 +143,6 @@ def generate_thumbnails(
     images: Sequence[MatchedImage],
     size: int,
     cache_dir: Path,
-    crop_cache_dir: Path,
     workers: int = 8,
 ) -> dict[str, Path]:
     """Build every thumbnail in parallel, returning path -> thumbnail."""
@@ -137,7 +152,7 @@ def generate_thumbnails(
     results: dict[str, Path] = {}
     with ThreadPoolExecutor(max_workers=max(1, workers), thread_name_prefix="analyzer-thumb") as pool:
         for path, thumbnail in zip(unique, pool.map(
-            lambda p: build_thumbnail(p, size, cache_dir, crop_cache_dir), unique
+            lambda p: build_thumbnail(p, size, cache_dir), unique
         )):
             if thumbnail is not None:
                 results[path] = thumbnail
@@ -145,7 +160,7 @@ def generate_thumbnails(
     return results
 
 
-# Overlay colours for the false-negative diagnostic thumbnail.
+# Overlay colours for the detector-box diagnostic thumbnail.
 SELECTED_BOX = (16, 185, 129)   # the box that produced the crop the model scored
 OTHER_BOX = (250, 204, 21)      # runners-up: visible, clearly not the choice
 NO_DETECTION = (239, 68, 68)
@@ -159,16 +174,18 @@ def annotate_thumbnail(
 ) -> Path | None:
     """Draw the detector's boxes onto a copy of an existing thumbnail.
 
-    False negatives only. The point is to answer, at a glance, whether the
-    detector contributed to the miss: solid green is the box that became the
-    crop the model actually scored, thin dashed amber are the other candidates it
-    passed over, and a red corner marker means it found nothing at all (so the
-    model saw the whole frame).
+    The point is to answer, at a glance, whether the detector contributed to a
+    mistake: solid green is the box that became the crop the model actually
+    scored, thin dashed amber are the other candidates it passed over, and a red
+    corner marker means it found nothing at all (so the model saw the whole
+    frame).
 
-    Boxes come from `record` in full-frame coordinates and are scaled by the same
-    letterbox transform the thumbnail already used, so the overlay lands where
-    the subject is. Aspect ratio, thumbnail size and layout are untouched - this
-    writes a same-size sibling image, so the report gets no heavier.
+    Boxes come from `record` in full-frame coordinates. They are mapped onto the
+    thumbnail by normalising against the frame and scaling onto the letterboxed
+    content rectangle, which only holds because the thumbnail shows the whole
+    frame - see `_load_source_image`. Aspect ratio, thumbnail size and layout are
+    untouched: this writes a same-size sibling image, so the report gets no
+    heavier.
     """
     if record is None or not record.boxes or record.source_size is None:
         return None
@@ -181,10 +198,11 @@ def annotate_thumbnail(
     if frame_width <= 0 or frame_height <= 0:
         return None
 
-    # The thumbnail is the source letterboxed into a square: one scale factor
-    # plus centring offsets. Recomputing it here (rather than storing it) keeps
-    # the overlay correct even if the thumbnail size changes between runs.
-    scale = min(size / frame_width, size / frame_height)
+    # The thumbnail is the full frame letterboxed into a square: the content
+    # rectangle keeps the frame's aspect ratio and is centred, with background
+    # bars filling the rest. Derived here rather than stored, so the overlay
+    # stays correct even if the thumbnail size changes between runs.
+    scale = min(base.width / frame_width, base.height / frame_height)
     drawn_width, drawn_height = frame_width * scale, frame_height * scale
     offset_x = (base.width - drawn_width) / 2
     offset_y = (base.height - drawn_height) / 2
@@ -393,7 +411,7 @@ def sheet_specs(result: "AnalysisResult") -> list[SheetSpec]:
     ]
 
 
-def render_contact_sheets(result: "AnalysisResult", crop_cache_dir: Path | None = None) -> list[Path]:
+def render_contact_sheets(result: "AnalysisResult") -> list[Path]:
     """Generate every contact sheet, sharing one thumbnail pass."""
     specs = [spec for spec in sheet_specs(result) if spec.images]
     if not specs:
@@ -401,7 +419,6 @@ def render_contact_sheets(result: "AnalysisResult", crop_cache_dir: Path | None 
         return []
 
     config = result.config
-    crop_cache = Path(crop_cache_dir) if crop_cache_dir else DEFAULT_CROP_CACHE_DIR
 
     # One pass over the union: an image on two sheets is decoded once.
     every_image = [image for spec in specs for image in spec.images]
@@ -409,7 +426,6 @@ def render_contact_sheets(result: "AnalysisResult", crop_cache_dir: Path | None 
         every_image,
         config.thumbnail_size,
         config.thumbnails_dir,
-        crop_cache,
         workers=config.thumbnail_workers,
     )
 

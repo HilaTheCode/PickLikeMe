@@ -174,6 +174,95 @@ class DetectorOutputReuseTests(unittest.TestCase):
                 self.assertEqual(cache.get(moved, allow_detect=False).origin, "cache")
 
 
+class FullFramePreviewTests(unittest.TestCase):
+    """A preview must show the whole original image, never the cached bird crop.
+
+    Regression: previews were built from the crop cache while detector boxes are
+    recorded in full-frame coordinates, so every annotated preview showed a small
+    region with boxes drawn against a frame that was not there.
+    """
+
+    def _frame_and_crop(self, root: Path):
+        """A source image whose crop cache holds a visibly different picture."""
+        from picklikeme.bird_crop import crop_cache_path
+
+        source = root / "IMG_0001.jpg"
+        frame = np.zeros((200, 400, 3), dtype=np.uint8)
+        frame[:, :, 2] = 200                      # a blue full frame ...
+        frame[20:60, 30:90] = (255, 0, 0)         # ... with a red subject in it
+        Image.fromarray(frame).save(source, "JPEG", quality=95)
+
+        cached = crop_cache_path(root / "crops", source)
+        cached.parent.mkdir(parents=True, exist_ok=True)
+        Image.fromarray(np.full((40, 60, 3), (0, 255, 0), dtype=np.uint8)).save(cached)
+        return source, cached
+
+    def test_the_preview_comes_from_the_original_not_the_crop_cache(self):
+        from picklikeme.analyzer.contactsheets import build_thumbnail
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source, cached = self._frame_and_crop(root)
+            self.assertTrue(cached.exists(), "fixture must populate the crop cache")
+
+            thumb = build_thumbnail(str(source), 100, root / "thumbs")
+            pixels = np.asarray(Image.open(thumb).convert("RGB")).reshape(-1, 3)
+
+            # The crop cache is solid green; the original is blue with red in it.
+            crop_green = ((pixels[:, 1] > 180) & (pixels[:, 0] < 90) & (pixels[:, 2] < 90)).sum()
+            self.assertEqual(crop_green, 0, "the preview was built from the cached crop")
+            self.assertGreater(
+                ((pixels[:, 2] > 150) & (pixels[:, 0] < 100)).sum(), 100, "no full frame in the preview"
+            )
+
+    def test_the_preview_keeps_the_whole_frames_aspect_ratio(self):
+        """Letterboxed into the square, not cropped to fill it: a 2:1 frame must
+        occupy half the height and leave background bars."""
+        from picklikeme.analyzer.contactsheets import BACKGROUND, build_thumbnail
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source, _ = self._frame_and_crop(root)
+            thumb = build_thumbnail(str(source), 100, root / "thumbs")
+            image = np.asarray(Image.open(thumb).convert("RGB"))
+
+            self.assertEqual(image.shape[:2], (100, 100))
+            top_row = image[0]
+            self.assertTrue(
+                np.allclose(top_row, np.array(BACKGROUND), atol=12),
+                "the frame was cropped to fill the square instead of letterboxed",
+            )
+            self.assertFalse(np.allclose(image[50], np.array(BACKGROUND), atol=12))
+
+    def test_boxes_land_on_the_subject_in_the_full_frame(self):
+        """The end-to-end property: a box around the subject in full-frame
+        coordinates must be drawn around the subject in the preview."""
+        from picklikeme.analyzer.contactsheets import build_thumbnail
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source, _ = self._frame_and_crop(root)
+            thumb = build_thumbnail(str(source), 100, root / "thumbs")
+
+            out = annotate_thumbnail(
+                thumb,
+                record_of([Box(30, 20, 90, 60, 0.9, 16, selected=True)], size=(400, 200)),
+                root / "boxes.jpg",
+                100,
+            )
+            drawn = np.asarray(Image.open(out).convert("RGB"))
+
+            # The frame is letterboxed: 400x200 into 100x100 leaves 25px bars, so
+            # the box spans x 7-22, y 30-40 in thumbnail coordinates.
+            def greenish(patch):
+                return (
+                    (patch[:, :, 1] > 120) & (patch[:, :, 0] < 120) & (patch[:, :, 2] < 160)
+                ).sum()
+
+            self.assertGreater(greenish(drawn[26:46, 3:28]), 10, "no box near the subject")
+            self.assertEqual(greenish(drawn[60:100, 60:100]), 0, "a box was drawn far from the subject")
+
+
 class OverlayDrawingTests(unittest.TestCase):
     def test_boxes_are_drawn_onto_the_thumbnail(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -306,7 +395,7 @@ class ScopeTests(unittest.TestCase):
 
             fp_images = [r.image for r in result.errors.false_positives]
             thumbs = generate_thumbnails(
-                fp_images, config.thumbnail_size, config.thumbnails_dir, root / "no_crops", workers=2
+                fp_images, config.thumbnail_size, config.thumbnails_dir, workers=2
             )
             overlays = build_thumbnail_overlays(result, thumbs, result.detections)
 
@@ -332,7 +421,7 @@ class ScopeTests(unittest.TestCase):
                 r.image for r in result.errors.false_positives
             ]
             thumbs = generate_thumbnails(
-                everything, config.thumbnail_size, config.thumbnails_dir, root / "no_crops", workers=2
+                everything, config.thumbnail_size, config.thumbnails_dir, workers=2
             )
             overlays = build_thumbnail_overlays(result, thumbs, result.detections)
 
@@ -357,7 +446,7 @@ class ScopeTests(unittest.TestCase):
             result, config = self._result(
                 root, categories=("false_negatives", "false_positives")
             )
-            render_contact_sheets(result, crop_cache_dir=root / "no_crops")
+            render_contact_sheets(result)
 
             from picklikeme.analyzer.reports.html import write_html_report
 
@@ -381,7 +470,7 @@ class ScopeTests(unittest.TestCase):
             root = Path(tmp)
             result, config = self._result(root, categories=())
             self.assertEqual(result.detections, {})
-            render_contact_sheets(result, crop_cache_dir=root / "no_crops")
+            render_contact_sheets(result)
 
             from picklikeme.analyzer.reports.html import build_html
 

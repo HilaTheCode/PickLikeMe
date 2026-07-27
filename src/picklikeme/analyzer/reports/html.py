@@ -549,8 +549,8 @@ def _annotated_thumb(result: "AnalysisResult", image_path: str) -> Path | None:
 
 
 DETECTOR_BOX_LEGEND = (
-    '<p class="sub" style="margin:0 0 16px">Thumbnails throughout this report show what the '
-    'detector found, when known: '
+    '<p class="sub" style="margin:0 0 16px">Thumbnails throughout this report show the whole '
+    'frame, with what the detector found drawn on it when known: '
     '<span style="color:#10b981;font-weight:650">solid green</span> is the box that became the '
     'crop the model actually scored, '
     '<span style="color:#facc15;font-weight:650">dashed amber</span> are detections it passed over, '

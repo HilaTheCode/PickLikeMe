@@ -510,6 +510,23 @@ This is diagnostic display only, like the annotations: `--no-detect-missing-boxe
 and comparing metrics with and without it enabled are both covered by tests
 that assert every metric stays bit-identical either way.
 
+### Previews are always the whole frame
+
+Every thumbnail shows the **entire original image**, resized to fit and
+letterboxed into a square — never cropped, and never the cached bird crop.
+
+Two reasons. Boxes are recorded in full-frame coordinates, so a crop-based
+preview draws every box in the wrong place. And a crop cannot show what a
+photographer most needs to see, which is whether the detector chose the wrong
+region to begin with.
+
+Cost is kept down without cropping: RAWs use their embedded full-frame JPEG
+preview (milliseconds, versus about a second for a demosaic), falling back to a
+demosaic only for the rare RAW that has none. Thumbnails are then cached under
+`thumbnails/`, keyed by source path, size **and a cache version** — bumping that
+version is how a change like this retires every stale entry without deleting
+anything.
+
 ### Where the boxes come from
 
 1. **The record `picklikeme preprocess` wrote** beside the cached crop, if the

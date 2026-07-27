@@ -582,14 +582,14 @@ class EndToEndTests(unittest.TestCase):
 
             from picklikeme.analyzer.contactsheets import render_contact_sheets
 
-            sheets = render_contact_sheets(result, crop_cache_dir=root / "no_cache")
+            sheets = render_contact_sheets(result)
             self.assertTrue(sheets)
             self.assertTrue(all(path.exists() for path in sheets))
             self.assertTrue(any(config.thumbnails_dir.rglob("*.jpg")))
 
             # Second pass must reuse the cache rather than re-decode.
             before = {p: p.stat().st_mtime_ns for p in config.thumbnails_dir.rglob("*.jpg")}
-            render_contact_sheets(result, crop_cache_dir=root / "no_cache")
+            render_contact_sheets(result)
             after = {p: p.stat().st_mtime_ns for p in config.thumbnails_dir.rglob("*.jpg")}
             self.assertEqual(before, after, "thumbnails were regenerated instead of reused")
 

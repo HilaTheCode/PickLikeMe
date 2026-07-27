@@ -201,7 +201,7 @@ class ReportLinkTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             result, config = analyse(root, root / "out", subdir="2026/india/birds")
-            render_contact_sheets(result, crop_cache_dir=root / "no_crops")
+            render_contact_sheets(result)
             html = write_html_report(result).read_text(encoding="utf-8")
 
             checked = 0
@@ -222,7 +222,7 @@ class ReportLinkTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             result, config = analyse(root, root / "out")
-            render_contact_sheets(result, crop_cache_dir=root / "no_crops")
+            render_contact_sheets(result)
             html = write_html_report(result).read_text(encoding="utf-8")
 
             panels = re.findall(r'<div class="fn" data-path="([^"]*)".*?<img src="([^"]*)"', html, re.S)
