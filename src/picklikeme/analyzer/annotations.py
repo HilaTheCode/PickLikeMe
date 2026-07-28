@@ -124,6 +124,19 @@ class InvalidAnnotationValue(ValueError):
     """
 
 
+# `picklikeme review`'s manual override. Two values and no config: unlike a
+# diagnosis vocabulary, "keep or reject" is the workflow itself, not something
+# a photographer would want to reword. Absence of a row means "no manual
+# decision", which is different from either value.
+REVIEW_KEEP = "keep"
+REVIEW_REJECT = "reject"
+REVIEW_DECISIONS: frozenset[str] = frozenset({REVIEW_KEEP, REVIEW_REJECT})
+
+
+class InvalidReviewDecision(ValueError):
+    """Raised for a review decision outside {keep, reject}."""
+
+
 def validate_field(fields_config: AnnotationFieldsConfig, field_id: str, value_id: str | None) -> str | None:
     """Check one field against the configured vocabulary. None/blank means
     'not set'."""
@@ -402,6 +415,27 @@ class AnnotationStore:
                     PRIMARY KEY (image_hash, legacy_field_id),
                     FOREIGN KEY (image_hash) REFERENCES annotations_v2(image_hash) ON DELETE CASCADE
                 );
+
+                -- `picklikeme review`: the photographer's manual Keep/Reject,
+                -- overriding the model's ordering. Its own table rather than an
+                -- annotation field, because the two have different lifetimes
+                -- and different meanings - see set_review_decision().
+                --
+                -- image_path is the last known location, kept so a whole
+                -- session's decisions load in one query without resolving
+                -- identity for every image; image_hash stays the identity and
+                -- is what a lookup falls back to when a file has moved.
+                -- Deliberately no FOREIGN KEY to annotations_v2: a decision
+                -- must be able to exist for an image that was never diagnosed,
+                -- and deleting a diagnosis must not erase a decision.
+                CREATE TABLE IF NOT EXISTS review_decisions (
+                    image_hash TEXT PRIMARY KEY,
+                    decision   TEXT NOT NULL,
+                    image_path TEXT NOT NULL,
+                    filename   TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_review_path ON review_decisions(image_path);
 
                 CREATE INDEX IF NOT EXISTS idx_v2_filename ON annotations_v2(filename);
                 CREATE INDEX IF NOT EXISTS idx_v2_updated  ON annotations_v2(updated_at DESC);
@@ -872,6 +906,102 @@ class AnnotationStore:
             cursor = self._conn.execute("DELETE FROM annotations_v2 WHERE image_hash = ?", (digest,))
             self._conn.execute("DELETE FROM annotation_categories_v2 WHERE image_hash = ?", (digest,))
         return cursor.rowcount > 0
+
+    # -- review decisions ---------------------------------------------------
+    #
+    # `picklikeme review`'s manual Keep/Reject. Kept in this store, and this
+    # file, because it is irreplaceable human input - the same reason the
+    # diagnoses live here rather than in a recomputable cache (see
+    # analyzer/detections.py's module docstring for the rule).
+    #
+    # A separate table rather than a configured annotation field, deliberately:
+    # save() replaces field_values wholesale, so a review write would erase the
+    # photographer's diagnosis dropdowns; saving with every field empty deletes
+    # the row entirely; and summarise() would fold keep/reject counts into the
+    # false-negative/false-positive breakdowns those statistics exist to keep
+    # trustworthy. The two are different facts with different lifetimes.
+
+    def set_review_decision(self, image_path: str | Path, decision: str) -> str:
+        """Record a manual Keep or Reject. Raises IdentityUnavailable.
+
+        Keyed on content identity, so the decision follows the image through
+        the rename that `organize` performs moments later.
+        """
+        if decision not in REVIEW_DECISIONS:
+            raise InvalidReviewDecision(
+                f"decision must be one of {sorted(REVIEW_DECISIONS)}, got {decision!r}"
+            )
+        digest = self._identity_of(image_path)  # raises IdentityUnavailable
+        path = Path(image_path)
+        with self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO review_decisions (image_hash, decision, image_path, filename, updated_at)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(image_hash) DO UPDATE SET
+                    decision   = excluded.decision,
+                    image_path = excluded.image_path,
+                    filename   = excluded.filename,
+                    updated_at = excluded.updated_at
+                """,
+                (digest, decision, str(path), path.name, _now()),
+            )
+        return digest
+
+    def clear_review_decision(self, image_path: str | Path) -> bool:
+        """Drop back to whatever the threshold says. Raises IdentityUnavailable."""
+        digest = self._identity_of(image_path)
+        with self._conn:
+            cursor = self._conn.execute("DELETE FROM review_decisions WHERE image_hash = ?", (digest,))
+        return cursor.rowcount > 0
+
+    def review_decisions(self) -> list[dict]:
+        """Every recorded decision, in one query.
+
+        Bulk rather than per-image because a review session opens on thousands
+        of images at once: resolving content identity for each of them just to
+        discover most have never been decided would cost minutes on a cold
+        cache (see identity.py's measurements). The caller matches on
+        `image_path` first and falls back to `image_hash` only for the few rows
+        that miss - see picklikeme.review.session.
+        """
+        rows = self._conn.execute(
+            "SELECT image_hash, decision, image_path, filename, updated_at FROM review_decisions"
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def review_decision_count(self) -> int:
+        return int(
+            self._conn.execute("SELECT COUNT(*) AS n FROM review_decisions").fetchone()["n"]
+        )
+
+    def repoint_review_decisions(self, moves: dict[str, "Path"]) -> int:
+        """Follow the images that arranging just moved.
+
+        `image_hash` already identifies them, so nothing is *lost* without this
+        - but `image_path` is what makes a whole session's decisions load in
+        one query, and every path in it goes stale the moment files are filed
+        into `_Selected`/`_Rejected`. Repointing from the exact old -> new map
+        keeps the fast path fast on the next review, at the cost of one UPDATE
+        per moved file. The same reasoning as sidecar.rewrite_ranking_paths.
+        """
+        if not moves:
+            return 0
+        updated = 0
+        now = _now()
+        with self._conn:
+            for old, new in moves.items():
+                new_path = Path(new)
+                cursor = self._conn.execute(
+                    """UPDATE review_decisions
+                       SET image_path = ?, filename = ?, updated_at = ?
+                       WHERE image_path = ?""",
+                    (str(new_path), new_path.name, now, str(old)),
+                )
+                updated += cursor.rowcount
+        if updated:
+            logger.info("Repointed %d review decision(s) after arranging", updated)
+        return updated
 
 
 # ---------------------------------------------------------------------------

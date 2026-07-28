@@ -1,9 +1,17 @@
-"""Part of the ranking workflow: file the ranked images by the model's verdict.
+"""Part of the ranking workflow: file the images by the final verdict.
 
-`picklikeme.rank` produces an ordering; this acts on it, moving the top
-`--selection-percentage` of images into `selected_by_ai/` and the rest into
-`rejected_by_ai/`. That turns a ranking into something a photographer can
-actually work with in Lightroom or Explorer.
+`picklikeme.rank` produces an ordering and `picklikeme review` lets the
+photographer correct it; this acts on the result, moving images into
+`_Selected/` and `_Rejected/`. That turns a ranking into something a
+photographer can actually work with in Lightroom or Explorer.
+
+Two entry points over one move loop:
+
+- `organize_by_decision(selected, rejected, ...)` - explicit sets, which is what
+  a reviewed shoot produces once manual Keep/Reject overrides mean the selected
+  images are no longer simply the top of the ranking.
+- `organize_ranked_images(ranked, ..., percentage)` - the unreviewed case, which
+  splits the ranking at a percentage and defers to the above.
 
 Lives in the ranking module, not the analyzer: the analyzer is a read-only
 reporting tool and must never move a file. Nothing here imports from
@@ -32,8 +40,8 @@ from typing import Sequence
 
 logger = logging.getLogger(__name__)
 
-SELECTED_DIRNAME = "selected_by_ai"
-REJECTED_DIRNAME = "rejected_by_ai"
+SELECTED_DIRNAME = "_Selected"
+REJECTED_DIRNAME = "_Rejected"
 
 # Folders this module creates. Enumeration must skip them, or a second ranking
 # run would re-rank its own output and shuffle files between the two.
@@ -63,7 +71,7 @@ def validate_selection_percentage(value: float) -> float:
 
 
 def selection_count(total: int, percentage: float) -> int:
-    """How many of `total` ranked images go to selected_by_ai.
+    """How many of `total` ranked images go to `_Selected`.
 
     Rounded to nearest so 25% of 10 is 2 rather than 3, with the endpoints exact:
     0% selects nothing and 100% selects everything, whatever the rounding would
@@ -134,44 +142,52 @@ class OrganizeResult:
         return "\n".join(lines)
 
 
-def organize_ranked_images(
-    ranked_paths: Sequence[str],
+def organize_by_decision(
+    selected_paths: Sequence[str],
+    rejected_paths: Sequence[str],
     destination_root: str | Path,
-    selection_percentage: float = DEFAULT_SELECTION_PERCENTAGE,
     *,
     dry_run: bool = False,
+    announce: bool = True,
 ) -> OrganizeResult:
-    """Move ranked images into selected_by_ai / rejected_by_ai.
+    """Move images into `_Selected` / `_Rejected` by an explicit verdict.
 
-    `ranked_paths` must be in ranking order, best first - the caller already has
-    that from the ranking, and recomputing it here would risk disagreeing with
-    the CSV that was just written.
+    The two sets are given outright rather than derived from a cut, because a
+    reviewed shoot's selection is not a prefix of the ranking: a manual Keep on
+    a low-scoring frame, or a manual Reject on a high-scoring one, breaks that
+    assumption entirely.
+
+    Anything the caller left out of both lists is simply not touched. That is
+    how an image with no ranking and no manual decision stays where it is
+    instead of being swept somewhere it was never judged to belong.
+
+    `dry_run` still fills in every count and `moves`, so a confirmation dialog
+    can show exactly what would happen before a single file is touched.
     """
-    percentage = validate_selection_percentage(selection_percentage)
     destination_root = Path(destination_root)
-    total = len(ranked_paths)
-    cut = selection_count(total, percentage)
-
     result = OrganizeResult(
-        ranked=total,
-        selected=cut,
-        rejected=total - cut,
+        ranked=len(selected_paths) + len(rejected_paths),
+        selected=len(selected_paths),
+        rejected=len(rejected_paths),
         selected_dir=destination_root / SELECTED_DIRNAME,
         rejected_dir=destination_root / REJECTED_DIRNAME,
     )
-    if total == 0:
+    if result.ranked == 0:
         return result
 
-    print(f"Organizing images into {SELECTED_DIRNAME} and {REJECTED_DIRNAME}...")
-    print(f"  top {percentage:g}% of {total:,} ranked images -> {SELECTED_DIRNAME}")
+    if announce:
+        print(f"Organizing images into {SELECTED_DIRNAME} and {REJECTED_DIRNAME}...")
+        print(f"  {result.selected:,} -> {SELECTED_DIRNAME}, {result.rejected:,} -> {REJECTED_DIRNAME}")
 
     if not dry_run:
         for directory in (result.selected_dir, result.rejected_dir):
             directory.mkdir(parents=True, exist_ok=True)
 
-    for position, raw_path in enumerate(ranked_paths):
+    for raw_path, target_dir in [
+        *((path, result.selected_dir) for path in selected_paths),
+        *((path, result.rejected_dir) for path in rejected_paths),
+    ]:
         source = Path(raw_path)
-        target_dir = result.selected_dir if position < cut else result.rejected_dir
         try:
             if not source.is_file():
                 result.skipped += 1
@@ -198,5 +214,39 @@ def organize_ranked_images(
             result.failures.append((raw_path, f"{type(exc).__name__}: {exc}"))
             logger.warning("Could not organize %s: %s", source, exc)
 
+    if announce:
+        print(result.render())
+    return result
+
+
+def organize_ranked_images(
+    ranked_paths: Sequence[str],
+    destination_root: str | Path,
+    selection_percentage: float = DEFAULT_SELECTION_PERCENTAGE,
+    *,
+    dry_run: bool = False,
+) -> OrganizeResult:
+    """Move ranked images into `_Selected` / `_Rejected` by a percentage cut.
+
+    `ranked_paths` must be in ranking order, best first - the caller already has
+    that from the ranking, and recomputing it here would risk disagreeing with
+    the CSV that was just written.
+
+    The unreviewed path: the model's ordering is taken at face value. Once a
+    photographer has reviewed a shoot, `organize_by_decision` is what runs.
+    """
+    percentage = validate_selection_percentage(selection_percentage)
+    cut = selection_count(len(ranked_paths), percentage)
+    if not ranked_paths:
+        return organize_by_decision([], [], destination_root, dry_run=dry_run, announce=False)
+
+    # Announced here rather than by organize_by_decision, so the header can name
+    # the percentage that produced the split.
+    print(f"Organizing images into {SELECTED_DIRNAME} and {REJECTED_DIRNAME}...")
+    print(f"  top {percentage:g}% of {len(ranked_paths):,} ranked images -> {SELECTED_DIRNAME}")
+
+    result = organize_by_decision(
+        ranked_paths[:cut], ranked_paths[cut:], destination_root, dry_run=dry_run, announce=False
+    )
     print(result.render())
     return result

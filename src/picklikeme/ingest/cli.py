@@ -108,6 +108,12 @@ def _annotate_command(args: argparse.Namespace) -> None:
     raise SystemExit(run_annotate(args))
 
 
+def _review_command(args: argparse.Namespace) -> None:
+    from ..review.cli import run_review
+
+    raise SystemExit(run_review(args))
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(prog="picklikeme", description="Pick Like Me ingestion pipeline")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -160,6 +166,16 @@ def main(argv: list[str] | None = None) -> None:
         description="Serve an analysis report so false-negative annotations can be saved",
     )
     annotate_parser.set_defaults(func=_annotate_command)
+
+    from ..review.cli import build_review_parser
+
+    review_parser = sub.add_parser(
+        "review",
+        parents=[build_review_parser(add_help=False)],
+        help="Review a ranked folder and file it into _Selected / _Rejected",
+        description="Review a ranked folder and file it into _Selected / _Rejected",
+    )
+    review_parser.set_defaults(func=_review_command)
 
     args = parser.parse_args(argv)
     args.func(args)

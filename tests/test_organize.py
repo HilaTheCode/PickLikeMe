@@ -1,8 +1,12 @@
-"""Part 3: filing ranked images into selected_by_ai / rejected_by_ai.
+"""Part 3: filing images into _Selected / _Rejected.
 
 These images are the only copy, so the safety properties are tested as hard as
 the happy path: nothing is overwritten, a partial failure does not abort the
 rest, and a re-run is a no-op rather than a shuffle.
+
+Two entry points share one move loop - `organize_ranked_images` (a percentage
+cut of a ranking) and `organize_by_decision` (explicit sets, which is what a
+reviewed shoot produces) - so the safety properties are asserted against both.
 """
 
 import sys
@@ -19,6 +23,7 @@ from picklikeme.organize import (
     REJECTED_DIRNAME,
     SELECTED_DIRNAME,
     InvalidSelectionPercentage,
+    organize_by_decision,
     organize_ranked_images,
     selection_count,
     unique_destination,
@@ -236,6 +241,100 @@ class OrganizeTests(unittest.TestCase):
                 self.assertIn(label, text)
 
 
+class OrganizeByDecisionTests(unittest.TestCase):
+    """The reviewed path: explicit sets, because a manual Keep on a low-scoring
+    frame means the selection is no longer a prefix of the ranking."""
+
+    def test_explicit_sets_are_filed_regardless_of_ranking_order(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            shoot = Path(tmp) / "shoot"
+            ranked = make_ranked(shoot, 6)
+            # The worst-ranked image kept, the best-ranked rejected - exactly
+            # what a percentage cut could never express.
+            result = organize_by_decision([ranked[5]], ranked[:5], shoot)
+
+            self.assertEqual(result.selected, 1)
+            self.assertEqual(result.rejected, 5)
+            self.assertEqual(result.moved, 6)
+            self.assertTrue((shoot / SELECTED_DIRNAME / "IMG_0005.NEF").exists())
+            self.assertTrue((shoot / REJECTED_DIRNAME / "IMG_0000.NEF").exists())
+
+    def test_an_image_in_neither_set_is_left_untouched(self):
+        """How an unranked, undecided image stays put instead of being swept
+        somewhere it was never judged to belong."""
+        with tempfile.TemporaryDirectory() as tmp:
+            shoot = Path(tmp) / "shoot"
+            ranked = make_ranked(shoot, 4)
+            untouched = Path(ranked[3])
+
+            result = organize_by_decision(ranked[:2], ranked[2:3], shoot)
+
+            self.assertEqual(result.ranked, 3, "the omitted image is not counted")
+            self.assertTrue(untouched.exists(), "an omitted image must not move")
+            self.assertEqual(untouched.parent, shoot)
+
+    def test_nothing_is_overwritten_on_a_name_collision(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            shoot = Path(tmp) / "shoot"
+            ranked = make_ranked(shoot, 1)
+            existing = shoot / SELECTED_DIRNAME
+            existing.mkdir(parents=True)
+            (existing / "IMG_0000.NEF").write_bytes(b"do not clobber me")
+
+            result = organize_by_decision(ranked, [], shoot)
+
+            self.assertEqual(result.renamed, 1)
+            self.assertEqual((existing / "IMG_0000.NEF").read_bytes(), b"do not clobber me")
+            self.assertTrue((existing / "IMG_0000_1.NEF").exists())
+
+    def test_a_missing_source_is_recorded_and_the_rest_still_move(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            shoot = Path(tmp) / "shoot"
+            ranked = make_ranked(shoot, 3)
+            Path(ranked[0]).unlink()
+
+            result = organize_by_decision(ranked[:2], ranked[2:], shoot)
+
+            self.assertEqual(result.skipped, 1)
+            self.assertEqual(result.moved, 2)
+            self.assertEqual(result.failures[0][1], "source file not found")
+
+    def test_rerunning_is_a_no_op_rather_than_a_shuffle(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            shoot = Path(tmp) / "shoot"
+            ranked = make_ranked(shoot, 4)
+            first = organize_by_decision(ranked[:2], ranked[2:], shoot)
+
+            selected_now = [str(p) for p in first.moves.values()][:2]
+            rejected_now = [str(p) for p in first.moves.values()][2:]
+            second = organize_by_decision(selected_now, rejected_now, shoot)
+
+            self.assertEqual(second.moved, 0)
+            self.assertEqual(second.skipped, 4)
+            self.assertEqual(second.errors, 0)
+
+    def test_dry_run_moves_nothing_but_reports_the_full_plan(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            shoot = Path(tmp) / "shoot"
+            ranked = make_ranked(shoot, 4)
+
+            result = organize_by_decision(ranked[:1], ranked[1:], shoot, dry_run=True)
+
+            self.assertEqual(result.moved, 4)
+            self.assertEqual(len(result.moves), 4, "the plan is needed for the confirm dialog")
+            for path in ranked:
+                self.assertTrue(Path(path).exists(), "dry_run must not move a file")
+            self.assertFalse((shoot / SELECTED_DIRNAME).exists(), "dry_run must not create folders")
+
+    def test_empty_input_creates_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            shoot = Path(tmp) / "shoot"
+            shoot.mkdir(parents=True)
+            result = organize_by_decision([], [], shoot)
+            self.assertEqual(result.ranked, 0)
+            self.assertFalse((shoot / SELECTED_DIRNAME).exists())
+
+
 class EnumerationTests(unittest.TestCase):
     """A second ranking run must not re-rank its own output."""
 
@@ -256,7 +355,9 @@ class EnumerationTests(unittest.TestCase):
     def test_exclusion_is_case_insensitive_and_covers_nesting(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            nested = root / "2026" / "Selected_By_AI" / "deeper"
+            # A case variant of SELECTED_DIRNAME, nested: exclusion must match
+            # on the folder name however it is spelled and at any depth.
+            nested = root / "2026" / "_selected" / "deeper"
             nested.mkdir(parents=True)
             (nested / "filed.NEF").write_bytes(b"x")
             (root / "keep.NEF").write_bytes(b"x")

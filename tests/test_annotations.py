@@ -15,7 +15,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from picklikeme.analyzer.annotations import DEFAULT_ANNOTATIONS_DB, AnnotationStore
+from picklikeme.analyzer.annotations import DEFAULT_ANNOTATIONS_DB, AnnotationStore, summarise
 from picklikeme.identity import IdentityUnavailable, cache_key, image_identity
 from picklikeme.analyzer.config import AnalysisConfig
 from test_analyzer import build_dataset, write_ranking  # reuse the analyzer fixtures
@@ -681,6 +681,156 @@ class ServerTests(unittest.TestCase):
             with AnnotationStore(root / "kb.db") as store:
                 with self.assertRaises(SystemExit):
                     make_server(empty, store, port=0)
+
+
+class ReviewDecisionTests(unittest.TestCase):
+    """`picklikeme review`'s manual Keep/Reject, stored in this same database.
+
+    It shares the store with the diagnoses because both are irreplaceable human
+    input, but it is a separate table because the two have different lifetimes -
+    and these tests pin exactly that boundary.
+    """
+
+    def test_a_decision_round_trips(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = make_image(Path(tmp) / "a.NEF")
+            with store_in(tmp) as store:
+                store.set_review_decision(path, "keep")
+
+            with AnnotationStore(Path(tmp) / "kb" / "fn.db") as reopened:
+                rows = reopened.review_decisions()
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["decision"], "keep")
+            self.assertEqual(rows[0]["filename"], "a.NEF")
+
+    def test_deciding_again_replaces_rather_than_duplicates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = make_image(Path(tmp) / "a.NEF")
+            with store_in(tmp) as store:
+                store.set_review_decision(path, "keep")
+                store.set_review_decision(path, "reject")
+                rows = store.review_decisions()
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["decision"], "reject")
+
+    def test_clearing_removes_the_decision(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = make_image(Path(tmp) / "a.NEF")
+            with store_in(tmp) as store:
+                store.set_review_decision(path, "keep")
+                self.assertTrue(store.clear_review_decision(path))
+                self.assertEqual(store.review_decision_count(), 0)
+                self.assertFalse(store.clear_review_decision(path), "clearing twice is not an error")
+
+    def test_a_value_outside_keep_reject_is_refused(self):
+        from picklikeme.analyzer.annotations import InvalidReviewDecision
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = make_image(Path(tmp) / "a.NEF")
+            with store_in(tmp) as store:
+                with self.assertRaises(InvalidReviewDecision):
+                    store.set_review_decision(path, "maybe")
+                self.assertEqual(store.review_decision_count(), 0)
+
+    def test_a_decision_follows_a_renamed_file(self):
+        """Keyed on content identity, like every other record here - the file
+        is about to be renamed by arranging, moments after the decision."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            original = make_image(root / "IMG_9.NEF", b"the same bird")
+            with store_in(tmp) as store:
+                store.set_review_decision(original, "keep")
+                recorded = store.review_decisions()[0]["image_hash"]
+
+                original.unlink()
+                renamed = make_image(root / "best_of_shoot.NEF", b"the same bird")
+                self.assertEqual(store.identity_of(renamed), recorded)
+
+    def test_an_unreadable_image_cannot_be_decided_on(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with store_in(tmp) as store:
+                with self.assertRaises(IdentityUnavailable):
+                    store.set_review_decision(Path(tmp) / "gone.NEF", "keep")
+
+    def test_repointing_follows_the_files_that_arranging_moved(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = make_image(root / "a.NEF")
+            moved = root / "_Selected" / "a.NEF"
+            with store_in(tmp) as store:
+                store.set_review_decision(path, "keep")
+
+                self.assertEqual(store.repoint_review_decisions({str(path): moved}), 1)
+
+                row = store.review_decisions()[0]
+                self.assertEqual(row["image_path"], str(moved))
+                self.assertEqual(row["decision"], "keep", "the verdict itself is untouched")
+
+    def test_a_decision_and_a_diagnosis_are_independent(self):
+        """Different facts with different lifetimes: deleting one must never
+        take the other with it. This is why the table has no foreign key."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = make_image(Path(tmp) / "a.NEF")
+            with store_in(tmp) as store:
+                store.set_review_decision(path, "reject")
+                store.save(path, fields={"crop_quality": "too_small"})
+
+                store.delete(path)  # clears the diagnosis
+                self.assertIsNone(store.get(path))
+                self.assertEqual(store.review_decision_count(), 1, "the decision survives")
+
+                store.clear_review_decision(path)
+                store.save(path, fields={"crop_quality": "good"})
+                self.assertEqual(store.review_decision_count(), 0)
+                self.assertIsNotNone(store.get(path), "the diagnosis survives")
+
+    def test_decisions_never_enter_the_annotation_breakdowns(self):
+        """The diagnosis statistics exist to be trustworthy; a keep/reject is
+        not a diagnosis and must not be counted as one."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = make_image(Path(tmp) / "a.NEF")
+            with store_in(tmp) as store:
+                store.set_review_decision(path, "keep")
+                _, summary = summarise(store, [str(path)])
+
+            self.assertEqual(summary.annotated, 0)
+            for counts in summary.field_counts.values():
+                self.assertEqual(counts, [])
+
+    def test_review_decisions_never_change_any_metric(self):
+        """The same invariant the annotations have to satisfy: a photographer's
+        workflow state must not move the numbers the model is judged by."""
+        from picklikeme.analyzer.analysis import run_analysis
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db = root / "kb.db"
+            ranking, selected, rejected = build_fn_dataset(root)
+
+            def run():
+                return run_analysis(
+                    AnalysisConfig(
+                        ranking_path=ranking,
+                        selected_root=selected,
+                        rejected_root=rejected,
+                        output_dir=root / "out",
+                        annotations_db=db,
+                        charts=False,
+                        contact_sheets=False,
+                    )
+                )
+
+            before = run()
+            metrics_before = {v.name: v.value for v in before.metrics.values}
+
+            with AnnotationStore(db) as store:
+                for record in before.errors.false_negatives:
+                    store.set_review_decision(record.image_path, "keep")
+                self.assertGreater(store.review_decision_count(), 0)
+
+            after = run()
+            self.assertEqual(metrics_before, {v.name: v.value for v in after.metrics.values})
+            self.assertEqual(before.confusion.as_dict(), after.confusion.as_dict())
 
 
 class CliTests(unittest.TestCase):

@@ -61,38 +61,72 @@ class RankCliWiringTests(unittest.TestCase):
             finally:
                 sys.argv = old
 
-    def test_output_csv_is_timestamped_so_runs_never_overwrite_each_other(self):
-        """The ranked CSV handed to write_results_csv must carry the run's
-        date/time, not the bare --output-csv name."""
+    def _run_rank(self, root: Path, extra_argv: list[str]):
+        """Drive rank.main() with everything expensive mocked out, returning the
+        path it handed to write_results_csv."""
         import picklikeme.rank as rank_module
+
+        checkpoint = root / "ckpt.pt"
+        checkpoint.write_bytes(b"fake")
+        argv = [
+            "rank",
+            "--input", str(root),
+            "--checkpoint", str(checkpoint),
+            "--no-crop-birds",
+            "--device", "cpu",
+        ] + extra_argv
+        old = sys.argv
+        sys.argv = argv
+        try:
+            with mock.patch.object(rank_module, "PreferenceHead"), \
+                    mock.patch.object(rank_module, "load_checkpoint", return_value={"model_state_dict": {}}), \
+                    mock.patch.object(rank_module, "RawImageLoader"), \
+                    mock.patch.object(rank_module, "rank_dataset", return_value=[]), \
+                    mock.patch.object(rank_module, "write_results_csv", return_value=[root / "written.csv"]) as write_csv:
+                rank_module.main()
+        finally:
+            sys.argv = old
+        return Path(write_csv.call_args.args[0])
+
+    def test_the_ranking_is_written_into_the_folder_it_describes(self):
+        """The default: `review --input <folder>` must find the ranking by
+        computing one path, so rank puts it there rather than in the CWD."""
+        from picklikeme.sidecar import RANKING_FILENAME, SIDECAR_DIRNAME, ranking_path
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "x.nef").write_bytes(b"raw")
-            checkpoint = root / "ckpt.pt"
-            checkpoint.write_bytes(b"fake")
 
-            argv = [
-                "rank",
-                "--input", str(root),
-                "--checkpoint", str(checkpoint),
-                "--output-csv", str(root / "rankings.csv"),
-                "--no-crop-birds",
-                "--device", "cpu",
-            ]
-            old = sys.argv
-            sys.argv = argv
-            try:
-                with mock.patch.object(rank_module, "PreferenceHead"), \
-                        mock.patch.object(rank_module, "load_checkpoint", return_value={"model_state_dict": {}}), \
-                        mock.patch.object(rank_module, "RawImageLoader"), \
-                        mock.patch.object(rank_module, "rank_dataset", return_value=[]), \
-                        mock.patch.object(rank_module, "write_results_csv", return_value=[root / "written.csv"]) as write_csv:
-                    rank_module.main()
-            finally:
-                sys.argv = old
+            written_path = self._run_rank(root, [])
 
-            written_path = Path(write_csv.call_args.args[0])
+            self.assertEqual(written_path, ranking_path(root))
+            self.assertEqual(written_path.name, RANKING_FILENAME)
+            self.assertEqual(written_path.parent.name, SIDECAR_DIRNAME)
+            self.assertNotIn("rankings_", written_path.name, "the default carries no timestamp")
+
+    def test_run_metadata_is_recorded_beside_the_ranking(self):
+        from picklikeme.sidecar import read_run_metadata
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "x.nef").write_bytes(b"raw")
+
+            self._run_rank(root, [])
+
+            metadata = read_run_metadata(root)
+            self.assertEqual(metadata["image_count"], 1)
+            self.assertIn("written_at", metadata)
+            self.assertIn("checkpoint", metadata)
+
+    def test_explicit_output_csv_still_overrides_and_is_timestamped(self):
+        """The escape hatch: an explicit path opts out of the sidecar entirely,
+        and keeps the timestamp so consecutive runs never overwrite."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "x.nef").write_bytes(b"raw")
+
+            written_path = self._run_rank(root, ["--output-csv", str(root / "rankings.csv")])
+
             self.assertRegex(written_path.name, r"^rankings_\d{8}-\d{6}\.csv$")
             self.assertEqual(written_path.parent, root)
 

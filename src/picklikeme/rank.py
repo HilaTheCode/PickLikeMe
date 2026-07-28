@@ -20,18 +20,21 @@ from pathlib import Path
 
 from .auto_crop import resolve_device
 from .bird_crop import CropParams
-from .config import DEFAULT_CHECKPOINT_PATH, DEFAULT_CROP_CACHE_DIR, DEFAULT_MAX_CSV_ROWS
+from .config import DEFAULT_CHECKPOINT_PATH, DEFAULT_CROP_CACHE_DIR, DEFAULT_MAX_CSV_ROWS, cli_prefix
 from .dataset import UnlabeledImageDataset
 from .model import DINOV3_BACKBONE, ModelConfig, PreferenceHead
 from .organize import (
     DEFAULT_SELECTION_PERCENTAGE,
     ORGANIZE_DIRNAMES,
+    REJECTED_DIRNAME,
+    SELECTED_DIRNAME,
     InvalidSelectionPercentage,
     organize_ranked_images,
     validate_selection_percentage,
 )
 from .preprocess import build_cache
 from .raw_io import RawImageLoader
+from .sidecar import RANKING_FILENAME, SIDECAR_DIRNAME, ranking_path, write_run_metadata
 from .train import load_checkpoint, rank_dataset, timestamped_output_path, write_results_csv
 
 
@@ -59,10 +62,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--checkpoint", default=str(DEFAULT_CHECKPOINT_PATH), help="Trained checkpoint to load (default: the project's rolling checkpoint)")
     parser.add_argument(
         "--output-csv",
-        default="rankings.csv",
-        help="Base name for the ranked CSV. The run's start date/time is appended "
-        "to the stem so every run gets a unique file and no previous rankings are "
-        "overwritten (e.g. rankings_20260725-143000.csv).",
+        default=None,
+        help="Write the ranked CSV here instead of into the folder's own "
+        f"{SIDECAR_DIRNAME}/{RANKING_FILENAME}. The run's start date/time is appended to the "
+        "stem (e.g. rankings_20260725-143000.csv). Passing this opts out of "
+        "`picklikeme review --input <folder>` finding the ranking on its own.",
     )
     parser.add_argument(
         "--max-rows",
@@ -87,20 +91,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
         const=True,
         default=True,
         metavar="true/false",
-        help="Move the ranked images into selected_by_ai/ and rejected_by_ai/ under the input "
-        "folder (default: true). Pass false to leave every file where it is.",
+        help=f"Move the ranked images into {SELECTED_DIRNAME}/ and {REJECTED_DIRNAME}/ under the "
+        "input folder (default: true). Pass false to leave every file where it is, which is "
+        "what `picklikeme review` expects - it files them once you have reviewed them.",
     )
     parser.add_argument(
         "--selection-percentage",
         type=float,
         default=DEFAULT_SELECTION_PERCENTAGE,
-        help=f"Percentage of the highest-ranked images to place in selected_by_ai "
+        help=f"Percentage of the highest-ranked images to place in {SELECTED_DIRNAME} "
         f"(default: {DEFAULT_SELECTION_PERCENTAGE:g}; 0-100).",
     )
     parser.add_argument(
         "--organize-dir",
         default=None,
-        help="Where selected_by_ai/ and rejected_by_ai/ are created (default: the --input folder)",
+        help=f"Where {SELECTED_DIRNAME}/ and {REJECTED_DIRNAME}/ are created (default: the --input folder)",
     )
     return parser
 
@@ -129,15 +134,25 @@ def main() -> None:
         )
 
     # Skip our own output folders: without this, a second run would rank the
-    # images a previous run had already filed and shuffle them again.
-    dataset = UnlabeledImageDataset.from_folder(input_folder, exclude_dirs=set(ORGANIZE_DIRNAMES))
+    # images a previous run had already filed and shuffle them again. The
+    # sidecar holds no images, but is excluded explicitly rather than by luck.
+    dataset = UnlabeledImageDataset.from_folder(
+        input_folder, exclude_dirs=set(ORGANIZE_DIRNAMES) | {SIDECAR_DIRNAME}
+    )
     if len(dataset) == 0:
         raise SystemExit(f"No RAW images (.arw/.nef/.cr3) found under {input_folder.resolve()}")
     print(f"Found {len(dataset)} images to rank under {input_folder.resolve()}")
 
     # Resolved before the crop-cache build so the destination is known up front,
     # not only after a long preprocessing + scoring pass.
-    output_csv = timestamped_output_path(args.output_csv, run_started)
+    #
+    # By default the ranking is written into the folder it describes, so
+    # `picklikeme review --input <folder>` finds it by computing one path
+    # rather than searching. An explicit --output-csv overrides that entirely.
+    if args.output_csv:
+        output_csv = timestamped_output_path(args.output_csv, run_started)
+    else:
+        output_csv = ranking_path(input_folder)
     print(f"Ranked CSV for this run will be written to {output_csv.resolve()}")
 
     device = resolve_device(args.device)
@@ -186,6 +201,20 @@ def main() -> None:
     print(f"\nRanked CSV written to {output_paths[0]}")
     if len(output_paths) > 1:
         print(f"Additional CSV files: {', '.join(str(path) for path in output_paths[1:])}")
+
+    if args.output_csv:
+        # The ranking is not where review looks, so say how to reach it.
+        print(f"\nTo review this shoot:\n  {cli_prefix()} review --input \"{input_folder}\" "
+              f"--ranking \"{output_paths[0]}\"")
+    else:
+        write_run_metadata(
+            input_folder,
+            backbone=args.backbone,
+            checkpoint=str(checkpoint_path.resolve()),
+            image_count=len(dataset),
+            crop_birds=bool(args.crop_birds),
+        )
+        print(f"\nTo review this shoot:\n  {cli_prefix()} review --input \"{input_folder}\"")
 
 
 if __name__ == "__main__":

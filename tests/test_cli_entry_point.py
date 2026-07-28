@@ -63,7 +63,7 @@ class ModuleEntryPointTests(unittest.TestCase):
             cwd=PROJECT_ROOT,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
-        for command in ("analyze", "annotate", "build-manifest"):
+        for command in ("analyze", "annotate", "build-manifest", "review"):
             self.assertIn(command, result.stdout)
 
     def test_module_invocation_reaches_the_annotate_subcommand(self):
