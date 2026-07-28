@@ -77,6 +77,8 @@ display:flex;flex-direction:column;box-shadow:0 1px 2px var(--shadow)}
 .card.sel{border-color:var(--good);border-width:2px}
 .card.rej{border-color:var(--bad);border-width:2px}
 .card.unt{border-style:dashed;border-color:var(--warn)}
+.thumb-link{display:block;position:relative;cursor:zoom-in}
+.thumb-link:hover .thumb{filter:brightness(1.06)}
 .thumb{width:100%;aspect-ratio:1;background:var(--panel-2);object-fit:cover;display:block}
 .ph{width:100%;aspect-ratio:1;background:var(--panel-2);display:flex;align-items:center;
 justify-content:center;color:var(--muted);font-size:12.5px;text-align:center;padding:12px}
@@ -190,10 +192,17 @@ function card(image){
   const cls = image.state === 'manual_keep' || image.state === 'auto_selected' ? 'sel'
             : image.state === 'unranked' ? 'unt' : 'rej';
   const url = 'thumb?path=' + encodeURIComponent(image.image_path) + (PLM.boxes ? '&boxes=1' : '');
+  // The thumbnail is a cropped-to-square preview; clicking it opens the RAW's
+  // own full-size decode (the same /preview the analysis report uses for
+  // "Open Preview") in a new tab, so a photographer can actually judge focus
+  // and detail rather than the small square used for scanning the gallery.
+  const previewUrl = 'preview?path=' + encodeURIComponent(image.image_path);
   const visual = image.missing_file
     ? '<div class="ph">File not found<br>(listed in the ranking)</div>'
-    : '<img class="thumb" loading="lazy" src="' + esc(url) + '" alt="' + esc(image.filename) + '"' +
-      ' onerror="this.outerHTML=\\'<div class=ph>No preview available</div>\\'">';
+    : '<a class="thumb-link" href="' + esc(previewUrl) + '" target="_blank" rel="noopener" title="Open full size">' +
+        '<img class="thumb" loading="lazy" src="' + esc(url) + '" alt="' + esc(image.filename) + '"' +
+        ' onerror="this.outerHTML=\\'<div class=ph>No preview available</div>\\'">' +
+      '</a>';
   const score = image.score == null
     ? 'no score'
     : 'score ' + image.score.toFixed(4) + (image.rank ? ' &middot; rank ' + image.rank.toLocaleString() : '');
@@ -314,11 +323,6 @@ async function boot(){
   q('#dlg-go').addEventListener('click', doArrange);
 
   try{
-    // Every endpoint answers {ok, ..., state}, not the gallery state itself -
-    // arrange and reconcile carry a sibling (result, recovered) alongside it,
-    // which is why api() hands back the whole envelope rather than unwrapping
-    // it for every caller. Every other call site extracts .state at the point
-    // of use (see decide/setPercent/doArrange below); this is the same thing.
     // Every endpoint answers {ok, ..., state}, not the gallery state itself -
     // arrange and reconcile carry a sibling (result, recovered) alongside it,
     // which is why api() hands back the whole envelope rather than unwrapping

@@ -15,6 +15,7 @@ import threading
 import unittest
 import urllib.error
 import urllib.request
+from io import BytesIO
 from pathlib import Path
 from unittest import mock
 from urllib.parse import quote
@@ -283,6 +284,44 @@ class ThumbnailEndpointTests(ReviewServerTestCase):
         with self.assertRaises(urllib.error.HTTPError) as ctx:
             urllib.request.urlopen(self.base + "/thumb")
         self.assertEqual(ctx.exception.code, 400)
+
+
+class ClickThroughToFullSizeTests(ReviewServerTestCase):
+    """Clicking a card's thumbnail opens the RAW's own full-size decode in a
+    new tab - the same /preview endpoint the analysis report already uses for
+    "Open Preview", inherited unchanged from AnnotationRequestHandler and
+    confined to the reviewed folder by the same `source_roots` check as
+    /thumb and /open-folder."""
+
+    def test_every_card_s_thumbnail_links_to_the_preview_endpoint(self):
+        """The gallery is rendered client-side from fetched state (the page
+        ships empty - see PageTests), so the card markup lives in the JS
+        template, not the served document body."""
+        from picklikeme.review.page import build_js
+
+        js = build_js()
+        self.assertIn('class="thumb-link"', js)
+        self.assertIn("preview?path=", js)
+        self.assertIn('target="_blank"', js)
+        self.assertIn('rel="noopener"', js)
+
+    def test_the_preview_endpoint_serves_the_full_frame_not_the_square_thumb(self):
+        url = "/preview?path=" + quote(str(self.images[0]), safe="")
+        with urllib.request.urlopen(self.base + url) as response:
+            self.assertEqual(response.headers["Content-Type"], "image/jpeg")
+            data = response.read()
+
+        decoded = Image.open(BytesIO(data))
+        self.assertEqual(decoded.size, (60, 40), "the fixture's real dimensions, not a cropped square")
+
+    def test_the_preview_endpoint_is_confined_to_the_reviewed_folder(self):
+        """The click-through must not become a new way to read the whole disk."""
+        secret = self.root / "secret.jpg"
+        Image.fromarray(np.zeros((8, 8, 3), dtype=np.uint8)).save(secret)
+
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            urllib.request.urlopen(self.base + "/preview?path=" + quote(str(secret), safe=""))
+        self.assertEqual(ctx.exception.code, 403)
 
 
 class ArrangeEndpointTests(ReviewServerTestCase):
