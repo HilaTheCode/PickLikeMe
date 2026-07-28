@@ -75,7 +75,7 @@ background:var(--panel-2);font-size:13px}
 .card{background:var(--panel);border:1px solid var(--border);border-radius:11px;overflow:hidden;
 display:flex;flex-direction:column;box-shadow:0 1px 2px var(--shadow)}
 .card.sel{border-color:var(--good);border-width:2px}
-.card.rej{opacity:.62}
+.card.rej{border-color:var(--bad);border-width:2px}
 .card.unt{border-style:dashed;border-color:var(--warn)}
 .thumb{width:100%;aspect-ratio:1;background:var(--panel-2);object-fit:cover;display:block}
 .ph{width:100%;aspect-ratio:1;background:var(--panel-2);display:flex;align-items:center;
