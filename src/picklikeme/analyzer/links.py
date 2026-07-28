@@ -21,6 +21,13 @@ The fix is to emit both forms: a `file://` href that works offline, plus the
 absolute path in `data-source` so the served page can rewrite the href to the
 server's own `/source` endpoint. One artifact, correct in both modes, on Windows
 and on POSIX.
+
+`folder_file_uri`/`folder_api_url` and `preview_api_url` extend the same
+dual-form pattern to two actions that replaced a bare RAW hyperlink (browsers
+cannot render RAW files at all, so a direct link to one was never useful):
+"Open Folder" (a directory listing - the closest thing to opening the OS file
+manager a web page can do) and "Open Preview" (the RAW's own embedded
+full-size preview, extracted server-side on demand).
 """
 
 from __future__ import annotations
@@ -31,8 +38,10 @@ from urllib.parse import quote
 
 logger = logging.getLogger(__name__)
 
-# Query parameter the annotation server reads for /source.
+# Query parameter the annotation server reads for /source, /folder, /preview.
 SOURCE_ENDPOINT = "source"
+FOLDER_ENDPOINT = "folder"
+PREVIEW_ENDPOINT = "preview"
 SOURCE_PARAM = "path"
 
 
@@ -73,6 +82,45 @@ def source_api_url(image_path: str | Path) -> str:
     happens to be on.
     """
     return f"{SOURCE_ENDPOINT}?{SOURCE_PARAM}={quote(str(Path(image_path)), safe='')}"
+
+
+def folder_file_uri(image_path: str | Path) -> str | None:
+    """`file://` URI for the folder containing an image, or None when the
+    image itself cannot be located (if the image is unreachable, its folder
+    is not trustworthy either - same rule source_file_uri already applies).
+
+    A directory `file://` URI is what "Open Folder" resolves to offline: every
+    browser renders it as a listing of the folder's contents, which is the
+    closest thing to opening the OS file manager that a web page can trigger -
+    there is no browser API for the latter, and RAW files themselves are not
+    renderable, so a direct link to the RAW was never useful here anyway.
+    """
+    resolved = absolute_source_path(image_path)
+    if resolved is None:
+        return None
+    try:
+        # Trailing slash: some browsers only recognise a file:// URI as a
+        # directory listing (rather than attempting to load "a file with no
+        # extension") when it ends in one.
+        return resolved.parent.as_uri() + "/"
+    except ValueError as exc:  # pragma: no cover - resolved paths are absolute
+        logger.debug("No folder URI for %s: %s", image_path, exc)
+        return None
+
+
+def folder_api_url(image_path: str | Path) -> str:
+    """Relative URL for the served mode's folder listing (see server._serve_folder)."""
+    parent = str(Path(image_path).parent)
+    return f"{FOLDER_ENDPOINT}?{SOURCE_PARAM}={quote(parent, safe='')}"
+
+
+def preview_api_url(image_path: str | Path) -> str:
+    """Relative URL for the served mode's full-size RAW preview extraction
+    (see server._serve_preview). No offline equivalent exists - browsers
+    cannot decode a RAW file at all - so callers fall back to the report's
+    own small thumbnail when the server is not running.
+    """
+    return f"{PREVIEW_ENDPOINT}?{SOURCE_PARAM}={quote(str(Path(image_path)), safe='')}"
 
 
 def asset_url(target: str | Path, output_dir: str | Path) -> str | None:

@@ -158,9 +158,14 @@ subject-centered image (background discarded). This is **on by default**; pass
 
 The detector accepts every COCO animal class — the wildlife targets `bird`,
 `elephant`, `bear`, `zebra`, `giraffe`, plus `cat`, `dog`, `horse`, `sheep`,
-`cow`. The highest-confidence detection among those wins, whatever its class;
-images with no supported animal fall back to the full frame. The flags and cache
-keep their historical `bird` names.
+`cow`. Among the surviving detections, **the largest bounding box wins,
+whatever its class** — for this archive, the intended subject is almost
+always the biggest animal in frame, and a small but confidently-detected
+animal must not be preferred over it. Confidence only breaks a tie between
+detections whose areas are already close (`--area-tie-frac`, default 10%);
+see `bird_crop.select_best_detection()` for the exact policy. Images with no
+supported animal fall back to the full frame. The flags and cache keep their
+historical `bird` names.
 
 Build the crop cache once **before training** (detects the animal per image,
 crops with a small safety margin, aspect ratio preserved, and caches the

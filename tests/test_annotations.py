@@ -488,7 +488,7 @@ class HtmlIntegrationTests(unittest.TestCase):
             )
         )
 
-    def test_panels_include_edit_save_and_the_field_editors(self):
+    def test_panels_show_save_and_the_field_editors_with_no_edit_click_required(self):
         from picklikeme.analyzer.reports.html import build_html
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -496,7 +496,8 @@ class HtmlIntegrationTests(unittest.TestCase):
             result = self._result(root, root / "kb.db")
             html = build_html(result)
 
-            self.assertIn("btn-edit", html)
+            self.assertNotIn("btn-edit", html)
+            self.assertNotIn("btn-cancel", html)
             self.assertIn("btn-save", html)
             self.assertIn("ann-field", html)
             for label in ("Crop Quality", "Image Quality", "Agree with Model Decision"):

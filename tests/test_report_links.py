@@ -33,7 +33,14 @@ from picklikeme.analyzer.analysis import run_analysis
 from picklikeme.analyzer.annotations import AnnotationStore
 from picklikeme.analyzer.config import AnalysisConfig
 from picklikeme.analyzer.contactsheets import _thumbnail_cache_path, render_contact_sheets
-from picklikeme.analyzer.links import asset_url, source_api_url, source_file_uri
+from picklikeme.analyzer.links import (
+    asset_url,
+    folder_api_url,
+    folder_file_uri,
+    preview_api_url,
+    source_api_url,
+    source_file_uri,
+)
 from picklikeme.analyzer.reports.html import build_html, write_html_report
 from picklikeme.analyzer.server import dataset_roots, make_server
 
@@ -164,6 +171,33 @@ class LinkHelperTests(unittest.TestCase):
         self.assertNotIn(" ", url)
         self.assertNotIn("\\", url)
 
+    def test_folder_file_uri_points_at_the_parent_with_a_trailing_slash(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            image = Path(tmp) / "shoot" / "a.jpg"
+            image.parent.mkdir(parents=True)
+            image.write_bytes(b"x")
+            uri = folder_file_uri(image)
+            self.assertTrue(uri.startswith("file:"))
+            self.assertTrue(uri.endswith("/"), "a directory URI must end in / for browsers to list it")
+            self.assertNotIn("a.jpg", uri)
+            self.assertTrue(uri.endswith("shoot/"))
+
+    def test_folder_file_uri_is_none_when_the_image_cannot_be_located(self):
+        """Same rule as source_file_uri: an unlocatable image means its folder
+        is not trustworthy either, so no link is offered rather than a guess."""
+        self.assertIsNone(folder_file_uri("/definitely/not/here.jpg"))
+
+    def test_folder_api_url_targets_the_parent_directory(self):
+        url = folder_api_url(r"D:\shoot\a b.jpg")
+        self.assertTrue(url.startswith("folder?path="))
+        self.assertNotIn("a%20b.jpg", url)  # the file itself must not appear
+        self.assertIn(quote(r"D:\shoot", safe=""), url)
+
+    def test_preview_api_url_targets_the_file_itself(self):
+        url = preview_api_url(r"D:\shoot\a b.jpg")
+        self.assertTrue(url.startswith("preview?path="))
+        self.assertIn(quote(r"D:\shoot\a b.jpg", safe=""), url)
+
 
 class ReportLinkTests(unittest.TestCase):
     def test_relative_paths_in_the_ranking_do_not_break_the_report(self):
@@ -243,19 +277,39 @@ class ReportLinkTests(unittest.TestCase):
                 colour = int(np.asarray(Image.open(actual))[24, 24, 0])
                 self.assertLessEqual(abs(colour - (index * 29) % 256), 3)
 
-    def test_source_links_carry_the_absolute_path_for_the_served_mode(self):
+    def test_open_folder_and_preview_carry_the_absolute_path_for_the_served_mode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            result, _ = analyse(root, root / "out")
+            render_contact_sheets(result)  # Open Preview's offline href needs a thumbnail to exist
+            html = write_html_report(result).read_text(encoding="utf-8")
+
+            folders = re.findall(r'data-folder="([^"]*)"', html)
+            self.assertTrue(folders, "Open Folder must expose data-folder for the served rewrite")
+            for path in folders:
+                self.assertTrue(Path(path).is_absolute(), path)
+                self.assertTrue(Path(path).is_dir(), path)
+
+            previews = re.findall(r'data-preview="([^"]*)"', html)
+            self.assertTrue(previews, "Open Preview must expose data-preview for the served rewrite")
+            for path in previews:
+                self.assertTrue(Path(path).is_absolute(), path)
+                self.assertTrue(Path(path).exists(), path)
+
+    def test_no_raw_hyperlink_remains(self):
+        """The old direct link to the RAW file - unreliable since browsers
+        cannot render RAW at all - must be gone, replaced by the two actions."""
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             result, _ = analyse(root, root / "out")
             html = build_html(result)
-            sources = re.findall(r'data-source="([^"]*)"', html)
-            self.assertTrue(sources, "links must expose data-source for the served rewrite")
-            for path in sources:
-                self.assertTrue(Path(path).is_absolute(), path)
-                self.assertTrue(Path(path).exists(), path)
+            self.assertNotIn("data-source=", html)
+            self.assertIn("Open Folder", html)
+            self.assertIn("Open Preview", html)
 
-    def test_relocated_dataset_degrades_to_plain_text(self):
-        """If the images are gone the filename must not be a dead link."""
+    def test_relocated_dataset_disables_open_folder_but_keeps_the_filename_readable(self):
+        """If the images are gone, the filename must still be readable text
+        and Open Folder must degrade to disabled rather than a dead link."""
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             result, _ = analyse(root, root / "out")
@@ -263,8 +317,9 @@ class ReportLinkTests(unittest.TestCase):
                 for image in (root / folder).iterdir():
                     image.unlink()
             html = build_html(result)
-            self.assertNotIn('data-source="', html)
+            self.assertNotIn('data-folder="', html)
             self.assertIn("<span title=", html)
+            self.assertIn('title="original file not found">Open Folder</span>', html)
 
 
 class SourceEndpointTests(unittest.TestCase):
@@ -363,6 +418,121 @@ class SourceEndpointTests(unittest.TestCase):
             output.mkdir()
             (output / "report.html").write_text("<html></html>", encoding="utf-8")
             self.assertEqual(dataset_roots(output), ())
+
+
+class FolderAndPreviewEndpointTests(unittest.TestCase):
+    """Open Folder and Open Preview's served-mode counterparts: /folder and
+    /preview, the equivalents of /source for a directory listing and a
+    full-size RAW extraction respectively. Same confinement to the dataset
+    roots as /source, checked the same way."""
+
+    def _tempdir(self):
+        return tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+
+    def _serve(self, root: Path, output_dir: Path):
+        store = AnnotationStore(root / "kb.db")
+        server = make_server(output_dir, store, port=0)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        return server, store, f"http://127.0.0.1:{server.server_address[1]}"
+
+    def _prepare(self, root: Path):
+        result, config = analyse(root, root / "out")
+        from picklikeme.analyzer.reports import write_json_report
+
+        write_json_report(result, config.output_dir / "analysis.json")
+        write_html_report(result)
+        return result, config
+
+    def test_folder_lists_the_files_it_contains(self):
+        with self._tempdir() as tmp:
+            root = Path(tmp)
+            result, config = self._prepare(root)
+            target = result.errors.false_negatives[0].image_path
+            folder = str(Path(target).parent)
+
+            server, store, base = self._serve(root, config.output_dir)
+            try:
+                url = f"{base}/folder?path={quote(folder, safe='')}"
+                with urllib.request.urlopen(url) as response:
+                    self.assertEqual(response.headers["Content-Type"], "text/html; charset=utf-8")
+                    body = response.read().decode("utf-8")
+                self.assertIn(Path(target).name, body)
+                # Every listed entry links through /source, since a served
+                # page cannot follow a file:// link at all, folder or file.
+                self.assertIn(f"source?path={quote(target, safe='')}", body)
+            finally:
+                server.shutdown()
+                server.server_close()
+                store.close()
+
+    def test_folder_outside_the_dataset_is_refused(self):
+        with self._tempdir() as tmp:
+            root = Path(tmp)
+            _, config = self._prepare(root)
+            outside = root / "elsewhere"
+            outside.mkdir()
+
+            server, store, base = self._serve(root, config.output_dir)
+            try:
+                with self.assertRaises(urllib.error.HTTPError) as ctx:
+                    urllib.request.urlopen(f"{base}/folder?path={quote(str(outside), safe='')}")
+                self.assertEqual(ctx.exception.code, 403)
+            finally:
+                server.shutdown()
+                server.server_close()
+                store.close()
+
+    def test_folder_missing_path_parameter_is_a_bad_request(self):
+        with self._tempdir() as tmp:
+            root = Path(tmp)
+            _, config = self._prepare(root)
+            server, store, base = self._serve(root, config.output_dir)
+            try:
+                with self.assertRaises(urllib.error.HTTPError) as ctx:
+                    urllib.request.urlopen(f"{base}/folder")
+                self.assertEqual(ctx.exception.code, 400)
+            finally:
+                server.shutdown()
+                server.server_close()
+                store.close()
+
+    def test_preview_streams_a_full_size_image_not_the_small_thumbnail(self):
+        with self._tempdir() as tmp:
+            root = Path(tmp)
+            result, config = self._prepare(root)
+            target = result.errors.false_negatives[0].image_path
+
+            server, store, base = self._serve(root, config.output_dir)
+            try:
+                url = f"{base}/preview?path={quote(target, safe='')}"
+                with urllib.request.urlopen(url) as response:
+                    self.assertEqual(response.headers["Content-Type"], "image/jpeg")
+                    data = response.read()
+                # The fixture's images are 40x60 JPEGs (see build_dataset) -
+                # this must be that image, not the (much smaller) thumbnail.
+                decoded = Image.open(__import__("io").BytesIO(data))
+                self.assertEqual(decoded.size, (60, 40))
+            finally:
+                server.shutdown()
+                server.server_close()
+                store.close()
+
+    def test_preview_outside_the_dataset_is_refused(self):
+        with self._tempdir() as tmp:
+            root = Path(tmp)
+            _, config = self._prepare(root)
+            secret = root / "secret.jpg"
+            Image.fromarray(np.zeros((10, 10, 3), dtype=np.uint8)).save(secret)
+
+            server, store, base = self._serve(root, config.output_dir)
+            try:
+                with self.assertRaises(urllib.error.HTTPError) as ctx:
+                    urllib.request.urlopen(f"{base}/preview?path={quote(str(secret), safe='')}")
+                self.assertEqual(ctx.exception.code, 403)
+            finally:
+                server.shutdown()
+                server.server_close()
+                store.close()
 
 
 if __name__ == "__main__":

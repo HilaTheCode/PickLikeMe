@@ -20,13 +20,15 @@ Deliberate constraints:
 
 from __future__ import annotations
 
+import html
+import io
 import json
 import logging
 import mimetypes
 import threading
 from http.server import HTTPServer, SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
 from ..config import cli_prefix
 from ..identity import IdentityUnavailable
@@ -131,10 +133,112 @@ class AnnotationRequestHandler(SimpleHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _within_dataset(self, raw_path: str) -> Path | None:
+        """Resolve and validate a query-string path against the dataset roots
+        shared by /source, /folder and /preview. Returns None (and has already
+        sent the error response) when the path is missing, unusable, or
+        outside `source_roots` - the same confinement /source has always had,
+        reused so a new endpoint cannot accidentally be a weaker file reader."""
+        if not raw_path:
+            self._send_json({"error": "path is required"}, status=400)
+            return None
+        try:
+            target = Path(raw_path).resolve()
+        except OSError:
+            self._send_json({"error": "unusable path"}, status=400)
+            return None
+        if not any(_is_within(target, root) for root in self.source_roots):
+            logger.warning("Refused a path outside the dataset roots: %s", target)
+            self._send_json({"error": "path is outside this report's dataset"}, status=403)
+            return None
+        return target
+
+    def _serve_folder(self) -> None:
+        """List a folder's files as a small HTML page of /source links.
+
+        "Open Folder"'s served-mode counterpart: browsers cannot follow a
+        served page's file:// link (see links.py), so the offline `file://`
+        directory listing has no equivalent once the report is served -
+        this generates the closest thing, confined to the dataset exactly
+        like /source.
+        """
+        params = parse_qs(urlparse(self.path).query)
+        target = self._within_dataset((params.get("path") or [""])[0])
+        if target is None:
+            return
+        if not target.is_dir():
+            self._send_json({"error": "not a folder (has it moved?)"}, status=404)
+            return
+
+        try:
+            names = sorted(p.name for p in target.iterdir() if p.is_file())
+        except OSError as exc:
+            self._send_json({"error": f"could not list folder: {exc}"}, status=500)
+            return
+
+        items = "".join(
+            f'<li><a href="source?path={quote(str(target / name), safe="")}" '
+            f'target="_blank">{html.escape(name)}</a></li>'
+            for name in names
+        )
+        body = (
+            "<!doctype html><meta charset=utf-8>"
+            f"<title>{html.escape(target.name)}</title>"
+            "<style>body{font:14px sans-serif;background:#0f172a;color:#e2e8f0;padding:20px}"
+            "a{color:#60a5fa}li{margin:3px 0}</style>"
+            f"<h1>{html.escape(str(target))}</h1>"
+            f"<p>{len(names)} file(s)</p><ul>{items}</ul>"
+        ).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _serve_preview(self) -> None:
+        """Stream the image's own full-size preview - the RAW's embedded
+        JPEG, or a demosaic if it has none - not the report's small cached
+        thumbnail. "Open Preview"'s served-mode upgrade: browsers cannot
+        decode RAW at all, so there is no way to offer this offline.
+        """
+        params = parse_qs(urlparse(self.path).query)
+        target = self._within_dataset((params.get("path") or [""])[0])
+        if target is None:
+            return
+        if not target.is_file():
+            self._send_json({"error": "file not found (has the dataset moved?)"}, status=404)
+            return
+
+        from .contactsheets import load_source_image
+
+        try:
+            image = load_source_image(str(target))
+        except Exception as exc:  # noqa: BLE001 - reported to the UI, never a crash
+            logger.warning("Could not extract a preview for %s: %s", target, exc)
+            self._send_json({"error": f"could not extract a preview: {exc}"}, status=500)
+            return
+
+        buffer = io.BytesIO()
+        image.save(buffer, format="JPEG", quality=92)
+        data = buffer.getvalue()
+        self.send_response(200)
+        self.send_header("Content-Type", "image/jpeg")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(data)
+
     def do_GET(self) -> None:  # noqa: N802 - stdlib signature
         route = urlparse(self.path).path
         if route == "/source":
             self._serve_source_image()
+            return
+        if route == "/folder":
+            self._serve_folder()
+            return
+        if route == "/preview":
+            self._serve_preview()
             return
         if route == "/api/health":
             self._send_json({"ok": True, "database": str(self.store.db_path)})

@@ -86,13 +86,17 @@ def _thumbnail_cache_path(cache_dir: Path, source: str, size: int) -> Path:
     return cache_dir / digest[:2] / f"{digest}.jpg"
 
 
-def _load_source_image(image_path: str) -> Image.Image:
+def load_source_image(image_path: str) -> Image.Image:
     """The whole original frame, as cheaply as the format allows.
 
     Never the cached bird crop. Detector boxes are recorded in full-frame
     coordinates, so a crop-based preview would put every box in the wrong place;
     and a crop cannot show what a photographer most needs to see, which is
     whether the detector picked the wrong region in the first place.
+
+    Public (not prefixed with `_`): also used directly by server._serve_preview
+    to stream a full-size RAW preview on demand for the report's "Open
+    Preview" action, without going through the thumbnail cache at all.
     """
     source = Path(image_path)
     if not source.exists():
@@ -126,7 +130,7 @@ def build_thumbnail(image_path: str, size: int, cache_dir: Path) -> Path | None:
     if target.exists():
         return target
     try:
-        image = _load_source_image(image_path)
+        image = load_source_image(image_path)
     except Exception as exc:  # noqa: BLE001 - a missing source must not stop the sheet
         logger.debug("No thumbnail for %s: %s", image_path, exc)
         return None
@@ -183,7 +187,7 @@ def annotate_thumbnail(
     Boxes come from `record` in full-frame coordinates. They are mapped onto the
     thumbnail by normalising against the frame and scaling onto the letterboxed
     content rectangle, which only holds because the thumbnail shows the whole
-    frame - see `_load_source_image`. Aspect ratio, thumbnail size and layout are
+    frame - see `load_source_image`. Aspect ratio, thumbnail size and layout are
     untouched: this writes a same-size sibling image, so the report gets no
     heavier.
     """

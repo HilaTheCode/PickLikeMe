@@ -23,7 +23,7 @@ from typing import TYPE_CHECKING
 
 from ...config import cli_prefix
 from ..annotations import ANNOTATION_FIELD_LABELS, ANNOTATION_FIELDS
-from ..links import asset_url, source_api_url, source_file_uri
+from ..links import asset_url, folder_file_uri
 from ..suggestions import CRITICAL, WARNING
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -75,6 +75,11 @@ tbody tr:hover{background:var(--panel-2)}
 .good{color:var(--good)}.bad{color:var(--bad)}.warn{color:var(--warn)}.muted{color:var(--muted)}
 .pill{display:inline-block;padding:1px 8px;border-radius:999px;font-size:11.5px;font-weight:600;
 border:1px solid currentColor}
+.open-actions{display:inline-flex;gap:6px;margin-left:8px;vertical-align:middle}
+.pill-link{display:inline-block;padding:1px 8px;border-radius:999px;font-size:11px;font-weight:600;
+border:1px solid var(--border);color:var(--muted);text-decoration:none;white-space:nowrap}
+a.pill-link{color:var(--accent);border-color:var(--accent)}
+a.pill-link:hover{background:var(--accent);color:#fff}
 .charts{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:14px}
 .chart{background:var(--panel-2);border:1px solid var(--border);border-radius:10px;padding:10px}
 .chart img{width:100%;height:auto;display:block}
@@ -107,12 +112,11 @@ footer{color:var(--muted);font-size:12.5px;text-align:center;margin-top:34px}
 .fn-tags{margin-top:7px;display:flex;flex-wrap:wrap;gap:5px}
 .tag{background:var(--accent);color:#fff;border:0;padding:2px 9px;border-radius:999px;font-size:11.5px;
 font-weight:600}
-.fn-actions{display:flex;flex-direction:column;gap:6px;flex:none}
 .fn-note{white-space:pre-wrap;color:var(--text);font-size:13px;margin-top:7px;
 border-left:2px solid var(--border);padding-left:9px}
-.fn-editor{display:none;padding:0 13px 13px}
-.fn.editing .fn-editor{display:block}
-.fn.editing{border-color:var(--accent)}
+/* Always visible - no Edit click gates it. Annotating means every image's
+   fields are already on screen, ready to fill in. */
+.fn-editor{display:block;padding:0 13px 13px;border-top:1px solid var(--border);margin-top:9px}
 .field-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px;
 margin:11px 0 4px}
 .field{display:flex;flex-direction:column;gap:5px}
@@ -203,8 +207,6 @@ function plmRenderTags(el, annotation){
 
 function plmEsc(s){const d=document.createElement('div');d.textContent=s;return d.innerHTML;}
 
-function plmToggleEdit(el){ el.classList.toggle('editing'); }
-
 async function plmSave(el){
   const status = el.querySelector('.status');
   const path = el.dataset.path;
@@ -229,7 +231,6 @@ async function plmSave(el){
     plmRenderTags(el, j.annotation);
     status.textContent = j.deleted ? 'Annotation cleared.' : 'Saved.';
     status.className = 'status saved';
-    el.classList.remove('editing');
     // Each category (false negatives, false positives) has its own filter bar
     // and count, so only the panel's own scope needs refreshing.
     const scope = el.closest('.ann-scope');
@@ -277,9 +278,7 @@ function plmApplyFilters(scope){
 
 document.addEventListener('DOMContentLoaded', async ()=>{
   document.querySelectorAll('.fn').forEach(el=>{
-    el.querySelector('.btn-edit')?.addEventListener('click',()=>plmToggleEdit(el));
     el.querySelector('.btn-save')?.addEventListener('click',()=>plmSave(el));
-    el.querySelector('.btn-cancel')?.addEventListener('click',()=>el.classList.remove('editing'));
   });
   document.querySelectorAll('.ann-scope').forEach(scope=>{
     scope.querySelector('.f-state')?.addEventListener('change',()=>plmApplyFilters(scope));
@@ -292,10 +291,17 @@ document.addEventListener('DOMContentLoaded', async ()=>{
   const banners=[...document.querySelectorAll('.ann-offline')];
   if(PLM.online){
     banners.forEach(b=>b.style.display='none');
-    // Browsers refuse to navigate from a served page to a local-file URL, so a
-    // served report must reach originals through the server. Rewrite them once.
-    document.querySelectorAll('a[data-source]').forEach(a=>{
-      a.href='source?path='+encodeURIComponent(a.dataset.source);
+    // Browsers refuse to navigate from a served page to any file:// URL, so a
+    // served report must reach folders and previews through the server.
+    // Rewrite once: Open Folder from its offline file:// listing to the
+    // server's /folder endpoint, Open Preview from the report's small cached
+    // thumbnail to the server's /preview (the RAW's own full-size preview).
+    document.querySelectorAll('a[data-folder]').forEach(a=>{
+      a.href='folder?path='+encodeURIComponent(a.dataset.folder);
+      a.target='_blank';
+    });
+    document.querySelectorAll('a[data-preview]').forEach(a=>{
+      a.href='preview?path='+encodeURIComponent(a.dataset.preview);
       a.target='_blank';
     });
     // Refresh from the database in case it changed since the report was written.
@@ -354,21 +360,52 @@ def _num(value: float | None, spec: str = "{:.4f}") -> str:
     return '<span class="muted">n/a</span>' if value is None else spec.format(value)
 
 
-def _source_link(image_path: str, label: str) -> str:
-    """Anchor to an original image, usable in both report modes.
+def _name_label(image_path: str, label: str) -> str:
+    """Plain filename display - no longer a link.
 
-    `href` is a file:// URI so the link works when the report is opened from
-    disk. `data-source` carries the absolute path so the served page can rewrite
-    the href to the server's /source endpoint - browsers block http:// -> file://
-    navigation outright, which is why a served report's links appeared broken.
+    Browsers cannot render a RAW file at all, so a direct `file://` (or
+    served) link to one was unreliable at best: it only ever worked for the
+    minority of formats a browser happens to display, and did nothing
+    (indistinguishable from a broken link) for the RAW files this report is
+    mostly about. See _open_actions for what replaced it.
     """
-    uri = source_file_uri(image_path)
-    if uri is None:
-        return f'<span title="{_e(image_path)}" class="muted">{_e(label)}</span>'
-    return (
-        f'<a href="{_e(uri)}" data-source="{_e(image_path)}" '
-        f'title="{_e(image_path)}">{_e(label)}</a>'
+    return f'<span title="{_e(image_path)}">{_e(label)}</span>'
+
+
+def _open_actions(image_path: str, thumb_url: str | None) -> str:
+    """"Open Folder" / "Open Preview" - what inspecting a failure actually
+    needs, replacing the old (browser-unusable) direct RAW link.
+
+    Both follow the report's established dual-mode pattern (see the
+    `data-source` handling in JS): a working default for the common
+    opened-from-disk case, upgraded by JS to a server endpoint when the report
+    is served - because a served page cannot follow *any* `file://` link,
+    folder or file.
+
+    - **Open Folder**: offline, a `file://` directory listing (every browser
+      renders one - the closest a web page can get to opening the OS file
+      manager, since there is no API for the latter). Served, the analyzer's
+      own `/folder` listing endpoint.
+    - **Open Preview**: offline, the report's own small cached thumbnail
+      (already on disk, always available, no server needed). Served, the
+      `/preview` endpoint - the RAW's real full-size embedded preview, which
+      is worth the round trip because it is usually far higher resolution
+      than the report thumbnail.
+    """
+    folder_uri = folder_file_uri(image_path)
+    folder = (
+        f'<a href="{_e(folder_uri)}" data-folder="{_e(str(Path(image_path).parent))}" '
+        f'target="_blank" class="pill-link">Open Folder</a>'
+        if folder_uri is not None
+        else '<span class="muted pill-link" title="original file not found">Open Folder</span>'
     )
+    preview = (
+        f'<a href="{_e(thumb_url)}" data-preview="{_e(image_path)}" '
+        f'target="_blank" class="pill-link">Open Preview</a>'
+        if thumb_url
+        else '<span class="muted pill-link" title="no preview available">Open Preview</span>'
+    )
+    return f'<span class="open-actions">{folder}{preview}</span>'
 
 
 def _section(title: str, body: str, subtitle: str = "", collapsed: bool = False) -> str:
@@ -519,18 +556,20 @@ def _error_table(records, output_dir: Path, thumbs: dict[str, Path]) -> str:
     for record in records:
         image = record.image
         thumb = thumbs.get(image.image_path)
+        thumb_url = None
         cell = ""
         if thumb is not None and thumb.exists():
-            rel = asset_url(thumb, output_dir)
-            if rel:
+            thumb_url = asset_url(thumb, output_dir)
+            if thumb_url:
                 cell = (
-                    f'<img src="{_e(rel)}" style="width:96px;height:96px;object-fit:contain;'
+                    f'<img src="{_e(thumb_url)}" style="width:96px;height:96px;object-fit:contain;'
                     'border-radius:5px;background:#0b0f17" loading="lazy">'
                 )
-        name = _source_link(image.image_path, image.filename)
+        name = _name_label(image.image_path, image.filename)
+        actions = _open_actions(image.image_path, thumb_url)
         confidence = image.confidence
         rows.append(
-            f"<tr><td>{cell}</td><td>{name}</td>"
+            f"<tr><td>{cell}</td><td>{name}{actions}</td>"
             f'<td class="num" data-v="{image.score}">{image.score:.4f}</td>'
             f'<td class="num" data-v="{confidence or 0}">{_num(confidence, "{:.3f}")}</td>'
             f'<td class="num" data-v="{image.rank}">{image.rank:,}</td>'
@@ -662,12 +701,14 @@ def _annotation_panels(
         # `thumbs` is pre-merged with overlays in build_html(), so this is
         # already the annotated copy when one exists.
         thumb = thumbs.get(path)
+        thumb_url = None
         thumb_html = '<img alt="no preview" style="display:flex">'
         if thumb is not None and thumb.exists():
-            rel = asset_url(thumb, output_dir)
-            if rel:
-                thumb_html = f'<img src="{_e(rel)}" alt="{_e(image.filename)}" loading="lazy">'
-        name = _source_link(path, image.filename)
+            thumb_url = asset_url(thumb, output_dir)
+            if thumb_url:
+                thumb_html = f'<img src="{_e(thumb_url)}" alt="{_e(image.filename)}" loading="lazy">'
+        name = _name_label(path, image.filename)
+        actions = _open_actions(path, thumb_url)
         boxes = ""
         if detection is not None and detection.boxes:
             selected = detection.selected
@@ -731,18 +772,16 @@ def _annotation_panels(
             )
             + f'data-annotated="{"1" if answered else "0"}">'
             f'<div class="fn-top">{thumb_html}'
-            f'<div class="fn-meta"><div class="fn-name">{name}{moved}</div>'
+            f'<div class="fn-meta"><div class="fn-name">{name}{moved}</div>{actions}'
             f'<div class="fn-nums">score {image.score:.4f} &middot; confidence '
             f'{_num(image.confidence, "{:.3f}")} &middot; rank {image.rank:,} &middot; '
             f"displaced {record.rank_displacement:,} &middot; {_e(decision_label)}{captured}{boxes}</div>"
             f'<div class="fn-tags">{tags}</div>{legacy}'
-            f"</div>"
-            f'<div class="fn-actions"><button class="btn-edit">Edit</button></div></div>'
+            f"</div></div>"
             f'<div class="fn-editor">'
             f'<div class="sub">Your diagnosis - judge the crop and the photograph separately.</div>'
             f'<div class="field-grid">{selects}</div>'
             f'<div class="row"><button class="btn-save primary">Save</button>'
-            f'<button class="btn-cancel">Cancel</button>'
             f'<span class="status"></span></div>'
             f"</div></div>"
         )

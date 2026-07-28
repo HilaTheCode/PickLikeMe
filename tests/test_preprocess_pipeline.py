@@ -21,11 +21,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 import picklikeme.preprocess as preprocess_module
 from picklikeme.bird_crop import (
     CACHE_SHARD_CHARS,
+    CROP_CACHE_VERSION,
     CROP_PARAMS_FILENAME,
     BirdDetection,
     CropParams,
     crop_cache_path,
+    read_crop_params,
     save_crop_png,
+    write_crop_params,
 )
 from picklikeme.preprocess import DECODE_WINDOW, build_cache, default_decode_workers
 from picklikeme.raw_io import RawImageLoader
@@ -99,7 +102,7 @@ class FakeDetector:
             self._busy.release()
 
 
-def _run_build(paths, cache_dir, decoder, detector, force=False, decode_workers=4):
+def _run_build(paths, cache_dir, decoder, detector, force=False, decode_workers=4, params=None):
     """Run the real build_cache with fakes swapped in for the decoder/detector."""
     original_loader = preprocess_module.RawImageLoader
     original_detector = preprocess_module.BirdDetector
@@ -109,7 +112,12 @@ def _run_build(paths, cache_dir, decoder, detector, force=False, decode_workers=
     try:
         with redirect_stdout(buf):
             stats = build_cache(
-                paths, cache_dir, CropParams(), device="cpu", force=force, decode_workers=decode_workers
+                paths,
+                cache_dir,
+                params if params is not None else CropParams(),
+                device="cpu",
+                force=force,
+                decode_workers=decode_workers,
             )
     finally:
         preprocess_module.RawImageLoader = original_loader
@@ -223,6 +231,75 @@ class CacheReadWriteTests(unittest.TestCase):
             self.assertEqual(stats["cached"], 3)
             self.assertEqual(stats["skipped"], 0)
             self.assertEqual(len(decoder2.decoded), 3)
+
+
+class CacheVersionMismatchTests(unittest.TestCase):
+    """A cache built under a different crop-selection algorithm must never be
+    silently reused. This is the exact regression the crop-selection redesign
+    (highest-confidence -> area-dominant) depends on: nothing here changed
+    what a CropParams *value* looks like on its own, only what the detector
+    does with the boxes it selects among - so without a version bump, an old
+    cache and new code would compare equal and the stale crops would be
+    reused forever without any error.
+    """
+
+    def _seed_stale_cache(self, cache_dir: Path, version: str) -> None:
+        """A cache directory holding only crop_params.json - like a real one
+        that build_cache has already populated, minus the (irrelevant here)
+        actual PNGs."""
+        write_crop_params(cache_dir, CropParams(version=version))
+
+    def test_current_code_writes_the_bumped_version_by_default(self):
+        """Pins the version string itself, so a future accidental revert of
+        the bump is caught immediately rather than silently reopening this
+        exact hole."""
+        self.assertEqual(CROP_CACHE_VERSION, "v3")
+        self.assertEqual(CropParams().version, "v3")
+
+    def test_a_cache_from_the_previous_selection_algorithm_is_refused(self):
+        """The literal scenario this protects against: an existing cache built
+        by the highest-confidence (v2) algorithm must stop a v3 run cold,
+        rather than letting training silently proceed on stale crops."""
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = Path(tmp) / "crops"
+            self._seed_stale_cache(cache, version="v2")
+
+            with self.assertRaises(SystemExit) as ctx:
+                build_cache(_fake_paths(tmp, 3), cache, CropParams(), device="cpu", force=False)
+            message = str(ctx.exception)
+            self.assertIn("different parameters", message)
+            self.assertIn("--force", message)
+
+            # Refused before doing anything: the stale params file is left
+            # exactly as it was, not silently overwritten.
+            self.assertEqual(read_crop_params(cache).version, "v2")
+
+    def test_force_rebuilds_over_a_stale_version_and_records_the_new_one(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = Path(tmp) / "crops"
+            self._seed_stale_cache(cache, version="v2")
+            paths = _fake_paths(tmp, 3)
+
+            decoder = FakeDecoder()
+            stats, _ = _run_build(paths, cache, decoder, FakeDetector(decoder), force=True)
+
+            self.assertEqual(stats["cached"], 3, "a stale cache must be rebuilt in full, not skipped")
+            self.assertEqual(len(decoder.decoded), 3)
+            self.assertEqual(read_crop_params(cache).version, "v3")
+
+    def test_a_cache_already_at_the_current_version_is_reused_normally(self):
+        """The mismatch guard must not become a reason to always rebuild -
+        only an actual parameter difference should trigger it."""
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = Path(tmp) / "crops"
+            paths = _fake_paths(tmp, 3)
+            decoder = FakeDecoder()
+            _run_build(paths, cache, decoder, FakeDetector(decoder))  # writes v3 params
+
+            decoder2 = FakeDecoder()
+            stats, _ = _run_build(paths, cache, decoder2, FakeDetector(decoder2), force=False)
+            self.assertEqual(stats["skipped"], 3)
+            self.assertEqual(decoder2.decoded, [])
 
 
 class ResumeTests(unittest.TestCase):

@@ -25,7 +25,38 @@ Design notes:
 
 Bump CROP_CACHE_VERSION whenever the crop algorithm, its defaults, or the set
 of accepted detection classes changes, so a stale cache is detected instead of
-silently reused. v1 = bird only; v2 = SUPPORTED_ANIMAL_CLASSES.
+silently reused. v1 = bird only; v2 = SUPPORTED_ANIMAL_CLASSES; v3 = area-
+dominant selection among survivors (see "Crop selection policy" below).
+
+Crop selection policy
+----------------------
+Faster R-CNN's own postprocessing already does the filtering that is NOT
+policy: it drops anything below its own score threshold, keeps only the
+accepted classes (SUPPORTED_ANIMAL_CLASSES by default), and runs per-class
+non-maximum suppression. What is left after that - the *surviving*
+detections - still often number more than one (two classes competing for the
+same animal, a second animal in frame, a false detection in the background),
+and something has to pick exactly one to crop to. That is `select_best_detection`.
+
+- **v2 and earlier (superseded): highest confidence wins, full stop.** A
+  single pass tracking a running max score. No box size, aspect ratio,
+  position, or anything else about the box ever entered the comparison. This
+  under-served a wildlife photography archive because a small, sharp, highly
+  confident detection (a bird poking out of a corner, a distant animal caught
+  cleanly) would beat the large, obviously-intended subject the photographer
+  actually composed the shot around, whenever the large subject's box scored
+  even slightly lower - motion blur, an awkward pose, or partial occlusion are
+  all things that suppress a detector's confidence on a large, real subject
+  without making it any less the photo's subject.
+
+- **v3 (current): area dominates; confidence only breaks a near-tie.** The
+  largest surviving detection wins, *unless* another detection's area is
+  within `area_tie_frac` (default 10%) of the largest, in which case the
+  highest-confidence detection among that near-largest group wins. A
+  detection whose area is not close to the largest can never win by having
+  higher confidence - there is no confidence value large enough to compensate
+  for a much smaller box. This is a deliberate size-first policy, not a
+  weighted score: area and confidence are never combined into one number.
 """
 
 from __future__ import annotations
@@ -34,6 +65,7 @@ import hashlib
 import json
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from typing import Sequence
 
 import cv2
 import numpy as np
@@ -75,13 +107,20 @@ def coco_class_name(label: int) -> str:
     return SUPPORTED_ANIMAL_CLASSES.get(int(label), f"class {int(label)}")
 
 
-CROP_CACHE_VERSION = "v2"
+CROP_CACHE_VERSION = "v3"
 CROP_PARAMS_FILENAME = "crop_params.json"
 
 # Cache entries live in cache_dir/<first 2 hex chars of digest>/<digest>.png.
 # Two characters gives 256 shards: ~215 files per shard at 55k images, which
 # keeps NTFS directory operations fast without creating a deep tree.
 CACHE_SHARD_CHARS = 2
+
+# How close two surviving detections' areas must be, as a fraction of the
+# larger one, before confidence is allowed to decide between them. 0.10 means
+# a detection needs to reach 90% of the largest detection's area to even be
+# considered for the confidence tie-break; anything smaller loses on size
+# alone, however much more confident it is. See select_best_detection().
+DEFAULT_AREA_TIE_FRAC = 0.10
 
 
 @dataclass(frozen=True)
@@ -92,6 +131,7 @@ class CropParams:
     margin_frac: float = 0.05          # small safety margin around the tight box
     conf_threshold: float = 0.30       # min detection confidence to accept a detection
     max_side: int = 1024               # cap the cached crop's long side (px)
+    area_tie_frac: float = DEFAULT_AREA_TIE_FRAC  # size-tie tolerance for select_best_detection
     detector: str = "fasterrcnn_resnet50_fpn_v2"
     version: str = CROP_CACHE_VERSION
 
@@ -99,6 +139,14 @@ class CropParams:
 # ---------------------------------------------------------------------------
 # Bounding-box geometry (pure functions, no torch import needed)
 # ---------------------------------------------------------------------------
+
+def box_area(box: tuple[float, float, float, float]) -> float:
+    """Pixel area of an (x1, y1, x2, y2) box. Never negative, even for a
+    malformed box (x2 < x1 or y2 < y1), so area-based comparisons - notably
+    select_best_detection() - stay well-defined without their own guards."""
+    x1, y1, x2, y2 = box
+    return max(0.0, x2 - x1) * max(0.0, y2 - y1)
+
 
 def expand_and_clamp_box(
     box: tuple[float, float, float, float],
@@ -269,6 +317,47 @@ class BirdDetection:
     label: int = COCO_BIRD_CLASS
 
 
+def select_best_detection(
+    candidates: Sequence[BirdDetection],
+    area_tie_frac: float = DEFAULT_AREA_TIE_FRAC,
+) -> BirdDetection | None:
+    """The single detection build_crop should crop to, chosen from every
+    detection that has already passed class and confidence filtering (and,
+    upstream of this, the detector's own per-class NMS - see the module
+    docstring's "Crop selection policy" section).
+
+    Policy: **bounding-box area dominates**. The largest candidate wins,
+    unless another candidate's area is within `area_tie_frac` of it, in which
+    case confidence breaks the tie among that near-largest group only. This is
+    deliberately not a weighted score - area and confidence are never combined
+    into one number - so a detection that is not close in size to the largest
+    can never win by being more confident, however large the gap.
+
+    The single source of truth for subject selection: BirdDetector.detect_best_bird
+    and detect_with_all both call this rather than each implementing their own
+    comparison, so the two can never disagree about which box wins.
+
+    Returns None for an empty `candidates` (nothing survived filtering),
+    mirroring "no detection" everywhere else in this module.
+    """
+    if not candidates:
+        return None
+
+    areas = [(candidate, box_area(candidate.box)) for candidate in candidates]
+    largest_area = max(area for _, area in areas)
+
+    if largest_area <= 0.0:
+        # Degenerate boxes only (zero width or height, which a real detector
+        # should never emit): area carries no information here, so fall back
+        # to confidence alone rather than an arbitrary choice among equally
+        # uninformative candidates.
+        return max(candidates, key=lambda detection: detection.score)
+
+    tie_threshold = largest_area * (1.0 - area_tie_frac)
+    contenders = [candidate for candidate, area in areas if area >= tie_threshold]
+    return max(contenders, key=lambda detection: detection.score)
+
+
 @dataclass
 class CropResult:
     """Everything build_crop produces for one image: the crop the model will
@@ -316,6 +405,7 @@ class BirdDetector:
         device: str = "cpu",
         conf_threshold: float = 0.30,
         classes: "dict[int, str] | set[int] | None" = None,
+        area_tie_frac: float = DEFAULT_AREA_TIE_FRAC,
     ):
         import torch
         from torchvision.models.detection import (
@@ -327,6 +417,7 @@ class BirdDetector:
         self.device = device
         self.conf_threshold = conf_threshold
         self.classes = frozenset(SUPPORTED_ANIMAL_CLASSES if classes is None else classes)
+        self.area_tie_frac = area_tie_frac
         weights = FasterRCNN_ResNet50_FPN_V2_Weights.COCO_V1
         self.model = fasterrcnn_resnet50_fpn_v2(weights=weights).to(device).eval()
 
@@ -335,9 +426,8 @@ class BirdDetector:
 
         Exists so a caller that wants the runners-up - the false-negative
         diagnostic overlay - does not have to run inference a second time. The
-        winner is chosen by the identical loop `detect_best_bird` has always
-        used, including its tie behaviour, so adding this cannot change which
-        box is cropped.
+        winner is chosen by select_best_detection(), the same function
+        detect_best_bird() delegates to, so the two can never disagree.
         """
         torch = self._torch
         with PROFILE.stage("detector preprocess"):
@@ -354,55 +444,26 @@ class BirdDetector:
             labels = output["labels"].cpu().numpy()
             scores = output["scores"].cpu().numpy()
 
-        best: BirdDetection | None = None
-        best_score = self.conf_threshold
-        accepted: list[BirdDetection] = []
-        for box, label, score in zip(boxes, labels, scores):
-            if int(label) not in self.classes or score < self.conf_threshold:
-                continue
-            detection = BirdDetection(
-                box=tuple(float(v) for v in box), score=float(score), label=int(label)
-            )
-            accepted.append(detection)
-            # Unchanged winner selection: >= means a later equal score wins.
-            if score >= best_score:
-                best_score = float(score)
-                best = detection
+            accepted: list[BirdDetection] = [
+                BirdDetection(box=tuple(float(v) for v in box), score=float(score), label=int(label))
+                for box, label, score in zip(boxes, labels, scores)
+                if int(label) in self.classes and score >= self.conf_threshold
+            ]
+            best = select_best_detection(accepted, self.area_tie_frac)
         return best, accepted
 
     def detect_best_bird(self, image_rgb: np.ndarray) -> BirdDetection | None:
-        """Highest-confidence detection of a supported animal class above the
-        threshold, or None.
+        """The detection build_crop should crop to, or None if nothing
+        survived class/confidence filtering.
 
-        This is the single source of truth for subject selection and
-        confidence: everything that needs a box and/or a score goes through
-        here. Selection is class-agnostic — the single highest-scoring box among
-        the accepted classes wins, exactly as it did when only birds were
-        accepted.
+        This is the single source of truth for subject selection: everything
+        that needs a box goes through here (or through detect_with_all, which
+        this delegates to, so the two entry points always agree). What "best"
+        means is entirely select_best_detection()'s policy - area-dominant,
+        confidence only as a tie-break among near-equal areas; see the module
+        docstring's "Crop selection policy" section.
         """
-        torch = self._torch
-        # Stages are split for profiling only; the operations and their order
-        # are unchanged (the host->device copy is merely named).
-        with PROFILE.stage("detector preprocess"):
-            tensor = torch.from_numpy(image_rgb).permute(2, 0, 1).contiguous().float().div(255.0)
-            device_tensor = tensor.to(self.device)
-            PROFILE.cuda_sync(torch, self.device)
-        with PROFILE.stage("gpu inference"):
-            with torch.no_grad():
-                output = self.model([device_tensor])[0]
-            PROFILE.cuda_sync(torch, self.device)
-
-        with PROFILE.stage("detector postprocess"):
-            boxes = output["boxes"].cpu().numpy()
-            labels = output["labels"].cpu().numpy()
-            scores = output["scores"].cpu().numpy()
-
-        best: BirdDetection | None = None
-        best_score = self.conf_threshold
-        for box, label, score in zip(boxes, labels, scores):
-            if int(label) in self.classes and score >= best_score:
-                best_score = float(score)
-                best = BirdDetection(box=tuple(float(v) for v in box), score=float(score), label=int(label))
+        best, _ = self.detect_with_all(image_rgb)
         return best
 
     def best_bird_box(self, image_rgb: np.ndarray) -> tuple[float, float, float, float] | None:

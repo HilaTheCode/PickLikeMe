@@ -199,7 +199,9 @@ def build_cache(
 
     # RawImageLoader here decodes the full frame (no crop cache) so we can detect.
     decoder = RawImageLoader(raw_root=".", resize_mode="letterbox")
-    detector = BirdDetector(device=device, conf_threshold=params.conf_threshold)
+    detector = BirdDetector(
+        device=device, conf_threshold=params.conf_threshold, area_tie_frac=params.area_tie_frac
+    )
 
     total = len(image_paths)
     stats = {"total": total, "cached": 0, "skipped": 0, "birds": 0, "fallbacks": 0, "errors": 0}
@@ -209,6 +211,7 @@ def build_cache(
     print(f"  {'cache dir:':<20}{Path(cache_dir).resolve()}")
     print(f"  {'accepted classes:':<20}{', '.join(sorted(SUPPORTED_ANIMAL_CLASSES.values()))}")
     print(f"  {'min confidence:':<20}{params.conf_threshold}")
+    print(f"  {'selection:':<20}largest area wins; confidence ties within {params.area_tie_frac:.0%} of it")
     print(f"  {'decode workers:':<20}{decode_workers} (window {DECODE_WINDOW}, GPU stays sequential)")
 
     if PROFILE.enabled:
@@ -466,6 +469,14 @@ def main() -> None:
     parser.add_argument("--margin-frac", type=float, default=CropParams.margin_frac)
     parser.add_argument("--conf-threshold", type=float, default=CropParams.conf_threshold)
     parser.add_argument("--max-side", type=int, default=CropParams.max_side)
+    parser.add_argument(
+        "--area-tie-frac",
+        type=float,
+        default=CropParams.area_tie_frac,
+        help="Detections within this fraction of the largest survivor's area are tied on "
+        "size and broken by confidence; anything smaller loses on size alone "
+        f"(default: {CropParams.area_tie_frac})",
+    )
     parser.add_argument("--force", action="store_true", help="Rebuild crops even if already cached")
     parser.add_argument(
         "--decode-workers",
@@ -480,6 +491,7 @@ def main() -> None:
         margin_frac=args.margin_frac,
         conf_threshold=args.conf_threshold,
         max_side=args.max_side,
+        area_tie_frac=args.area_tie_frac,
     )
     with fatal_errors_logged_to_stdout():
         preprocess_folders(
