@@ -287,23 +287,13 @@ class ThumbnailEndpointTests(ReviewServerTestCase):
 
 
 class ClickThroughToFullSizeTests(ReviewServerTestCase):
-    """Clicking a card's thumbnail opens the RAW's own full-size decode in a
-    new tab - the same /preview endpoint the analysis report already uses for
-    "Open Preview", inherited unchanged from AnnotationRequestHandler and
-    confined to the reviewed folder by the same `source_roots` check as
-    /thumb and /open-folder."""
-
-    def test_every_card_s_thumbnail_links_to_the_preview_endpoint(self):
-        """The gallery is rendered client-side from fetched state (the page
-        ships empty - see PageTests), so the card markup lives in the JS
-        template, not the served document body."""
-        from picklikeme.review.page import build_js
-
-        js = build_js()
-        self.assertIn('class="thumb-link"', js)
-        self.assertIn("preview?path=", js)
-        self.assertIn('target="_blank"', js)
-        self.assertIn('rel="noopener"', js)
+    """Clicking a card's thumbnail opens the in-app Lightbox, which decodes
+    the RAW's own full-size preview via /preview - the same endpoint the
+    analysis report uses for "Open Preview", inherited unchanged from
+    AnnotationRequestHandler and confined to the reviewed folder by the same
+    `source_roots` check as /thumb and /open-folder. The photographer never
+    leaves the page (no target="_blank" any more - see Lightbox in page.py
+    for the markup-level checks on that)."""
 
     def test_the_preview_endpoint_serves_the_full_frame_not_the_square_thumb(self):
         url = "/preview?path=" + quote(str(self.images[0]), safe="")
@@ -315,13 +305,84 @@ class ClickThroughToFullSizeTests(ReviewServerTestCase):
         self.assertEqual(decoded.size, (60, 40), "the fixture's real dimensions, not a cropped square")
 
     def test_the_preview_endpoint_is_confined_to_the_reviewed_folder(self):
-        """The click-through must not become a new way to read the whole disk."""
+        """The Lightbox must not become a new way to read the whole disk."""
         secret = self.root / "secret.jpg"
         Image.fromarray(np.zeros((8, 8, 3), dtype=np.uint8)).save(secret)
 
         with self.assertRaises(urllib.error.HTTPError) as ctx:
             urllib.request.urlopen(self.base + "/preview?path=" + quote(str(secret), safe=""))
         self.assertEqual(ctx.exception.code, 403)
+
+
+class LightboxMarkupTests(unittest.TestCase):
+    """Structural checks on the Lightbox module, with no server involved.
+
+    Like PageMarkupTests, these exist because the suite has no JS engine (the
+    actual interactive behaviour - zoom math, pan clamping, keep/reject then
+    advance, drag-vs-click disambiguation - is verified separately by
+    executing the real generated JS in Node; that harness is not committed
+    since this project's test stack has none, see the .state-bug fix commit
+    for the precedent). What runs here is what a plain source-pattern check
+    actually can catch: the wiring between the gallery and the viewer, and
+    that nothing needed by that wiring was left out of the markup.
+    """
+
+    def test_card_click_targets_are_wired_to_the_lightbox_not_a_link(self):
+        from picklikeme.review.page import build_js
+
+        js = build_js()
+        self.assertNotIn("target=\"_blank\"", js, "the viewer must not fall back to opening a new tab")
+        self.assertIn("Lightbox.open(Number(el.dataset.index))", js)
+        self.assertIn("class=\"thumb-link\" data-index=", js)
+
+    def test_every_lightbox_control_the_script_looks_up_exists_in_the_markup(self):
+        """The same class of bug the theme-button fix caught, applied to the
+        whole new viewer: a null dereference in any of these aborts the script
+        the same way, taking the entire page down with it - not just the
+        viewer."""
+        from picklikeme.review.page import build_js, build_page
+
+        html = build_page()
+        present = set(re.findall(r'id="([A-Za-z0-9_-]+)"', html))
+        wanted = set(re.findall(r"""q\(['"]#([A-Za-z0-9_-]+)['"]\)""", build_js()))
+
+        missing = sorted(wanted - present)
+        self.assertEqual(missing, [], f"the script queries element(s) the markup never defines: {missing}")
+
+    def test_keep_reject_reuse_the_existing_decide_function(self):
+        """Not a second POST implementation - decideAndAdvance calls the same
+        decide() the gallery cards use, so validation, PLM.state refresh and
+        status reporting can never drift between the two surfaces."""
+        from picklikeme.review.page import build_js
+
+        self.assertIn("await decide(image.image_path, action)", build_js())
+
+    def test_the_dialog_element_is_used_for_native_escape_and_focus_handling(self):
+        """Reuses the platform's own modal semantics (already established by
+        the arrange confirmation dialog in this same page) rather than
+        reimplementing focus trapping and Escape-to-close by hand."""
+        from picklikeme.review.page import build_page
+
+        self.assertIn('<dialog id="lightbox">', build_page())
+
+    def test_escape_is_intercepted_to_share_the_fade_out_with_every_other_close(self):
+        from picklikeme.review.page import build_js
+
+        self.assertIn("addEventListener('cancel'", build_js())
+
+    def test_a_bounded_preload_cache_is_used_instead_of_relying_on_http_caching(self):
+        """/preview is Cache-Control: no-store (shared with the analysis
+        report's own use of it - see analyzer/server.py), so naive preloading
+        via `new Image().src = ...` would refetch and redecode on every
+        navigation regardless. The cache must be bounded (evicted), not just
+        present, or a long session would leak a blob URL per image ever
+        visited."""
+        from picklikeme.review.page import build_js
+
+        js = build_js()
+        self.assertIn("URL.createObjectURL", js)
+        self.assertIn("URL.revokeObjectURL", js)
+        self.assertIn("evictFarFromCurrent", js)
 
 
 class ArrangeEndpointTests(ReviewServerTestCase):
