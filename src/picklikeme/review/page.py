@@ -51,6 +51,7 @@ font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial
 header{position:sticky;top:0;z-index:20;background:var(--panel);border-bottom:1px solid var(--border);
 padding:12px 20px;box-shadow:0 1px 3px var(--shadow)}
 .title{display:flex;align-items:baseline;gap:12px;flex-wrap:wrap}
+.title #theme{margin-left:auto;flex-shrink:0}
 h1{font-size:17px;margin:0;font-weight:650}
 .folder{font-size:12.5px;color:var(--muted);font-family:ui-monospace,Consolas,monospace}
 .bar{display:flex;gap:16px;align-items:center;flex-wrap:wrap;margin-top:10px}
@@ -122,7 +123,12 @@ const q = s => document.querySelector(s);
 function setTheme(t){
   document.documentElement.setAttribute('data-theme', t);
   try{ localStorage.setItem('plm-theme', t) }catch(e){}
-  q('#theme').textContent = t === 'dark' ? 'Light mode' : 'Dark mode';
+  // Guarded: this runs before DOMContentLoaded so the theme is applied without
+  // a flash of the wrong one, which means the button may not be parsed yet.
+  // Nothing cosmetic is allowed to throw here - an exception at this point
+  // would abort the whole script and the gallery would never load at all.
+  const button = q('#theme');
+  if(button) button.textContent = t === 'dark' ? 'Light mode' : 'Dark mode';
 }
 (function(){
   let t; try{ t = localStorage.getItem('plm-theme') }catch(e){}
@@ -283,8 +289,16 @@ async function doArrange(){
 }
 
 async function boot(){
-  q('#theme').addEventListener('click', () =>
-    setTheme(document.documentElement.getAttribute('data-theme') === 'dark' ? 'light' : 'dark'));
+  const theme = q('#theme');
+  // The button exists (see build_page), and setTheme has already labelled it
+  // by now; both are written defensively so a markup change can never leave
+  // the gallery unable to load.
+  if(theme){
+    theme.textContent = document.documentElement.getAttribute('data-theme') === 'dark'
+      ? 'Light mode' : 'Dark mode';
+    theme.addEventListener('click', () =>
+      setTheme(document.documentElement.getAttribute('data-theme') === 'dark' ? 'light' : 'dark'));
+  }
   document.querySelectorAll('.preset').forEach(b =>
     b.addEventListener('click', () => setPercent(b.dataset.percent)));
   q('#percent').addEventListener('change', e => setPercent(e.target.value));
@@ -345,6 +359,7 @@ def build_page(title: str = "PickLikeMe review") -> str:
   <div class="title">
     <h1>Review</h1>
     <span class="folder" id="folder"></span>
+    <button id="theme">Dark mode</button>
   </div>
   <div class="bar">
     <div class="group">

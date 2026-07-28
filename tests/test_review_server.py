@@ -8,6 +8,7 @@ not have opened a way to read files outside the folder under review.
 """
 
 import json
+import re
 import sys
 import tempfile
 import threading
@@ -95,6 +96,50 @@ class PageTests(ReviewServerTestCase):
         self.assertIn("api/review/state", body)
         for image in self.images:
             self.assertNotIn(str(image), body)
+
+
+class PageMarkupTests(unittest.TestCase):
+    """Structural checks on the generated document, with no server involved.
+
+    These exist because the suite cannot run the page's JavaScript, so a
+    scripting error is invisible to every other test here: asserting that a
+    string appears in the HTML says nothing about whether the page works. One
+    such bug shipped - `setTheme()` dereferenced a `#theme` button that was
+    never in the markup, and because it runs at parse time the exception
+    aborted the whole script before `DOMContentLoaded` was ever registered, so
+    the gallery silently never loaded.
+    """
+
+    def _ids_the_script_reaches_for(self, js: str) -> set[str]:
+        return set(re.findall(r"""q\(['"]#([A-Za-z0-9_-]+)['"]\)""", js)) | set(
+            re.findall(r"""getElementById\(['"]([A-Za-z0-9_-]+)['"]\)""", js)
+        )
+
+    def test_every_element_the_script_looks_up_exists_in_the_markup(self):
+        from picklikeme.review.page import build_js, build_page
+
+        html = build_page()
+        present = set(re.findall(r'id="([A-Za-z0-9_-]+)"', html))
+
+        missing = sorted(self._ids_the_script_reaches_for(build_js()) - present)
+
+        self.assertEqual(
+            missing,
+            [],
+            f"the page script queries element(s) that the markup never defines: {missing}. "
+            "A null dereference here aborts the whole script and the gallery never loads.",
+        )
+
+    def test_the_theme_toggle_is_present_and_survives_a_missing_button(self):
+        """The specific regression, from both directions: the button is in the
+        markup, and the code that labels it is written so it could not kill the
+        page even if a future edit removed it again."""
+        from picklikeme.review.page import build_js, build_page
+
+        self.assertIn('id="theme"', build_page())
+        js = build_js()
+        self.assertIn("const button = q('#theme');", js)
+        self.assertIn("if(button) button.textContent", js)
 
 
 class StateEndpointTests(ReviewServerTestCase):
