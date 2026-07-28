@@ -27,7 +27,13 @@ from picklikeme.analyzer.contactsheets import (
     render_contact_sheets,
     _thumbnail_cache_path,
 )
-from picklikeme.analyzer.detections import Box, DetectionCache, DetectionRecord, _from_payload
+from picklikeme.analyzer.detections import (
+    DETECTION_CACHE_VERSION,
+    Box,
+    DetectionCache,
+    DetectionRecord,
+    _from_payload,
+)
 from picklikeme.bird_crop import (
     BirdDetection,
     CropParams,
@@ -172,6 +178,141 @@ class DetectorOutputReuseTests(unittest.TestCase):
                 moved.parent.mkdir()
                 moved.write_bytes(b"unique pixels")
                 self.assertEqual(cache.get(moved, allow_detect=False).origin, "cache")
+
+
+class DetectionCacheVersioningTests(unittest.TestCase):
+    """A backfilled row is only trustworthy for as long as the crop-selection
+    policy that chose its "selected" box hasn't changed - so this cache is
+    stamped with bird_crop.CROP_CACHE_VERSION and never serves a row stamped
+    with anything else. See the module docstring's "Versioned against the
+    same policy as the crop cache" section.
+    """
+
+    PAYLOAD = {
+        "version": 1,
+        "source_size": [200, 100],
+        "selected": {"box": [1, 2, 3, 4], "score": 0.8, "label": 16},
+        "detections": [{"box": [1, 2, 3, 4], "score": 0.8, "label": 16}],
+    }
+
+    def test_the_cache_version_tracks_the_crop_cache_version(self):
+        """Pinned so a future decoupling (a second constant someone forgets
+        to bump) is caught immediately rather than silently reopening the
+        exact hole this versioning closes."""
+        from picklikeme.bird_crop import CROP_CACHE_VERSION
+
+        self.assertEqual(DETECTION_CACHE_VERSION, CROP_CACHE_VERSION)
+
+    def test_a_row_written_by_store_is_served(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "IMG.NEF"
+            source.write_bytes(b"pixels")
+            with DetectionCache(root / "det.db", root / "no_cache") as cache:
+                cache._store(cache._identity(source), self.PAYLOAD)
+                self.assertEqual(cache.get(source, allow_detect=False).origin, "cache")
+
+    def test_a_row_stamped_with_a_different_version_is_never_served(self):
+        """The literal scenario this protects against: a row backfilled under
+        an older crop-selection policy must not be trusted just because an
+        image_hash matches."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "IMG.NEF"
+            source.write_bytes(b"pixels")
+            with DetectionCache(root / "det.db", root / "no_cache") as cache:
+                digest = cache._identity(source)
+                cache._conn.execute(
+                    "INSERT INTO detection_cache(image_hash, payload, cache_version) VALUES (?, ?, ?)",
+                    (digest, json.dumps(self.PAYLOAD), "some-older-version"),
+                )
+                cache._conn.commit()
+
+                # allow_detect=False proves the stale row was ignored, not
+                # silently served: with nothing else to fall back to, the
+                # result must be empty rather than the stale "selected" box.
+                record = cache.get(source, allow_detect=False)
+                self.assertEqual(record.origin, "unavailable")
+                self.assertEqual(record.boxes, [])
+
+    def test_a_stale_row_heals_itself_on_the_next_successful_detection(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "IMG.png"
+            Image.fromarray(np.zeros((40, 60, 3), dtype=np.uint8)).save(source)
+            with DetectionCache(root / "det.db", root / "no_cache") as cache:
+                digest = cache._identity(source)
+                cache._conn.execute(
+                    "INSERT INTO detection_cache(image_hash, payload, cache_version) VALUES (?, ?, ?)",
+                    (digest, json.dumps(self.PAYLOAD), "some-older-version"),
+                )
+                cache._conn.commit()
+
+                cache.detector = TwoBoxDetector()  # skip loading the real model
+                healed = cache.get(source, allow_detect=True)
+                self.assertEqual(healed.origin, "detected")
+                self.assertEqual(healed.selected.score, 0.92)  # TwoBoxDetector's winner, not the stale 0.8
+
+                # The healed row is now itself a normal cache hit.
+                again = cache.get(source, allow_detect=False)
+                self.assertEqual(again.origin, "cache")
+                self.assertEqual(again.selected.score, 0.92)
+
+    def test_opening_a_database_from_before_versioning_existed_purges_it(self):
+        """A database created by the pre-versioning code has no cache_version
+        column at all - opening it must retrofit the column (so reads don't
+        crash) and treat every existing row as stale (so nothing pre-policy
+        is ever served), not merely tolerate the missing column."""
+        import sqlite3
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db_path = root / "det.db"
+            source = root / "IMG.NEF"
+            source.write_bytes(b"pixels")
+
+            conn = sqlite3.connect(db_path)
+            conn.execute(
+                """
+                CREATE TABLE detection_cache (
+                    image_hash TEXT PRIMARY KEY,
+                    payload    TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                )
+                """
+            )
+            # A real image_identity digest, computed the same way the cache
+            # itself would, so this row is a genuine pre-migration entry.
+            from picklikeme.identity import image_identity
+
+            conn.execute(
+                "INSERT INTO detection_cache(image_hash, payload) VALUES (?, ?)",
+                (image_identity(source), json.dumps(self.PAYLOAD)),
+            )
+            conn.commit()
+            conn.close()
+
+            with DetectionCache(db_path, root / "no_cache") as cache:
+                columns = {row["name"] for row in cache._conn.execute("PRAGMA table_info(detection_cache)")}
+                self.assertIn("cache_version", columns)
+                remaining = cache._conn.execute("SELECT COUNT(*) AS n FROM detection_cache").fetchone()["n"]
+                self.assertEqual(remaining, 0, "a pre-versioning row must be purged, not kept forever")
+
+                record = cache.get(source, allow_detect=False)
+                self.assertEqual(record.origin, "unavailable")
+
+    def test_opening_a_database_already_at_the_current_version_keeps_its_rows(self):
+        """The purge must not be a blunt 'always wipe on open' - only an
+        actual version mismatch should discard anything."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "IMG.NEF"
+            source.write_bytes(b"pixels")
+            with DetectionCache(root / "det.db", root / "no_cache") as cache:
+                cache._store(cache._identity(source), self.PAYLOAD)
+
+            with DetectionCache(root / "det.db", root / "no_cache") as reopened:
+                self.assertEqual(reopened.get(source, allow_detect=False).origin, "cache")
 
 
 class FullFramePreviewTests(unittest.TestCase):

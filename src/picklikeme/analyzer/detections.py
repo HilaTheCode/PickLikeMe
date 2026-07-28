@@ -16,6 +16,19 @@ been there, and the result is cached so it happens once per image, ever.
 
 The cache lives in the analyzer's own database. The analyzer stays read-only
 with respect to the crop cache: it never writes a sidecar there.
+
+**Versioned against the same policy as the crop cache.** A cached row records
+which detection `select_best_detection()` chose as "selected", so it goes
+stale for exactly the same reason a cached crop does: a crop-selection
+algorithm change (bird_crop.CROP_CACHE_VERSION) picks a different winner from
+the same boxes. Rather than a second constant someone has to remember to bump
+alongside it, this cache stamps every row with CROP_CACHE_VERSION directly, so
+the two can never drift out of sync. A row whose stamp does not match the
+current version is never served (step 2 above is skipped as if the row did not
+exist), so `get()` falls through to step 3 and re-detects; `_store()` then
+overwrites it with the current version, healing the cache one image at a time
+rather than needing a bulk rebuild. Stale rows are also swept out on open, so
+the database does not accumulate old generations forever.
 """
 
 from __future__ import annotations
@@ -27,7 +40,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
-from ..bird_crop import coco_class_name, read_detections
+from ..bird_crop import CROP_CACHE_VERSION, coco_class_name, read_detections
 from ..config import PROJECT_ROOT
 from ..identity import IdentityUnavailable
 
@@ -35,6 +48,10 @@ from ..identity import IdentityUnavailable
 # these boxes are derived data that can always be recomputed, while an
 # annotation is irreplaceable. Lives under cache/ for the same reason.
 DEFAULT_DETECTIONS_DB = PROJECT_ROOT / "cache" / "analyzer_detections.db"
+
+# Reused, not a fresh constant of its own - see the module docstring's
+# "Versioned against the same policy as the crop cache" section.
+DETECTION_CACHE_VERSION = CROP_CACHE_VERSION
 
 logger = logging.getLogger(__name__)
 
@@ -133,14 +150,51 @@ class DetectionCache:
             self._conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS detection_cache (
-                    image_hash TEXT PRIMARY KEY,
-                    payload    TEXT NOT NULL,
-                    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                    image_hash    TEXT PRIMARY KEY,
+                    payload       TEXT NOT NULL,
+                    cache_version TEXT,
+                    created_at    TEXT NOT NULL DEFAULT (datetime('now'))
                 )
                 """
             )
+        self._ensure_column("detection_cache", "cache_version", "TEXT")
+        self._purge_stale()
         self.detector = None  # created lazily, only if something must be detected
         self.detected_count = 0
+
+    def _ensure_column(self, table: str, column: str, sql_type: str) -> None:
+        """Add a column to an existing table if it is not already there.
+
+        A database created before this column existed needs it retrofitted -
+        `CREATE TABLE IF NOT EXISTS` alone does not do that. Checked via
+        PRAGMA rather than attempted and caught, so it is silent and
+        idempotent on every open (same pattern as AnnotationStore).
+        """
+        columns = {row["name"] for row in self._conn.execute(f"PRAGMA table_info({table})")}
+        if column not in columns:
+            with self._conn:
+                self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {sql_type}")
+            logger.info("Added column %s.%s (upgrading an existing database)", table, column)
+
+    def _purge_stale(self) -> None:
+        """Drop rows written under a different crop-selection policy.
+
+        Not required for correctness - _cached() already refuses to serve a
+        stale row - but without this, every past policy generation would sit
+        in the database forever as dead weight. A row with no stamp at all
+        (NULL) predates this versioning entirely and is stale by definition.
+        """
+        with self._conn:
+            cursor = self._conn.execute(
+                "DELETE FROM detection_cache WHERE cache_version IS NULL OR cache_version != ?",
+                (DETECTION_CACHE_VERSION,),
+            )
+        if cursor.rowcount:
+            logger.info(
+                "Purged %d stale detection cache entr%s (crop-selection policy changed)",
+                cursor.rowcount,
+                "y" if cursor.rowcount == 1 else "ies",
+            )
 
     def close(self) -> None:
         self._conn.close()
@@ -161,9 +215,15 @@ class DetectionCache:
 
     def _cached(self, digest: str) -> DetectionRecord | None:
         row = self._conn.execute(
-            "SELECT payload FROM detection_cache WHERE image_hash = ?", (digest,)
+            "SELECT payload, cache_version FROM detection_cache WHERE image_hash = ?", (digest,)
         ).fetchone()
         if row is None:
+            return None
+        if row["cache_version"] != DETECTION_CACHE_VERSION:
+            # Belt and suspenders: _purge_stale() already removes rows like
+            # this on open, but a lookup must never trust a stale row even if
+            # one somehow slipped past that. Treated as a miss, not an error -
+            # get() falls straight through to a fresh detection pass.
             return None
         try:
             return _from_payload(json.loads(row["payload"]), "cache")
@@ -173,8 +233,8 @@ class DetectionCache:
     def _store(self, digest: str, payload: dict) -> None:
         with self._conn:
             self._conn.execute(
-                "INSERT OR REPLACE INTO detection_cache(image_hash, payload) VALUES (?, ?)",
-                (digest, json.dumps(payload)),
+                "INSERT OR REPLACE INTO detection_cache(image_hash, payload, cache_version) VALUES (?, ?, ?)",
+                (digest, json.dumps(payload), DETECTION_CACHE_VERSION),
             )
 
     def _detect(self, image_path: str | Path, conf_threshold: float, device: str) -> dict | None:

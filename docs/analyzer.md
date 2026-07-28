@@ -605,25 +605,44 @@ at the old 200 a distant bird landed in ~10 px and its box was a solid blob.
 
 1. **The record `picklikeme preprocess` wrote** beside the cached crop, if the
    detector already ran during preprocessing — free, no extra inference.
-2. **The analyzer's own cache** (`analyzer.detections.DetectionCache`, a
-   separate SQLite database from the annotation knowledge base — so
-   `--no-annotations` never touches it and vice versa), keyed by content
-   identity so it survives a moved file.
+2. **The analyzer's own cache** (`analyzer.detections.DetectionCache`,
+   `cache/analyzer_detections.db` — a separate SQLite database from the
+   annotation knowledge base, so `--no-annotations` never touches it and vice
+   versa), keyed by content identity so it survives a moved file.
 3. **One detection pass**, only for images in neither of the above, and only for
    the images actually shown in this report (bounded by `--max-examples` and the
    number of contact-sheet categories) — never for the whole dataset. Every
-   result is cached, so it costs once per image, ever.
+   result is cached, so it costs once per image *for a given crop-selection
+   policy* (see Versioning below) — not literally "ever".
 
 `--no-detect-missing-boxes` restricts the analyzer to steps 1 and 2, so it never
 runs the detector itself.
+
+### Versioning
+
+Step 2's cache stores which detection `select_best_detection()` chose as
+"selected" — the same policy the crop cache uses — so it goes stale for exactly
+the same reason a cached crop does: a crop-selection algorithm change
+(`bird_crop.CROP_CACHE_VERSION`) can pick a different winner from the same
+boxes. Every row is stamped with `CROP_CACHE_VERSION` directly rather than a
+second constant someone has to remember to bump alongside it, so the two caches
+can never drift out of sync.
+
+Unlike the crop cache, this needs no `--force` and no manual deletion: a row
+stamped with anything other than the current version is simply never served
+(as if it did not exist), so step 3 runs again and overwrites it — the cache
+heals itself one image at a time as reports touch each image, rather than
+needing a bulk rebuild. Stale rows are also swept out the moment the database is
+next opened, so old policy generations don't sit there as dead weight.
 
 ### Cost
 
 Extending the overlay from false negatives only to every thumbnail means step 3
 can now run for a proportionally larger set of images the first time this is
 used against a crop cache built before preprocessing recorded detections (an
-older cache). Re-runs over the same images are free regardless — the cache in
-step 2 is permanent. `--no-detect-missing-boxes` is the escape hatch if the
+older cache), or the first time it is used after a crop-selection policy change
+(see Versioning above). Re-runs over the same images under the same policy are
+free regardless. `--no-detect-missing-boxes` is the escape hatch if the
 first-run cost matters more than the boxes for images preprocessing never
 recorded.
 
