@@ -22,6 +22,7 @@ import unittest
 import urllib.error
 import urllib.request
 from pathlib import Path
+from unittest import mock
 from urllib.parse import quote, unquote, urlparse
 
 import numpy as np
@@ -35,8 +36,8 @@ from picklikeme.analyzer.config import AnalysisConfig
 from picklikeme.analyzer.contactsheets import _thumbnail_cache_path, render_contact_sheets
 from picklikeme.analyzer.links import (
     asset_url,
-    folder_api_url,
     folder_file_uri,
+    open_folder_api_url,
     preview_api_url,
     source_api_url,
     source_file_uri,
@@ -187,9 +188,9 @@ class LinkHelperTests(unittest.TestCase):
         is not trustworthy either, so no link is offered rather than a guess."""
         self.assertIsNone(folder_file_uri("/definitely/not/here.jpg"))
 
-    def test_folder_api_url_targets_the_parent_directory(self):
-        url = folder_api_url(r"D:\shoot\a b.jpg")
-        self.assertTrue(url.startswith("folder?path="))
+    def test_open_folder_api_url_targets_the_parent_directory(self):
+        url = open_folder_api_url(r"D:\shoot\a b.jpg")
+        self.assertTrue(url.startswith("open-folder?path="))
         self.assertNotIn("a%20b.jpg", url)  # the file itself must not appear
         self.assertIn(quote(r"D:\shoot", safe=""), url)
 
@@ -420,11 +421,11 @@ class SourceEndpointTests(unittest.TestCase):
             self.assertEqual(dataset_roots(output), ())
 
 
-class FolderAndPreviewEndpointTests(unittest.TestCase):
-    """Open Folder and Open Preview's served-mode counterparts: /folder and
-    /preview, the equivalents of /source for a directory listing and a
-    full-size RAW extraction respectively. Same confinement to the dataset
-    roots as /source, checked the same way."""
+class OpenFolderAndPreviewEndpointTests(unittest.TestCase):
+    """Open Folder and Open Preview's served-mode counterparts: /open-folder
+    and /preview. /open-folder is confined to the dataset roots exactly like
+    /source; instead of an in-browser listing it calls the real OS file
+    manager (mocked here - the suite must not actually spawn Explorer)."""
 
     def _tempdir(self):
         return tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
@@ -443,7 +444,7 @@ class FolderAndPreviewEndpointTests(unittest.TestCase):
         write_html_report(result)
         return result, config
 
-    def test_folder_lists_the_files_it_contains(self):
+    def test_open_folder_calls_the_os_file_manager(self):
         with self._tempdir() as tmp:
             root = Path(tmp)
             result, config = self._prepare(root)
@@ -452,20 +453,20 @@ class FolderAndPreviewEndpointTests(unittest.TestCase):
 
             server, store, base = self._serve(root, config.output_dir)
             try:
-                url = f"{base}/folder?path={quote(folder, safe='')}"
-                with urllib.request.urlopen(url) as response:
-                    self.assertEqual(response.headers["Content-Type"], "text/html; charset=utf-8")
-                    body = response.read().decode("utf-8")
-                self.assertIn(Path(target).name, body)
-                # Every listed entry links through /source, since a served
-                # page cannot follow a file:// link at all, folder or file.
-                self.assertIn(f"source?path={quote(target, safe='')}", body)
+                with mock.patch("picklikeme.analyzer.server.open_in_file_manager") as opened:
+                    url = f"{base}/open-folder?path={quote(folder, safe='')}"
+                    with urllib.request.urlopen(url) as response:
+                        self.assertEqual(response.headers["Content-Type"], "application/json; charset=utf-8")
+                        body = json.loads(response.read().decode("utf-8"))
+                    self.assertEqual(body, {"ok": True})
+                opened.assert_called_once()
+                self.assertEqual(Path(opened.call_args.args[0]), Path(folder))
             finally:
                 server.shutdown()
                 server.server_close()
                 store.close()
 
-    def test_folder_outside_the_dataset_is_refused(self):
+    def test_open_folder_outside_the_dataset_is_refused(self):
         with self._tempdir() as tmp:
             root = Path(tmp)
             _, config = self._prepare(root)
@@ -474,22 +475,24 @@ class FolderAndPreviewEndpointTests(unittest.TestCase):
 
             server, store, base = self._serve(root, config.output_dir)
             try:
-                with self.assertRaises(urllib.error.HTTPError) as ctx:
-                    urllib.request.urlopen(f"{base}/folder?path={quote(str(outside), safe='')}")
-                self.assertEqual(ctx.exception.code, 403)
+                with mock.patch("picklikeme.analyzer.server.open_in_file_manager") as opened:
+                    with self.assertRaises(urllib.error.HTTPError) as ctx:
+                        urllib.request.urlopen(f"{base}/open-folder?path={quote(str(outside), safe='')}")
+                    self.assertEqual(ctx.exception.code, 403)
+                opened.assert_not_called()
             finally:
                 server.shutdown()
                 server.server_close()
                 store.close()
 
-    def test_folder_missing_path_parameter_is_a_bad_request(self):
+    def test_open_folder_missing_path_parameter_is_a_bad_request(self):
         with self._tempdir() as tmp:
             root = Path(tmp)
             _, config = self._prepare(root)
             server, store, base = self._serve(root, config.output_dir)
             try:
                 with self.assertRaises(urllib.error.HTTPError) as ctx:
-                    urllib.request.urlopen(f"{base}/folder")
+                    urllib.request.urlopen(f"{base}/open-folder")
                 self.assertEqual(ctx.exception.code, 400)
             finally:
                 server.shutdown()

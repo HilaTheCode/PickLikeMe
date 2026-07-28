@@ -17,8 +17,8 @@ from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 
-from ..config import cli_prefix, fatal_errors_logged_to_stdout, format_duration
-from .config import DEFAULT_ANALYSIS_DIR, OPTIMIZATION_TARGETS, AnalysisConfig, timestamped_output_dir
+from ..config import DEFAULT_RESULTS_DIR, RUN_TIMESTAMP_FORMAT, cli_prefix, fatal_errors_logged_to_stdout, format_duration
+from .config import OPTIMIZATION_TARGETS, AnalysisConfig, timestamped_output_dir
 
 logger = logging.getLogger("picklikeme.analyzer")
 
@@ -43,9 +43,11 @@ def build_parser(add_help: bool = True) -> argparse.ArgumentParser:
     parser.add_argument(
         "--output",
         default=None,
-        help=f"Base directory for this run's reports (default: {DEFAULT_ANALYSIS_DIR}). The run's "
-        "start date/time is appended to the folder name so consecutive analyses never overwrite "
-        "each other (e.g. analysis_20260727-093015/).",
+        help="Base directory for this run's reports. By default, if --ranking points inside "
+        f"an {DEFAULT_RESULTS_DIR.name}/<timestamp>/ranking/ directory (as written by "
+        "picklikeme train), the report is written into that same run's report/ subdirectory; "
+        f"otherwise a fresh timestamped directory is created under {DEFAULT_RESULTS_DIR}. Pass "
+        "--output to override this and force a specific (still timestamped) location instead.",
     )
     parser.add_argument("--config", default=None, help="JSON config file; explicit flags override it")
     parser.add_argument("--title", default=None, help="Report title")
@@ -81,8 +83,17 @@ def build_parser(add_help: bool = True) -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--serve",
+        dest="serve",
         action="store_true",
-        help="After analysing, serve the report on 127.0.0.1 so annotations can be saved",
+        default=True,
+        help="After analysing, serve the report on 127.0.0.1 and open a browser (default)",
+    )
+    parser.add_argument(
+        "--no-serve",
+        dest="serve",
+        action="store_false",
+        help="Write the report and exit without starting the server or opening a browser "
+        "(for scripts and automation)",
     )
     parser.add_argument("--port", type=int, default=None, help="Port for --serve / annotate (default: 8756)")
     parser.add_argument("--no-html", action="store_true", help="Skip the HTML report")
@@ -146,6 +157,29 @@ def _configure_logging(verbose: bool) -> None:
     )
 
 
+def resolve_run_dir(ranking_path: Path | None, now: datetime) -> Path:
+    """The run directory this analysis' report should live under.
+
+    Reuses the training run's own directory when --ranking points inside one
+    (analysis_results/<timestamp>/ranking/...), so the report lands next to
+    the CSV that produced it without the user having to pass a --run-dir by
+    hand. Anything else (a hand-picked or foreign ranking file) gets a fresh,
+    freshly-timestamped run directory of its own.
+    """
+    if ranking_path is not None:
+        resolved = ranking_path.resolve()
+        if resolved.parent.name == "ranking" and resolved.parent.parent.parent == DEFAULT_RESULTS_DIR.resolve():
+            return resolved.parent.parent
+
+    stamp = now.strftime(RUN_TIMESTAMP_FORMAT)
+    candidate = DEFAULT_RESULTS_DIR / stamp
+    suffix = 1
+    while candidate.exists():
+        candidate = DEFAULT_RESULTS_DIR / f"{stamp}_{suffix}"
+        suffix += 1
+    return candidate
+
+
 def run(args: argparse.Namespace) -> int:
     """Execute an analysis and write every enabled artefact."""
     from .analysis import run_analysis
@@ -158,19 +192,30 @@ def run(args: argparse.Namespace) -> int:
     # overwrite each other's reports - stamped here, not inside AnalysisConfig
     # or run_analysis, so a library caller that builds a config directly (tests,
     # notebooks, a script) keeps exact control over where its output lands.
-    #
-    # The %Y%m%d-%H%M%S stamp has 1-second resolution, so two runs that both
-    # finish parsing args within the same second (a small ranking, no charts,
-    # or a tight test/automation loop) would otherwise collide. If the stamped
-    # directory already exists, a numbered suffix is added - the same
-    # never-overwrite guarantee the ranking/CSV outputs already give, just
-    # applied to a directory instead of a file.
-    stamped = timestamped_output_dir(config.output_dir, datetime.now())
-    output_dir = stamped
-    suffix = 1
-    while output_dir.exists():
-        output_dir = stamped.with_name(f"{stamped.name}_{suffix}")
-        suffix += 1
+    if args.output is not None:
+        # Explicit --output: honour it exactly, stamped the same way it always
+        # has been. The %Y%m%d-%H%M%S stamp has 1-second resolution, so two
+        # runs that both finish parsing args within the same second (a small
+        # ranking, no charts, or a tight test/automation loop) would otherwise
+        # collide - a numbered suffix is added when that happens.
+        stamped = timestamped_output_dir(config.output_dir, datetime.now())
+        output_dir = stamped
+        suffix = 1
+        while output_dir.exists():
+            output_dir = stamped.with_name(f"{stamped.name}_{suffix}")
+            suffix += 1
+    else:
+        # No explicit --output: land the report inside the run directory this
+        # ranking CSV belongs to (see resolve_run_dir), under report/. Only
+        # the report/ leaf gets a collision suffix - the run directory itself
+        # is stable and shared with the training run that produced the CSV.
+        run_dir = resolve_run_dir(config.ranking_path, datetime.now())
+        base_report_dir = run_dir / "report"
+        output_dir = base_report_dir
+        suffix = 1
+        while output_dir.exists():
+            output_dir = base_report_dir.with_name(f"{base_report_dir.name}_{suffix}")
+            suffix += 1
     config = replace(config, output_dir=output_dir)
 
     with fatal_errors_logged_to_stdout():
@@ -243,8 +288,9 @@ def build_annotate_parser(add_help: bool = True) -> "argparse.ArgumentParser":
     )
     parser.add_argument(
         "--output",
-        default=str(DEFAULT_ANALYSIS_DIR),
-        help=f"Analysis directory containing report.html (default: {DEFAULT_ANALYSIS_DIR})",
+        default=str(DEFAULT_RESULTS_DIR),
+        help=f"Analysis directory containing report.html, e.g. "
+        f"{DEFAULT_RESULTS_DIR}/<timestamp>/report (default: {DEFAULT_RESULTS_DIR})",
     )
     parser.add_argument("--annotations-db", default=None, help="Knowledge-base SQLite file")
     parser.add_argument("--port", type=int, default=None, help="Port to listen on (default: 8756)")

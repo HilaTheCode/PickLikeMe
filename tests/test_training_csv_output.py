@@ -7,9 +7,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from picklikeme.config import DEFAULT_MAX_CSV_ROWS
+from picklikeme.config import DEFAULT_MAX_CSV_ROWS, DEFAULT_RESULTS_DIR, run_dir_for_timestamp
 from picklikeme.dataset import FolderLabelDataset
-from picklikeme.train import CSV_PREAMBLE_LINES, timestamped_output_path, write_results_csv
+from picklikeme.train import CSV_PREAMBLE_LINES, write_results_csv
 
 
 class TrainingCsvOutputTests(unittest.TestCase):
@@ -128,26 +128,24 @@ class RowLimitTests(unittest.TestCase):
             self.assertEqual(len(written), 1, "50 rows must not split at the 30,000 default")
 
 
-class TimestampedOutputPathTests(unittest.TestCase):
-    def test_stamp_is_appended_to_stem_keeping_dir_and_suffix(self):
-        stamped = timestamped_output_path(
-            Path("out") / "training_results.csv", datetime(2026, 7, 25, 14, 30, 0)
-        )
-        self.assertEqual(stamped.name, "training_results_20260725-143000.csv")
-        self.assertEqual(stamped.parent, Path("out"))
+class RunDirForTimestampTests(unittest.TestCase):
+    """A training run's own directory - analysis_results/<timestamp>/ - which
+    now carries the uniqueness that filenames used to (see train_and_rank)."""
 
-    def test_accepts_a_plain_string_path(self):
-        stamped = timestamped_output_path("training_results.csv", datetime(2026, 1, 2, 3, 4, 5))
-        self.assertEqual(stamped, Path("training_results_20260102-030405.csv"))
+    def test_run_dir_is_nested_under_the_project_results_directory(self):
+        run_dir = run_dir_for_timestamp(datetime(2026, 7, 25, 14, 30, 0))
+        self.assertEqual(run_dir.parent, DEFAULT_RESULTS_DIR)
+        self.assertEqual(run_dir.name, "2026-07-25_14-30-00")
 
-    def test_two_runs_a_second_apart_get_distinct_names(self):
-        first = timestamped_output_path("r.csv", datetime(2026, 7, 25, 14, 30, 0))
-        second = timestamped_output_path("r.csv", datetime(2026, 7, 25, 14, 30, 1))
+    def test_two_runs_a_second_apart_get_distinct_directories(self):
+        first = run_dir_for_timestamp(datetime(2026, 7, 25, 14, 30, 0))
+        second = run_dir_for_timestamp(datetime(2026, 7, 25, 14, 30, 1))
         self.assertNotEqual(first, second)
 
-    def test_chunked_files_sort_next_to_the_first_file(self):
-        """write_results_csv appends _1/_2 for overflow; the stamp must stay in
-        the stem so all files of one run share a common prefix."""
+    def test_chunked_files_land_together_in_the_run_s_ranking_directory(self):
+        """write_results_csv appends _1/_2 for overflow; both files must land
+        in the same run directory since the directory - not the filename -
+        now carries the uniqueness."""
         with tempfile.TemporaryDirectory() as tmpdir:
             select_root = Path(tmpdir) / "select"
             reject_root = Path(tmpdir) / "reject"
@@ -159,14 +157,14 @@ class TimestampedOutputPathTests(unittest.TestCase):
 
             dataset = FolderLabelDataset(select_root=str(select_root), reject_root=str(reject_root), raw_root=str(select_root))
             ranked = [(str(item.image_path), float(idx), 1) for idx, item in enumerate(dataset)]
-            stamped = timestamped_output_path(Path(tmpdir) / "results.csv", datetime(2026, 7, 25, 14, 30, 0))
+            # A run's ranking directory (train_and_rank derives this from
+            # run_dir_for_timestamp() / "ranking" / <base filename>).
+            output_path = Path(tmpdir) / "2026-07-25_14-30-00" / "ranking" / "results.csv"
 
-            written_paths = write_results_csv(stamped, dataset, ranked, str(select_root), str(reject_root), max_rows=2)
+            written_paths = write_results_csv(output_path, dataset, ranked, str(select_root), str(reject_root), max_rows=2)
 
-            self.assertEqual(
-                [path.name for path in written_paths],
-                ["results_20260725-143000.csv", "results_20260725-143000_1.csv"],
-            )
+            self.assertEqual([path.name for path in written_paths], ["results.csv", "results_1.csv"])
+            self.assertEqual({path.parent for path in written_paths}, {output_path.parent})
 
 
 if __name__ == "__main__":

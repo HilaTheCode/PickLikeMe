@@ -14,13 +14,14 @@ Deliberate constraints:
   for a tool that runs for a few minutes at a time.
 - **Serves only the analysis directory.** Paths are resolved and checked to be
   inside it, so a crafted URL cannot read elsewhere on disk.
-- **Writes only annotations.** The API has no endpoint that can touch a
-  ranking, a checkpoint, a report or an image.
+- **Writes only annotations.** The API has no endpoint that can modify a
+  ranking, a checkpoint, a report or an image. `/open-folder` is the one
+  exception to "read-only otherwise": it spawns the OS file manager (see
+  os_actions.py), confined to the dataset's own roots exactly like /source.
 """
 
 from __future__ import annotations
 
-import html
 import io
 import json
 import logging
@@ -28,11 +29,12 @@ import mimetypes
 import threading
 from http.server import HTTPServer, SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, quote, unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 from ..config import cli_prefix
 from ..identity import IdentityUnavailable
 from .annotations import AnnotationStore, InvalidAnnotationValue
+from .os_actions import open_in_file_manager
 
 logger = logging.getLogger(__name__)
 
@@ -153,14 +155,13 @@ class AnnotationRequestHandler(SimpleHTTPRequestHandler):
             return None
         return target
 
-    def _serve_folder(self) -> None:
-        """List a folder's files as a small HTML page of /source links.
+    def _open_folder(self) -> None:
+        """Open a folder in the OS's real file manager (os.startfile on Windows).
 
-        "Open Folder"'s served-mode counterpart: browsers cannot follow a
-        served page's file:// link (see links.py), so the offline `file://`
-        directory listing has no equivalent once the report is served -
-        this generates the closest thing, confined to the dataset exactly
-        like /source.
+        "Open Folder"'s served-mode counterpart: browsers cannot reach the OS
+        at all (see os_actions.py), so a served page cannot do this itself -
+        the server does it on the browser's behalf, confined to the dataset
+        exactly like /source.
         """
         params = parse_qs(urlparse(self.path).query)
         target = self._within_dataset((params.get("path") or [""])[0])
@@ -171,30 +172,11 @@ class AnnotationRequestHandler(SimpleHTTPRequestHandler):
             return
 
         try:
-            names = sorted(p.name for p in target.iterdir() if p.is_file())
+            open_in_file_manager(target)
         except OSError as exc:
-            self._send_json({"error": f"could not list folder: {exc}"}, status=500)
+            self._send_json({"error": f"could not open folder: {exc}"}, status=500)
             return
-
-        items = "".join(
-            f'<li><a href="source?path={quote(str(target / name), safe="")}" '
-            f'target="_blank">{html.escape(name)}</a></li>'
-            for name in names
-        )
-        body = (
-            "<!doctype html><meta charset=utf-8>"
-            f"<title>{html.escape(target.name)}</title>"
-            "<style>body{font:14px sans-serif;background:#0f172a;color:#e2e8f0;padding:20px}"
-            "a{color:#60a5fa}li{margin:3px 0}</style>"
-            f"<h1>{html.escape(str(target))}</h1>"
-            f"<p>{len(names)} file(s)</p><ul>{items}</ul>"
-        ).encode("utf-8")
-        self.send_response(200)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
-        self.wfile.write(body)
+        self._send_json({"ok": True})
 
     def _serve_preview(self) -> None:
         """Stream the image's own full-size preview - the RAW's embedded
@@ -234,8 +216,8 @@ class AnnotationRequestHandler(SimpleHTTPRequestHandler):
         if route == "/source":
             self._serve_source_image()
             return
-        if route == "/folder":
-            self._serve_folder()
+        if route == "/open-folder":
+            self._open_folder()
             return
         if route == "/preview":
             self._serve_preview()

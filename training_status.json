@@ -1,9 +1,9 @@
 {
-  "epoch": 20,
-  "total_epochs": 20,
-  "batch": 157,
-  "total_batches": 157,
-  "loss": 0.15090322819579938,
-  "message": "completed epoch 20/20",
-  "updated_at": "2026-07-25T01:52:17"
+  "epoch": 1,
+  "total_epochs": 1,
+  "batch": 3,
+  "total_batches": 3,
+  "loss": 0.6626725395520529,
+  "message": "completed epoch 1/1",
+  "updated_at": "2026-07-28T07:30:38"
 }

@@ -23,6 +23,8 @@ from .config import (
     ProjectConfig,
     fatal_errors_logged_to_stdout,
     format_duration,
+    run_dir_for_timestamp,
+    tee_stdout_to_file,
 )
 from .dataset import FolderLabelDataset, LabelDataset, PathSuffixIndex
 from .evaluate import compute_metrics, format_metrics, score_items, write_metrics_json
@@ -553,17 +555,16 @@ def timestamped_output_path(output_path: str | Path, run_started: datetime) -> P
     """Insert a run timestamp into the filename stem, so consecutive runs write
     distinct result files instead of silently overwriting the previous ones.
 
-    Used for every per-run *output* of training and ranking (results CSVs, the
-    metrics JSON). Deliberately NOT used for the rolling checkpoint or the
-    status JSON: those are meant to be found and overwritten at a known, stable
-    path — `--resume` and any progress poller depend on it.
+    Used by `picklikeme.rank` (ranking a new, unlabeled folder - not part of a
+    training run, so it has no analysis_results/<timestamp>/ run directory of
+    its own to land in). `train_and_rank` no longer uses this: its outputs
+    get their uniqueness from run_dir_for_timestamp() instead.
 
-    The stamp is the run's *start* time, not the write time: a run that trains
-    for two days should be named for when it began, and the name is known (and
-    printable) before training starts. Applied to the stem so the chunked
-    `_1`/`_2` suffixes from write_results_csv still sort next to the first file:
-    `training_results_20260725-143000_1.csv`. The `%Y%m%d-%H%M%S` format sorts
-    chronologically under a plain lexicographic `ls`.
+    The stamp is the run's *start* time, not the write time. Applied to the
+    stem so the chunked `_1`/`_2` suffixes from write_results_csv still sort
+    next to the first file: `rankings_20260725-143000_1.csv`. The
+    `%Y%m%d-%H%M%S` format sorts chronologically under a plain lexicographic
+    `ls`.
     """
     output_path = Path(output_path)
     stamp = run_started.strftime("%Y%m%d-%H%M%S")
@@ -641,9 +642,9 @@ def build_arg_parser(add_help: bool = True) -> argparse.ArgumentParser:
     parser.add_argument(
         "--output-csv",
         default="training_results.csv",
-        help="Base name for the ranking results CSV. The run's start date/time is "
-        "appended to the stem so every run gets a unique file and no previous "
-        "results are overwritten (e.g. training_results_20260725-143000.csv).",
+        help="Base name for the ranking results CSV, written under this run's own "
+        "analysis_results/<timestamp>/ranking/ directory so no previous run's "
+        "results are ever overwritten.",
     )
     parser.add_argument(
         "--max-rows",
@@ -664,9 +665,8 @@ def build_arg_parser(add_help: bool = True) -> argparse.ArgumentParser:
     parser.add_argument(
         "--metrics-json",
         default="evaluation_metrics.json",
-        help="Base name for the test-set metrics written when --split is given. The "
-        "run's start date/time is appended to the stem, matching the results CSV "
-        "(e.g. evaluation_metrics_20260725-143000.json).",
+        help="Base name for the test-set metrics written when --split is given, under "
+        "this run's own analysis_results/<timestamp>/metrics/ directory.",
     )
     parser.add_argument("--resize-mode", default="letterbox", choices=["letterbox", "stretch"], help="letterbox = V2 aspect-preserving; stretch = V1 baseline behavior")
     parser.add_argument("--backbone", default=DINOV3_BACKBONE, help="V3 pretrained backbone (any timm model name), or 'cnn' to reproduce the V1/V2 baseline backbone")
@@ -693,15 +693,22 @@ def train_and_rank(args) -> None:
     if not args.select_root or not args.reject_root:
         raise SystemExit("Both --select-root and --reject-root are required.")
 
-    # Stamped once, up front, and shared by every per-run output: the filenames
-    # name the run by its start time, all outputs of one run carry the same
-    # stamp, and the paths are printed before training so they're known for the
-    # whole run.
+    # Stamped once, up front, and shared by every per-run output: one run
+    # directory holds the ranking CSV, metrics, and log, so `picklikeme analyze`
+    # can later find them all together by timestamp.
     run_started = datetime.now()
-    output_csv = timestamped_output_path(args.output_csv, run_started)
-    metrics_json = timestamped_output_path(args.metrics_json, run_started)
-    print(f"Ranking results for this run will be written to {output_csv.resolve()}")
+    run_dir = run_dir_for_timestamp(run_started)
+    output_csv = run_dir / "ranking" / Path(args.output_csv).name
+    metrics_json = run_dir / "metrics" / Path(args.metrics_json).name
+    log_path = run_dir / "logs" / "training.log"
+    print(f"Run directory: {run_dir.resolve()}")
 
+    with tee_stdout_to_file(log_path):
+        with fatal_errors_logged_to_stdout():
+            _train_and_rank(args, output_csv, metrics_json)
+
+
+def _train_and_rank(args, output_csv: Path, metrics_json: Path) -> None:
     raw_root = args.raw_root or args.select_root
     config = ProjectConfig(
         raw_root=raw_root,
@@ -801,8 +808,7 @@ def train_and_rank(args) -> None:
 
 def main() -> None:
     args = build_arg_parser().parse_args()
-    with fatal_errors_logged_to_stdout():
-        train_and_rank(args)
+    train_and_rank(args)
 
 
 if __name__ == "__main__":

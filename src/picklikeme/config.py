@@ -2,6 +2,7 @@ import sys
 import traceback
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 # Project root resolved from this file's location (src/picklikeme/config.py ->
@@ -12,6 +13,18 @@ DEFAULT_CHECKPOINT_DIR = PROJECT_ROOT / "checkpoints"
 DEFAULT_CHECKPOINT_PATH = DEFAULT_CHECKPOINT_DIR / "model_checkpoint.pt"
 DEFAULT_CROP_CACHE_DIR = PROJECT_ROOT / "cache" / "crops"
 DEFAULT_INSPECTION_DIR = PROJECT_ROOT / "inspection"
+
+# Every training run (and the analyzer report generated from it) shares one
+# timestamped directory here, so a run's ranking CSV, metrics, log and report
+# are always found together instead of scattered across the project root.
+DEFAULT_RESULTS_DIR = PROJECT_ROOT / "analysis_results"
+RUN_TIMESTAMP_FORMAT = "%Y-%m-%d_%H-%M-%S"
+
+
+def run_dir_for_timestamp(run_started: datetime) -> Path:
+    """The one directory a run's outputs (ranking CSV, metrics, log, and -
+    once `picklikeme analyze` is pointed at that CSV - the report) all share."""
+    return DEFAULT_RESULTS_DIR / run_started.strftime(RUN_TIMESTAMP_FORMAT)
 
 # Maximum lines per results/ranking CSV before it rolls over to a numbered
 # continuation file (`name.csv`, `name_1.csv`, ...). Counts the metrics
@@ -47,6 +60,46 @@ def fatal_errors_logged_to_stdout():
         print(traceback.format_exc().rstrip())
         print("=" * 64)
         raise
+
+
+class _Tee:
+    """Writes to two streams at once. Forwards unknown attributes (`isatty`,
+    `encoding`, ...) to `primary` so code that introspects `sys.stdout` -
+    tqdm-style progress bars in particular - keeps working unmodified."""
+
+    def __init__(self, primary, secondary):
+        self._primary = primary
+        self._secondary = secondary
+
+    def write(self, data: str) -> int:
+        self._secondary.write(data)
+        return self._primary.write(data)
+
+    def flush(self) -> None:
+        self._primary.flush()
+        self._secondary.flush()
+
+    def __getattr__(self, name):
+        return getattr(self._primary, name)
+
+
+@contextmanager
+def tee_stdout_to_file(log_path: str | Path):
+    """Duplicate everything printed during the block into `log_path` as well
+    as the console, without touching any of the existing print() call sites.
+
+    A run's own log file, saved next to its other outputs, rather than relying
+    on the caller to remember to redirect the shell's output.
+    """
+    log_path = Path(log_path)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    original_stdout = sys.stdout
+    with open(log_path, "w", encoding="utf-8") as log_file:
+        sys.stdout = _Tee(original_stdout, log_file)
+        try:
+            yield
+        finally:
+            sys.stdout = original_stdout
 
 
 def cli_prefix() -> str:

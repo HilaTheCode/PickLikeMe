@@ -293,12 +293,18 @@ document.addEventListener('DOMContentLoaded', async ()=>{
     banners.forEach(b=>b.style.display='none');
     // Browsers refuse to navigate from a served page to any file:// URL, so a
     // served report must reach folders and previews through the server.
-    // Rewrite once: Open Folder from its offline file:// listing to the
-    // server's /folder endpoint, Open Preview from the report's small cached
-    // thumbnail to the server's /preview (the RAW's own full-size preview).
+    // Open Folder: intercept the click and ask the server to pop the real OS
+    // file manager (os.startfile) instead of navigating anywhere - offline it
+    // stays a file:// listing since there is no server to ask.
     document.querySelectorAll('a[data-folder]').forEach(a=>{
-      a.href='folder?path='+encodeURIComponent(a.dataset.folder);
-      a.target='_blank';
+      a.addEventListener('click', async (ev)=>{
+        ev.preventDefault();
+        try{
+          const r = await fetch('open-folder?path='+encodeURIComponent(a.dataset.folder));
+          const j = await r.json();
+          if(!r.ok || j.error) throw new Error(j.error || ('HTTP '+r.status));
+        }catch(e){ alert('Could not open folder: '+e.message); }
+      });
     });
     document.querySelectorAll('a[data-preview]').forEach(a=>{
       a.href='preview?path='+encodeURIComponent(a.dataset.preview);
@@ -384,8 +390,8 @@ def _open_actions(image_path: str, thumb_url: str | None) -> str:
 
     - **Open Folder**: offline, a `file://` directory listing (every browser
       renders one - the closest a web page can get to opening the OS file
-      manager, since there is no API for the latter). Served, the analyzer's
-      own `/folder` listing endpoint.
+      manager, since there is no API for the latter). Served, the real OS
+      file manager via the server's `/open-folder` endpoint (os.startfile).
     - **Open Preview**: offline, the report's own small cached thumbnail
       (already on disk, always available, no server needed). Served, the
       `/preview` endpoint - the RAW's real full-size embedded preview, which

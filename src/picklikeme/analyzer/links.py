@@ -22,12 +22,12 @@ absolute path in `data-source` so the served page can rewrite the href to the
 server's own `/source` endpoint. One artifact, correct in both modes, on Windows
 and on POSIX.
 
-`folder_file_uri`/`folder_api_url` and `preview_api_url` extend the same
+`folder_file_uri`/`open_folder_api_url` and `preview_api_url` extend the same
 dual-form pattern to two actions that replaced a bare RAW hyperlink (browsers
 cannot render RAW files at all, so a direct link to one was never useful):
-"Open Folder" (a directory listing - the closest thing to opening the OS file
-manager a web page can do) and "Open Preview" (the RAW's own embedded
-full-size preview, extracted server-side on demand).
+"Open Folder" (offline, a `file://` directory listing; served, the real OS
+file manager via the server's os.startfile call) and "Open Preview" (the
+RAW's own embedded full-size preview, extracted server-side on demand).
 """
 
 from __future__ import annotations
@@ -38,9 +38,9 @@ from urllib.parse import quote
 
 logger = logging.getLogger(__name__)
 
-# Query parameter the annotation server reads for /source, /folder, /preview.
+# Query parameter the annotation server reads for /source, /open-folder, /preview.
 SOURCE_ENDPOINT = "source"
-FOLDER_ENDPOINT = "folder"
+OPEN_FOLDER_ENDPOINT = "open-folder"
 PREVIEW_ENDPOINT = "preview"
 SOURCE_PARAM = "path"
 
@@ -108,10 +108,10 @@ def folder_file_uri(image_path: str | Path) -> str | None:
         return None
 
 
-def folder_api_url(image_path: str | Path) -> str:
-    """Relative URL for the served mode's folder listing (see server._serve_folder)."""
+def open_folder_api_url(image_path: str | Path) -> str:
+    """Relative URL for the served mode's real OS folder open (see server._open_folder)."""
     parent = str(Path(image_path).parent)
-    return f"{FOLDER_ENDPOINT}?{SOURCE_PARAM}={quote(parent, safe='')}"
+    return f"{OPEN_FOLDER_ENDPOINT}?{SOURCE_PARAM}={quote(parent, safe='')}"
 
 
 def preview_api_url(image_path: str | Path) -> str:

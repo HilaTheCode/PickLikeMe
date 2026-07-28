@@ -12,9 +12,7 @@ from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime
 from pathlib import Path
 
-from ..config import PROJECT_ROOT
-
-DEFAULT_ANALYSIS_DIR = PROJECT_ROOT / "analysis"
+from ..config import DEFAULT_RESULTS_DIR
 
 # Percentile cut-offs for top-K ranking quality. These are the fractions a
 # photographer actually culls at: "show me the best 1%..30% of the shoot".
@@ -53,7 +51,7 @@ class AnalysisConfig:
     ranking_path: Path
     selected_root: Path | None = None
     rejected_root: Path | None = None
-    output_dir: Path = DEFAULT_ANALYSIS_DIR
+    output_dir: Path = DEFAULT_RESULTS_DIR
     report_title: str = "PickLikeMe model analysis"
 
     # Decision threshold applied to the probability (or score) to turn a

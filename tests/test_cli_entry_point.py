@@ -239,7 +239,7 @@ class AnnotateServerLaunchTests(unittest.TestCase):
                     "--rejected", str(rejected),
                     "--output", str(root / "out"),
                     "--annotations-db", str(root / "kb.db"),
-                    "--no-charts", "--no-contact-sheets", "--quiet",
+                    "--no-charts", "--no-contact-sheets", "--quiet", "--no-serve",
                 ],
                 cwd=PROJECT_ROOT,
                 capture_output=True,
