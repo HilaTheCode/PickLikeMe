@@ -141,6 +141,42 @@ class PageMarkupTests(unittest.TestCase):
         self.assertIn("const button = q('#theme');", js)
         self.assertIn("if(button) button.textContent", js)
 
+    def test_every_endpoint_answers_with_an_envelope_not_the_state_itself(self):
+        """Every review endpoint answers `{ok, ..., state}` - arrange and
+        reconcile carry a sibling (`result`, `recovered`) alongside `state`,
+        which is exactly why `api()` hands back the whole envelope rather than
+        unwrapping it once for every caller. That makes ".state" a contract
+        each call site must honour for itself: assigning the raw envelope to
+        PLM.state (skipping the unwrap) type-checks fine and fails silently
+        until `render()` dereferences `undefined.total` - the exact shape of
+        bug that shipped in the initial `api/review/state` load in boot().
+
+        This can't run the page's JS to prove it at runtime (see the class
+        docstring), so it encodes the same invariant as a source pattern: every
+        `PLM.state = ` assignment must go through a `.state` unwrap, and none
+        may assign a raw `api(...)` result directly.
+        """
+        from picklikeme.review.page import build_js
+
+        js = build_js()
+        # The right-hand side of each assignment, not the whole statement: every
+        # line's left-hand side is the literal text "PLM.state", so searching
+        # the whole line for ".state" is trivially true and catches nothing -
+        # exactly how this check first shipped, and exactly why the regression
+        # it was meant to catch reached the user instead.
+        right_hand_sides = [
+            match.group(1).strip() for match in re.finditer(r"PLM\.state\s*=\s*(.+?);", js, re.S)
+        ]
+        self.assertGreaterEqual(len(right_hand_sides), 4, "expected an assignment per endpoint call site")
+
+        not_unwrapped = [rhs for rhs in right_hand_sides if not rhs.endswith(".state")]
+        self.assertEqual(
+            not_unwrapped,
+            [],
+            "every `PLM.state = ...` assignment must unwrap `.state` from the API envelope "
+            f"on its right-hand side; found one that does not: {not_unwrapped}",
+        )
+
 
 class StateEndpointTests(ReviewServerTestCase):
     def test_state_describes_every_image_and_its_counts(self):

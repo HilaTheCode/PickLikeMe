@@ -314,7 +314,17 @@ async function boot(){
   q('#dlg-go').addEventListener('click', doArrange);
 
   try{
-    PLM.state = await api('api/review/state');
+    // Every endpoint answers {ok, ..., state}, not the gallery state itself -
+    // arrange and reconcile carry a sibling (result, recovered) alongside it,
+    // which is why api() hands back the whole envelope rather than unwrapping
+    // it for every caller. Every other call site extracts .state at the point
+    // of use (see decide/setPercent/doArrange below); this is the same thing.
+    // Every endpoint answers {ok, ..., state}, not the gallery state itself -
+    // arrange and reconcile carry a sibling (result, recovered) alongside it,
+    // which is why api() hands back the whole envelope rather than unwrapping
+    // it for every caller. Every other call site extracts .state at the point
+    // of use (see decide/setPercent/doArrange below); this is the same thing.
+    PLM.state = (await api('api/review/state')).state;
     render();
   }catch(e){
     q('#grid').innerHTML = '<div class="empty">Could not load this review: ' + esc(e.message) + '</div>';
