@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from ...config import cli_prefix
-from ..annotations import ANNOTATION_FIELD_LABELS, ANNOTATION_FIELDS
+from ..annotation_config import AnnotationField, AnnotationFieldsConfig
 from ..links import asset_url, folder_file_uri
 from ..suggestions import CRITICAL, WARNING
 
@@ -143,7 +143,7 @@ border:1px solid var(--border);background:var(--panel);color:var(--text)}
 .freq .lbl{font-size:13px}
 """
 
-JS = """
+JS_TEMPLATE = """
 document.querySelectorAll('.head').forEach(h=>h.addEventListener('click',()=>
   h.parentElement.classList.toggle('collapsed')));
 
@@ -181,20 +181,18 @@ async function plmProbe(){
   }catch(e){ return false; }
 }
 
-// The three diagnostic fields, and their display labels. Kept in one place so
-// save, render and filter all agree; the server validates the same set.
-const PLM_FIELDS = ['crop_quality','image_quality','agree_with_model_decision'];
-const PLM_LABELS = {
-  crop_quality:'Crop Quality',
-  image_quality:'Image Quality',
-  agree_with_model_decision:'Agree with Model Decision'
-};
+// The configured diagnostic fields and their display labels - generated from
+// config/annotations.yaml at report-build time (see _build_js), not
+// hardcoded here. Kept in one place so save, render and filter all agree;
+// the server validates against the same config.
+const PLM_FIELDS = __PLM_FIELDS_JSON__;
+const PLM_LABELS = __PLM_LABELS_JSON__;
 const plmAttr = f => 'data-'+f.replace(/_/g,'-');
 
 function plmRenderTags(el, annotation){
   const tags = el.querySelector('.fn-tags');
   const values = {};
-  PLM_FIELDS.forEach(f=>{ values[f] = (annotation && annotation[f]) || ''; });
+  PLM_FIELDS.forEach(f=>{ values[f] = (annotation && annotation.fields && annotation.fields[f]) || ''; });
   if(tags){
     const html = PLM_FIELDS.filter(f=>values[f])
       .map(f=>`<span class="tag field-tag">${plmEsc(PLM_LABELS[f])}: ${plmEsc(values[f])}</span>`)
@@ -325,7 +323,7 @@ document.addEventListener('DOMContentLoaded', async ()=>{
           el.dataset.hash=a.image_hash;
           plmRenderTags(el,a);
           el.querySelectorAll('select.ann-field').forEach(sel=>{
-            sel.value=a[sel.dataset.field]||'';
+            sel.value=(a.fields && a.fields[sel.dataset.field])||'';
           });
         }
       });
@@ -356,6 +354,19 @@ document.querySelectorAll('table').forEach(table=>{
   });
 });
 """
+
+
+def _build_js(fields_config: AnnotationFieldsConfig) -> str:
+    """JS_TEMPLATE with its two config-driven constants filled in.
+
+    Plain string substitution rather than an f-string: JS_TEMPLATE is full of
+    literal `{`/`}` (object literals, template strings, arrow functions), so
+    treating it as an f-string would require escaping nearly every brace in
+    it. Substituting two placeholder tokens sidesteps that entirely.
+    """
+    field_ids = json.dumps(list(fields_config.field_ids))
+    field_labels = json.dumps({f.id: f.label for f in fields_config})
+    return JS_TEMPLATE.replace("__PLM_FIELDS_JSON__", field_ids).replace("__PLM_LABELS_JSON__", field_labels)
 
 
 def _e(value) -> str:
@@ -617,21 +628,38 @@ DETECTOR_BOX_LEGEND = (
 )
 
 
-def _field_select(field_name: str, values: list[str], current: str | None) -> str:
-    """One labelled dropdown for a fixed-vocabulary annotation field.
+def _field_label(fields_config: AnnotationFieldsConfig, field_id: str) -> str:
+    """A field's configured label, or its raw id if it's retired (no longer
+    in fields_config) - never raises, so historical data always renders."""
+    field_def = fields_config.get(field_id)
+    return field_def.label if field_def is not None else field_id
 
-    A `<select>` rather than radios: three fields of four options each would be
-    twelve radio targets per panel, which crowds a list meant to be scanned
-    quickly. The blank option is what "not answered yet" looks like, and is what
-    a photographer picks to clear a field.
+
+def _value_label(fields_config: AnnotationFieldsConfig, field_id: str, value_id: str) -> str:
+    """A value's configured label within a field, or the raw value id if
+    either the field or that value is retired."""
+    field_def = fields_config.get(field_id)
+    return field_def.label_for(value_id) if field_def is not None else value_id
+
+
+def _field_select(field_def: AnnotationField, current: str | None) -> str:
+    """One labelled dropdown for a configured, fixed-vocabulary annotation
+    field. The option's `value` is the value's stable id (what gets stored
+    and posted back); its text is the configured label - the one place this
+    file actually distinguishes the two.
+
+    A `<select>` rather than radios: several fields of several options each
+    would be many radio targets per panel, which crowds a list meant to be
+    scanned quickly. The blank option is what "not answered yet" looks like,
+    and is what a photographer picks to clear a field.
     """
     options = '<option value="">- not set -</option>' + "".join(
-        f'<option value="{_e(value)}"{" selected" if value == current else ""}>{_e(value)}</option>'
-        for value in values
+        f'<option value="{_e(value.id)}"{" selected" if value.id == current else ""}>{_e(value.label)}</option>'
+        for value in field_def.values
     )
     return (
-        f'<label class="field"><span class="field-label">{_e(ANNOTATION_FIELD_LABELS[field_name])}</span>'
-        f'<select class="ann-field" data-field="{_e(field_name)}">{options}</select></label>'
+        f'<label class="field"><span class="field-label">{_e(field_def.label)}</span>'
+        f'<select class="ann-field" data-field="{_e(field_def.id)}">{options}</select></label>'
     )
 
 
@@ -639,6 +667,7 @@ def _annotation_panels(
     records: list,
     result: "AnalysisResult",
     thumbs: dict[str, Path],
+    fields_config: AnnotationFieldsConfig,
     *,
     scope: str,
     decision_label: str,
@@ -652,7 +681,11 @@ def _annotation_panels(
     report.
 
     Every field renders unset unless the database already holds a value for
-    that image - nothing is ever pre-selected on the model's behalf.
+    that image - nothing is ever pre-selected on the model's behalf. `fields_config`
+    is whatever config/annotations.yaml defined when this report was generated;
+    editable dropdowns only ever offer its fields. A stored value for a field
+    or value id no longer in `fields_config` (a retired id) still displays as
+    a read-only tag - see `_tag_text` - it just cannot be re-selected.
 
     Wrapped in a `.ann-scope` container so its filter bar only ever filters its
     own panels: this function is called once per category, and the two sets of
@@ -661,16 +694,15 @@ def _annotation_panels(
     if not records:
         return f'<p class="sub">{_e(empty_message)}</p>'
 
-    vocabularies = {name: list(values) for name, values in ANNOTATION_FIELDS.items()}
     output_dir = result.config.output_dir
 
     field_filters = "".join(
-        f'<label>{_e(ANNOTATION_FIELD_LABELS[name])} '
-        f'<select class="f-field" data-field="{_e(name)}">'
+        f'<label>{_e(field_def.label)} '
+        f'<select class="f-field" data-field="{_e(field_def.id)}">'
         '<option value="">any</option>'
-        + "".join(f'<option value="{_e(v)}">{_e(v)}</option>' for v in values)
+        + "".join(f'<option value="{_e(v.id)}">{_e(v.label)}</option>' for v in field_def.values)
         + "</select></label>"
-        for name, values in vocabularies.items()
+        for field_def in fields_config
     )
     filters = (
         '<div class="filters">'
@@ -699,10 +731,12 @@ def _annotation_panels(
         path = image.image_path
         detection = (result.detections or {}).get(path)
         annotation = result.annotations.get(path)
+        # Editable fields only - what the dropdowns offer and what the filter
+        # bar's data-<field> attributes match against.
         values = {
-            name: (getattr(annotation, name) if annotation else None) for name in ANNOTATION_FIELDS
+            field_def.id: (annotation.fields.get(field_def.id) if annotation else None)
+            for field_def in fields_config
         }
-        answered = [v for v in values.values() if v]
 
         # `thumbs` is pre-merged with overlays in build_html(), so this is
         # already the annotated copy when one exists.
@@ -738,12 +772,15 @@ def _annotation_panels(
             if annotation and annotation.capture_datetime
             else ""
         )
+        # Every stored field, not just the currently-configured ones: a
+        # retired field or value id (renamed/removed from config since it was
+        # saved) still displays here, read-only, rather than disappearing.
         tags = (
             "".join(
-                f'<span class="tag field-tag">{_e(ANNOTATION_FIELD_LABELS[field_name])}: '
-                f"{_e(value)}</span>"
-                for field_name, value in values.items()
-                if value
+                f'<span class="tag field-tag">{_e(_field_label(fields_config, field_id))}: '
+                f"{_e(_value_label(fields_config, field_id, value_id))}</span>"
+                for field_id, value_id in (annotation.fields.items() if annotation else ())
+                if value_id
             )
             or '<span class="status">not yet annotated</span>'
         )
@@ -764,19 +801,16 @@ def _annotation_panels(
                 f"earlier annotation &middot; {_e(' &middot; '.join(bits))}</div>"
             ).replace("&amp;middot;", "&middot;")
 
-        selects = "".join(
-            _field_select(field_name, vocabularies.get(field_name, []), values[field_name])
-            for field_name in ANNOTATION_FIELDS
-        )
+        selects = "".join(_field_select(field_def, values[field_def.id]) for field_def in fields_config)
 
         panels.append(
             f'<div class="fn" data-path="{_e(path)}" '
             f'data-hash="{_e(annotation.image_hash if annotation else "")}" '
             + "".join(
-                f'data-{field_name.replace("_", "-")}="{_e(values[field_name] or "")}" '
-                for field_name in ANNOTATION_FIELDS
+                f'data-{field_def.id.replace("_", "-")}="{_e(values[field_def.id] or "")}" '
+                for field_def in fields_config
             )
-            + f'data-annotated="{"1" if answered else "0"}">'
+            + f'data-annotated="{"1" if (annotation is not None and not annotation.is_empty) else "0"}">'
             f'<div class="fn-top">{thumb_html}'
             f'<div class="fn-meta"><div class="fn-name">{name}{moved}</div>{actions}'
             f'<div class="fn-nums">score {image.score:.4f} &middot; confidence '
@@ -801,7 +835,7 @@ def _annotation_panels(
     )
 
 
-def _annotation_summary(summary, *, category_label: str, section_hint: str) -> str:
+def _annotation_summary(summary, fields_config: AnnotationFieldsConfig, *, category_label: str, section_hint: str) -> str:
     """One category's summary section (false negatives, or false positives) -
     same layout for both, so the numbers can be compared side by side.
     """
@@ -812,10 +846,13 @@ def _annotation_summary(summary, *, category_label: str, section_hint: str) -> s
         f"{summary.annotated:,} of {summary.total_images:,} annotated"
         + (f" ({summary.coverage * 100:.1f}%)" if summary.coverage is not None else "")
     )
-    # The headline number: how often you looked at a mistake and disagreed with
-    # the model's call. None when nobody has answered that field yet.
+    # The headline number: how often you looked at a mistake and disagreed
+    # with the model's call. Only shown when the shipped 'agree_with_model_decision'
+    # field (with its 'no' value) is still configured - a soft convention, not
+    # a hardcoded requirement: rename or remove that field and this card just
+    # stops appearing, everything else in this report still works.
     agree_counts = dict(summary.field_counts.get("agree_with_model_decision") or [])
-    disagreements = agree_counts.get("No", 0) if agree_counts else None
+    disagreements = agree_counts.get("no", 0) if agree_counts else None
     cards = (
         '<div class="cards">'
         f'<div class="card"><div class="label">{_e(category_label)}</div>'
@@ -842,18 +879,18 @@ def _annotation_summary(summary, *, category_label: str, section_hint: str) -> s
     # One breakdown per field: the fields are independent judgements, so they get
     # independent charts rather than being pooled into a single tag frequency.
     blocks = []
-    for field_name, label in ANNOTATION_FIELD_LABELS.items():
-        counts = summary.field_counts.get(field_name) or []
+    for field_def in fields_config:
+        counts = summary.field_counts.get(field_def.id) or []
         if not counts:
             continue
         biggest = counts[0][1]
         bars = "".join(
             f'<div class="freq"><span class="n">{count:,}</span>'
             f'<span class="bar" style="width:{count / biggest * 260:.0f}px"></span>'
-            f'<span class="lbl">{_e(name)}</span></div>'
-            for name, count in counts
+            f'<span class="lbl">{_e(field_def.label_for(value_id))}</span></div>'
+            for value_id, count in counts
         )
-        blocks.append(f"<h3 style='margin:18px 0 8px;font-size:15px'>{_e(label)}</h3>{bars}")
+        blocks.append(f"<h3 style='margin:18px 0 8px;font-size:15px'>{_e(field_def.label)}</h3>{bars}")
     if blocks:
         frequencies = "".join(blocks)
     else:
@@ -864,13 +901,19 @@ def _annotation_summary(summary, *, category_label: str, section_hint: str) -> s
 
     combinations = ""
     if summary.combination_counts:
+        from ..annotations import UNSET_COMBINATION_PLACEHOLDER
+
+        def _combo_cell(field_id: str, value_id: str) -> str:
+            text = value_id if value_id == UNSET_COMBINATION_PLACEHOLDER else _value_label(fields_config, field_id, value_id)
+            return f"<td>{_e(text)}</td>"
+
         rows = "".join(
             f'<tr><td class="num">{count:,}</td>'
-            + "".join(f"<td>{_e(value)}</td>" for value in combo)
+            + "".join(_combo_cell(field_id, value_id) for field_id, value_id in zip(summary.combination_fields, combo))
             + "</tr>"
             for combo, count in summary.combination_counts
         )
-        headers = "".join(f"<th>{_e(label)}</th>" for label in ANNOTATION_FIELD_LABELS.values())
+        headers = "".join(f"<th>{_e(_field_label(fields_config, fid))}</th>" for fid in summary.combination_fields)
         combinations = (
             "<h3 style='margin:18px 0 6px;font-size:15px'>Most common combinations</h3>"
             f'<table><thead><tr><th class="num">Count</th>{headers}</tr></thead>'
@@ -889,9 +932,9 @@ def _annotation_summary(summary, *, category_label: str, section_hint: str) -> s
 
     def _recent_tags(a) -> str:
         return "".join(
-            f'<span class="tag field-tag">{_e(value)}</span> '
-            for value in (a.crop_quality, a.image_quality, a.agree_with_model_decision)
-            if value
+            f'<span class="tag field-tag">{_e(_value_label(fields_config, field_id, value_id))}</span> '
+            for field_id, value_id in a.fields.items()
+            if value_id
         )
 
     recent = ""
@@ -1027,6 +1070,10 @@ def build_html(result: "AnalysisResult", thumbs: dict[str, Path] | None = None) 
     config = result.config
     output_dir = config.output_dir
     errors = result.errors
+    # Loaded once here (by run_analysis, see analysis.py) so this whole report
+    # reflects the config/annotations.yaml that was live when it was
+    # generated - never a module-level global that could drift between runs.
+    fields_config: AnnotationFieldsConfig = result.annotation_fields_config
 
     # Every thumbnail in the report prefers its detector-box overlay when one
     # was rendered, computed once here so every section below (error tables,
@@ -1048,6 +1095,7 @@ def build_html(result: "AnalysisResult", thumbs: dict[str, Path] | None = None) 
                 errors.false_negatives,
                 result,
                 thumbs,
+                fields_config,
                 scope="false_negative",
                 decision_label="you kept it",
                 empty_message="No false negatives - nothing to annotate.",
@@ -1058,6 +1106,7 @@ def build_html(result: "AnalysisResult", thumbs: dict[str, Path] | None = None) 
             "False negative summary",
             _annotation_summary(
                 result.annotation_summary,
+                fields_config,
                 category_label="False negatives",
                 section_hint="False negatives",
             ),
@@ -1073,6 +1122,7 @@ def build_html(result: "AnalysisResult", thumbs: dict[str, Path] | None = None) 
                 errors.false_positives,
                 result,
                 thumbs,
+                fields_config,
                 scope="false_positive",
                 decision_label="you rejected it",
                 empty_message="No false positives - nothing to annotate.",
@@ -1083,6 +1133,7 @@ def build_html(result: "AnalysisResult", thumbs: dict[str, Path] | None = None) 
             "False positive summary",
             _annotation_summary(
                 result.fp_annotation_summary,
+                fields_config,
                 category_label="False positives",
                 section_hint="False positives",
             ),
@@ -1139,7 +1190,7 @@ def build_html(result: "AnalysisResult", thumbs: dict[str, Path] | None = None) 
 <footer>Generated by picklikeme analyze &middot; read-only: no model, cache or source image was modified
 &middot; annotations are yours, never generated, and never affect any metric</footer>
 </div><script>window.PLM_ANNOTATIONS={inlined_annotations};</script>
-<script>{JS}</script></body></html>"""
+<script>{_build_js(fields_config)}</script></body></html>"""
 
 
 def write_html_report(result: "AnalysisResult", thumbs: dict[str, Path] | None = None) -> Path:

@@ -1,0 +1,54 @@
+# Annotation field definitions for the analyzer's false-negative / false-
+# positive review UI (`picklikeme analyze` / `picklikeme annotate`).
+#
+# This file is data, not code: add a field, or add a value to an existing
+# field, and it appears in the report after the analyzer is next run - no
+# source change, no recompilation.
+#
+# Each field's `id` is its YAML key. The database stores a value's `id`, never
+# its `label` - so a label can be reworded freely without touching any
+# existing annotation. Once an id has been used and saved into the database,
+# treat it as permanent: renaming or removing it orphans historical data (the
+# analyzer will still show it, but flags it at startup as retired). Adding a
+# brand new id is always safe.
+#
+# `id` and `label` must both be plain strings. Quote anything YAML could
+# otherwise read as a boolean or number - "yes"/"no"/"Yes"/"No" below are all
+# quoted for exactly this reason (unquoted, YAML 1.1 parses them as booleans,
+# not strings, and the loader will refuse to start with a clear error rather
+# than silently storing `True`/`False`).
+
+annotation_fields:
+  crop_quality:
+    label: Crop Quality
+    values:
+      - id: good
+        label: Good
+      - id: too_small
+        label: Too Small
+      - id: wrong_location
+        label: Wrong Location
+      - id: too_large
+        label: Too Large
+
+  image_quality:
+    label: Image Quality
+    values:
+      - id: good
+        label: Good
+      - id: missing_eye
+        label: Missing Eye
+      - id: out_of_focus
+        label: Out of Focus
+      - id: no_relevant_subject
+        label: No Relevant Subject
+      - id: group_scene
+        label: Group Scene
+
+  agree_with_model_decision:
+    label: Agree with Model Decision
+    values:
+      - id: "yes"
+        label: "Yes"
+      - id: "no"
+        label: "No"

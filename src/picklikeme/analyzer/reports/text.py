@@ -194,6 +194,7 @@ def render_annotations(result: AnalysisResult) -> str:
         blocks.append(
             render_annotation_summary(
                 result.annotation_summary,
+                result.annotation_fields_config,
                 title="False negative annotations",
                 item_label="false negatives",
             )
@@ -202,6 +203,7 @@ def render_annotations(result: AnalysisResult) -> str:
         blocks.append(
             render_annotation_summary(
                 result.fp_annotation_summary,
+                result.annotation_fields_config,
                 title="False positive annotations",
                 item_label="false positives",
             )

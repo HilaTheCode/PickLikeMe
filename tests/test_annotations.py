@@ -15,12 +15,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from picklikeme.analyzer.annotations import (
-    DEFAULT_ANNOTATIONS_DB,
-    AnnotationStore,
-    render_summary,
-    summarise,
-)
+from picklikeme.analyzer.annotations import DEFAULT_ANNOTATIONS_DB, AnnotationStore
 from picklikeme.identity import IdentityUnavailable, cache_key, image_identity
 from picklikeme.analyzer.config import AnalysisConfig
 from test_analyzer import build_dataset, write_ranking  # reuse the analyzer fixtures
@@ -162,31 +157,31 @@ class StorageTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = make_image(Path(tmp) / "IMG_0001.NEF")
             with store_in(tmp) as store:
-                saved = store.save(path, crop_quality="Too Small", image_quality="Out of Focus")
+                saved = store.save(path, fields={"crop_quality": "too_small", "image_quality": "out_of_focus"})
                 self.assertTrue(saved.image_hash.startswith("p1:"))
 
             with AnnotationStore(Path(tmp) / "kb" / "fn.db") as reopened:
                 annotation = reopened.get(path)
                 self.assertIsNotNone(annotation)
-                self.assertEqual(annotation.crop_quality, "Too Small")
+                self.assertEqual(annotation.fields["crop_quality"], "too_small")
                 self.assertEqual(annotation.filename, "IMG_0001.NEF")
 
     def test_saving_again_replaces_the_answers_and_keeps_created_at(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = make_image(Path(tmp) / "a.NEF")
             with store_in(tmp) as store:
-                first = store.save(path, crop_quality="Good")
-                second = store.save(path, crop_quality="Too Large", image_quality="Missing Eye")
+                first = store.save(path, fields={"crop_quality": "good"})
+                second = store.save(path, fields={"crop_quality": "too_large", "image_quality": "missing_eye"})
 
                 self.assertEqual(second.created_at, first.created_at)
-                self.assertEqual(store.get(path).crop_quality, "Too Large")
-                self.assertEqual(store.get(path).image_quality, "Missing Eye")
+                self.assertEqual(store.get(path).fields["crop_quality"], "too_large")
+                self.assertEqual(store.get(path).fields["image_quality"], "missing_eye")
 
     def test_clearing_everything_deletes_the_record(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = make_image(Path(tmp) / "a.NEF")
             with store_in(tmp) as store:
-                store.save(path, crop_quality="Good")
+                store.save(path, fields={"crop_quality": "good"})
                 self.assertEqual(store.count(), 1)
                 store.save(path)
                 self.assertEqual(store.count(), 0)
@@ -197,13 +192,13 @@ class StorageTests(unittest.TestCase):
             root = Path(tmp)
             original = make_image(root / "IMG_9.NEF", b"the same bird")
             with store_in(tmp) as store:
-                store.save(original, crop_quality="Too Small")
+                store.save(original, fields={"crop_quality": "too_small"})
                 original.unlink()
                 renamed = make_image(root / "best_of_shoot.NEF", b"the same bird")
 
                 found = store.get(renamed)
                 self.assertIsNotNone(found, "identity must survive a rename")
-                self.assertEqual(found.crop_quality, "Too Small")
+                self.assertEqual(found.fields["crop_quality"], "too_small")
                 self.assertTrue(found.relocated)
 
     def test_annotation_follows_a_reorganised_archive(self):
@@ -211,9 +206,9 @@ class StorageTests(unittest.TestCase):
             root = Path(tmp)
             original = make_image(root / "D_drive" / "2026" / "india" / "a.NEF", b"elephant frame")
             with store_in(tmp) as store:
-                store.save(original, crop_quality="Wrong Location")
+                store.save(original, fields={"crop_quality": "wrong_location"})
                 moved = make_image(root / "E_drive" / "archive" / "asia" / "a.NEF", b"elephant frame")
-                self.assertEqual(store.get(moved).crop_quality, "Wrong Location")
+                self.assertEqual(store.get(moved).fields["crop_quality"], "wrong_location")
 
     def test_duplicate_filenames_are_never_confused(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -221,9 +216,9 @@ class StorageTests(unittest.TestCase):
             with store_in(tmp) as store:
                 a = make_image(root / "shootA" / "DSC_0001.NEF", b"frame A")
                 b = make_image(root / "shootB" / "DSC_0001.NEF", b"frame B")
-                store.save(a, image_quality="Good")
+                store.save(a, fields={"image_quality": "good"})
 
-                self.assertEqual(store.get(a).image_quality, "Good")
+                self.assertEqual(store.get(a).fields["image_quality"], "good")
                 self.assertIsNone(store.get(b), "a same-named different image must not match")
 
     def test_unreadable_image_is_an_explicit_failure_not_a_guess(self):
@@ -233,7 +228,7 @@ class StorageTests(unittest.TestCase):
                 with self.assertRaises(IdentityUnavailable):
                     store.get(missing)
                 with self.assertRaises(IdentityUnavailable):
-                    store.save(missing, crop_quality="Good")
+                    store.save(missing, fields={"crop_quality": "good"})
 
     def test_get_many_separates_unresolved_from_unannotated(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -242,7 +237,7 @@ class StorageTests(unittest.TestCase):
             plain = make_image(root / "plain.NEF")
             missing = root / "missing.NEF"
             with store_in(tmp) as store:
-                store.save(good, crop_quality="Good")
+                store.save(good, fields={"crop_quality": "good"})
                 found, unresolved = store.get_many([str(good), str(plain), str(missing)])
 
             self.assertEqual(list(found), [str(good)])
@@ -405,9 +400,11 @@ class IsolationTests(unittest.TestCase):
                 for record in clean.errors.false_negatives:
                     store.save(
                         record.image_path,
-                        crop_quality="Too Small",
-                        image_quality="Out of Focus",
-                        agree_with_model_decision="No",
+                        fields={
+                            "crop_quality": "too_small",
+                            "image_quality": "out_of_focus",
+                            "agree_with_model_decision": "no",
+                        },
                     )
             self.assertGreater(len(clean.errors.false_negatives), 0, "fixture must produce FNs")
 
@@ -517,17 +514,18 @@ class HtmlIntegrationTests(unittest.TestCase):
             first = self._result(root, db)
             target = first.errors.false_negatives[0].image_path
             with AnnotationStore(db) as store:
-                store.save(target, crop_quality="Too Small", agree_with_model_decision="No")
+                store.save(target, fields={"crop_quality": "too_small", "agree_with_model_decision": "no"})
 
             again = self._result(root, db)
             html = build_html(again)
 
-            self.assertIn('<option value="Too Small" selected>', html)
+            # The option's value is the stored id; its text is the configured label.
+            self.assertIn('<option value="too_small" selected>Too Small</option>', html)
             # Inlined so a file:// report still shows what is known.
             self.assertIn("window.PLM_ANNOTATIONS=", html)
             self.assertEqual(
-                json.loads(json.dumps(again.annotations[target].as_dict()))["crop_quality"],
-                "Too Small",
+                json.loads(json.dumps(again.annotations[target].as_dict()))["fields"]["crop_quality"],
+                "too_small",
             )
 
     def test_report_stays_offline_with_the_annotation_ui(self):
@@ -566,16 +564,19 @@ class ServerTests(unittest.TestCase):
                     self.assertTrue(json.load(response)["ok"])
 
                 with urllib.request.urlopen(f"{base}/api/fields") as response:
-                    self.assertIn("crop_quality", json.load(response)["fields"])
+                    fields = json.load(response)["fields"]
+                    self.assertIn("crop_quality", [f["id"] for f in fields])
+                    crop_field = next(f for f in fields if f["id"] == "crop_quality")
+                    self.assertIn({"id": "too_small", "label": "Too Small"}, crop_field["values"])
 
                 image = root / "IMG_1.NEF"
                 image.write_bytes(b"real pixels")
                 payload = json.dumps(
                     {
                         "image_path": str(image),
-                        "crop_quality": "Good",
-                        "image_quality": "Missing Eye",
-                        "agree_with_model_decision": "Yes",
+                        "crop_quality": "good",
+                        "image_quality": "missing_eye",
+                        "agree_with_model_decision": "yes",
                     }
                 ).encode("utf-8")
                 request = urllib.request.Request(
@@ -587,10 +588,10 @@ class ServerTests(unittest.TestCase):
                 with urllib.request.urlopen(request) as response:
                     body = json.load(response)
                 self.assertTrue(body["ok"])
-                self.assertEqual(body["annotation"]["image_quality"], "Missing Eye")
+                self.assertEqual(body["annotation"]["fields"]["image_quality"], "missing_eye")
 
                 # Persisted, not just echoed.
-                self.assertEqual(store.get(image).agree_with_model_decision, "Yes")
+                self.assertEqual(store.get(image).fields["agree_with_model_decision"], "yes")
 
                 with urllib.request.urlopen(f"{base}/api/annotations") as response:
                     self.assertEqual(len(json.load(response)["annotations"]), 1)

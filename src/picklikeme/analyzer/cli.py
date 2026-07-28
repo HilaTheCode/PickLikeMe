@@ -18,6 +18,7 @@ from datetime import datetime
 from pathlib import Path
 
 from ..config import DEFAULT_RESULTS_DIR, RUN_TIMESTAMP_FORMAT, cli_prefix, fatal_errors_logged_to_stdout, format_duration
+from .annotation_config import DEFAULT_ANNOTATIONS_CONFIG
 from .config import OPTIMIZATION_TARGETS, AnalysisConfig, timestamped_output_dir
 
 logger = logging.getLogger("picklikeme.analyzer")
@@ -77,6 +78,12 @@ def build_parser(add_help: bool = True) -> argparse.ArgumentParser:
         "(default: <project>/annotations/false_negatives.db, outside any output dir so it survives runs)",
     )
     parser.add_argument(
+        "--annotations-config",
+        default=None,
+        help="YAML file defining the annotation fields and their values "
+        f"(default: {DEFAULT_ANNOTATIONS_CONFIG})",
+    )
+    parser.add_argument(
         "--no-annotations",
         action="store_true",
         help="Do not read the annotation database",
@@ -125,6 +132,7 @@ def config_from_args(args: argparse.Namespace) -> AnalysisConfig:
         "baseline_label": "baseline_label",
         "compare_label": "compare_label",
         "annotations_db": "annotations_db",
+        "annotations_config": "annotations_config",
     }
     for arg_name, config_name in mapping.items():
         value = getattr(args, arg_name, None)
@@ -272,7 +280,12 @@ def run(args: argparse.Namespace) -> int:
     if getattr(args, "serve", False) and config.html_report:
         from .server import DEFAULT_PORT, serve
 
-        serve(config.output_dir, config.annotations_db_path, args.port or DEFAULT_PORT)
+        serve(
+            config.output_dir,
+            config.annotations_db_path,
+            args.port or DEFAULT_PORT,
+            annotations_config_path=config.annotations_config_path,
+        )
     return 0
 
 
@@ -293,6 +306,11 @@ def build_annotate_parser(add_help: bool = True) -> "argparse.ArgumentParser":
         f"{DEFAULT_RESULTS_DIR}/<timestamp>/report (default: {DEFAULT_RESULTS_DIR})",
     )
     parser.add_argument("--annotations-db", default=None, help="Knowledge-base SQLite file")
+    parser.add_argument(
+        "--annotations-config",
+        default=None,
+        help=f"YAML file defining the annotation fields and their values (default: {DEFAULT_ANNOTATIONS_CONFIG})",
+    )
     parser.add_argument("--port", type=int, default=None, help="Port to listen on (default: 8756)")
     parser.add_argument("--no-browser", action="store_true", help="Do not open a browser")
     return parser
@@ -308,6 +326,7 @@ def run_annotate(args: argparse.Namespace) -> int:
         Path(args.annotations_db) if args.annotations_db else DEFAULT_ANNOTATIONS_DB,
         args.port or DEFAULT_PORT,
         open_browser=not args.no_browser,
+        annotations_config_path=Path(args.annotations_config) if args.annotations_config else DEFAULT_ANNOTATIONS_CONFIG,
     )
     return 0
 

@@ -53,6 +53,11 @@ class AnalysisResult:
     annotations: dict = field(default_factory=dict)
     annotation_summary: object | None = None
     fp_annotation_summary: object | None = None
+    # The config/annotations.yaml definitions live for this whole result, so
+    # every renderer (HTML, text) uses the exact field/value ids and labels
+    # that were live when this analysis ran, loaded once here rather than
+    # separately by each renderer.
+    annotation_fields_config: object | None = None
     # Detector boxes for the false negatives only, for the diagnostic
     # overlay. Display data: no metric reads them.
     detections: dict = field(default_factory=dict)
@@ -159,14 +164,17 @@ def _attach_annotations(result: AnalysisResult) -> None:
     merged into one dict since an image is never in both categories at once.
 
     A missing or unreadable database is not an error - the knowledge base is
-    optional, and an analysis must never fail because of it.
+    optional, and an analysis must never fail because of it. `result.annotation_fields_config`
+    is already loaded (unconditionally, by run_analysis) by the time this runs.
     """
     from .annotations import AnnotationStore, summarise
+
+    fields_config = result.annotation_fields_config
 
     fn_paths = [record.image_path for record in result.errors.false_negatives]
     fp_paths = [record.image_path for record in result.errors.false_positives]
     try:
-        with AnnotationStore(result.config.annotations_db_path) as store:
+        with AnnotationStore(result.config.annotations_db_path, fields_config=fields_config) as store:
             fn_annotations, result.annotation_summary = summarise(store, fn_paths)
             fp_annotations, result.fp_annotation_summary = summarise(store, fp_paths)
     except Exception as exc:  # noqa: BLE001 - optional feature, never fatal
@@ -283,6 +291,15 @@ def run_analysis(config: AnalysisConfig) -> AnalysisResult:
     from .suggestions import generate_suggestions
 
     result.suggestions = generate_suggestions(result)
+
+    # The field/value definitions are loaded regardless of --no-annotations:
+    # the report's dropdowns are drawn from them even when there is no
+    # database behind them (an unanswered dropdown is still a dropdown). A
+    # bad config/annotations.yaml is a hard startup error, not caught here -
+    # see _attach_annotations.
+    from .annotation_config import load_annotation_fields
+
+    result.annotation_fields_config = load_annotation_fields(config.annotations_config_path)
 
     # Annotations are loaded LAST, deliberately: by this point every metric,
     # threshold and suggestion is already fixed, so human notes cannot

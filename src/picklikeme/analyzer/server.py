@@ -226,12 +226,18 @@ class AnnotationRequestHandler(SimpleHTTPRequestHandler):
             self._send_json({"ok": True, "database": str(self.store.db_path)})
             return
         if route == "/api/fields":
-            from .annotations import ANNOTATION_FIELD_LABELS
-
+            # Self-describing and ordered, so a client never has to cross-
+            # reference a separate labels dict that could drift out of sync.
             self._send_json(
                 {
-                    "fields": self.store.field_vocabularies(),
-                    "labels": ANNOTATION_FIELD_LABELS,
+                    "fields": [
+                        {
+                            "id": f.id,
+                            "label": f.label,
+                            "values": [{"id": v.id, "label": v.label} for v in f.values],
+                        }
+                        for f in self.store.fields_config
+                    ]
                 }
             )
             return
@@ -274,12 +280,8 @@ class AnnotationRequestHandler(SimpleHTTPRequestHandler):
             return
 
         try:
-            annotation = self.store.save(
-                image_path,
-                crop_quality=payload.get("crop_quality") or None,
-                image_quality=payload.get("image_quality") or None,
-                agree_with_model_decision=payload.get("agree_with_model_decision") or None,
-            )
+            fields = {key: value for key, value in payload.items() if key != "image_path"}
+            annotation = self.store.save(image_path, fields=fields)
         except InvalidAnnotationValue as exc:
             # A value outside the fixed vocabulary is a bug in the caller, not a
             # user mistake - the UI only ever offers valid options. Rejected
@@ -390,11 +392,14 @@ def serve(
     db_path: str | Path | None = None,
     port: int = DEFAULT_PORT,
     open_browser: bool = True,
+    annotations_config_path: str | Path | None = None,
 ) -> None:
     """Serve a report directory until interrupted."""
+    from .annotation_config import DEFAULT_ANNOTATIONS_CONFIG, load_annotation_fields
     from .annotations import DEFAULT_ANNOTATIONS_DB
 
-    store = AnnotationStore(db_path or DEFAULT_ANNOTATIONS_DB)
+    fields_config = load_annotation_fields(annotations_config_path or DEFAULT_ANNOTATIONS_CONFIG)
+    store = AnnotationStore(db_path or DEFAULT_ANNOTATIONS_DB, fields_config=fields_config)
     server = make_server(Path(report_dir), store, port)
     url = f"http://{HOST}:{port}/report.html"
 

@@ -94,6 +94,11 @@ class AnalysisConfig:
     # every one of them. None means "use the project default".
     annotations_db: Path | None = None
     annotations_enabled: bool = True
+    # The annotation field/value definitions (config/annotations.yaml). Kept
+    # separate from annotations_db: the schema (what a "diagnosis" can say)
+    # and the accumulated data are different lifecycles. None means "use the
+    # project default".
+    annotations_config: Path | None = None
 
     # False-negative diagnostic overlay: draw the detector's boxes on the FN
     # thumbnails. Applies to no other report section.
@@ -153,6 +158,12 @@ class AnalysisConfig:
 
         return self.annotations_db or DEFAULT_ANNOTATIONS_DB
 
+    @property
+    def annotations_config_path(self) -> Path:
+        from .annotation_config import DEFAULT_ANNOTATIONS_CONFIG
+
+        return self.annotations_config or DEFAULT_ANNOTATIONS_CONFIG
+
     def to_dict(self) -> dict:
         """JSON-ready form, embedded in reports so a result can always be
         traced back to the settings that produced it."""
@@ -190,6 +201,7 @@ class AnalysisConfig:
             "output_dir",
             "compare_ranking_path",
             "annotations_db",
+            "annotations_config",
             "crop_cache_dir",
             "detections_db",
         }

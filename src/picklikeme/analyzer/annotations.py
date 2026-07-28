@@ -4,22 +4,26 @@ Why an image the photographer deliberately kept was rejected by the model - or
 deliberately rejected was kept by it - is knowledge only the photographer has.
 This module stores that knowledge and nothing else, using the same schema for
 both mistakes so the two are directly comparable: a false negative and a false
-positive get the same three questions, the same fixed answers, and the same
+positive get the same questions, the same fixed answers, and the same
 statistics.
 
-A diagnosis is three independent fixed-vocabulary fields - Crop Quality, Image
-Quality, and whether you Agree with the Model Decision. Closed vocabularies with
-no free-text option, because the purpose is data that can be counted: a growable
-tag list (which the superseded `categories` field was) makes frequencies
-incomparable over time, since "Backlit" and "backlighting" become two rows in a
-breakdown but one phenomenon.
+A diagnosis is a set of independent fixed-vocabulary fields, defined entirely
+by `config/annotations.yaml` (see `annotation_config.py`) - not by this
+module. Closed vocabularies with no free-text option, because the purpose is
+data that can be counted: a growable tag list (which the superseded
+`categories` field was) makes frequencies incomparable over time, since
+"Backlit" and "backlighting" become two rows in a breakdown but one
+phenomenon.
 
+- **Config, not code.** Which fields exist, their labels, and their allowed
+  values all come from `config/annotations.yaml`. The database stores each
+  value's stable **id**, never its display label, so relabeling a value in
+  config never touches a single existing annotation. Adding a field or a
+  value needs no code change - restarting the analyzer is enough.
 - **Never generated.** No heuristic, no model, nothing in this file infers a
-  value. Every field comes from a human via the report UI. That extends to the
-  redesign itself: pre-redesign records are preserved verbatim and are *not*
-  auto-mapped onto the new fields, because guessing that (say) an old "Subject
-  too small" tag meant Crop Quality "Too Small" would invent data the
-  photographer never entered - and it would then be counted as if they had.
+  value. Every field comes from a human via the report UI. That extends to
+  every migration this module does: nothing is ever guessed onto a field the
+  photographer never actually answered.
 - **Never influences metrics.** Annotations are attached to an AnalysisResult
   for display only. A test asserts every metric is bit-identical with and
   without an annotation database present.
@@ -27,7 +31,7 @@ breakdown but one phenomenon.
   because output directories are per-run and get replaced; a knowledge base
   accumulated over months must not be inside one.
 - **False negatives and false positives, identically.** Both are the model
-  disagreeing with the photographer; both get the same panel, the same three
+  disagreeing with the photographer; both get the same panel, the same
   fields, the same vocabulary. Nothing in the schema or this module records
   which category an annotation came from - the record is a diagnosis of the
   image, not of the run that flagged it - so the split shown in a report is
@@ -49,6 +53,7 @@ than losing it.
 
 from __future__ import annotations
 
+import json
 import logging
 import sqlite3
 from collections import Counter
@@ -59,6 +64,7 @@ from typing import Iterable, Sequence
 
 from ..config import PROJECT_ROOT, cli_prefix
 from ..identity import IdentityUnavailable, cache_key, capture_datetime, image_identity
+from .annotation_config import AnnotationFieldsConfig, load_annotation_fields
 
 logger = logging.getLogger(__name__)
 
@@ -66,69 +72,11 @@ logger = logging.getLogger(__name__)
 # overwritten, and this database is meant to outlive every one of them.
 DEFAULT_ANNOTATIONS_DB = PROJECT_ROOT / "annotations" / "false_negatives.db"
 
-# ---------------------------------------------------------------------------
-# The annotation vocabulary: three independent fixed-value fields.
-#
-# Every field is a closed set with no free-text escape hatch, because the point
-# is data that can be counted. A growable vocabulary (which the superseded
-# `categories` field had) makes frequencies incomparable across time: "Backlit"
-# and "backlighting" are two rows in a breakdown but one phenomenon.
-#
-# The three axes are deliberately independent - a technically fine crop of an
-# out-of-focus bird, or a badly placed crop of a perfectly sharp one, are
-# different diagnoses and must be recordable separately.
-# ---------------------------------------------------------------------------
-
-# How good was the crop the detector chose? Judged on its own, independent of
-# whether the underlying photograph is any good.
-CROP_QUALITY_VALUES: tuple[str, ...] = (
-    "Good",
-    "Too Small",
-    "Wrong Location",
-    "Too Large",
-)
-
-# How good is the photograph itself? Judged on its own, independent of how the
-# crop was placed.
-#   Good                - image quality is acceptable
-#   Missing Eye         - the bird's eye is not visible
-#   Out of Focus        - the bird is not sufficiently sharp
-#   No Relevant Subject - nothing meaningful to evaluate (bird too small,
-#                         heavily occluded, or effectively absent)
-#   Group Scene         - several subjects together; judged as a scene rather
-#                         than a single bird's pose or sharpness
-IMAGE_QUALITY_VALUES: tuple[str, ...] = (
-    "Good",
-    "Missing Eye",
-    "Out of Focus",
-    "No Relevant Subject",
-    "Group Scene",
-)
-
-# Having looked at it: was the model right about this image - rejecting a false
-# negative, or keeping a false positive?
-AGREE_WITH_MODEL_VALUES: tuple[str, ...] = ("Yes", "No")
-
-# field name -> allowed values, so validation, the API and the UI all read the
-# same source and cannot drift apart.
-ANNOTATION_FIELDS: dict[str, tuple[str, ...]] = {
-    "crop_quality": CROP_QUALITY_VALUES,
-    "image_quality": IMAGE_QUALITY_VALUES,
-    "agree_with_model_decision": AGREE_WITH_MODEL_VALUES,
-}
-
-# Human labels for the report UI, keyed the same way.
-ANNOTATION_FIELD_LABELS: dict[str, str] = {
-    "crop_quality": "Crop Quality",
-    "image_quality": "Image Quality",
-    "agree_with_model_decision": "Agree with Model Decision",
-}
-
 # --- superseded vocabularies, retained for reading old records only ---------
 # The growable category checklist and the single primary-cause radio that the
-# three fields above replaced. Nothing writes these any more; they are kept so
-# a database annotated before the change still renders its history instead of
-# appearing empty.
+# config-driven fields replaced. Nothing writes these any more; they are kept
+# so a database annotated before either change still renders its history
+# instead of appearing empty.
 LEGACY_CATEGORIES: tuple[str, ...] = (
     "Wrong crop",
     "Multiple subjects",
@@ -155,30 +103,41 @@ LEGACY_PRIMARY_FAILURE_CAUSES: tuple[str, ...] = (
     "Other",
 )
 
+# The three field names the pre-config-driven schema hardcoded as columns.
+# Used only by the one-time migration into the generic `field_values` column;
+# nothing else should ever reference these again.
+_LEGACY_FIELD_COLUMNS: tuple[str, ...] = ("crop_quality", "image_quality", "agree_with_model_decision")
+
 # v1 keyed annotations on a digest of the resolved path, which a rename would
 # have orphaned. v2 keys them on content identity and migrates v1 rows across.
-SCHEMA_VERSION = 2
+# v3 replaced three hardcoded per-field columns with one config-driven
+# `field_values` JSON column; see `_migrate_legacy_fields`.
+SCHEMA_VERSION = 3
 
 
 class InvalidAnnotationValue(ValueError):
-    """Raised when a field is given a value outside its fixed vocabulary.
+    """Raised when a field is given a value outside its fixed vocabulary, or
+    a field id that config does not define.
 
     Rejected rather than stored, because a stray value would quietly corrupt
     exactly the frequency counts this schema exists to make trustworthy.
     """
 
 
-def validate_field(field_name: str, value: str | None) -> str | None:
-    """Check one field against its vocabulary. None/blank means 'not set'."""
-    if field_name not in ANNOTATION_FIELDS:
-        raise InvalidAnnotationValue(f"unknown annotation field {field_name!r}")
-    cleaned = (value or "").strip()
+def validate_field(fields_config: AnnotationFieldsConfig, field_id: str, value_id: str | None) -> str | None:
+    """Check one field against the configured vocabulary. None/blank means
+    'not set'."""
+    field_def = fields_config.get(field_id)
+    if field_def is None:
+        raise InvalidAnnotationValue(
+            f"unknown annotation field {field_id!r} (configured fields: {list(fields_config.field_ids)})"
+        )
+    cleaned = (value_id or "").strip()
     if not cleaned:
         return None
-    allowed = ANNOTATION_FIELDS[field_name]
-    if cleaned not in allowed:
+    if not field_def.has_value(cleaned):
         raise InvalidAnnotationValue(
-            f"{ANNOTATION_FIELD_LABELS[field_name]} must be one of {list(allowed)}, got {cleaned!r}"
+            f"{field_def.label} must be one of {list(field_def.value_ids)}, got {cleaned!r}"
         )
     return cleaned
 
@@ -191,17 +150,18 @@ class Annotation:
     `image_hash` is the identity. `filename`, `original_path` and
     `capture_datetime` are metadata for display and are never matched on.
 
-    The three diagnostic fields are each optional and independent: a
-    photographer may judge the crop without judging the photograph, or record
-    only whether they agree with the model.
+    `fields` maps a config-defined field id to the value id recorded for it -
+    every field is optional and independent: a photographer may judge the
+    crop without judging the photograph, or record only whether they agree
+    with the model. It may also carry ids for a field or value that is no
+    longer in the current config (a "retired" id, kept for display rather
+    than silently dropped - see `AnnotationField.label_for`).
     """
 
     image_hash: str
     filename: str
     original_path: str
-    crop_quality: str | None = None
-    image_quality: str | None = None
-    agree_with_model_decision: str | None = None
+    fields: dict[str, str | None] = field(default_factory=dict)
     capture_datetime: str | None = None
     created_at: str = ""
     updated_at: str = ""
@@ -221,13 +181,11 @@ class Annotation:
     def is_empty(self) -> bool:
         """True when nothing is recorded, counting only the live fields.
 
-        Legacy content deliberately does not keep a record alive: clearing all
-        three dropdowns is how a mistaken annotation is deleted, and a leftover
+        Legacy content deliberately does not keep a record alive: clearing
+        every field is how a mistaken annotation is deleted, and a leftover
         old note must not silently block that.
         """
-        return not any(
-            (self.crop_quality, self.image_quality, self.agree_with_model_decision)
-        )
+        return not any(self.fields.values())
 
     @property
     def has_legacy_content(self) -> bool:
@@ -243,9 +201,7 @@ class Annotation:
             # Kept for the report JS, which indexes panels by their current path.
             "image_path": self.original_path,
             "capture_datetime": self.capture_datetime,
-            "crop_quality": self.crop_quality,
-            "image_quality": self.image_quality,
-            "agree_with_model_decision": self.agree_with_model_decision,
+            "fields": dict(self.fields),
             "created_at": self.created_at,
             "updated_at": self.updated_at,
             "relocated": self.relocated,
@@ -313,12 +269,56 @@ class MigrationReport:
         return "\n".join(lines)
 
 
+@dataclass
+class LegacyFieldMigrationReport:
+    """What the one-time migration from the three hardcoded columns
+    (crop_quality/image_quality/agree_with_model_decision) into the generic,
+    config-driven `field_values` column did.
+
+    Mirrors `MigrationReport`'s shape and philosophy: never silently drop a
+    value. A legacy value that cannot be matched to the current config (the
+    field or that exact label is no longer defined) is parked in
+    `unmigrated_legacy_field_values`, not lost.
+    """
+
+    candidates: int = 0
+    migrated: int = 0
+    unmapped: int = 0
+
+    @property
+    def ran(self) -> bool:
+        return self.candidates > 0
+
+    def as_dict(self) -> dict:
+        return {"candidates": self.candidates, "migrated": self.migrated, "unmapped": self.unmapped}
+
+    def render(self) -> str:
+        if not self.ran:
+            return ""
+        lines = [f"Legacy annotation field migration: {self.candidates} legacy value(s) found"]
+        lines.append(f"  migrated to config-driven ids: {self.migrated}")
+        if self.unmapped:
+            lines.append(
+                f"  could not be matched to config: {self.unmapped} "
+                "(kept in unmigrated_legacy_field_values, not lost)"
+            )
+        return "\n".join(lines)
+
+
 class AnnotationStore:
     """SQLite-backed store. Safe to open repeatedly; creates its schema."""
 
-    def __init__(self, db_path: str | Path = DEFAULT_ANNOTATIONS_DB):
+    def __init__(
+        self,
+        db_path: str | Path = DEFAULT_ANNOTATIONS_DB,
+        fields_config: AnnotationFieldsConfig | None = None,
+    ):
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        # Injectable so a test (or a future caller) can validate against a
+        # fixture config instead of the real config/annotations.yaml; the CLI
+        # always passes one explicitly (see analyzer.cli / analyzer.server).
+        self.fields_config = fields_config if fields_config is not None else load_annotation_fields()
         self._connect()
 
     def _connect(self) -> None:
@@ -347,6 +347,8 @@ class AnnotationStore:
 
                 -- image_hash is the identity; filename/original_path/
                 -- capture_datetime are metadata and are never matched on.
+                -- field_values is a JSON object {field_id: value_id, ...} -
+                -- config-driven, so adding a field never changes this schema.
                 CREATE TABLE IF NOT EXISTS annotations_v2 (
                     image_hash       TEXT PRIMARY KEY,
                     filename         TEXT NOT NULL,
@@ -389,6 +391,18 @@ class AnnotationStore:
                     reason     TEXT NOT NULL
                 );
 
+                -- A legacy (crop_quality/image_quality/agree_with_model_decision)
+                -- value whose exact label no longer matches anything in the
+                -- current config. Kept rather than dropped - see
+                -- LegacyFieldMigrationReport.
+                CREATE TABLE IF NOT EXISTS unmigrated_legacy_field_values (
+                    image_hash      TEXT NOT NULL,
+                    legacy_field_id TEXT NOT NULL,
+                    legacy_label    TEXT NOT NULL,
+                    PRIMARY KEY (image_hash, legacy_field_id),
+                    FOREIGN KEY (image_hash) REFERENCES annotations_v2(image_hash) ON DELETE CASCADE
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_v2_filename ON annotations_v2(filename);
                 CREATE INDEX IF NOT EXISTS idx_v2_updated  ON annotations_v2(updated_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_v2_category ON annotation_categories_v2(category);
@@ -402,15 +416,23 @@ class AnnotationStore:
             # database keeps its history readable.
         # Additive, guarded upgrades for databases created by earlier versions.
         # The superseded columns are listed too: a database that never had them
-        # still needs them to exist so the read path can select uniformly.
+        # still needs them to exist so the migration below can read them
+        # uniformly, whether or not it has ever run before.
         for column in (
             "primary_failure_cause",  # superseded, read-only
-            "crop_quality",
-            "image_quality",
-            "agree_with_model_decision",
+            "crop_quality",  # superseded (v2), read-only - see _migrate_legacy_fields
+            "image_quality",  # superseded (v2), read-only
+            "agree_with_model_decision",  # superseded (v2), read-only
+            "field_values",  # v3: JSON {field_id: value_id}, config-driven
         ):
-            self._ensure_column("annotations_v2", column, "TEXT")
+            sql_type = "TEXT"
+            self._ensure_column("annotations_v2", column, sql_type)
         self.migration = self._migrate_v1()
+        self.legacy_field_migration = self._migrate_legacy_fields()
+        with self._conn:
+            self._conn.execute("UPDATE schema_info SET version = ?", (SCHEMA_VERSION,))
+        for warning in self._retired_id_warnings():
+            logger.warning(warning)
 
     def _ensure_column(self, table: str, column: str, sql_type: str) -> None:
         """Add a column to an existing table if it is not already there.
@@ -533,8 +555,6 @@ class AnnotationStore:
                     "DELETE FROM annotation_categories WHERE image_key = ?", (old_key,)
                 )
 
-        with self._conn:
-            self._conn.execute("UPDATE schema_info SET version = ?", (SCHEMA_VERSION,))
         if report.migrated or report.merged or report.unmigrated:
             logger.info(
                 "Migration: %d re-keyed, %d merged, %d could not be resolved",
@@ -543,6 +563,108 @@ class AnnotationStore:
                 len(report.unmigrated),
             )
         return report
+
+    def _migrate_legacy_fields(self) -> "LegacyFieldMigrationReport":
+        """Fold the three legacy per-field columns into the generic,
+        config-driven `field_values` JSON column.
+
+        Runs on every open but only fills gaps: a (image_hash, field_id) that
+        already has an entry in field_values is left alone, so re-answering a
+        field through the new UI is never clobbered by an old legacy value.
+        Idempotent and non-destructive - the legacy columns themselves are
+        never modified or dropped.
+
+        A legacy value is matched to the current config by exact label text
+        (that is literally what the legacy columns stored). When the field or
+        that exact label no longer exists in config, the value is parked in
+        unmigrated_legacy_field_values rather than lost - see the class
+        docstring on LegacyFieldMigrationReport.
+        """
+        report = LegacyFieldMigrationReport()
+        columns = ", ".join(_LEGACY_FIELD_COLUMNS)
+        rows = self._conn.execute(
+            f"SELECT image_hash, field_values, {columns} FROM annotations_v2"
+        ).fetchall()
+
+        for row in rows:
+            legacy_values = {name: row[name] for name in _LEGACY_FIELD_COLUMNS if row[name]}
+            if not legacy_values:
+                continue
+            current = json.loads(row["field_values"]) if row["field_values"] else {}
+            changed = False
+            for legacy_field_id, legacy_label in legacy_values.items():
+                if legacy_field_id in current:
+                    continue  # already migrated, or answered again since
+                report.candidates += 1
+                field_def = self.fields_config.get(legacy_field_id)
+                matched = None
+                if field_def is not None:
+                    for value in field_def.values:
+                        if value.label == legacy_label:
+                            matched = value.id
+                            break
+                if matched is not None:
+                    current[legacy_field_id] = matched
+                    report.migrated += 1
+                    changed = True
+                else:
+                    with self._conn:
+                        self._conn.execute(
+                            """INSERT OR REPLACE INTO unmigrated_legacy_field_values
+                               (image_hash, legacy_field_id, legacy_label) VALUES (?, ?, ?)""",
+                            (row["image_hash"], legacy_field_id, legacy_label),
+                        )
+                    report.unmapped += 1
+            if changed:
+                with self._conn:
+                    self._conn.execute(
+                        "UPDATE annotations_v2 SET field_values = ? WHERE image_hash = ?",
+                        (json.dumps(current), row["image_hash"]),
+                    )
+
+        if report.ran:
+            logger.info(
+                "Legacy field migration: %d migrated, %d could not be matched to config",
+                report.migrated,
+                report.unmapped,
+            )
+        return report
+
+    def _retired_id_warnings(self) -> list[str]:
+        """Field/value ids with real historical usage that the current config
+        no longer defines - a rename or removal of an id already saved.
+
+        Reported as warnings, not a startup failure: the report still renders
+        (AnnotationField.label_for falls back to the raw id), only *selecting*
+        the retired value again is what's actually lost.
+        """
+        warnings: list[str] = []
+        rows = self._conn.execute(
+            "SELECT field_values FROM annotations_v2 WHERE field_values IS NOT NULL"
+        ).fetchall()
+        usage: dict[tuple[str, str], int] = {}
+        for row in rows:
+            for field_id, value_id in json.loads(row["field_values"]).items():
+                if value_id:
+                    usage[(field_id, value_id)] = usage.get((field_id, value_id), 0) + 1
+
+        for (field_id, value_id), count in sorted(usage.items()):
+            field_def = self.fields_config.get(field_id)
+            if field_def is None:
+                warnings.append(
+                    f"annotation field {field_id!r} is used by {count} existing annotation(s) but is "
+                    f"no longer defined in config/annotations.yaml. Historical annotations still "
+                    "display it; restore the field (its label can change safely) to make it "
+                    "selectable again."
+                )
+            elif not field_def.has_value(value_id):
+                warnings.append(
+                    f"annotation field {field_id!r} value {value_id!r} is used by {count} existing "
+                    "annotation(s) but is no longer defined in config/annotations.yaml. Historical "
+                    "annotations still display it (as a retired value); it can no longer be selected. "
+                    "Restore the same id (its label can change safely) if this was meant to be a rename."
+                )
+        return warnings
 
     # -- identity -----------------------------------------------------------
 
@@ -588,15 +710,14 @@ class AnnotationStore:
 
     # -- vocabularies -------------------------------------------------------
 
-    @staticmethod
-    def field_vocabularies() -> dict[str, list[str]]:
-        """The allowed values for each diagnostic field.
+    def field_vocabularies(self) -> dict[str, list[str]]:
+        """The allowed value ids for each configured diagnostic field.
 
-        A method on the store (rather than the UI importing the constants
+        Reads self.fields_config (rather than the UI importing constants
         directly) so that whatever validates a save is exactly what the report
         offers, and the two cannot drift.
         """
-        return {name: list(values) for name, values in ANNOTATION_FIELDS.items()}
+        return {f.id: list(f.value_ids) for f in self.fields_config}
 
     def legacy_categories(self) -> list[str]:
         """Category names a pre-redesign database recorded. Read-only."""
@@ -616,15 +737,12 @@ class AnnotationStore:
         relocated = current_path is not None and str(Path(current_path)) != str(
             Path(row["original_path"])
         )
+        fields = json.loads(row["field_values"]) if row["field_values"] else {}
         return Annotation(
             image_hash=row["image_hash"],
             filename=row["filename"],
             original_path=row["original_path"],
-            # _ensure_column guarantees every column exists by the time any read
-            # runs, even for a database created before these fields existed.
-            crop_quality=row["crop_quality"],
-            image_quality=row["image_quality"],
-            agree_with_model_decision=row["agree_with_model_decision"],
+            fields=fields,
             capture_datetime=row["capture_datetime"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
@@ -682,30 +800,28 @@ class AnnotationStore:
 
     # -- writes -------------------------------------------------------------
 
-    def save(
-        self,
-        image_path: str | Path,
-        crop_quality: str | None = None,
-        image_quality: str | None = None,
-        agree_with_model_decision: str | None = None,
-    ) -> Annotation:
+    def save(self, image_path: str | Path, fields: dict[str, str | None] | None = None) -> Annotation:
         """Create or replace one annotation.
 
-        Each field is validated against its fixed vocabulary and an unknown
-        value raises rather than being stored - the whole point of the closed
-        vocabularies is that the resulting counts can be trusted.
+        `fields` maps a configured field id to a value id (or None/blank to
+        leave it unset). Each is validated against `self.fields_config` and an
+        unknown field id or out-of-vocabulary value raises rather than being
+        stored - the whole point of the closed vocabularies is that the
+        resulting counts can be trusted.
 
-        Saving with all three fields empty deletes the record, so clearing the
-        dropdowns in the UI is how a mistaken annotation is removed; there is no
-        separate delete gesture to discover.
+        Saving with every field empty (or `fields` omitted entirely) deletes
+        the record, so clearing every dropdown in the UI is how a mistaken
+        annotation is removed; there is no separate delete gesture to discover.
         """
         digest = self._identity_of(image_path)  # raises IdentityUnavailable
-        crop = validate_field("crop_quality", crop_quality)
-        image = validate_field("image_quality", image_quality)
-        agree = validate_field("agree_with_model_decision", agree_with_model_decision)
+        cleaned = {
+            field_id: validate_field(self.fields_config, field_id, value_id)
+            for field_id, value_id in (fields or {}).items()
+        }
+        cleaned = {field_id: value_id for field_id, value_id in cleaned.items() if value_id}
         filename = Path(image_path).name
 
-        if not any((crop, image, agree)):
+        if not cleaned:
             self.delete(image_path)
             return Annotation(image_hash=digest, filename=filename, original_path=str(image_path))
 
@@ -719,41 +835,32 @@ class AnnotationStore:
             # image was when first diagnosed, and identity does the matching.
             original = existing["original_path"] if existing else str(Path(image_path))
             captured = capture_datetime(image_path)
+            payload = json.dumps(cleaned)
             self._conn.execute(
                 """
                 INSERT INTO annotations_v2
                     (image_hash, filename, original_path, capture_datetime,
-                     crop_quality, image_quality, agree_with_model_decision,
-                     notes, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, '', ?, ?)
+                     field_values, notes, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, '', ?, ?)
                 ON CONFLICT(image_hash) DO UPDATE SET
                     filename                  = excluded.filename,
                     capture_datetime          = COALESCE(excluded.capture_datetime, annotations_v2.capture_datetime),
-                    crop_quality              = excluded.crop_quality,
-                    image_quality             = excluded.image_quality,
-                    agree_with_model_decision = excluded.agree_with_model_decision,
+                    field_values              = excluded.field_values,
                     updated_at                = excluded.updated_at
                 """,
-                (digest, filename, original, captured, crop, image, agree, created, now),
+                (digest, filename, original, captured, payload, created, now),
             )
-            # Superseded columns are deliberately left untouched by the UPDATE
-            # above: an old note or category set stays readable as history.
+            # Superseded columns (crop_quality/image_quality/agree_with_model_decision,
+            # notes, primary_failure_cause) are deliberately left untouched by
+            # the UPDATE above: old content stays readable as history.
 
-        logger.info(
-            "Annotation saved for %s (crop=%s, image=%s, agree=%s)",
-            filename,
-            crop or "unset",
-            image or "unset",
-            agree or "unset",
-        )
+        logger.info("Annotation saved for %s (%s)", filename, ", ".join(f"{k}={v}" for k, v in cleaned.items()))
         saved = self.get(image_path)
         return saved if saved is not None else Annotation(
             image_hash=digest,
             filename=filename,
             original_path=original,
-            crop_quality=crop,
-            image_quality=image,
-            agree_with_model_decision=agree,
+            fields=cleaned,
             capture_datetime=captured,
             created_at=created,
             updated_at=now,
@@ -773,6 +880,9 @@ class AnnotationStore:
 # once per path list, so the two are directly comparable field for field.
 # ---------------------------------------------------------------------------
 
+UNSET_COMBINATION_PLACEHOLDER = "(unset)"
+
+
 @dataclass
 class AnnotationSummary:
     """Aggregates over the knowledge base, restricted to one outcome category
@@ -781,17 +891,21 @@ class AnnotationSummary:
 
     total_images: int = 0
     annotated: int = 0
-    # field name -> [(value, count)], one breakdown per diagnostic field, each
-    # ordered most frequent first. Only annotations that set that particular
-    # field are counted in it, so the three need not sum to the same total.
+    # field id -> [(value id, count)], one breakdown per configured field,
+    # each ordered most frequent first. Only annotations that set that
+    # particular field are counted in it, so the fields need not sum to the
+    # same total.
     field_counts: dict[str, list[tuple[str, int]]] = field(default_factory=dict)
-    # The distinct (crop, image, agree) triples actually observed, most common
-    # first - the cross-field pattern a single-field breakdown cannot show.
-    combination_counts: list[tuple[tuple[str, str, str], int]] = field(default_factory=list)
+    # The distinct value-id combinations actually observed across every
+    # configured field (in config order), most common first - the cross-field
+    # pattern a single-field breakdown cannot show.
+    combination_counts: list[tuple[tuple[str, ...], int]] = field(default_factory=list)
+    # The field ids `combination_counts` tuples are positional over, in order.
+    combination_fields: tuple[str, ...] = ()
     recent: list[Annotation] = field(default_factory=list)
     unannotated: list[str] = field(default_factory=list)
-    # The fixed vocabularies, so the UI renders the same options the store
-    # validates against.
+    # The configured vocabularies (value ids), so the UI renders the same
+    # options the store validates against.
     field_vocabularies: dict[str, list[str]] = field(default_factory=dict)
     # Records still carrying pre-redesign content, so it can be reported rather
     # than silently ignored.
@@ -826,12 +940,7 @@ class AnnotationSummary:
                 for name, counts in self.field_counts.items()
             },
             "combination_counts": [
-                {
-                    "crop_quality": combo[0],
-                    "image_quality": combo[1],
-                    "agree_with_model_decision": combo[2],
-                    "count": count,
-                }
+                {"values": dict(zip(self.combination_fields, combo)), "count": count}
                 for combo, count in self.combination_counts
             ],
             "recent": [annotation.as_dict() for annotation in self.recent],
@@ -862,22 +971,19 @@ def summarise(
     Returns (path -> annotation, summary) so the caller does one pass.
     """
     found, unresolved = store.get_many(image_paths)
+    field_ids = store.fields_config.field_ids
 
-    field_counters: dict[str, Counter[str]] = {name: Counter() for name in ANNOTATION_FIELDS}
-    combination_counter: Counter[tuple[str, str, str]] = Counter()
+    field_counters: dict[str, Counter[str]] = {field_id: Counter() for field_id in field_ids}
+    combination_counter: Counter[tuple[str, ...]] = Counter()
     for annotation in found.values():
-        for name in ANNOTATION_FIELDS:
-            value = getattr(annotation, name)
+        for field_id in field_ids:
+            value = annotation.fields.get(field_id)
             if value:
-                field_counters[name][value] += 1
+                field_counters[field_id][value] += 1
         # Unset fields participate as an explicit placeholder rather than being
         # dropped, so a combination row always describes the whole record.
         combination_counter[
-            (
-                annotation.crop_quality or "(unset)",
-                annotation.image_quality or "(unset)",
-                annotation.agree_with_model_decision or "(unset)",
-            )
+            tuple(annotation.fields.get(field_id) or UNSET_COMBINATION_PLACEHOLDER for field_id in field_ids)
         ] += 1
 
     recent = sorted(found.values(), key=lambda a: a.updated_at, reverse=True)[:recent_limit]
@@ -891,9 +997,10 @@ def summarise(
         annotated=len(found),
         field_counts={name: counter.most_common() for name, counter in field_counters.items()},
         combination_counts=combination_counter.most_common(combination_limit),
+        combination_fields=field_ids,
         recent=recent,
         unannotated=unannotated,
-        field_vocabularies={name: list(values) for name, values in ANNOTATION_FIELDS.items()},
+        field_vocabularies=store.field_vocabularies(),
         with_legacy_content=sum(1 for a in found.values() if a.has_legacy_content),
         database_path=str(store.db_path),
         total_in_database=store.count(),
@@ -905,14 +1012,22 @@ def summarise(
 
 
 def render_summary(
-    summary: AnnotationSummary, *, title: str = "Annotations", item_label: str = "images"
+    summary: AnnotationSummary, fields_config: AnnotationFieldsConfig, *, title: str = "Annotations", item_label: str = "images"
 ) -> str:
     """Text form, for report.txt and the console.
 
     `title` and `item_label` let the same renderer serve either category
     ("False negative annotations" / "false negatives", or "False positive
     annotations" / "false positives") without duplicating this function.
+    `fields_config` supplies display labels for the field ids `summary`
+    carries (which are stable ids, not labels).
     """
+    field_labels = {f.id: f.label for f in fields_config}
+
+    def _label_for(field_id: str, value_id: str) -> str:
+        field_def = fields_config.get(field_id)
+        return field_def.label_for(value_id) if field_def is not None else value_id
+
     lines = [
         title,
         "=" * len(title),
@@ -940,18 +1055,25 @@ def render_summary(
         lines.append(
             f"  {len(summary.pending_migration):,} old path-keyed record(s) await a resolvable file"
         )
-    for field_name, counts in summary.field_counts.items():
+    for field_id, counts in summary.field_counts.items():
         if not counts:
             continue
-        lines += ["", f"  {ANNOTATION_FIELD_LABELS[field_name]}:"]
+        label = field_labels.get(field_id, field_id)
+        lines += ["", f"  {label}:"]
         answered = sum(count for _, count in counts)
         for value, count in counts:
             share = count / answered * 100 if answered else 0.0
-            lines.append(f"    {value:<28}{count:>5,}  ({share:.0f}% of {answered} answered)")
+            display = _label_for(field_id, value)
+            lines.append(f"    {display:<28}{count:>5,}  ({share:.0f}% of {answered} answered)")
     if summary.combination_counts:
-        lines += ["", "  Most common combinations (crop / image / agree):"]
+        header = " / ".join(field_labels.get(fid, fid) for fid in summary.combination_fields)
+        lines += ["", f"  Most common combinations ({header}):"]
         for combo, count in summary.combination_counts:
-            lines.append(f"    {count:>4,}x  {' / '.join(combo)}")
+            display = " / ".join(
+                value if value == UNSET_COMBINATION_PLACEHOLDER else _label_for(field_id, value)
+                for field_id, value in zip(summary.combination_fields, combo)
+            )
+            lines.append(f"    {count:>4,}x  {display}")
     if summary.with_legacy_content:
         lines += [
             "",
@@ -962,12 +1084,8 @@ def render_summary(
         lines += ["", "  Recently annotated:"]
         for annotation in summary.recent[:8]:
             fields = " / ".join(
-                value or "-"
-                for value in (
-                    annotation.crop_quality,
-                    annotation.image_quality,
-                    annotation.agree_with_model_decision,
-                )
+                _label_for(fid, annotation.fields[fid]) if annotation.fields.get(fid) else "-"
+                for fid in summary.combination_fields
             )
             lines.append(f"    {annotation.updated_at[:16]}  {annotation.filename:<28}{fields}")
     if not summary.annotated:

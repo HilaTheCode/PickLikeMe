@@ -1,14 +1,20 @@
-"""The three fixed-vocabulary annotation fields.
+"""The config-driven annotation fields (config/annotations.yaml).
 
 Crop Quality, Image Quality and Agree with Model Decision replaced the growable
-category checklist plus the single primary-failure-cause radio. The point of the
-change is countable data, so the tests that matter here are the ones about
-*closedness*: a value outside the vocabulary must be refused rather than stored,
-and pre-redesign records must not be silently re-interpreted as if the
-photographer had answered the new questions.
+category checklist plus the single primary-failure-cause radio, and are now
+themselves defined by config rather than hardcoded in this package. The point
+of the redesign is countable data with a stable identity, so the tests that
+matter here are about *closedness* (a value outside the vocabulary must be
+refused rather than stored), *ids vs labels* (the database stores an id, the
+UI shows a label, and the two must never be confused), and that pre-redesign
+records are preserved rather than silently re-interpreted as new answers.
+
+These tests exercise the *real* shipped config/annotations.yaml (loaded via
+`store_in()`'s default), since it is itself part of what's being verified.
 """
 
 import json
+import re
 import sys
 import tempfile
 import threading
@@ -19,11 +25,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
+from picklikeme.analyzer.annotation_config import DEFAULT_ANNOTATIONS_CONFIG, load_annotation_fields
 from picklikeme.analyzer.annotations import (
-    AGREE_WITH_MODEL_VALUES,
-    ANNOTATION_FIELDS,
-    CROP_QUALITY_VALUES,
-    IMAGE_QUALITY_VALUES,
     AnnotationStore,
     InvalidAnnotationValue,
     render_summary,
@@ -31,73 +34,82 @@ from picklikeme.analyzer.annotations import (
 )
 from test_annotations import make_image, store_in
 
+# Legacy column names the pre-config-driven schema bolted onto annotations_v2.
+# Fixed, historical identifiers - not part of the configurable surface.
+LEGACY_FIELD_COLUMNS = ("crop_quality", "image_quality", "agree_with_model_decision")
+
 
 class VocabularyTests(unittest.TestCase):
-    def test_values_are_exactly_as_specified(self):
-        self.assertEqual(CROP_QUALITY_VALUES, ("Good", "Too Small", "Wrong Location", "Too Large"))
-        self.assertEqual(
-            IMAGE_QUALITY_VALUES,
-            ("Good", "Missing Eye", "Out of Focus", "No Relevant Subject", "Group Scene"),
-        )
-        self.assertEqual(AGREE_WITH_MODEL_VALUES, ("Yes", "No"))
+    def test_the_shipped_config_defines_the_expected_fields_in_order(self):
+        config = load_annotation_fields(DEFAULT_ANNOTATIONS_CONFIG)
+        self.assertEqual(config.field_ids, ("crop_quality", "image_quality", "agree_with_model_decision"))
 
-    def test_the_field_map_is_the_single_source_of_truth(self):
+    def test_the_shipped_config_s_values_are_exactly_as_specified(self):
+        config = load_annotation_fields(DEFAULT_ANNOTATIONS_CONFIG)
         self.assertEqual(
-            list(ANNOTATION_FIELDS),
-            ["crop_quality", "image_quality", "agree_with_model_decision"],
+            config.get("crop_quality").value_ids, ("good", "too_small", "wrong_location", "too_large")
         )
+        self.assertEqual(
+            config.get("image_quality").value_ids,
+            ("good", "missing_eye", "out_of_focus", "no_relevant_subject", "group_scene"),
+        )
+        self.assertEqual(config.get("agree_with_model_decision").value_ids, ("yes", "no"))
 
-    def test_store_exposes_the_same_vocabularies(self):
+    def test_store_exposes_the_same_vocabularies_as_its_config(self):
         with tempfile.TemporaryDirectory() as tmp:
             with store_in(tmp) as store:
                 self.assertEqual(
                     store.field_vocabularies(),
-                    {name: list(values) for name, values in ANNOTATION_FIELDS.items()},
+                    {f.id: list(f.value_ids) for f in store.fields_config},
                 )
 
 
 class StorageTests(unittest.TestCase):
-    def test_save_and_reload_round_trips_all_three_fields(self):
+    def test_save_and_reload_round_trips_every_field(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = make_image(Path(tmp) / "a.NEF")
             with store_in(tmp) as store:
                 saved = store.save(
                     path,
-                    crop_quality="Too Small",
-                    image_quality="Out of Focus",
-                    agree_with_model_decision="No",
+                    fields={
+                        "crop_quality": "too_small",
+                        "image_quality": "out_of_focus",
+                        "agree_with_model_decision": "no",
+                    },
                 )
                 self.assertTrue(saved.image_hash.startswith("p1:"))
 
             with AnnotationStore(Path(tmp) / "kb" / "fn.db") as reopened:
                 annotation = reopened.get(path)
-                self.assertEqual(annotation.crop_quality, "Too Small")
-                self.assertEqual(annotation.image_quality, "Out of Focus")
-                self.assertEqual(annotation.agree_with_model_decision, "No")
+                self.assertEqual(annotation.fields["crop_quality"], "too_small")
+                self.assertEqual(annotation.fields["image_quality"], "out_of_focus")
+                self.assertEqual(annotation.fields["agree_with_model_decision"], "no")
 
     def test_fields_are_independent(self):
         """Answering one question must not disturb the answers to the others."""
         with tempfile.TemporaryDirectory() as tmp:
             path = make_image(Path(tmp) / "a.NEF")
             with store_in(tmp) as store:
-                store.save(path, crop_quality="Good", image_quality="Missing Eye")
+                store.save(path, fields={"crop_quality": "good", "image_quality": "missing_eye"})
                 store.save(
                     path,
-                    crop_quality="Good",
-                    image_quality="Missing Eye",
-                    agree_with_model_decision="Yes",
+                    fields={
+                        "crop_quality": "good",
+                        "image_quality": "missing_eye",
+                        "agree_with_model_decision": "yes",
+                    },
                 )
                 annotation = store.get(path)
-                self.assertEqual(annotation.crop_quality, "Good")
-                self.assertEqual(annotation.image_quality, "Missing Eye")
-                self.assertEqual(annotation.agree_with_model_decision, "Yes")
+                self.assertEqual(annotation.fields["crop_quality"], "good")
+                self.assertEqual(annotation.fields["image_quality"], "missing_eye")
+                self.assertEqual(annotation.fields["agree_with_model_decision"], "yes")
 
     def test_any_single_field_is_enough_to_keep_the_record(self):
         with tempfile.TemporaryDirectory() as tmp:
-            for index, field_name in enumerate(ANNOTATION_FIELDS):
-                path = make_image(Path(tmp) / f"only_{index}.NEF", f"pixels {index}".encode())
-                with store_in(tmp) as store:
-                    saved = store.save(path, **{field_name: ANNOTATION_FIELDS[field_name][0]})
+            with store_in(tmp) as store:
+                for index, field_def in enumerate(store.fields_config):
+                    path = make_image(Path(tmp) / f"only_{index}.NEF", f"pixels {index}".encode())
+                    saved = store.save(path, fields={field_def.id: field_def.value_ids[0]})
                     self.assertFalse(saved.is_empty)
                     self.assertIsNotNone(store.get(path))
 
@@ -105,7 +117,7 @@ class StorageTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = make_image(Path(tmp) / "a.NEF")
             with store_in(tmp) as store:
-                store.save(path, crop_quality="Good", agree_with_model_decision="Yes")
+                store.save(path, fields={"crop_quality": "good", "agree_with_model_decision": "yes"})
                 self.assertEqual(store.count(), 1)
                 store.save(path)
                 self.assertEqual(store.count(), 0)
@@ -115,9 +127,9 @@ class StorageTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = make_image(Path(tmp) / "a.NEF")
             with store_in(tmp) as store:
-                saved = store.save(path, crop_quality="   ", image_quality="Good")
-                self.assertIsNone(saved.crop_quality)
-                self.assertEqual(saved.image_quality, "Good")
+                saved = store.save(path, fields={"crop_quality": "   ", "image_quality": "good"})
+                self.assertIsNone(saved.fields.get("crop_quality"))
+                self.assertEqual(saved.fields["image_quality"], "good")
 
     def test_a_value_outside_the_vocabulary_is_refused_not_stored(self):
         """The whole redesign exists to make the data countable, so free text
@@ -126,50 +138,60 @@ class StorageTests(unittest.TestCase):
             path = make_image(Path(tmp) / "a.NEF")
             with store_in(tmp) as store:
                 with self.assertRaises(InvalidAnnotationValue):
-                    store.save(path, crop_quality="a bit tight honestly")
+                    store.save(path, fields={"crop_quality": "a bit tight honestly"})
                 self.assertEqual(store.count(), 0)
 
     def test_validation_is_case_and_spelling_exact(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = make_image(Path(tmp) / "a.NEF")
             with store_in(tmp) as store:
-                for wrong in ("too small", "TOO SMALL", "Too  Small", "yes"):
+                for wrong in ("Too Small", "TOO_SMALL", "too  small", "yes"):
                     with self.assertRaises(InvalidAnnotationValue):
-                        store.save(path, crop_quality=wrong)
+                        store.save(path, fields={"crop_quality": wrong})
+
+    def test_an_unknown_field_id_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = make_image(Path(tmp) / "a.NEF")
+            with store_in(tmp) as store:
+                with self.assertRaises(InvalidAnnotationValue):
+                    store.save(path, fields={"nonexistent_field": "anything"})
 
     def test_annotation_follows_a_renamed_file(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             original = make_image(root / "IMG_9.NEF", b"the same bird")
             with store_in(tmp) as store:
-                store.save(original, crop_quality="Too Small")
+                store.save(original, fields={"crop_quality": "too_small"})
                 original.unlink()
                 renamed = make_image(root / "best_of_shoot.NEF", b"the same bird")
 
                 found = store.get(renamed)
                 self.assertIsNotNone(found, "identity must survive a rename")
-                self.assertEqual(found.crop_quality, "Too Small")
+                self.assertEqual(found.fields["crop_quality"], "too_small")
                 self.assertTrue(found.relocated)
 
-    def test_as_dict_exposes_every_field(self):
+    def test_as_dict_exposes_every_field_under_the_fields_key(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = make_image(Path(tmp) / "a.NEF")
             with store_in(tmp) as store:
                 payload = store.save(
                     path,
-                    crop_quality="Wrong Location",
-                    image_quality="No Relevant Subject",
-                    agree_with_model_decision="Yes",
+                    fields={
+                        "crop_quality": "wrong_location",
+                        "image_quality": "no_relevant_subject",
+                        "agree_with_model_decision": "yes",
+                    },
                 ).as_dict()
-            self.assertEqual(payload["crop_quality"], "Wrong Location")
-            self.assertEqual(payload["image_quality"], "No Relevant Subject")
-            self.assertEqual(payload["agree_with_model_decision"], "Yes")
+            self.assertEqual(payload["fields"]["crop_quality"], "wrong_location")
+            self.assertEqual(payload["fields"]["image_quality"], "no_relevant_subject")
+            self.assertEqual(payload["fields"]["agree_with_model_decision"], "yes")
 
 
 class LegacyRecordTests(unittest.TestCase):
-    """Records written before the redesign are preserved, shown, and *not*
-    guessed at. Inferring "Subject too small" meant Crop Quality "Too Small"
-    would fabricate an answer the photographer never gave, and then count it."""
+    """Records written before either redesign (fields as hardcoded columns, or
+    now as config-driven ids) are preserved, shown, and *not* guessed at.
+    Inferring "Subject too small" meant Crop Quality "Too Small" would
+    fabricate an answer the photographer never gave, and then count it."""
 
     def _make_pre_redesign_db(self, db_path: Path, image_hash: str, notes: str, cause: str) -> None:
         import sqlite3
@@ -218,7 +240,7 @@ class LegacyRecordTests(unittest.TestCase):
                 row = store._conn.execute(
                     "SELECT * FROM annotations_v2 WHERE image_hash = ?", ("p1:deadbeef",)
                 ).fetchone()
-                for column in ANNOTATION_FIELDS:
+                for column in (*LEGACY_FIELD_COLUMNS, "field_values"):
                     self.assertIn(column, row.keys())
                     self.assertIsNone(row[column])
                 self.assertEqual(row["notes"], "an old note")
@@ -249,8 +271,7 @@ class LegacyRecordTests(unittest.TestCase):
                 self.assertEqual(annotation.legacy_notes, "an old note")
                 self.assertEqual(annotation.legacy_primary_failure_cause, "Occlusion")
                 self.assertEqual(annotation.legacy_categories, ["Subject too small"])
-                for field_name in ANNOTATION_FIELDS:
-                    self.assertIsNone(getattr(annotation, field_name))
+                self.assertEqual(annotation.fields, {}, "no legacy field columns had data to migrate")
 
     def test_answering_the_new_fields_leaves_the_legacy_content_intact(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -262,9 +283,9 @@ class LegacyRecordTests(unittest.TestCase):
             self._make_pre_redesign_db(db, digest, "an old note", "Occlusion")
 
             with AnnotationStore(db) as store:
-                store.save(image, crop_quality="Good", agree_with_model_decision="No")
+                store.save(image, fields={"crop_quality": "good", "agree_with_model_decision": "no"})
                 annotation = store.get(image)
-                self.assertEqual(annotation.crop_quality, "Good")
+                self.assertEqual(annotation.fields["crop_quality"], "good")
                 self.assertEqual(annotation.legacy_notes, "an old note")
                 self.assertEqual(annotation.legacy_primary_failure_cause, "Occlusion")
 
@@ -290,17 +311,17 @@ class SummaryTests(unittest.TestCase):
             root = Path(tmp)
             paths = [make_image(root / f"i{i}.NEF", f"pixels {i}".encode()) for i in range(4)]
             with store_in(tmp) as store:
-                store.save(paths[0], crop_quality="Too Small", agree_with_model_decision="No")
-                store.save(paths[1], crop_quality="Too Small", agree_with_model_decision="No")
-                store.save(paths[2], crop_quality="Good", image_quality="Missing Eye")
-                store.save(paths[3], image_quality="Missing Eye")
+                store.save(paths[0], fields={"crop_quality": "too_small", "agree_with_model_decision": "no"})
+                store.save(paths[1], fields={"crop_quality": "too_small", "agree_with_model_decision": "no"})
+                store.save(paths[2], fields={"crop_quality": "good", "image_quality": "missing_eye"})
+                store.save(paths[3], fields={"image_quality": "missing_eye"})
 
                 _, summary = summarise(store, [str(p) for p in paths])
 
             self.assertEqual(summary.annotated, 4)
-            self.assertEqual(summary.field_counts["crop_quality"][0], ("Too Small", 2))
-            self.assertEqual(dict(summary.field_counts["image_quality"])["Missing Eye"], 2)
-            self.assertEqual(dict(summary.field_counts["agree_with_model_decision"]), {"No": 2})
+            self.assertEqual(summary.field_counts["crop_quality"][0], ("too_small", 2))
+            self.assertEqual(dict(summary.field_counts["image_quality"])["missing_eye"], 2)
+            self.assertEqual(dict(summary.field_counts["agree_with_model_decision"]), {"no": 2})
             # Unanswered fields never appear as a value of their own.
             self.assertNotIn("", dict(summary.field_counts["crop_quality"]))
 
@@ -311,16 +332,17 @@ class SummaryTests(unittest.TestCase):
             with store_in(tmp) as store:
                 store.save(
                     paths[0],
-                    crop_quality="Good",
-                    image_quality="Out of Focus",
-                    agree_with_model_decision="Yes",
+                    fields={"crop_quality": "good", "image_quality": "out_of_focus", "agree_with_model_decision": "yes"},
                 )
-                store.save(paths[1], crop_quality="Good")
+                store.save(paths[1], fields={"crop_quality": "good"})
                 _, summary = summarise(store, [str(p) for p in paths])
 
+            self.assertEqual(
+                summary.combination_fields, ("crop_quality", "image_quality", "agree_with_model_decision")
+            )
             combos = dict(summary.combination_counts)
-            self.assertEqual(combos[("Good", "Out of Focus", "Yes")], 1)
-            self.assertEqual(combos[("Good", "(unset)", "(unset)")], 1)
+            self.assertEqual(combos[("good", "out_of_focus", "yes")], 1)
+            self.assertEqual(combos[("good", "(unset)", "(unset)")], 1)
 
     def test_no_annotations_yields_empty_breakdowns(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -340,30 +362,28 @@ class SummaryTests(unittest.TestCase):
             with store_in(tmp) as store:
                 store.save(
                     path,
-                    crop_quality="Too Large",
-                    image_quality="Good",
-                    agree_with_model_decision="No",
+                    fields={"crop_quality": "too_large", "image_quality": "good", "agree_with_model_decision": "no"},
                 )
                 _, summary = summarise(store, [str(path)])
-            text = render_summary(summary)
+                fields_config = store.fields_config
+            text = render_summary(summary, fields_config)
             for label in ("Crop Quality:", "Image Quality:", "Agree with Model Decision:"):
                 self.assertIn(label, text)
-            self.assertIn("Too Large", text)
+            self.assertIn("Too Large", text)  # the label, not the raw id
 
     def test_as_dict_round_trips_the_breakdowns(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             path = make_image(root / "a.NEF")
             with store_in(tmp) as store:
-                store.save(path, crop_quality="Good", image_quality="Good",
-                           agree_with_model_decision="Yes")
+                store.save(path, fields={"crop_quality": "good", "image_quality": "good", "agree_with_model_decision": "yes"})
                 _, summary = summarise(store, [str(path)])
             payload = summary.as_dict()
             self.assertEqual(
-                payload["field_counts"]["crop_quality"], [{"value": "Good", "count": 1}]
+                payload["field_counts"]["crop_quality"], [{"value": "good", "count": 1}]
             )
             self.assertEqual(
-                payload["field_vocabularies"]["agree_with_model_decision"], ["Yes", "No"]
+                payload["field_vocabularies"]["agree_with_model_decision"], ["yes", "no"]
             )
             # Must survive a JSON round-trip: the report inlines this.
             self.assertEqual(json.loads(json.dumps(payload))["with_legacy_content"], 0)
@@ -373,6 +393,7 @@ class HtmlAndApiIntegrationTests(unittest.TestCase):
     def _result(self, tmp: Path, db: Path):
         from picklikeme.analyzer.analysis import run_analysis
         from picklikeme.analyzer.config import AnalysisConfig
+
         from test_annotations import build_fn_dataset
 
         ranking, selected, rejected = build_fn_dataset(tmp)
@@ -394,11 +415,13 @@ class HtmlAndApiIntegrationTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            html = build_html(self._result(root, root / "kb.db"))
-            for field_name, values in ANNOTATION_FIELDS.items():
-                self.assertIn(f'data-field="{field_name}"', html)
-                for value in values:
-                    self.assertIn(f'<option value="{value}"', html)
+            result = self._result(root, root / "kb.db")
+            html = build_html(result)
+            for field_def in result.annotation_fields_config:
+                self.assertIn(f'data-field="{field_def.id}"', html)
+                for value in field_def.values:
+                    self.assertIn(f'<option value="{value.id}"', html)
+                    self.assertIn(value.label, html)
             self.assertIn("ann-field", html)
 
     def test_the_report_offers_no_free_text_input(self):
@@ -423,15 +446,18 @@ class HtmlAndApiIntegrationTests(unittest.TestCase):
             with AnnotationStore(db) as store:
                 store.save(
                     target,
-                    crop_quality="Wrong Location",
-                    image_quality="Missing Eye",
-                    agree_with_model_decision="No",
+                    fields={
+                        "crop_quality": "wrong_location",
+                        "image_quality": "missing_eye",
+                        "agree_with_model_decision": "no",
+                    },
                 )
 
             html = build_html(self._result(root, db))
-            self.assertIn('<option value="Wrong Location" selected>', html)
-            self.assertIn('<option value="Missing Eye" selected>', html)
-            self.assertIn('data-crop-quality="Wrong Location"', html)
+            # The option's value is the stored id; its visible text is the label.
+            self.assertIn('<option value="wrong_location" selected>Wrong Location</option>', html)
+            self.assertIn('<option value="missing_eye" selected>Missing Eye</option>', html)
+            self.assertIn('data-crop-quality="wrong_location"', html)
 
     def test_summary_section_reports_disagreements(self):
         from picklikeme.analyzer.reports.html import build_html
@@ -442,7 +468,7 @@ class HtmlAndApiIntegrationTests(unittest.TestCase):
             first = self._result(root, db)
             target = first.errors.false_negatives[0].image_path
             with AnnotationStore(db) as store:
-                store.save(target, crop_quality="Too Small", agree_with_model_decision="No")
+                store.save(target, fields={"crop_quality": "too_small", "agree_with_model_decision": "no"})
 
             html = build_html(self._result(root, db))
             self.assertIn("Disagree with model", html)
@@ -473,7 +499,7 @@ class HtmlAndApiIntegrationTests(unittest.TestCase):
             method="POST",
         )
 
-    def test_server_saves_all_three_fields_and_publishes_the_vocabularies(self):
+    def test_server_saves_every_field_and_publishes_the_vocabularies(self):
         from picklikeme.analyzer.reports import write_json_report
         from picklikeme.analyzer.reports.html import write_html_report
 
@@ -492,22 +518,24 @@ class HtmlAndApiIntegrationTests(unittest.TestCase):
                         base,
                         {
                             "image_path": target,
-                            "crop_quality": "Too Small",
-                            "image_quality": "Out of Focus",
-                            "agree_with_model_decision": "No",
+                            "crop_quality": "too_small",
+                            "image_quality": "out_of_focus",
+                            "agree_with_model_decision": "no",
                         },
                     )
                 ) as response:
                     body = json.load(response)
-                self.assertEqual(body["annotation"]["crop_quality"], "Too Small")
-                self.assertEqual(store.get(target).agree_with_model_decision, "No")
+                self.assertEqual(body["annotation"]["fields"]["crop_quality"], "too_small")
+                self.assertEqual(store.get(target).fields["agree_with_model_decision"], "no")
 
                 with urllib.request.urlopen(f"{base}/api/fields") as response:
-                    fields = json.load(response)
+                    fields = json.load(response)["fields"]
+                by_id = {f["id"]: f for f in fields}
                 self.assertEqual(
-                    fields["fields"], {n: list(v) for n, v in ANNOTATION_FIELDS.items()}
+                    set(by_id["crop_quality"].keys()), {"id", "label", "values"}
                 )
-                self.assertEqual(fields["labels"]["crop_quality"], "Crop Quality")
+                self.assertEqual(by_id["crop_quality"]["label"], "Crop Quality")
+                self.assertIn({"id": "too_small", "label": "Too Small"}, by_id["crop_quality"]["values"])
             finally:
                 server.shutdown()
                 server.server_close()
@@ -540,6 +568,7 @@ class MetricIsolationTests(unittest.TestCase):
     def test_the_new_fields_never_change_a_metric(self):
         from picklikeme.analyzer.analysis import run_analysis
         from picklikeme.analyzer.config import AnalysisConfig
+
         from test_annotations import build_fn_dataset
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -567,9 +596,11 @@ class MetricIsolationTests(unittest.TestCase):
                 for record in before.errors.false_negatives:
                     store.save(
                         record.image_path,
-                        crop_quality="Too Small",
-                        image_quality="Out of Focus",
-                        agree_with_model_decision="No",
+                        fields={
+                            "crop_quality": "too_small",
+                            "image_quality": "out_of_focus",
+                            "agree_with_model_decision": "no",
+                        },
                     )
 
             after = run()
@@ -578,13 +609,14 @@ class MetricIsolationTests(unittest.TestCase):
 
 
 class FalsePositiveAnnotationTests(unittest.TestCase):
-    """False positives get the same three fields as false negatives - same
-    schema, same vocabulary, same editor - so the two are directly comparable.
-    """
+    """False positives get the same configured fields as false negatives -
+    same schema, same vocabulary, same editor - so the two are directly
+    comparable."""
 
     def _result(self, tmp: Path, db: Path):
         from picklikeme.analyzer.analysis import run_analysis
         from picklikeme.analyzer.config import AnalysisConfig
+
         from test_annotations import build_fn_dataset
 
         ranking, selected, rejected = build_fn_dataset(tmp)
@@ -611,12 +643,14 @@ class FalsePositiveAnnotationTests(unittest.TestCase):
             with store_in(tmp) as store:
                 saved = store.save(
                     target,
-                    crop_quality="Too Large",
-                    image_quality="Group Scene",
-                    agree_with_model_decision="No",
+                    fields={
+                        "crop_quality": "too_large",
+                        "image_quality": "group_scene",
+                        "agree_with_model_decision": "no",
+                    },
                 )
-            self.assertEqual(saved.crop_quality, "Too Large")
-            self.assertEqual(saved.image_quality, "Group Scene")
+            self.assertEqual(saved.fields["crop_quality"], "too_large")
+            self.assertEqual(saved.fields["image_quality"], "group_scene")
 
     def test_the_report_renders_an_annotation_panel_for_false_positives(self):
         from picklikeme.analyzer.reports.html import build_html
@@ -637,7 +671,6 @@ class FalsePositiveAnnotationTests(unittest.TestCase):
 
     def test_every_false_positive_gets_its_own_panel(self):
         from picklikeme.analyzer.reports.html import build_html
-        import re
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -655,14 +688,13 @@ class FalsePositiveAnnotationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             html = build_html(self._result(root, root / "kb.db"))
-            self.assertIn('<option value="Group Scene">Group Scene</option>', html)
+            self.assertIn('<option value="group_scene">Group Scene</option>', html)
 
     def test_false_negative_and_false_positive_filters_do_not_cross_contaminate(self):
         """Each category has its own filter bar; saving/filtering one must not
         touch the other's panels. Checked at the markup level: each `.ann-scope`
         contains only panels for its own category's paths."""
         from picklikeme.analyzer.reports.html import build_html
-        import re
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -695,13 +727,13 @@ class FalsePositiveAnnotationTests(unittest.TestCase):
             fn_target = first.errors.false_negatives[0].image_path
             fp_target = first.errors.false_positives[0].image_path
             with AnnotationStore(db) as store:
-                store.save(fn_target, crop_quality="Good")
-                store.save(fp_target, crop_quality="Wrong Location")
+                store.save(fn_target, fields={"crop_quality": "good"})
+                store.save(fp_target, fields={"crop_quality": "wrong_location"})
 
             again = self._result(root, db)
-            self.assertEqual(dict(again.annotation_summary.field_counts["crop_quality"]), {"Good": 1})
+            self.assertEqual(dict(again.annotation_summary.field_counts["crop_quality"]), {"good": 1})
             self.assertEqual(
-                dict(again.fp_annotation_summary.field_counts["crop_quality"]), {"Wrong Location": 1}
+                dict(again.fp_annotation_summary.field_counts["crop_quality"]), {"wrong_location": 1}
             )
 
     def test_json_report_carries_both_categories_separately(self):
@@ -712,17 +744,18 @@ class FalsePositiveAnnotationTests(unittest.TestCase):
             fn_target = first.errors.false_negatives[0].image_path
             fp_target = first.errors.false_positives[0].image_path
             with AnnotationStore(db) as store:
-                store.save(fn_target, crop_quality="Good")
-                store.save(fp_target, crop_quality="Wrong Location")
+                store.save(fn_target, fields={"crop_quality": "good"})
+                store.save(fp_target, fields={"crop_quality": "wrong_location"})
 
             payload = json.loads(json.dumps(self._result(root, db).as_dict()))
             self.assertEqual(
-                payload["false_negative_annotations"]["by_image"][fn_target]["crop_quality"], "Good"
+                payload["false_negative_annotations"]["by_image"][fn_target]["fields"]["crop_quality"],
+                "good",
             )
             self.assertNotIn(fp_target, payload["false_negative_annotations"]["by_image"])
             self.assertEqual(
-                payload["false_positive_annotations"]["by_image"][fp_target]["crop_quality"],
-                "Wrong Location",
+                payload["false_positive_annotations"]["by_image"][fp_target]["fields"]["crop_quality"],
+                "wrong_location",
             )
             self.assertNotIn(fn_target, payload["false_positive_annotations"]["by_image"])
 
@@ -747,15 +780,15 @@ class FalsePositiveAnnotationTests(unittest.TestCase):
                 request = urllib.request.Request(
                     f"{base}/api/annotations",
                     data=json.dumps(
-                        {"image_path": target, "image_quality": "Group Scene"}
+                        {"image_path": target, "image_quality": "group_scene"}
                     ).encode("utf-8"),
                     headers={"Content-Type": "application/json"},
                     method="POST",
                 )
                 with urllib.request.urlopen(request) as response:
                     body = json.load(response)
-                self.assertEqual(body["annotation"]["image_quality"], "Group Scene")
-                self.assertEqual(store.get(target).image_quality, "Group Scene")
+                self.assertEqual(body["annotation"]["fields"]["image_quality"], "group_scene")
+                self.assertEqual(store.get(target).fields["image_quality"], "group_scene")
             finally:
                 server.shutdown()
                 server.server_close()
