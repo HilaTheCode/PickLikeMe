@@ -12,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from picklikeme.bird_crop import (
     COCO_BIRD_CLASS,
     DEFAULT_AREA_TIE_FRAC,
+    DEFAULT_GROUP_SCENE_THRESHOLD,
     DOMESTIC_ANIMAL_CLASSES,
     SUPPORTED_ANIMAL_CLASSES,
     WILDLIFE_CLASSES,
@@ -23,6 +24,7 @@ from picklikeme.bird_crop import (
     crop_cache_path,
     crop_to_box,
     downscale_long_side,
+    enclosing_box,
     expand_and_clamp_box,
     read_crop_params,
     save_crop_png,
@@ -33,7 +35,13 @@ from picklikeme.raw_io import RawImageLoader
 
 
 def _detector_with_fake_model(
-    boxes, labels, scores, conf_threshold=0.3, classes=None, area_tie_frac=DEFAULT_AREA_TIE_FRAC
+    boxes,
+    labels,
+    scores,
+    conf_threshold=0.3,
+    classes=None,
+    area_tie_frac=DEFAULT_AREA_TIE_FRAC,
+    group_scene_threshold=DEFAULT_GROUP_SCENE_THRESHOLD,
 ):
     """A BirdDetector whose torchvision model is replaced by a fixed output, so
     the real selection logic (select_best_detection, via detect_best_bird /
@@ -45,6 +53,7 @@ def _detector_with_fake_model(
     detector.conf_threshold = conf_threshold
     detector.classes = frozenset(SUPPORTED_ANIMAL_CLASSES if classes is None else classes)
     detector.area_tie_frac = area_tie_frac
+    detector.group_scene_threshold = group_scene_threshold
     output = {
         "boxes": torch.tensor(boxes, dtype=torch.float),
         "labels": torch.tensor(labels),
@@ -117,6 +126,113 @@ class SelectBestDetectionTests(unittest.TestCase):
             BirdDetection(box=(0, 0, 10, 10), score=s, label=COCO_BIRD_CLASS) for s in (0.31, 0.5, 0.99)
         ]
         self.assertIn(select_best_detection(candidates), candidates)
+
+
+def _flock(count: int, start_score: float = 0.5) -> list[BirdDetection]:
+    """`count` small, non-overlapping detections spread out in a row, each a
+    little more confident than the last - stand-ins for a flock/herd/colony."""
+    return [
+        BirdDetection(box=(i * 20.0, 0.0, i * 20.0 + 10.0, 10.0), score=start_score + i * 0.01, label=COCO_BIRD_CLASS)
+        for i in range(count)
+    ]
+
+
+class GroupSceneSelectionTests(unittest.TestCase):
+    """select_best_detection()'s other policy: at or above group_scene_threshold
+    surviving detections, no individual is selected - the target becomes the
+    box enclosing the whole group. Intentional for wildlife photography, where
+    a flock/herd/colony is often the actual subject, not any one animal in it."""
+
+    def test_fewer_than_the_threshold_uses_the_normal_largest_box_policy(self):
+        candidates = _flock(9)
+        winner = select_best_detection(candidates, group_scene_threshold=10)
+        self.assertIn(winner, candidates, "below threshold, the winner must be one real detection")
+        self.assertNotEqual(winner.box, enclosing_box([c.box for c in candidates]))
+
+    def test_exactly_the_threshold_is_a_group_scene(self):
+        candidates = _flock(10)
+        winner = select_best_detection(candidates, group_scene_threshold=10)
+        self.assertNotIn(winner, candidates, "a group scene's box must not be any single detection")
+        self.assertEqual(winner.box, enclosing_box([c.box for c in candidates]))
+
+    def test_more_than_the_threshold_is_a_group_scene(self):
+        candidates = _flock(25)
+        winner = select_best_detection(candidates, group_scene_threshold=10)
+        self.assertEqual(winner.box, enclosing_box([c.box for c in candidates]))
+
+    def test_the_threshold_is_configurable(self):
+        candidates = _flock(4)
+        # Below a threshold of 5, normal per-detection selection applies...
+        normal = select_best_detection(candidates, group_scene_threshold=5)
+        self.assertIn(normal, candidates)
+        # ...but the same 4 detections are a group scene once the threshold is lowered to 4.
+        group = select_best_detection(candidates, group_scene_threshold=4)
+        self.assertEqual(group.box, enclosing_box([c.box for c in candidates]))
+
+    def test_the_group_box_encloses_every_valid_detection_with_mixed_sizes(self):
+        """Mixed box sizes and positions - not a neat row - so the enclosing
+        box genuinely has to take the min/max of all four edges, not just
+        assume the members are laid out predictably."""
+        candidates = [
+            BirdDetection(box=(100.0, 200.0, 140.0, 260.0), score=0.5, label=COCO_BIRD_CLASS),  # far top-left-ish
+            BirdDetection(box=(300.0, 50.0, 305.0, 55.0), score=0.6, label=COCO_BIRD_CLASS),  # tiny, high up
+            BirdDetection(box=(10.0, 400.0, 500.0, 420.0), score=0.4, label=COCO_BIRD_CLASS),  # wide, low
+            BirdDetection(box=(250.0, 150.0, 260.0, 170.0), score=0.9, label=COCO_BIRD_CLASS),  # small, central
+            BirdDetection(box=(480.0, 480.0, 520.0, 520.0), score=0.7, label=COCO_BIRD_CLASS),  # far bottom-right
+            *(_flock(5, start_score=0.3))  # pad up to the default threshold of 10
+        ]
+        self.assertGreaterEqual(len(candidates), 10)
+        winner = select_best_detection(candidates, group_scene_threshold=10)
+
+        expected = enclosing_box([c.box for c in candidates])
+        self.assertEqual(winner.box, expected)
+        # Every member's box must fit entirely inside the group box.
+        for member in candidates:
+            x1, y1, x2, y2 = member.box
+            gx1, gy1, gx2, gy2 = winner.box
+            self.assertGreaterEqual(x1, gx1)
+            self.assertGreaterEqual(y1, gy1)
+            self.assertLessEqual(x2, gx2)
+            self.assertLessEqual(y2, gy2)
+
+    def test_group_box_score_and_label_are_the_most_confident_members(self):
+        """score/label are informational only (crop geometry uses the box),
+        but they should still mean something rather than being arbitrary."""
+        candidates = _flock(10)
+        winner = select_best_detection(candidates, group_scene_threshold=10)
+        most_confident = max(candidates, key=lambda d: d.score)
+        self.assertEqual(winner.score, most_confident.score)
+        self.assertEqual(winner.label, most_confident.label)
+
+    def test_group_scene_ignores_area_tie_frac(self):
+        """The area/confidence tie-break is a below-threshold concept only -
+        it must not leak into (or change) group-scene selection."""
+        candidates = _flock(10)
+        strict = select_best_detection(candidates, area_tie_frac=0.0, group_scene_threshold=10)
+        loose = select_best_detection(candidates, area_tie_frac=1.0, group_scene_threshold=10)
+        expected = enclosing_box([c.box for c in candidates])
+        self.assertEqual(strict.box, expected)
+        self.assertEqual(loose.box, expected)
+
+
+class EnclosingBoxTests(unittest.TestCase):
+    def test_a_single_box_encloses_itself(self):
+        box = (1.0, 2.0, 3.0, 4.0)
+        self.assertEqual(enclosing_box([box]), box)
+
+    def test_encloses_boxes_scattered_in_every_direction(self):
+        boxes = [
+            (10.0, 10.0, 20.0, 20.0),
+            (0.0, 15.0, 5.0, 18.0),   # extends the left edge
+            (18.0, 0.0, 22.0, 5.0),   # extends the top edge and right edge
+            (5.0, 25.0, 12.0, 30.0),  # extends the bottom edge
+        ]
+        self.assertEqual(enclosing_box(boxes), (0.0, 0.0, 22.0, 30.0))
+
+    def test_a_box_fully_inside_another_does_not_shrink_the_result(self):
+        outer = (0.0, 0.0, 100.0, 100.0)
+        inner = (40.0, 40.0, 60.0, 60.0)
+        self.assertEqual(enclosing_box([outer, inner]), outer)
 
 
 class BoxAreaTests(unittest.TestCase):
@@ -193,6 +309,20 @@ class DetectBestBirdTests(unittest.TestCase):
         )
         self.assertIsNone(detector.detect_best_bird(self.IMG))
         self.assertIsNone(detector.best_bird_box(self.IMG))
+
+    def test_a_real_model_output_with_a_flock_becomes_a_group_scene(self):
+        """End to end through the real filtering (class + confidence), not
+        just select_best_detection() in isolation: a raw model output with
+        ten accepted birds plus an excluded person must still correctly
+        count only the ten toward the group threshold."""
+        boxes = [[i * 15, 0, i * 15 + 8, 8] for i in range(10)] + [[500, 500, 520, 520]]
+        labels = [COCO_BIRD_CLASS] * 10 + [1]  # ten birds + a person (excluded by class)
+        scores = [0.5 + i * 0.01 for i in range(10)] + [0.99]
+        detector = _detector_with_fake_model(boxes=boxes, labels=labels, scores=scores)
+
+        detection = detector.detect_best_bird(self.IMG)
+        expected = enclosing_box([tuple(float(v) for v in b) for b in boxes[:10]])
+        self.assertEqual(detection.box, expected)
 
 
 class SupportedClassTests(unittest.TestCase):
@@ -310,9 +440,14 @@ class CachePathTests(unittest.TestCase):
 
     def test_params_round_trip(self):
         with tempfile.TemporaryDirectory() as tmp:
-            params = CropParams(margin_frac=0.07, conf_threshold=0.4, max_side=800)
+            params = CropParams(
+                margin_frac=0.07, conf_threshold=0.4, max_side=800,
+                area_tie_frac=0.2, group_scene_threshold=6,
+            )
             write_crop_params(tmp, params)
-            self.assertEqual(read_crop_params(tmp), params)
+            reloaded = read_crop_params(tmp)
+            self.assertEqual(reloaded, params)
+            self.assertEqual(reloaded.group_scene_threshold, 6)
 
 
 class LoaderCropCacheTests(unittest.TestCase):
@@ -378,6 +513,65 @@ class BuildCropUsesAreaDominantSelectionTests(unittest.TestCase):
         # The cached crop is the large green region, not the small red one.
         mean_pixel = result.crop.reshape(-1, 3).mean(axis=0)
         self.assertGreater(mean_pixel[1], mean_pixel[0], "crop should be the large green box, not the small red one")
+
+
+class BuildCropHandlesGroupScenesTests(unittest.TestCase):
+    """End to end through build_crop for a group scene: the crop must be a
+    tight region enclosing the whole group, never the full-frame fallback -
+    the "even if the group is small, do not preserve unnecessary background"
+    requirement."""
+
+    def test_a_small_flock_in_a_large_frame_gets_a_tight_group_crop_not_the_full_frame(self):
+        frame = np.zeros((1000, 1000, 3), dtype=np.uint8)
+        # Ten small detections clustered in one corner - tiny relative to the frame.
+        boxes = [[50 + i * 20, 50 + i * 5, 50 + i * 20 + 15, 50 + i * 5 + 15] for i in range(10)]
+        detector = _detector_with_fake_model(
+            boxes=boxes,
+            labels=[COCO_BIRD_CLASS] * 10,
+            scores=[0.5 + i * 0.01 for i in range(10)],
+        )
+        result = build_crop(frame, detector, CropParams(margin_frac=0.05), collect_detections=True)
+
+        self.assertIsNotNone(result.detection, "a group is still a real subject - never the full-frame fallback")
+        self.assertIsNotNone(result.expanded_box)
+
+        frame_area = frame.shape[0] * frame.shape[1]
+        crop_area = result.crop.shape[0] * result.crop.shape[1]
+        self.assertLess(
+            crop_area / frame_area, 0.05,
+            "the crop must stay tight around the small group, not balloon toward the full frame",
+        )
+
+    def test_the_margin_is_applied_to_the_group_box_like_any_other_crop(self):
+        frame = np.zeros((500, 500, 3), dtype=np.uint8)
+        boxes = [[100 + i * 10, 100, 100 + i * 10 + 8, 108] for i in range(10)]
+        detector = _detector_with_fake_model(
+            boxes=boxes, labels=[COCO_BIRD_CLASS] * 10, scores=[0.5 + i * 0.01 for i in range(10)]
+        )
+        no_margin = build_crop(frame, detector, CropParams(margin_frac=0.0), collect_detections=True)
+        with_margin = build_crop(frame, detector, CropParams(margin_frac=0.2), collect_detections=True)
+
+        no_margin_area = (no_margin.expanded_box[2] - no_margin.expanded_box[0]) * (
+            no_margin.expanded_box[3] - no_margin.expanded_box[1]
+        )
+        with_margin_area = (with_margin.expanded_box[2] - with_margin.expanded_box[0]) * (
+            with_margin.expanded_box[3] - with_margin.expanded_box[1]
+        )
+        self.assertGreater(with_margin_area, no_margin_area)
+
+    def test_every_detection_falls_within_the_final_expanded_crop(self):
+        frame = np.zeros((400, 400, 3), dtype=np.uint8)
+        boxes = [[20 + i * 25, 30 + (i % 3) * 40, 20 + i * 25 + 12, 30 + (i % 3) * 40 + 12] for i in range(12)]
+        detector = _detector_with_fake_model(
+            boxes=boxes, labels=[COCO_BIRD_CLASS] * 12, scores=[0.4 + i * 0.01 for i in range(12)]
+        )
+        result = build_crop(frame, detector, CropParams(margin_frac=0.05), collect_detections=True)
+        gx1, gy1, gx2, gy2 = result.expanded_box
+        for x1, y1, x2, y2 in boxes:
+            self.assertGreaterEqual(x1, gx1)
+            self.assertGreaterEqual(y1, gy1)
+            self.assertLessEqual(x2, gx2)
+            self.assertLessEqual(y2, gy2)
 
 
 if __name__ == "__main__":

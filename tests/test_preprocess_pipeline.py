@@ -235,12 +235,12 @@ class CacheReadWriteTests(unittest.TestCase):
 
 class CacheVersionMismatchTests(unittest.TestCase):
     """A cache built under a different crop-selection algorithm must never be
-    silently reused. This is the exact regression the crop-selection redesign
-    (highest-confidence -> area-dominant) depends on: nothing here changed
-    what a CropParams *value* looks like on its own, only what the detector
-    does with the boxes it selects among - so without a version bump, an old
-    cache and new code would compare equal and the stale crops would be
-    reused forever without any error.
+    silently reused. This is the exact regression every crop-selection change
+    depends on (highest-confidence -> area-dominant -> group-scene handling):
+    nothing about those changes altered what a CropParams *value* looks like
+    on its own, only what the detector does with the boxes it selects among -
+    so without a version bump, an old cache and new code would compare equal
+    and the stale crops would be reused forever without any error.
     """
 
     def _seed_stale_cache(self, cache_dir: Path, version: str) -> None:
@@ -253,26 +253,29 @@ class CacheVersionMismatchTests(unittest.TestCase):
         """Pins the version string itself, so a future accidental revert of
         the bump is caught immediately rather than silently reopening this
         exact hole."""
-        self.assertEqual(CROP_CACHE_VERSION, "v3")
-        self.assertEqual(CropParams().version, "v3")
+        self.assertEqual(CROP_CACHE_VERSION, "v4")
+        self.assertEqual(CropParams().version, "v4")
 
-    def test_a_cache_from_the_previous_selection_algorithm_is_refused(self):
+    def test_a_cache_from_a_previous_selection_algorithm_is_refused(self):
         """The literal scenario this protects against: an existing cache built
-        by the highest-confidence (v2) algorithm must stop a v3 run cold,
-        rather than letting training silently proceed on stale crops."""
-        with tempfile.TemporaryDirectory() as tmp:
-            cache = Path(tmp) / "crops"
-            self._seed_stale_cache(cache, version="v2")
+        by an earlier algorithm (area-dominant v3, or highest-confidence v2)
+        must stop the current run cold, rather than letting training silently
+        proceed on stale crops."""
+        for stale_version in ("v2", "v3"):
+            with self.subTest(stale_version=stale_version):
+                with tempfile.TemporaryDirectory() as tmp:
+                    cache = Path(tmp) / "crops"
+                    self._seed_stale_cache(cache, version=stale_version)
 
-            with self.assertRaises(SystemExit) as ctx:
-                build_cache(_fake_paths(tmp, 3), cache, CropParams(), device="cpu", force=False)
-            message = str(ctx.exception)
-            self.assertIn("different parameters", message)
-            self.assertIn("--force", message)
+                    with self.assertRaises(SystemExit) as ctx:
+                        build_cache(_fake_paths(tmp, 3), cache, CropParams(), device="cpu", force=False)
+                    message = str(ctx.exception)
+                    self.assertIn("different parameters", message)
+                    self.assertIn("--force", message)
 
-            # Refused before doing anything: the stale params file is left
-            # exactly as it was, not silently overwritten.
-            self.assertEqual(read_crop_params(cache).version, "v2")
+                    # Refused before doing anything: the stale params file is
+                    # left exactly as it was, not silently overwritten.
+                    self.assertEqual(read_crop_params(cache).version, stale_version)
 
     def test_force_rebuilds_over_a_stale_version_and_records_the_new_one(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -285,7 +288,7 @@ class CacheVersionMismatchTests(unittest.TestCase):
 
             self.assertEqual(stats["cached"], 3, "a stale cache must be rebuilt in full, not skipped")
             self.assertEqual(len(decoder.decoded), 3)
-            self.assertEqual(read_crop_params(cache).version, "v3")
+            self.assertEqual(read_crop_params(cache).version, "v4")
 
     def test_a_cache_already_at_the_current_version_is_reused_normally(self):
         """The mismatch guard must not become a reason to always rebuild -

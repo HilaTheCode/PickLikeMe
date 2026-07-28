@@ -200,7 +200,10 @@ def build_cache(
     # RawImageLoader here decodes the full frame (no crop cache) so we can detect.
     decoder = RawImageLoader(raw_root=".", resize_mode="letterbox")
     detector = BirdDetector(
-        device=device, conf_threshold=params.conf_threshold, area_tie_frac=params.area_tie_frac
+        device=device,
+        conf_threshold=params.conf_threshold,
+        area_tie_frac=params.area_tie_frac,
+        group_scene_threshold=params.group_scene_threshold,
     )
 
     total = len(image_paths)
@@ -212,6 +215,10 @@ def build_cache(
     print(f"  {'accepted classes:':<20}{', '.join(sorted(SUPPORTED_ANIMAL_CLASSES.values()))}")
     print(f"  {'min confidence:':<20}{params.conf_threshold}")
     print(f"  {'selection:':<20}largest area wins; confidence ties within {params.area_tie_frac:.0%} of it")
+    print(
+        f"  {'group scenes:':<20}{params.group_scene_threshold}+ detections -> crop the whole group, "
+        "not one individual"
+    )
     print(f"  {'decode workers:':<20}{decode_workers} (window {DECODE_WINDOW}, GPU stays sequential)")
 
     if PROFILE.enabled:
@@ -477,6 +484,14 @@ def main() -> None:
         "size and broken by confidence; anything smaller loses on size alone "
         f"(default: {CropParams.area_tie_frac})",
     )
+    parser.add_argument(
+        "--group-scene-threshold",
+        type=int,
+        default=CropParams.group_scene_threshold,
+        help="At or above this many surviving detections, crop the box enclosing the whole "
+        "group instead of one individual - flocks, herds, colonies are the subject, not any "
+        f"single member of them (default: {CropParams.group_scene_threshold})",
+    )
     parser.add_argument("--force", action="store_true", help="Rebuild crops even if already cached")
     parser.add_argument(
         "--decode-workers",
@@ -492,6 +507,7 @@ def main() -> None:
         conf_threshold=args.conf_threshold,
         max_side=args.max_side,
         area_tie_frac=args.area_tie_frac,
+        group_scene_threshold=args.group_scene_threshold,
     )
     with fatal_errors_logged_to_stdout():
         preprocess_folders(

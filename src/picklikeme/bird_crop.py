@@ -26,7 +26,8 @@ Design notes:
 Bump CROP_CACHE_VERSION whenever the crop algorithm, its defaults, or the set
 of accepted detection classes changes, so a stale cache is detected instead of
 silently reused. v1 = bird only; v2 = SUPPORTED_ANIMAL_CLASSES; v3 = area-
-dominant selection among survivors (see "Crop selection policy" below).
+dominant selection among survivors; v4 = group-scene handling (see "Crop
+selection policy" below).
 
 Crop selection policy
 ----------------------
@@ -36,7 +37,7 @@ accepted classes (SUPPORTED_ANIMAL_CLASSES by default), and runs per-class
 non-maximum suppression. What is left after that - the *surviving*
 detections - still often number more than one (two classes competing for the
 same animal, a second animal in frame, a false detection in the background),
-and something has to pick exactly one to crop to. That is `select_best_detection`.
+and something has to decide what to crop to. That is `select_best_detection`.
 
 - **v2 and earlier (superseded): highest confidence wins, full stop.** A
   single pass tracking a running max score. No box size, aspect ratio,
@@ -49,14 +50,30 @@ and something has to pick exactly one to crop to. That is `select_best_detection
   all things that suppress a detector's confidence on a large, real subject
   without making it any less the photo's subject.
 
-- **v3 (current): area dominates; confidence only breaks a near-tie.** The
-  largest surviving detection wins, *unless* another detection's area is
-  within `area_tie_frac` (default 10%) of the largest, in which case the
-  highest-confidence detection among that near-largest group wins. A
-  detection whose area is not close to the largest can never win by having
-  higher confidence - there is no confidence value large enough to compensate
-  for a much smaller box. This is a deliberate size-first policy, not a
-  weighted score: area and confidence are never combined into one number.
+- **v3 (superseded on its own, still the policy below `group_scene_threshold`):
+  area dominates; confidence only breaks a near-tie.** The largest surviving
+  detection wins, *unless* another detection's area is within `area_tie_frac`
+  (default 10%) of the largest, in which case the highest-confidence detection
+  among that near-largest group wins. A detection whose area is not close to
+  the largest can never win by having higher confidence - there is no
+  confidence value large enough to compensate for a much smaller box. This is
+  a deliberate size-first policy, not a weighted score: area and confidence
+  are never combined into one number.
+
+- **v4 (current): group scenes crop to the whole group, not one member of it.**
+  Wildlife photography routinely and *intentionally* frames a flock, a herd, a
+  colony - a group of animals is the subject, not any single one of them.
+  Picking "the best" individual detection out of a flock of forty birds
+  (by area or by confidence, it does not matter which) crops to one bird and
+  discards the photograph's actual subject. So when the number of surviving
+  detections reaches `group_scene_threshold` (default 10), individual
+  selection is skipped entirely: the crop target becomes the smallest box
+  enclosing every surviving detection, then the normal margin and downstream
+  crop pipeline apply exactly as they do for a single subject. The full-frame
+  fallback (see "If no supported animal is detected" above) still only
+  applies when *nothing* was detected - a group scene never falls back to the
+  full frame, even when the group only occupies a small part of it: the whole
+  point is a tight crop around the actual subject, individual or group.
 """
 
 from __future__ import annotations
@@ -107,7 +124,7 @@ def coco_class_name(label: int) -> str:
     return SUPPORTED_ANIMAL_CLASSES.get(int(label), f"class {int(label)}")
 
 
-CROP_CACHE_VERSION = "v3"
+CROP_CACHE_VERSION = "v4"
 CROP_PARAMS_FILENAME = "crop_params.json"
 
 # Cache entries live in cache_dir/<first 2 hex chars of digest>/<digest>.png.
@@ -122,6 +139,12 @@ CACHE_SHARD_CHARS = 2
 # alone, however much more confident it is. See select_best_detection().
 DEFAULT_AREA_TIE_FRAC = 0.10
 
+# At or above this many surviving detections, the image is treated as a group
+# scene: the crop target becomes the box enclosing all of them, not a single
+# individual. See select_best_detection() and the module docstring's "Crop
+# selection policy" section.
+DEFAULT_GROUP_SCENE_THRESHOLD = 10
+
 
 @dataclass(frozen=True)
 class CropParams:
@@ -132,6 +155,7 @@ class CropParams:
     conf_threshold: float = 0.30       # min detection confidence to accept a detection
     max_side: int = 1024               # cap the cached crop's long side (px)
     area_tie_frac: float = DEFAULT_AREA_TIE_FRAC  # size-tie tolerance for select_best_detection
+    group_scene_threshold: int = DEFAULT_GROUP_SCENE_THRESHOLD  # >= this many detections -> group scene
     detector: str = "fasterrcnn_resnet50_fpn_v2"
     version: str = CROP_CACHE_VERSION
 
@@ -146,6 +170,23 @@ def box_area(box: tuple[float, float, float, float]) -> float:
     select_best_detection() - stay well-defined without their own guards."""
     x1, y1, x2, y2 = box
     return max(0.0, x2 - x1) * max(0.0, y2 - y1)
+
+
+def enclosing_box(
+    boxes: Sequence[tuple[float, float, float, float]],
+) -> tuple[float, float, float, float]:
+    """The smallest (x1, y1, x2, y2) box containing every given box.
+
+    Used for group scenes: the crop target is the region spanning the whole
+    group, not any one member of it. `boxes` must be non-empty - the caller
+    (select_best_detection) already knows there is at least one candidate by
+    the time this is reached.
+    """
+    x1 = min(box[0] for box in boxes)
+    y1 = min(box[1] for box in boxes)
+    x2 = max(box[2] for box in boxes)
+    y2 = max(box[3] for box in boxes)
+    return (x1, y1, x2, y2)
 
 
 def expand_and_clamp_box(
@@ -317,31 +358,65 @@ class BirdDetection:
     label: int = COCO_BIRD_CLASS
 
 
+def _group_scene_detection(candidates: Sequence[BirdDetection]) -> BirdDetection:
+    """A synthetic detection representing an entire group, for select_best_detection()'s
+    group-scene branch. Its `box` is the smallest box enclosing every candidate
+    - the actual crop target - so it is never just informational the way
+    `score`/`label` are here. `score` and `label` (the most confident
+    individual member's) exist only so this still behaves like a normal
+    BirdDetection for logging and the detector-box overlay: the enclosing box
+    renders as the "selected" crop, and every group member still renders as
+    a runner-up, which is exactly the picture a group scene should show.
+    """
+    representative = max(candidates, key=lambda detection: detection.score)
+    return BirdDetection(
+        box=enclosing_box([candidate.box for candidate in candidates]),
+        score=representative.score,
+        label=representative.label,
+    )
+
+
 def select_best_detection(
     candidates: Sequence[BirdDetection],
     area_tie_frac: float = DEFAULT_AREA_TIE_FRAC,
+    group_scene_threshold: int = DEFAULT_GROUP_SCENE_THRESHOLD,
 ) -> BirdDetection | None:
-    """The single detection build_crop should crop to, chosen from every
-    detection that has already passed class and confidence filtering (and,
-    upstream of this, the detector's own per-class NMS - see the module
-    docstring's "Crop selection policy" section).
+    """The crop target build_crop should use, chosen from every detection that
+    has already passed class and confidence filtering (and, upstream of this,
+    the detector's own per-class NMS - see the module docstring's "Crop
+    selection policy" section).
 
-    Policy: **bounding-box area dominates**. The largest candidate wins,
-    unless another candidate's area is within `area_tie_frac` of it, in which
-    case confidence breaks the tie among that near-largest group only. This is
-    deliberately not a weighted score - area and confidence are never combined
-    into one number - so a detection that is not close in size to the largest
-    can never win by being more confident, however large the gap.
+    Two policies, chosen by how many detections survived:
+
+    - **Fewer than `group_scene_threshold`: bounding-box area dominates.** The
+      largest candidate wins, unless another candidate's area is within
+      `area_tie_frac` of it, in which case confidence breaks the tie among
+      that near-largest group only. This is deliberately not a weighted score
+      - area and confidence are never combined into one number - so a
+      detection that is not close in size to the largest can never win by
+      being more confident, however large the gap.
+
+    - **`group_scene_threshold` or more: the image is a group scene.** Picking
+      one detection out of a flock, a herd or a colony would crop to a single
+      animal and discard the photograph's actual subject, so no individual
+      detection is selected at all - the target becomes the smallest box
+      enclosing every surviving detection (see `_group_scene_detection`). The
+      normal crop margin and downstream pipeline still apply to that box
+      exactly as they would to a single detection; there is no full-frame
+      fallback here, because a group is still a real, locatable subject.
 
     The single source of truth for subject selection: BirdDetector.detect_best_bird
     and detect_with_all both call this rather than each implementing their own
-    comparison, so the two can never disagree about which box wins.
+    comparison, so the two can never disagree about the crop target.
 
     Returns None for an empty `candidates` (nothing survived filtering),
     mirroring "no detection" everywhere else in this module.
     """
     if not candidates:
         return None
+
+    if len(candidates) >= group_scene_threshold:
+        return _group_scene_detection(candidates)
 
     areas = [(candidate, box_area(candidate.box)) for candidate in candidates]
     largest_area = max(area for _, area in areas)
@@ -406,6 +481,7 @@ class BirdDetector:
         conf_threshold: float = 0.30,
         classes: "dict[int, str] | set[int] | None" = None,
         area_tie_frac: float = DEFAULT_AREA_TIE_FRAC,
+        group_scene_threshold: int = DEFAULT_GROUP_SCENE_THRESHOLD,
     ):
         import torch
         from torchvision.models.detection import (
@@ -418,6 +494,7 @@ class BirdDetector:
         self.conf_threshold = conf_threshold
         self.classes = frozenset(SUPPORTED_ANIMAL_CLASSES if classes is None else classes)
         self.area_tie_frac = area_tie_frac
+        self.group_scene_threshold = group_scene_threshold
         weights = FasterRCNN_ResNet50_FPN_V2_Weights.COCO_V1
         self.model = fasterrcnn_resnet50_fpn_v2(weights=weights).to(device).eval()
 
@@ -449,7 +526,7 @@ class BirdDetector:
                 for box, label, score in zip(boxes, labels, scores)
                 if int(label) in self.classes and score >= self.conf_threshold
             ]
-            best = select_best_detection(accepted, self.area_tie_frac)
+            best = select_best_detection(accepted, self.area_tie_frac, self.group_scene_threshold)
         return best, accepted
 
     def detect_best_bird(self, image_rgb: np.ndarray) -> BirdDetection | None:
@@ -459,9 +536,10 @@ class BirdDetector:
         This is the single source of truth for subject selection: everything
         that needs a box goes through here (or through detect_with_all, which
         this delegates to, so the two entry points always agree). What "best"
-        means is entirely select_best_detection()'s policy - area-dominant,
-        confidence only as a tie-break among near-equal areas; see the module
-        docstring's "Crop selection policy" section.
+        means is entirely select_best_detection()'s policy - area-dominant
+        with confidence as a tie-break below `group_scene_threshold`
+        detections, the enclosing box of the whole group at or above it; see
+        the module docstring's "Crop selection policy" section.
         """
         best, _ = self.detect_with_all(image_rgb)
         return best

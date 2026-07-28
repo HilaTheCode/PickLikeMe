@@ -162,8 +162,12 @@ The detector accepts every COCO animal class — the wildlife targets `bird`,
 whatever its class** — for this archive, the intended subject is almost
 always the biggest animal in frame, and a small but confidently-detected
 animal must not be preferred over it. Confidence only breaks a tie between
-detections whose areas are already close (`--area-tie-frac`, default 10%);
-see `bird_crop.select_best_detection()` for the exact policy. Images with no
+detections whose areas are already close (`--area-tie-frac`, default 10%).
+At `--group-scene-threshold` or more surviving detections (default 10), the
+image is treated as a **group scene** — a flock, herd or colony — and no
+single detection is picked at all: the crop instead tightly encloses the
+whole group, never falling back to the full frame. See
+`bird_crop.select_best_detection()` for the exact policy. Images with no
 supported animal fall back to the full frame. The flags and cache keep their
 historical `bird` names.
 

@@ -377,12 +377,16 @@ def inspect_folder(args) -> None:
         conf_threshold=args.conf_threshold,
         max_side=args.max_side,
         area_tie_frac=args.area_tie_frac,
+        group_scene_threshold=args.group_scene_threshold,
     )
     loader = _build_loader(str(input_folder), args)
     device = resolve_device(args.device)
     print(f"Loading detector on {device} (read-only)...")
     detector = BirdDetector(
-        device=device, conf_threshold=params.conf_threshold, area_tie_frac=params.area_tie_frac
+        device=device,
+        conf_threshold=params.conf_threshold,
+        area_tie_frac=params.area_tie_frac,
+        group_scene_threshold=params.group_scene_threshold,
     )
 
     results: list[PipelineResult] = []
@@ -478,7 +482,10 @@ def inspect_cache(args) -> None:
     device = resolve_device(args.device)
     print(f"Loading detector on {device} to classify detected vs fallback (read-only)...")
     detector = BirdDetector(
-        device=device, conf_threshold=params.conf_threshold, area_tie_frac=params.area_tie_frac
+        device=device,
+        conf_threshold=params.conf_threshold,
+        area_tie_frac=params.area_tie_frac,
+        group_scene_threshold=params.group_scene_threshold,
     )
 
     tagged = classify_pairs(sample, detector, cache_reader)
@@ -520,6 +527,7 @@ def main() -> None:
     parser.add_argument("--conf-threshold", type=float, default=CropParams.conf_threshold, help="Folder mode: detection threshold (match preprocess)")
     parser.add_argument("--max-side", type=int, default=CropParams.max_side, help="Folder mode: crop long-side cap (match preprocess)")
     parser.add_argument("--area-tie-frac", type=float, default=CropParams.area_tie_frac, help="Folder mode: size-tie tolerance for detection selection (match preprocess)")
+    parser.add_argument("--group-scene-threshold", type=int, default=CropParams.group_scene_threshold, help="Folder mode: detections at/above this count crop the whole group (match preprocess)")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default=None, help="Device (default: auto - CUDA if available, else CPU)")
     args = parser.parse_args()
