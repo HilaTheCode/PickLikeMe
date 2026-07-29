@@ -414,21 +414,35 @@ class LightboxMarkupTests(unittest.TestCase):
         self.assertIn("URL.revokeObjectURL", js)
         self.assertIn("evictFarFromCurrent", js)
 
-    def test_ctrl_wheel_navigates_instead_of_zooming(self):
-        """A plain wheel still zooms (onWheel's existing behaviour); Ctrl held
-        down must short-circuit before any scale change, or the two gestures
-        would fight over the same event."""
+    def test_plain_wheel_navigates_and_ctrl_wheel_zooms(self):
+        """A plain wheel is the fast, default gesture for browsing (steps
+        through images); zooming is the deliberate, less frequent action, so
+        it only happens with Ctrl held. The navigate branch must short-
+        circuit before any scale change, or the two gestures would fight
+        over the same event."""
         from picklikeme.review.page import build_js
 
         js = build_js()
         wheel_body = re.search(r"function onWheel\(e\)\{(.*?)\n  \}", js, re.S)
         self.assertIsNotNone(wheel_body, "onWheel not found")
         body = wheel_body.group(1)
-        self.assertIn("e.ctrlKey", body)
+        self.assertIn("!e.ctrlKey", body)
         self.assertIn("next()", body)
         self.assertIn("prev()", body)
-        # The ctrl branch must return before reaching the zoom factor/setScale.
-        self.assertLess(body.index("e.ctrlKey"), body.index("setScale"))
+        # The navigate branch must return before reaching the zoom factor/setScale.
+        self.assertLess(body.index("!e.ctrlKey"), body.index("setScale"))
+
+    def test_overlay_chrome_stays_above_the_image_at_any_zoom(self):
+        """A CSS transform doesn't resize .lb-img-wrap's own layout box, so a
+        zoomed-in image can paint outside it - and img-wrap comes after the
+        top bar, close button and nav buttons in the markup, so without an
+        explicit z-index a zoomed image would paint over and hide them."""
+        from picklikeme.review.page import CSS
+
+        for selector in (".lb-top", ".lb-close", ".lb-nav", ".lb-bottom"):
+            rule = re.search(re.escape(selector) + r"[^{]*\{([^}]*)\}", CSS)
+            self.assertIsNotNone(rule, f"no CSS rule for {selector}")
+            self.assertIn("z-index", rule.group(1), f"{selector} has no z-index to stay above the zoomed image")
 
     def test_exposure_is_a_css_filter_never_a_decision_or_a_network_call(self):
         """The whole point of "display only": adjustExposure()/applyExposure()

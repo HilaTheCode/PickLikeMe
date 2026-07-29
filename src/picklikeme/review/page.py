@@ -136,7 +136,12 @@ font-weight:650;pointer-events:none}
 .lb-badge.auto_selected{background:rgba(16,185,129,.2);color:#6ee7b7;border:1px solid var(--good)}
 .lb-badge.auto_rejected{background:rgba(148,163,184,.15);color:#cbd5e1;border:1px solid #475569}
 .lb-badge.unranked{background:rgba(245,158,11,.18);color:#fcd34d;border:1px solid var(--warn)}
-.lb-close,.lb-nav{position:absolute;border-radius:50%;background:rgba(255,255,255,.08);
+/* z-index:5 on every piece of overlay chrome (close/nav/top bar/bottom bar):
+   a CSS transform doesn't resize .lb-img-wrap's own layout box, so once the
+   image is zoomed past fit it can paint outside that box - and img-wrap
+   comes after this chrome in the markup, so without an explicit z-index the
+   zoomed image would paint over it and hide it. */
+.lb-close,.lb-nav{position:absolute;z-index:5;border-radius:50%;background:rgba(255,255,255,.08);
 border:1px solid rgba(255,255,255,.18);color:#fff;display:flex;align-items:center;justify-content:center;
 cursor:pointer}
 .lb-close:hover,.lb-nav:hover{background:rgba(255,255,255,.2)}
@@ -144,7 +149,7 @@ cursor:pointer}
 .lb-close{top:16px;right:20px;width:38px;height:38px;font-size:20px;line-height:1}
 .lb-nav{top:50%;margin-top:-26px;width:52px;height:52px;font-size:24px}
 .lb-nav.prev{left:16px}.lb-nav.next{right:16px}
-.lb-top{position:absolute;top:0;left:70px;right:70px;padding:16px 0;display:flex;justify-content:center;
+.lb-top{position:absolute;z-index:5;top:0;left:70px;right:70px;padding:16px 0;display:flex;justify-content:center;
 align-items:center;gap:16px;font-size:12.5px;color:#cbd5e1;flex-wrap:wrap;font-variant-numeric:tabular-nums}
 .lb-exp{display:flex;align-items:center;gap:6px}
 .lb-exp button{width:22px;height:22px;padding:0;border-radius:50%;font-size:14px;line-height:1;
@@ -154,7 +159,7 @@ background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.25);color:#f
 .lb-save{background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.25);color:#e2e8f0;
 border-radius:7px;padding:4px 10px;font-size:12px;cursor:pointer}
 .lb-save:hover{background:rgba(255,255,255,.2)}
-.lb-bottom{position:absolute;left:0;right:0;bottom:0;display:flex;flex-direction:column;
+.lb-bottom{position:absolute;z-index:5;left:0;right:0;bottom:0;display:flex;flex-direction:column;
 align-items:center;gap:10px;padding:12px 16px 18px;background:linear-gradient(to top,rgba(0,0,0,.5),transparent)}
 .lb-acts{display:flex;gap:12px}
 .lb-acts button{font-size:15px;padding:11px 28px;border-radius:10px;font-weight:650;
@@ -637,10 +642,12 @@ const Lightbox = (function(){
   function onWheel(e){
     if(!current()) return;
     e.preventDefault();
-    // Ctrl+wheel steps through images instead of zooming, so a reviewer can
-    // flip through a shoot without leaving the mouse - down advances, up goes
-    // back, matching the direction wheel-scrolling a page already implies.
-    if(e.ctrlKey){
+    // A plain wheel steps through images - the fast, default gesture for
+    // browsing a shoot without leaving the mouse. Zooming is the deliberate,
+    // less frequent action, so it only happens with Ctrl held (which also
+    // stops the browser's own Ctrl+wheel page-zoom, courtesy of the
+    // preventDefault above).
+    if(!e.ctrlKey){
       if(e.deltaY > 0) next();
       else if(e.deltaY < 0) prev();
       return;
