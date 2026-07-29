@@ -137,6 +137,20 @@ class InvalidReviewDecision(ValueError):
     """Raised for a review decision outside {keep, reject}."""
 
 
+# Why a manual Keep/Reject overrides the model - optional, and only ever
+# meaningful alongside a decision (see set_review_decision). Fixed, like the
+# decision itself, rather than config-driven: these two are eye-visibility
+# calls the review workflow itself cares about, not a photographer's own
+# vocabulary the way an annotation field's values are.
+REVIEW_REASON_EYES_NOT_SEEN = "eyes_not_seen"
+REVIEW_REASON_CLEAR_EYES_SEEN = "clear_eyes_seen"
+REVIEW_REASONS: frozenset[str] = frozenset({REVIEW_REASON_EYES_NOT_SEEN, REVIEW_REASON_CLEAR_EYES_SEEN})
+
+
+class InvalidReviewReason(ValueError):
+    """Raised for a review reason outside REVIEW_REASONS (and not None)."""
+
+
 def validate_field(fields_config: AnnotationFieldsConfig, field_id: str, value_id: str | None) -> str | None:
     """Check one field against the configured vocabulary. None/blank means
     'not set'."""
@@ -431,6 +445,7 @@ class AnnotationStore:
                 CREATE TABLE IF NOT EXISTS review_decisions (
                     image_hash TEXT PRIMARY KEY,
                     decision   TEXT NOT NULL,
+                    reason     TEXT,
                     image_path TEXT NOT NULL,
                     filename   TEXT NOT NULL,
                     updated_at TEXT NOT NULL
@@ -461,6 +476,9 @@ class AnnotationStore:
         ):
             sql_type = "TEXT"
             self._ensure_column("annotations_v2", column, sql_type)
+        # review_decisions predates the reason column - a database from before
+        # that feature has the table but not the column.
+        self._ensure_column("review_decisions", "reason", "TEXT")
         self.migration = self._migrate_v1()
         self.legacy_field_migration = self._migrate_legacy_fields()
         with self._conn:
@@ -921,30 +939,40 @@ class AnnotationStore:
     # false-negative/false-positive breakdowns those statistics exist to keep
     # trustworthy. The two are different facts with different lifetimes.
 
-    def set_review_decision(self, image_path: str | Path, decision: str) -> str:
-        """Record a manual Keep or Reject. Raises IdentityUnavailable.
+    def set_review_decision(
+        self, image_path: str | Path, decision: str, *, reason: str | None = None
+    ) -> str:
+        """Record a manual Keep or Reject, with an optional reason for the
+        override. Raises IdentityUnavailable.
 
         Keyed on content identity, so the decision follows the image through
-        the rename that `organize` performs moments later.
+        the rename that `organize` performs moments later. `reason` fully
+        replaces whatever reason (if any) this image already had - there is
+        no partial update, matching the decision it is meaningless without.
         """
         if decision not in REVIEW_DECISIONS:
             raise InvalidReviewDecision(
                 f"decision must be one of {sorted(REVIEW_DECISIONS)}, got {decision!r}"
+            )
+        if reason is not None and reason not in REVIEW_REASONS:
+            raise InvalidReviewReason(
+                f"reason must be one of {sorted(REVIEW_REASONS)} or null, got {reason!r}"
             )
         digest = self._identity_of(image_path)  # raises IdentityUnavailable
         path = Path(image_path)
         with self._conn:
             self._conn.execute(
                 """
-                INSERT INTO review_decisions (image_hash, decision, image_path, filename, updated_at)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO review_decisions (image_hash, decision, reason, image_path, filename, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
                 ON CONFLICT(image_hash) DO UPDATE SET
                     decision   = excluded.decision,
+                    reason     = excluded.reason,
                     image_path = excluded.image_path,
                     filename   = excluded.filename,
                     updated_at = excluded.updated_at
                 """,
-                (digest, decision, str(path), path.name, _now()),
+                (digest, decision, reason, str(path), path.name, _now()),
             )
         return digest
 
@@ -966,7 +994,7 @@ class AnnotationStore:
         that miss - see picklikeme.review.session.
         """
         rows = self._conn.execute(
-            "SELECT image_hash, decision, image_path, filename, updated_at FROM review_decisions"
+            "SELECT image_hash, decision, reason, image_path, filename, updated_at FROM review_decisions"
         ).fetchall()
         return [dict(row) for row in rows]
 

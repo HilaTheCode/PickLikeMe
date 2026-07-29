@@ -732,6 +732,66 @@ class ReviewDecisionTests(unittest.TestCase):
                     store.set_review_decision(path, "maybe")
                 self.assertEqual(store.review_decision_count(), 0)
 
+    def test_a_decision_can_carry_a_reason(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = make_image(Path(tmp) / "a.NEF")
+            with store_in(tmp) as store:
+                store.set_review_decision(path, "reject", reason="eyes_not_seen")
+                rows = store.review_decisions()
+            self.assertEqual(rows[0]["reason"], "eyes_not_seen")
+
+    def test_a_reason_is_optional(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = make_image(Path(tmp) / "a.NEF")
+            with store_in(tmp) as store:
+                store.set_review_decision(path, "keep")
+                self.assertIsNone(store.review_decisions()[0]["reason"])
+
+    def test_an_invalid_reason_is_refused_and_nothing_is_recorded(self):
+        """Validated before either the decision or the reason is written, so a
+        bad reason cannot leave a decision recorded with no explanation."""
+        from picklikeme.analyzer.annotations import InvalidReviewReason
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = make_image(Path(tmp) / "a.NEF")
+            with store_in(tmp) as store:
+                with self.assertRaises(InvalidReviewReason):
+                    store.set_review_decision(path, "keep", reason="squinting")
+                self.assertEqual(store.review_decision_count(), 0)
+
+    def test_replacing_a_decision_without_a_reason_drops_the_old_one(self):
+        """reason is a full replace, not a merge - matching the decision it
+        has no meaning apart from."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = make_image(Path(tmp) / "a.NEF")
+            with store_in(tmp) as store:
+                store.set_review_decision(path, "reject", reason="eyes_not_seen")
+                store.set_review_decision(path, "keep")
+                self.assertIsNone(store.review_decisions()[0]["reason"])
+
+    def test_an_existing_database_without_the_reason_column_is_retrofitted(self):
+        """A database created before this feature has the table but not the
+        column - CREATE TABLE IF NOT EXISTS alone would never add it."""
+        import sqlite3
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "kb" / "fn.db"
+            db_path.parent.mkdir(parents=True, exist_ok=True)
+            conn = sqlite3.connect(str(db_path))
+            conn.execute(
+                """CREATE TABLE review_decisions (
+                    image_hash TEXT PRIMARY KEY, decision TEXT NOT NULL,
+                    image_path TEXT NOT NULL, filename TEXT NOT NULL, updated_at TEXT NOT NULL
+                )"""
+            )
+            conn.commit()
+            conn.close()
+
+            path = make_image(Path(tmp) / "a.NEF")
+            with AnnotationStore(db_path) as store:
+                store.set_review_decision(path, "keep", reason="clear_eyes_seen")
+                self.assertEqual(store.review_decisions()[0]["reason"], "clear_eyes_seen")
+
     def test_a_decision_follows_a_renamed_file(self):
         """Keyed on content identity, like every other record here - the file
         is about to be renamed by arranging, moments after the decision."""

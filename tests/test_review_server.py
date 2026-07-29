@@ -241,6 +241,35 @@ class DecisionEndpointTests(ReviewServerTestCase):
         self.assertEqual(ctx.exception.code, 400)
         self.assertEqual(self.store.review_decision_count(), 0)
 
+    def test_a_reason_is_saved_alongside_the_decision(self):
+        worst = str(self.images[-1])
+
+        payload = self.post(
+            "/api/review/decision", {"image_path": worst, "decision": "reject", "reason": "eyes_not_seen"}
+        )
+
+        image = next(i for i in payload["state"]["images"] if i["image_path"] == worst)
+        self.assertEqual(image["reason"], "eyes_not_seen")
+        self.assertEqual(self.store.review_decisions()[0]["reason"], "eyes_not_seen")
+
+    def test_an_invalid_reason_is_refused_and_nothing_is_stored(self):
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            self.post(
+                "/api/review/decision",
+                {"image_path": str(self.images[0]), "decision": "keep", "reason": "squinting"},
+            )
+
+        self.assertEqual(ctx.exception.code, 400)
+        self.assertEqual(self.store.review_decision_count(), 0)
+
+    def test_clearing_a_decision_clears_its_reason_too(self):
+        best = str(self.images[0])
+        self.post("/api/review/decision", {"image_path": best, "decision": "keep", "reason": "clear_eyes_seen"})
+
+        self.post("/api/review/decision", {"image_path": best, "decision": None})
+
+        self.assertEqual(self.store.review_decision_count(), 0)
+
 
 class KeepPercentEndpointTests(ReviewServerTestCase):
     def test_changing_the_percentage_reclassifies(self):
@@ -385,7 +414,7 @@ class LightboxMarkupTests(unittest.TestCase):
         status reporting can never drift between the two surfaces."""
         from picklikeme.review.page import build_js
 
-        self.assertIn("await decide(image.image_path, action)", build_js())
+        self.assertIn("await decide(image.image_path, action, q('#lb-reason').value || null)", build_js())
 
     def test_the_dialog_element_is_used_for_native_escape_and_focus_handling(self):
         """Reuses the platform's own modal semantics (already established by
@@ -540,6 +569,74 @@ class LightboxMarkupTests(unittest.TestCase):
 
         self.assertIn('id="lb-save-jpeg"', build_page())
         self.assertIn("addEventListener('click', saveJpeg)", build_js())
+
+
+class ReasonFieldTests(unittest.TestCase):
+    """The override-reason dropdown next to Keep/Reject - structural checks
+    only, same rationale as LightboxMarkupTests: the interactive behaviour is
+    verified separately by executing the real generated JS in Node."""
+
+    def test_both_reasons_are_offered_as_options(self):
+        from picklikeme.review.page import build_page
+
+        html = build_page()
+        self.assertIn('id="lb-reason"', html)
+        self.assertIn('value="eyes_not_seen"', html)
+        self.assertIn("Eyes not seen", html)
+        self.assertIn('value="clear_eyes_seen"', html)
+        self.assertIn("Clear Eyes Seen", html)
+        # A reason is optional - blank must be a real, selectable option, not
+        # just whatever <select> defaults to.
+        self.assertIn('value=""', html)
+
+    def test_deciding_from_the_lightbox_sends_whatever_the_dropdown_currently_shows(self):
+        """The dropdown, not the last-saved reason - so a reason picked right
+        before clicking Keep/Reject is the one that gets sent, and clicking
+        with nothing picked sends none."""
+        from picklikeme.review.page import build_js
+
+        js = build_js()
+        self.assertIn(
+            "await decide(image.image_path, action, q('#lb-reason').value || null)", js
+        )
+
+    def test_changing_the_reason_after_a_decision_updates_it_without_re_deciding(self):
+        """onReasonChange must call postDecision directly - reusing decide()
+        here would misread "same decision again" as the toggle-off gesture
+        and clear the decision instead of just updating its reason."""
+        from picklikeme.review.page import build_js
+
+        js = build_js()
+        handler = re.search(r"async function onReasonChange\(\)\{(.*?)\n  \}", js, re.S)
+        self.assertIsNotNone(handler, "onReasonChange not found")
+        body = handler.group(1)
+        self.assertIn("if(!image || !image.decision) return", body)
+        self.assertIn("postDecision(image.image_path, image.decision, q('#lb-reason').value || null)", body)
+        self.assertNotIn("await decide(", body, "must not go through decide()'s toggle logic")
+
+    def test_the_dropdown_resets_to_the_current_image_s_own_reason_on_every_navigation(self):
+        """Otherwise a reason picked for one image (even if never saved,
+        because Keep/Reject was never clicked) would leak onto the next one
+        just by browsing past it."""
+        from picklikeme.review.page import build_js
+
+        js = build_js()
+        self.assertIn("function updateReasonSelect(image)", js)
+        self.assertIn("updateReasonSelect(image);", js, "must run on every renderAll(), not just on decide")
+        select_fn = re.search(r"function updateReasonSelect\(image\)\{(.*?)\n  \}", js, re.S)
+        self.assertIsNotNone(select_fn)
+        self.assertIn("(image && image.reason) || ''", select_fn.group(1))
+
+    def test_reason_is_never_used_by_the_gallery_cards_only_the_lightbox(self):
+        """The grid has no reason control - a card's Keep/Reject click must
+        not silently invent one."""
+        from picklikeme.review.page import build_js
+
+        js = build_js()
+        card_click_binding = re.search(
+            r"b\.addEventListener\('click', \(\) => decide\(b\.dataset\.path, b\.dataset\.act\)\);", js
+        )
+        self.assertIsNotNone(card_click_binding, "gallery card decide() call changed shape unexpectedly")
 
 
 class GalleryFilterTests(unittest.TestCase):

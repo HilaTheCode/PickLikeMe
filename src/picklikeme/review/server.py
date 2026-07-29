@@ -24,7 +24,7 @@ from http.server import HTTPServer, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from ..analyzer.annotations import AnnotationStore, InvalidReviewDecision
+from ..analyzer.annotations import AnnotationStore, InvalidReviewDecision, InvalidReviewReason
 from ..analyzer.server import HOST, AnnotationRequestHandler
 from ..identity import IdentityUnavailable
 from .page import build_page
@@ -209,7 +209,7 @@ class ReviewRequestHandler(AnnotationRequestHandler):
                 },
                 status=409,
             )
-        except (InvalidReviewDecision, KeyError, ValueError) as exc:
+        except (InvalidReviewDecision, InvalidReviewReason, KeyError, ValueError) as exc:
             self._send_json({"error": str(exc)}, status=400)
         except Exception as exc:  # noqa: BLE001 - reported to the UI, never fatal
             logger.exception("Review request failed")
@@ -222,7 +222,10 @@ class ReviewRequestHandler(AnnotationRequestHandler):
         decision = payload.get("decision")
         if decision is not None and not isinstance(decision, str):
             raise ValueError("decision must be 'keep', 'reject', or null")
-        self.session.set_decision(image_path, decision)
+        reason = payload.get("reason")
+        if reason is not None and not isinstance(reason, str):
+            raise ValueError("reason must be a string or null")
+        self.session.set_decision(image_path, decision, reason=reason)
         self._send_json(self._state_payload())
 
     def _post_keep_percent(self, payload: dict) -> None:

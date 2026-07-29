@@ -176,6 +176,48 @@ class ManualOverrideTests(SessionTestCase):
         with self.assertRaises(KeyError):
             session.set_decision(str(self.root / "elsewhere.jpg"), "keep")
 
+    def test_a_reason_travels_with_the_override(self):
+        shoot, images, _ = build_shoot(self.root, ranked=10)
+        session = self.session(shoot, keep_percent=10)
+        worst = str(images[-1])
+
+        session.set_decision(worst, "reject", reason="eyes_not_seen")
+
+        image = next(i for i in session.images if i.image_path == worst)
+        self.assertEqual(image.reason, "eyes_not_seen")
+        self.assertEqual(image.as_dict("manual_reject")["reason"], "eyes_not_seen")
+
+    def test_a_reason_is_optional_and_defaults_to_none(self):
+        shoot, images, _ = build_shoot(self.root, ranked=3)
+        session = self.session(shoot)
+        path = str(images[0])
+
+        session.set_decision(path, "keep")
+
+        image = next(i for i in session.images if i.image_path == path)
+        self.assertIsNone(image.reason)
+
+    def test_clearing_a_decision_clears_its_reason_too(self):
+        shoot, images, _ = build_shoot(self.root, ranked=3)
+        session = self.session(shoot)
+        path = str(images[0])
+        session.set_decision(path, "keep", reason="clear_eyes_seen")
+
+        session.set_decision(path, None)
+
+        image = next(i for i in session.images if i.image_path == path)
+        self.assertIsNone(image.reason)
+
+    def test_a_reason_is_persisted_immediately_like_the_decision_it_belongs_to(self):
+        shoot, images, _ = build_shoot(self.root, ranked=6)
+        session = self.session(shoot, keep_percent=25)
+        session.set_decision(str(images[4]), "reject", reason="eyes_not_seen")
+
+        reopened = self.session(shoot, keep_percent=25)
+
+        image = next(i for i in reopened.images if i.image_path == str(images[4]))
+        self.assertEqual(image.reason, "eyes_not_seen")
+
 
 class MissingDataTests(SessionTestCase):
     def test_an_image_absent_from_the_ranking_still_appears(self):
@@ -327,6 +369,19 @@ class IdentityRecoveryTests(SessionTestCase):
         reopened = self.session(shoot, keep_percent=25)
 
         self.assertEqual(reopened.reconcile_by_identity(), 0)
+
+    def test_a_reason_is_recovered_along_with_the_decision_it_belongs_to(self):
+        shoot, images, _ = build_shoot(self.root, ranked=4)
+        session = self.session(shoot, keep_percent=25)
+        session.set_decision(str(images[3]), "keep", reason="clear_eyes_seen")
+
+        moved = shoot / "renamed_by_hand.jpg"
+        images[3].rename(moved)
+
+        reopened = self.session(shoot, keep_percent=25)
+        reopened.reconcile_by_identity()
+
+        self.assertEqual(reopened._image_for(str(moved)).reason, "clear_eyes_seen")
 
 
 if __name__ == "__main__":
