@@ -145,7 +145,15 @@ cursor:pointer}
 .lb-nav{top:50%;margin-top:-26px;width:52px;height:52px;font-size:24px}
 .lb-nav.prev{left:16px}.lb-nav.next{right:16px}
 .lb-top{position:absolute;top:0;left:70px;right:70px;padding:16px 0;display:flex;justify-content:center;
-gap:16px;font-size:12.5px;color:#cbd5e1;flex-wrap:wrap;font-variant-numeric:tabular-nums}
+align-items:center;gap:16px;font-size:12.5px;color:#cbd5e1;flex-wrap:wrap;font-variant-numeric:tabular-nums}
+.lb-exp{display:flex;align-items:center;gap:6px}
+.lb-exp button{width:22px;height:22px;padding:0;border-radius:50%;font-size:14px;line-height:1;
+background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.25);color:#fff;cursor:pointer}
+.lb-exp button:hover{background:rgba(255,255,255,.2)}
+.lb-exp .val{min-width:56px;text-align:center}
+.lb-save{background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.25);color:#e2e8f0;
+border-radius:7px;padding:4px 10px;font-size:12px;cursor:pointer}
+.lb-save:hover{background:rgba(255,255,255,.2)}
 .lb-bottom{position:absolute;left:0;right:0;bottom:0;display:flex;flex-direction:column;
 align-items:center;gap:10px;padding:12px 16px 18px;background:linear-gradient(to top,rgba(0,0,0,.5),transparent)}
 .lb-acts{display:flex;gap:12px}
@@ -341,11 +349,22 @@ const Lightbox = (function(){
   const PRELOAD_RADIUS = 2;   // neighbours on each side kept decoded and warm
   const FILM_RADIUS = 8;      // neighbours on each side shown in the filmstrip
 
+  const EXPOSURE_STEP = 1 / 3;  // EV per click
+  const EXPOSURE_MIN_STEPS = -9;  // -3.0 EV
+  const EXPOSURE_MAX_STEPS = 9;   // +3.0 EV
+
   let index = -1;
   let scale = 1;
   let pan = {x: 0, y: 0};
   let drag = null;            // {startX,startY,panX,panY,moved} while dragging
   let suppressClick = false;  // true for the click a drag-release also fires
+  // Steps, not EV directly: an integer avoids float drift across repeated
+  // +-1/3 additions. Deliberately NOT reset by open()/go()/resetView() - it
+  // is meant to stay applied while browsing, like FastRawViewer's exposure
+  // preview, until the reviewer dials it back down themselves. Display only:
+  // never read by decide()/arrange(), never sent to the server, never
+  // touches the RAW file.
+  let exposureSteps = 0;
   // path -> blob object URL for the full-size decode. Bounded to a small
   // window around the current index and revoked on eviction, so a session of
   // thousands of images cannot leak memory. This exists at all because
@@ -400,8 +419,13 @@ const Lightbox = (function(){
     updateZoomIndicator();
     updateDecisionButtons(image);
     updateBadge(image);
+    updateSaveButton(image);
     renderImage(image);
     renderFilmstrip();
+  }
+
+  function updateSaveButton(image){
+    q('#lb-save-jpeg').disabled = !image || !!image.missing_file;
   }
 
   function updateBadge(image){
@@ -534,6 +558,46 @@ const Lightbox = (function(){
     if(!wasLast) next();
   }
 
+  // -- exposure (display only) -----------------------------------------------
+  // A CSS brightness() filter on the <img> itself - nothing is decoded,
+  // re-rendered or written anywhere. brightness(2^EV) approximates a stop of
+  // exposure well enough to judge a dark or bright frame at a glance, which
+  // is the only job this has: it is not colour-accurate RAW development.
+
+  function applyExposure(){
+    const ev = exposureSteps * EXPOSURE_STEP;
+    q('#lb-img').style.filter = exposureSteps === 0 ? '' : 'brightness(' + Math.pow(2, ev).toFixed(4) + ')';
+    q('#lb-exp-value').textContent = (ev >= 0 ? '+' : '') + ev.toFixed(1) + ' EV';
+    q('#lb-exp-down').disabled = exposureSteps <= EXPOSURE_MIN_STEPS;
+    q('#lb-exp-up').disabled = exposureSteps >= EXPOSURE_MAX_STEPS;
+  }
+
+  function adjustExposure(direction){
+    exposureSteps = Math.max(EXPOSURE_MIN_STEPS, Math.min(EXPOSURE_MAX_STEPS, exposureSteps + direction));
+    applyExposure();
+  }
+
+  // -- save as JPEG -----------------------------------------------------------
+  // A real navigation to a same-origin URL, not a fetch: the server answers
+  // with Content-Disposition: attachment (see review/server.py's
+  // _serve_save_jpeg), so the browser's own download handling takes over -
+  // its own Save As dialog or download folder, whichever the browser is
+  // configured for. Deliberately does not bake the exposure preview above
+  // into the file: that is a display-only adjustment, and a save is meant to
+  // be the camera's own rendering, not an edit.
+
+  function saveJpeg(){
+    const image = current();
+    if(!image || image.missing_file) return;
+    const a = document.createElement('a');
+    a.href = 'save-jpeg?path=' + encodeURIComponent(image.image_path);
+    a.download = '';
+    a.rel = 'noopener';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+  }
+
   // -- zoom & pan -----------------------------------------------------------
 
   function setScale(newScale, anchor){
@@ -636,6 +700,10 @@ const Lightbox = (function(){
     q('#lb-next').addEventListener('click', next);
     q('#lb-keep').addEventListener('click', () => decideAndAdvance('keep'));
     q('#lb-reject').addEventListener('click', () => decideAndAdvance('reject'));
+    q('#lb-exp-down').addEventListener('click', () => adjustExposure(-1));
+    q('#lb-exp-up').addEventListener('click', () => adjustExposure(1));
+    q('#lb-save-jpeg').addEventListener('click', saveJpeg);
+    applyExposure();  // paints the initial "+0.0 EV" label and button state once
     q('#lb-stage').addEventListener('click', onStageClick);
     q('#lb-stage').addEventListener('wheel', onWheel, {passive: false});
     q('#lb-img').addEventListener('dblclick', onDblClick);
@@ -850,6 +918,13 @@ def build_page(title: str = "PickLikeMe review") -> str:
       <span id="lb-filename"></span>
       <span id="lb-score"></span>
       <span id="lb-zoom">Fit</span>
+      <span class="lb-exp" id="lb-exp" title="Display only - never written to the RAW file or saved anywhere">
+        <span aria-hidden="true">&#9728;</span>
+        <button id="lb-exp-down" type="button" aria-label="Decrease exposure">&minus;</button>
+        <span class="val" id="lb-exp-value">+0.0 EV</span>
+        <button id="lb-exp-up" type="button" aria-label="Increase exposure">+</button>
+      </span>
+      <button class="lb-save" id="lb-save-jpeg" type="button" title="Save the camera's own JPEG for sharing">Save JPEG</button>
     </div>
     <button class="lb-close" id="lb-close" aria-label="Close" title="Close (Esc)">&times;</button>
     <button class="lb-nav prev" id="lb-prev" aria-label="Previous image" title="Previous">&#8249;</button>

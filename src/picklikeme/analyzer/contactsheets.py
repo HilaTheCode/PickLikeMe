@@ -86,6 +86,21 @@ def _thumbnail_cache_path(cache_dir: Path, source: str, size: int) -> Path:
     return cache_dir / digest[:2] / f"{digest}.jpg"
 
 
+def _extract_thumb(raw):
+    """The RAW's embedded thumbnail, or None if it has none rawpy can read.
+
+    Shared by `load_source_image` (which decodes it into a frame to work
+    with) and `export_jpeg_bytes` (which, when the thumbnail is already a
+    JPEG, wants the camera's own bytes untouched rather than a decode).
+    """
+    import rawpy
+
+    try:
+        return raw.extract_thumb()
+    except (rawpy.LibRawNoThumbnailError, rawpy.LibRawUnsupportedThumbnailError):
+        return None
+
+
 def load_source_image(image_path: str) -> Image.Image:
     """The whole original frame, as cheaply as the format allows.
 
@@ -109,9 +124,8 @@ def load_source_image(image_path: str) -> Image.Image:
     import rawpy
 
     with rawpy.imread(str(source)) as raw:
-        try:
-            thumb = raw.extract_thumb()
-        except (rawpy.LibRawNoThumbnailError, rawpy.LibRawUnsupportedThumbnailError):
+        thumb = _extract_thumb(raw)
+        if thumb is None:
             # No embedded preview: pay for the demosaic rather than drop the
             # image from the report. Rare, and only for the images a report
             # actually shows.
@@ -122,6 +136,46 @@ def load_source_image(image_path: str) -> Image.Image:
 
             return Image.open(io.BytesIO(thumb.data)).convert("RGB")
         return Image.fromarray(thumb.data).convert("RGB")
+
+
+def export_jpeg_bytes(image_path: str) -> bytes:
+    """The best available JPEG for `image_path`, extracted as cheaply as the
+    format allows - never a RAW development pipeline.
+
+    - Already a JPEG: its own bytes, unchanged.
+    - A RAW with an embedded JPEG thumbnail: the camera's own bytes, not a
+      decode-then-recompress of them (unlike `/preview`, which always goes
+      through PIL because it also has to serve the demosaic fallback through
+      the same code path). This is what makes "Save as JPEG" both instant and
+      indistinguishable from the camera's own rendering.
+    - Anything else (a RAW with no embedded thumbnail, or a non-JPEG image
+      format): `load_source_image`'s own fallback, re-encoded.
+
+    Used by review/server.py's `/save-jpeg` - a convenience export for
+    sharing, not a step toward RAW editing.
+    """
+    source = Path(image_path)
+    if not source.exists():
+        raise FileNotFoundError(image_path)
+
+    suffix = source.suffix.lower()
+    if suffix in {".jpg", ".jpeg"}:
+        return source.read_bytes()
+
+    if suffix not in STANDARD_IMAGE_SUFFIXES:
+        import rawpy
+
+        with rawpy.imread(str(source)) as raw:
+            thumb = _extract_thumb(raw)
+        if thumb is not None and thumb.format == rawpy.ThumbFormat.JPEG:
+            return thumb.data
+
+    import io
+
+    image = load_source_image(image_path)
+    buffer = io.BytesIO()
+    image.save(buffer, format="JPEG", quality=95)
+    return buffer.getvalue()
 
 
 def build_thumbnail(image_path: str, size: int, cache_dir: Path) -> Path | None:

@@ -314,6 +314,36 @@ class ClickThroughToFullSizeTests(ReviewServerTestCase):
         self.assertEqual(ctx.exception.code, 403)
 
 
+class SaveJpegEndpointTests(ReviewServerTestCase):
+    """The Lightbox's "Save JPEG" button - a download, not a preview: the
+    response must carry Content-Disposition: attachment so the browser's own
+    Save As / download handling takes over, and it must respect the same
+    dataset confinement every other path-taking endpoint has."""
+
+    def test_the_response_is_offered_as_a_download_not_rendered_inline(self):
+        url = "/save-jpeg?path=" + quote(str(self.images[0]), safe="")
+        with urllib.request.urlopen(self.base + url) as response:
+            self.assertEqual(response.headers["Content-Type"], "image/jpeg")
+            self.assertIn("attachment", response.headers["Content-Disposition"])
+            self.assertIn(".jpg", response.headers["Content-Disposition"])
+            data = response.read()
+        self.assertGreater(len(data), 0)
+
+    def test_it_is_confined_to_the_reviewed_folder(self):
+        secret = self.root / "secret.jpg"
+        Image.fromarray(np.zeros((8, 8, 3), dtype=np.uint8)).save(secret)
+
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            urllib.request.urlopen(self.base + "/save-jpeg?path=" + quote(str(secret), safe=""))
+        self.assertEqual(ctx.exception.code, 403)
+
+    def test_a_missing_file_is_a_clean_404(self):
+        missing = self.shoot / "gone.jpg"
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            urllib.request.urlopen(self.base + "/save-jpeg?path=" + quote(str(missing), safe=""))
+        self.assertEqual(ctx.exception.code, 404)
+
+
 class LightboxMarkupTests(unittest.TestCase):
     """Structural checks on the Lightbox module, with no server involved.
 
@@ -399,6 +429,53 @@ class LightboxMarkupTests(unittest.TestCase):
         self.assertIn("prev()", body)
         # The ctrl branch must return before reaching the zoom factor/setScale.
         self.assertLess(body.index("e.ctrlKey"), body.index("setScale"))
+
+    def test_exposure_is_a_css_filter_never_a_decision_or_a_network_call(self):
+        """The whole point of "display only": adjustExposure()/applyExposure()
+        must never call decide(), api(), or fetch - if it ever needed to, that
+        would mean exposure had started writing something down somewhere."""
+        from picklikeme.review.page import build_js
+
+        js = build_js()
+        exposure_block = re.search(
+            r"function applyExposure\(\)\{(.*?)\n  \}\n\n  function adjustExposure",
+            js,
+            re.S,
+        )
+        self.assertIsNotNone(exposure_block, "applyExposure not found")
+        body = exposure_block.group(1)
+        self.assertIn("style.filter", body)
+        self.assertIn("brightness(", body)
+        for forbidden in ("fetch(", "api(", "decide(", "PLM.state ="):
+            self.assertNotIn(forbidden, body)
+
+    def test_exposure_is_clamped_to_plus_minus_three_ev(self):
+        from picklikeme.review.page import build_js
+
+        js = build_js()
+        self.assertIn("EXPOSURE_MIN_STEPS = -9", js)
+        self.assertIn("EXPOSURE_MAX_STEPS = 9", js)
+
+    def test_save_jpeg_triggers_a_real_download_not_a_fetch(self):
+        """A same-origin navigation, not fetch()+blob: the server answers with
+        Content-Disposition: attachment (see review/server.py), so the
+        browser's own Save As / download handling does the actual saving -
+        this only has to point it at the right URL."""
+        from picklikeme.review.page import build_js
+
+        js = build_js()
+        save_block = re.search(r"function saveJpeg\(\)\{(.*?)\n  \}", js, re.S)
+        self.assertIsNotNone(save_block, "saveJpeg not found")
+        body = save_block.group(1)
+        self.assertIn("'save-jpeg?path=' + encodeURIComponent(image.image_path)", body)
+        self.assertIn("a.click()", body)
+        self.assertNotIn("fetch(", body)
+
+    def test_save_jpeg_button_is_wired_and_present_in_the_markup(self):
+        from picklikeme.review.page import build_js, build_page
+
+        self.assertIn('id="lb-save-jpeg"', build_page())
+        self.assertIn("addEventListener('click', saveJpeg)", build_js())
 
 
 class GalleryFilterTests(unittest.TestCase):

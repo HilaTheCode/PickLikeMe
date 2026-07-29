@@ -117,6 +117,40 @@ class ReviewRequestHandler(AnnotationRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _serve_save_jpeg(self) -> None:
+        """The currently-viewed image as a downloadable JPEG.
+
+        Not a preview: the response carries `Content-Disposition: attachment`
+        so the browser's own download/Save As handling takes over rather than
+        rendering it inline, and the bytes come from `export_jpeg_bytes` -
+        the camera's own embedded JPEG where one exists, so this is a share-
+        ready copy, not a step toward RAW development.
+        """
+        target = self._within_dataset(self._query_path())
+        if target is None:
+            return
+        if not target.is_file():
+            self._send_json({"error": "file not found (has it moved?)"}, status=404)
+            return
+
+        from ..analyzer.contactsheets import export_jpeg_bytes
+
+        try:
+            data = export_jpeg_bytes(str(target))
+        except Exception as exc:  # noqa: BLE001 - reported to the UI, never a crash
+            logger.warning("Could not export a JPEG for %s: %s", target, exc)
+            self._send_json({"error": f"could not export a JPEG: {exc}"}, status=500)
+            return
+
+        filename = target.with_suffix(".jpg").name
+        self.send_response(200)
+        self.send_header("Content-Type", "image/jpeg")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(data)
+
     def do_GET(self) -> None:  # noqa: N802 - stdlib signature
         route = urlparse(self.path).path
         if route in ("/", "/review.html", "/index.html"):
@@ -124,6 +158,9 @@ class ReviewRequestHandler(AnnotationRequestHandler):
             return
         if route == "/thumb":
             self._serve_thumbnail()
+            return
+        if route == "/save-jpeg":
+            self._serve_save_jpeg()
             return
         if route == "/api/review/state":
             self._send_json(self._state_payload())
