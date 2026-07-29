@@ -384,6 +384,58 @@ class LightboxMarkupTests(unittest.TestCase):
         self.assertIn("URL.revokeObjectURL", js)
         self.assertIn("evictFarFromCurrent", js)
 
+    def test_ctrl_wheel_navigates_instead_of_zooming(self):
+        """A plain wheel still zooms (onWheel's existing behaviour); Ctrl held
+        down must short-circuit before any scale change, or the two gestures
+        would fight over the same event."""
+        from picklikeme.review.page import build_js
+
+        js = build_js()
+        wheel_body = re.search(r"function onWheel\(e\)\{(.*?)\n  \}", js, re.S)
+        self.assertIsNotNone(wheel_body, "onWheel not found")
+        body = wheel_body.group(1)
+        self.assertIn("e.ctrlKey", body)
+        self.assertIn("next()", body)
+        self.assertIn("prev()", body)
+        # The ctrl branch must return before reaching the zoom factor/setScale.
+        self.assertLess(body.index("e.ctrlKey"), body.index("setScale"))
+
+
+class GalleryFilterTests(unittest.TestCase):
+    """Structural checks for the Selected/Rejected/All filter, with no server
+    involved - same rationale as LightboxMarkupTests: the interactive part is
+    covered by the uncommitted Node harness, this covers the wiring."""
+
+    def test_filter_buttons_exist_for_all_selected_and_rejected(self):
+        from picklikeme.review.page import build_page
+
+        html = build_page()
+        self.assertIn('data-filter="all"', html)
+        self.assertIn('data-filter="selected"', html)
+        self.assertIn('data-filter="rejected"', html)
+
+    def test_filter_buttons_are_wired_to_set_filter(self):
+        from picklikeme.review.page import build_js
+
+        js = build_js()
+        self.assertIn("querySelectorAll('.filter')", js)
+        self.assertIn("setFilter(b.dataset.filter)", js)
+
+    def test_the_gallery_and_the_lightbox_share_one_classification_and_one_filtered_list(self):
+        """cardClass() is the single source of truth for what counts as
+        selected/rejected (it is also what colours a card's border), and
+        visibleImages() is what both render() and the Lightbox's navigation
+        read - so a card can never appear under a filter its own border colour
+        disagrees with, and the viewer can never step outside what is on
+        screen."""
+        from picklikeme.review.page import build_js
+
+        js = build_js()
+        self.assertIn("function cardClass(image)", js)
+        self.assertIn("const cls = cardClass(image);", js)
+        self.assertIn("function visibleImages()", js)
+        self.assertIn("function images(){ return visibleImages(); }", js)
+
 
 class ArrangeEndpointTests(ReviewServerTestCase):
     def test_a_dry_run_reports_the_plan_without_moving_anything(self):

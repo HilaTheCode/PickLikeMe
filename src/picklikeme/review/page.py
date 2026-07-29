@@ -44,8 +44,8 @@ CSS = """
 *{box-sizing:border-box}
 :root{--bg:#f8fafc;--panel:#fff;--panel-2:#f1f5f9;--text:#0f172a;--muted:#64748b;
 --border:#e2e8f0;--accent:#2563eb;--good:#10b981;--bad:#ef4444;--warn:#f59e0b;--shadow:rgba(15,23,42,.08)}
-:root[data-theme="dark"]{--bg:#0b1020;--panel:#141a2e;--panel-2:#1b2338;--text:#e2e8f0;
---muted:#94a3b8;--border:#26314d;--accent:#60a5fa;--good:#34d399;--bad:#f87171;--warn:#fbbf24;--shadow:rgba(0,0,0,.4)}
+:root[data-theme="dark"]{--bg:#0a0f28;--panel:#131a3a;--panel-2:#19214a;--text:#e2e8f0;
+--muted:#94a3b8;--border:#293567;--accent:#60a5fa;--good:#34d399;--bad:#f87171;--warn:#fbbf24;--shadow:rgba(0,0,0,.4)}
 body{margin:0;background:var(--bg);color:var(--text);
 font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
 header{position:sticky;top:0;z-index:20;background:var(--panel);border-bottom:1px solid var(--border);
@@ -122,8 +122,8 @@ background:#05070d;color:#fff;overflow:hidden}
 @keyframes lbFadeIn{from{opacity:0}to{opacity:1}}
 @keyframes lbFadeOut{to{opacity:0}}
 .lb-stage{position:relative;width:100%;height:100%;display:flex;align-items:center;justify-content:center}
-.lb-img-wrap{position:relative;max-width:92vw;max-height:74vh;display:flex}
-.lb-img{max-width:92vw;max-height:74vh;object-fit:contain;user-select:none;-webkit-user-drag:none;
+.lb-img-wrap{position:relative;max-width:97vw;max-height:86vh;display:flex}
+.lb-img{max-width:97vw;max-height:86vh;object-fit:contain;user-select:none;-webkit-user-drag:none;
 transform-origin:center center;display:block;transition:transform .08s ease-out}
 .lb-img.dragging{transition:none}
 .lb-img.grabbable{cursor:grab}.lb-img.grabbing{cursor:grabbing;transition:none}
@@ -169,8 +169,23 @@ const PLM = {
   state: null,
   boxes: false,
   busy: false,
+  filter: 'all',  // 'all' | 'selected' | 'rejected' - client-side only, survives state refreshes
   labels: __STATE_LABELS__,
 };
+
+// Same classification the card's border colour uses, so the filter and what a
+// card visually looks like can never disagree.
+function cardClass(image){
+  return image.state === 'manual_keep' || image.state === 'auto_selected' ? 'sel'
+       : image.state === 'unranked' ? 'unt' : 'rej';
+}
+
+function visibleImages(){
+  const images = (PLM.state && PLM.state.images) || [];
+  if(PLM.filter === 'selected') return images.filter(i => cardClass(i) === 'sel');
+  if(PLM.filter === 'rejected') return images.filter(i => cardClass(i) === 'rej');
+  return images;
+}
 
 const esc = s => { const d = document.createElement('div'); d.textContent = s == null ? '' : s; return d.innerHTML; };
 const q = s => document.querySelector(s);
@@ -236,12 +251,23 @@ function render(){
     notice.style.display = 'none';
   }
 
+  document.querySelectorAll('.filter').forEach(b => {
+    b.classList.toggle('on', b.dataset.filter === PLM.filter);
+  });
+
   const grid = q('#grid');
   if(!s.images.length){
     grid.innerHTML = '<div class="empty">No images found in this folder.</div>';
     return;
   }
-  grid.innerHTML = s.images.map((image, i) => card(image, i)).join('');
+  // Index into the filtered, displayed list - not s.images - so the lightbox
+  // opened from a filtered view navigates only what is actually on screen.
+  const visible = visibleImages();
+  if(!visible.length){
+    grid.innerHTML = '<div class="empty">No images match this filter.</div>';
+    return;
+  }
+  grid.innerHTML = visible.map((image, i) => card(image, i)).join('');
   grid.querySelectorAll('button[data-act]').forEach(b => {
     b.addEventListener('click', () => decide(b.dataset.path, b.dataset.act));
   });
@@ -254,8 +280,7 @@ function render(){
 }
 
 function card(image, index){
-  const cls = image.state === 'manual_keep' || image.state === 'auto_selected' ? 'sel'
-            : image.state === 'unranked' ? 'unt' : 'rej';
+  const cls = cardClass(image);
   const url = 'thumb?path=' + encodeURIComponent(image.image_path) + (PLM.boxes ? '&boxes=1' : '');
   // Opens the in-app Lightbox rather than navigating anywhere - see Lightbox
   // below. Not an <a> any more: this is a click handler, not a link.
@@ -328,7 +353,10 @@ const Lightbox = (function(){
   // own use of it), so the browser's own HTTP cache cannot do the job.
   const cache = new Map();
 
-  function images(){ return (PLM.state && PLM.state.images) || []; }
+  // The same filtered list the gallery is currently showing - see
+  // visibleImages() - so opening from a filtered view and pressing
+  // next/previous stays inside what the reviewer is actually looking at.
+  function images(){ return visibleImages(); }
   function current(){ return images()[index]; }
   function previewUrl(path){ return 'preview?path=' + encodeURIComponent(path); }
 
@@ -545,6 +573,14 @@ const Lightbox = (function(){
   function onWheel(e){
     if(!current()) return;
     e.preventDefault();
+    // Ctrl+wheel steps through images instead of zooming, so a reviewer can
+    // flip through a shoot without leaving the mouse - down advances, up goes
+    // back, matching the direction wheel-scrolling a page already implies.
+    if(e.ctrlKey){
+      if(e.deltaY > 0) next();
+      else if(e.deltaY < 0) prev();
+      return;
+    }
     const factor = e.deltaY < 0 ? 1.15 : 1 / 1.15;
     setScale(scale * factor, {x: e.clientX, y: e.clientY});
   }
@@ -627,6 +663,13 @@ async function setPercent(value){
   }catch(e){ say('Could not change the percentage: ' + e.message, true); }
 }
 
+// Client-side only - it doesn't round-trip through the server, so switching
+// filters is instant and never disturbs the underlying decisions.
+function setFilter(name){
+  PLM.filter = name;
+  render();
+}
+
 async function openFolder(){
   try{
     await api('open-folder?path=' + encodeURIComponent(PLM.state.input_folder));
@@ -687,6 +730,8 @@ async function boot(){
   }
   document.querySelectorAll('.preset').forEach(b =>
     b.addEventListener('click', () => setPercent(b.dataset.percent)));
+  document.querySelectorAll('.filter').forEach(b =>
+    b.addEventListener('click', () => setFilter(b.dataset.filter)));
   q('#percent').addEventListener('change', e => setPercent(e.target.value));
   q('#boxes').addEventListener('click', () => {
     PLM.boxes = !PLM.boxes;
@@ -759,6 +804,12 @@ def build_page(title: str = "PickLikeMe review") -> str:
       {_presets_html()}
       <input type="number" id="percent" min="0" max="100" step="1" aria-label="Keep percentage">
       <span class="lbl">%</span>
+    </div>
+    <div class="group">
+      <span class="lbl">Show</span>
+      <button class="filter on" data-filter="all">All</button>
+      <button class="filter" data-filter="selected">Selected</button>
+      <button class="filter" data-filter="rejected">Rejected</button>
     </div>
     <div class="group">
       <button id="boxes">Show detector boxes</button>
