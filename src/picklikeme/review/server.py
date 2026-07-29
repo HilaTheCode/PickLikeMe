@@ -225,7 +225,10 @@ class ReviewRequestHandler(AnnotationRequestHandler):
         reason = payload.get("reason")
         if reason is not None and not isinstance(reason, str):
             raise ValueError("reason must be a string or null")
-        self.session.set_decision(image_path, decision, reason=reason)
+        reason_note = payload.get("reason_note")
+        if reason_note is not None and not isinstance(reason_note, str):
+            raise ValueError("reason_note must be a string or null")
+        self.session.set_decision(image_path, decision, reason=reason, reason_note=reason_note)
         self._send_json(self._state_payload())
 
     def _post_keep_percent(self, payload: dict) -> None:

@@ -414,7 +414,7 @@ class LightboxMarkupTests(unittest.TestCase):
         status reporting can never drift between the two surfaces."""
         from picklikeme.review.page import build_js
 
-        self.assertIn("await decide(image.image_path, action, q('#lb-reason').value || null)", build_js())
+        self.assertIn("await decide(image.image_path, action, reason, reasonNote)", build_js())
 
     def test_the_dialog_element_is_used_for_native_escape_and_focus_handling(self):
         """Reuses the platform's own modal semantics (already established by
@@ -596,9 +596,8 @@ class ReasonFieldTests(unittest.TestCase):
         from picklikeme.review.page import build_js
 
         js = build_js()
-        self.assertIn(
-            "await decide(image.image_path, action, q('#lb-reason').value || null)", js
-        )
+        self.assertIn("await decide(image.image_path, action, reason, reasonNote)", js)
+        self.assertIn("const reason = q('#lb-reason').value || null", js)
 
     def test_changing_the_reason_after_a_decision_updates_it_without_re_deciding(self):
         """onReasonChange must call postDecision directly - reusing decide()
@@ -611,7 +610,7 @@ class ReasonFieldTests(unittest.TestCase):
         self.assertIsNotNone(handler, "onReasonChange not found")
         body = handler.group(1)
         self.assertIn("if(!image || !image.decision) return", body)
-        self.assertIn("postDecision(image.image_path, image.decision, q('#lb-reason').value || null)", body)
+        self.assertIn("postDecision(image.image_path, image.decision, reason, null)", body)
         self.assertNotIn("await decide(", body, "must not go through decide()'s toggle logic")
 
     def test_the_dropdown_resets_to_the_current_image_s_own_reason_on_every_navigation(self):

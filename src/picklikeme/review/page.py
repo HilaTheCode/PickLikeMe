@@ -18,7 +18,13 @@ from __future__ import annotations
 
 import json
 
-from ..analyzer.annotations import REVIEW_REASON_CLEAR_EYES_SEEN, REVIEW_REASON_EYES_NOT_SEEN
+from ..analyzer.annotations import (
+    REVIEW_REASON_BAD_QUALITY,
+    REVIEW_REASON_CLEAR_EYES_SEEN,
+    REVIEW_REASON_EYES_NOT_SEEN,
+    REVIEW_REASON_GOOD_QUALITY,
+    REVIEW_REASON_OTHER,
+)
 from .session import (
     STATE_AUTO_REJECTED,
     STATE_AUTO_SELECTED,
@@ -47,6 +53,9 @@ STATE_LABELS = {
 REASON_LABELS = {
     REVIEW_REASON_EYES_NOT_SEEN: "Eyes not seen",
     REVIEW_REASON_CLEAR_EYES_SEEN: "Clear Eyes Seen",
+    REVIEW_REASON_GOOD_QUALITY: "Overall good image quality",
+    REVIEW_REASON_BAD_QUALITY: "Overall bad image quality",
+    REVIEW_REASON_OTHER: "Other",
 }
 
 CSS = """
@@ -179,6 +188,8 @@ border-radius:7px;padding:4px 10px;font-size:12px;cursor:pointer}
 .lb-save:hover{background:rgba(0,0,0,.14)}
 #lb-reason{font:inherit;font-size:12px;color:#000;background:rgba(0,0,0,.06);
 border:1px solid rgba(0,0,0,.2);border-radius:7px;padding:4px 8px;cursor:pointer}
+#lb-reason-note{font:inherit;font-size:12px;color:#000;background:rgba(0,0,0,.06);
+border:1px solid rgba(0,0,0,.2);border-radius:7px;padding:4px 8px;width:160px}
 .lb-acts{display:flex;gap:10px}
 .lb-acts button{font-size:13px;padding:7px 18px;border-radius:10px;font-weight:650;
 background:rgba(0,0,0,.04);border:1px solid rgba(0,0,0,.15);color:#000}
@@ -340,14 +351,22 @@ function card(image, index){
 }
 
 // Shared by decide() (which also decides whether to toggle) and the Lightbox's
-// reason dropdown (which must save a new reason for the SAME decision without
-// re-running that toggle logic - see onReasonChange).
-async function postDecision(path, decision, reason){
+// reason dropdown/note (which must save a new reason for the SAME decision
+// without re-running that toggle logic - see onReasonChange). reason_note
+// only ever reaches the server alongside reason === 'other', mirroring what
+// the store itself enforces (annotations.py's set_review_decision) - this is
+// just the same rule applied before the request even goes out.
+async function postDecision(path, decision, reason, reason_note){
   try{
     const j = await api('api/review/decision', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({image_path: path, decision: decision, reason: decision ? (reason || null) : null}),
+      body: JSON.stringify({
+        image_path: path,
+        decision: decision,
+        reason: decision ? (reason || null) : null,
+        reason_note: decision && reason === 'other' ? (reason_note || null) : null,
+      }),
     });
     PLM.state = j.state;
     render();
@@ -357,12 +376,13 @@ async function postDecision(path, decision, reason){
 
 // Clicking the button an image already carries clears the override, so the
 // image returns to whatever the threshold says. That is the only way back to
-// automatic, so it must be the obvious one. `reason` is optional and only
-// the Lightbox ever supplies one (the gallery cards have no reason control).
-async function decide(path, action, reason){
+// automatic, so it must be the obvious one. `reason`/`reason_note` are
+// optional and only the Lightbox ever supplies them (the gallery cards have
+// no reason control).
+async function decide(path, action, reason, reason_note){
   const image = PLM.state.images.find(i => i.image_path === path);
   const decision = image && image.decision === action ? null : action;
-  await postDecision(path, decision, reason);
+  await postDecision(path, decision, reason, reason_note);
 }
 
 // ===========================================================================
@@ -461,12 +481,18 @@ const Lightbox = (function(){
     q('#lb-save-jpeg').disabled = !image || !!image.missing_file;
   }
 
-  // Reset to this image's own stored reason (or blank) on every navigation,
-  // so a reason picked for one image can never leak onto the next one it was
-  // never actually saved against.
+  // Reset to this image's own stored reason (and note, and note visibility)
+  // on every navigation, so a reason picked for one image can never leak
+  // onto the next one it was never actually saved against.
   function updateReasonSelect(image){
-    q('#lb-reason').value = (image && image.reason) || '';
-    q('#lb-reason').disabled = !image || !!image.missing_file;
+    const reason = (image && image.reason) || '';
+    const disabled = !image || !!image.missing_file;
+    q('#lb-reason').value = reason;
+    q('#lb-reason').disabled = disabled;
+    const note = q('#lb-reason-note');
+    note.value = (image && image.reason_note) || '';
+    note.style.display = reason === 'other' ? '' : 'none';
+    note.disabled = disabled;
   }
 
   function updateBadge(image){
@@ -589,13 +615,16 @@ const Lightbox = (function(){
   // Reuses decide() rather than posting again: same validation, same
   // PLM.state refresh, same status reporting - the lightbox just also
   // advances afterwards, which is the one thing the gallery view never needs.
-  // Whatever the reason dropdown currently shows travels with this decision -
-  // that is the only place a fresh reason ever comes from.
+  // Whatever the reason dropdown (and, for "Other", its note) currently show
+  // travel with this decision - that is the only place a fresh reason ever
+  // comes from.
   async function decideAndAdvance(action){
     const image = current();
     if(!image) return;
     const wasLast = index >= images().length - 1;
-    await decide(image.image_path, action, q('#lb-reason').value || null);
+    const reason = q('#lb-reason').value || null;
+    const reasonNote = reason === 'other' ? (q('#lb-reason-note').value || null) : null;
+    await decide(image.image_path, action, reason, reasonNote);
     updateDecisionButtons(current());
     updateBadge(current());
     updateReasonSelect(current());
@@ -605,11 +634,25 @@ const Lightbox = (function(){
   // Lets the reason be changed (or added) for an image that already carries a
   // decision, without re-clicking Keep/Reject - postDecision() directly,
   // bypassing decide()'s toggle logic, since re-supplying the SAME decision
-  // here must never be read as "clear it".
+  // here must never be read as "clear it". Picking "Other" only reveals the
+  // note field and waits - see onReasonNoteCommit - rather than saving an
+  // empty explanation the instant it's chosen.
   async function onReasonChange(){
     const image = current();
+    const reason = q('#lb-reason').value || null;
+    q('#lb-reason-note').style.display = reason === 'other' ? '' : 'none';
     if(!image || !image.decision) return;
-    await postDecision(image.image_path, image.decision, q('#lb-reason').value || null);
+    if(reason === 'other'){ q('#lb-reason-note').focus(); return; }
+    await postDecision(image.image_path, image.decision, reason, null);
+    updateReasonSelect(current());
+  }
+
+  // Commits the free-text note for "Other" - on blur or Enter, not on every
+  // keystroke, so choosing a few words doesn't fire a save per character.
+  async function onReasonNoteCommit(){
+    const image = current();
+    if(!image || !image.decision || q('#lb-reason').value !== 'other') return;
+    await postDecision(image.image_path, image.decision, 'other', q('#lb-reason-note').value || null);
     updateReasonSelect(current());
   }
 
@@ -761,6 +804,8 @@ const Lightbox = (function(){
     q('#lb-exp-up').addEventListener('click', () => adjustExposure(1));
     q('#lb-save-jpeg').addEventListener('click', saveJpeg);
     q('#lb-reason').addEventListener('change', onReasonChange);
+    q('#lb-reason-note').addEventListener('blur', onReasonNoteCommit);
+    q('#lb-reason-note').addEventListener('keydown', e => { if(e.key === 'Enter') e.target.blur(); });
     applyExposure();  // paints the initial "+0.0 EV" label and button state once
     q('#lb-stage').addEventListener('click', onStageClick);
     q('#lb-stage').addEventListener('wheel', onWheel, {passive: false});
@@ -1001,13 +1046,14 @@ def build_page(title: str = "PickLikeMe review") -> str:
           <button id="lb-exp-up" type="button" aria-label="Increase exposure">+</button>
         </span>
         <button class="lb-save" id="lb-save-jpeg" type="button" title="Save the camera's own JPEG for sharing">Save JPEG</button>
-        <select id="lb-reason" aria-label="Reason for overriding the model" title="Why you kept or rejected this, if you want to record it">
-          {_reason_options_html()}
-        </select>
         <div class="lb-acts">
           <button class="keep" id="lb-keep">Keep</button>
           <button class="rej" id="lb-reject">Reject</button>
         </div>
+        <select id="lb-reason" aria-label="Reason for overriding the model" title="Why you kept or rejected this, if you want to record it">
+          {_reason_options_html()}
+        </select>
+        <input type="text" id="lb-reason-note" style="display:none" placeholder="Describe why..." aria-label="Describe the reason">
         <div class="lb-status" id="lb-status"></div>
       </div>
       <div class="lb-film" id="lb-film"></div>

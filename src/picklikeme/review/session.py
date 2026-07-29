@@ -21,7 +21,7 @@ import logging
 from dataclasses import dataclass
 from pathlib import Path
 
-from ..analyzer.annotations import REVIEW_KEEP, REVIEW_REJECT, AnnotationStore
+from ..analyzer.annotations import REVIEW_KEEP, REVIEW_REJECT, REVIEW_REASON_OTHER, AnnotationStore
 from ..identity import IdentityUnavailable
 from ..organize import (
     DEFAULT_SELECTION_PERCENTAGE,
@@ -54,6 +54,9 @@ class ReviewImage:
     # Why a manual decision overrides the model - one of REVIEW_REASONS, or
     # None. Meaningless without a decision, and always cleared alongside one.
     reason: str | None = None
+    # Free text, only meaningful alongside REVIEW_REASON_OTHER - see
+    # AnnotationStore.set_review_decision.
+    reason_note: str | None = None
     # Set when the ranking lists an image that is no longer on disk. Shown as a
     # placeholder rather than dropped, so the photographer can see the gap.
     missing_file: bool = False
@@ -70,6 +73,7 @@ class ReviewImage:
             "rank": self.rank,
             "decision": self.decision,
             "reason": self.reason,
+            "reason_note": self.reason_note,
             "state": state,
             "missing_file": self.missing_file,
         }
@@ -165,13 +169,20 @@ class ReviewSession:
         closes the gap for the few rows a path match misses.
         """
         rows = self.store.review_decisions()
-        self._decisions_by_hash = {row["image_hash"]: (row["decision"], row.get("reason")) for row in rows}
-        by_path = {_key(row["image_path"]): (row["decision"], row.get("reason")) for row in rows}
+        by_hash = {
+            row["image_hash"]: (row["decision"], row.get("reason"), row.get("reason_note")) for row in rows
+        }
+        by_path = {
+            _key(row["image_path"]): (row["decision"], row.get("reason"), row.get("reason_note"))
+            for row in rows
+        }
+        self._decisions_by_hash = by_hash
         matched: set[str] = set()
         for image in self.images:
-            decision, reason = by_path.get(_key(image.image_path), (None, None))
+            decision, reason, reason_note = by_path.get(_key(image.image_path), (None, None, None))
             image.decision = decision
             image.reason = reason
+            image.reason_note = reason_note
             # A decision matched to a path whose file is gone is not really
             # matched: the image it describes has moved, and its new copy is
             # elsewhere in the gallery waiting to be found by identity.
@@ -198,10 +209,11 @@ class ReviewSession:
                 digest = self.store.identity_of(image.image_path)
             except IdentityUnavailable:
                 continue
-            decision, reason = self._decisions_by_hash.get(digest, (None, None))
+            decision, reason, reason_note = self._decisions_by_hash.get(digest, (None, None, None))
             if decision is not None:
                 image.decision = decision
                 image.reason = reason
+                image.reason_note = reason_note
                 recovered += 1
         if recovered:
             logger.info("Recovered %d review decision(s) by content identity", recovered)
@@ -280,13 +292,21 @@ class ReviewSession:
 
     # -- writes -------------------------------------------------------------
 
-    def set_decision(self, image_path: str, decision: str | None, reason: str | None = None) -> str:
+    def set_decision(
+        self,
+        image_path: str,
+        decision: str | None,
+        reason: str | None = None,
+        reason_note: str | None = None,
+    ) -> str:
         """Record (or clear) a manual Keep/Reject and update the gallery.
 
         `reason` says why the photographer overrode the model - meaningless
         without a decision, so clearing the decision always clears it too,
         and setting one without a reason clears any reason left over from a
-        previous decision on this image.
+        previous decision on this image. `reason_note` is free text and only
+        means anything alongside REVIEW_REASON_OTHER; the store drops it
+        otherwise, and this mirrors that here too.
 
         Persisted immediately - a review session's work must never exist only
         in a browser tab.
@@ -295,10 +315,14 @@ class ReviewSession:
         if decision is None:
             self.store.clear_review_decision(image.image_path)
             reason = None
+            reason_note = None
         else:
-            self.store.set_review_decision(image.image_path, decision, reason=reason)
+            if reason != REVIEW_REASON_OTHER:
+                reason_note = None
+            self.store.set_review_decision(image.image_path, decision, reason=reason, reason_note=reason_note)
         image.decision = decision
         image.reason = reason
+        image.reason_note = reason_note
         return self.states()[image.image_path]
 
     def _image_for(self, image_path: str) -> ReviewImage:
