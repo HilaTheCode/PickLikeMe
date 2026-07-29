@@ -435,14 +435,35 @@ class LightboxMarkupTests(unittest.TestCase):
     def test_overlay_chrome_stays_above_the_image_at_any_zoom(self):
         """A CSS transform doesn't resize .lb-img-wrap's own layout box, so a
         zoomed-in image can paint outside it - and img-wrap comes after the
-        top bar, close button and nav buttons in the markup, so without an
+        close button, nav buttons and bottom bar in the markup, so without an
         explicit z-index a zoomed image would paint over and hide them."""
         from picklikeme.review.page import CSS
 
-        for selector in (".lb-top", ".lb-close", ".lb-nav", ".lb-bottom"):
+        for selector in (".lb-close", ".lb-nav", ".lb-bottom"):
             rule = re.search(re.escape(selector) + r"[^{]*\{([^}]*)\}", CSS)
             self.assertIsNotNone(rule, f"no CSS rule for {selector}")
             self.assertIn("z-index", rule.group(1), f"{selector} has no z-index to stay above the zoomed image")
+
+    def test_the_info_row_lives_in_the_bottom_bar_with_keep_reject(self):
+        """Moved down per feedback: previously a separate floating bar over
+        the top of the image, now one toolbar with Keep/Reject at the bottom."""
+        from picklikeme.review.page import CSS, build_page
+
+        html = build_page()
+        bottom = re.search(r'<div class="lb-bottom">(.*?)</div>\s*</div>\s*</dialog>', html, re.S)
+        self.assertIsNotNone(bottom, "lb-bottom not found")
+        body = bottom.group(1)
+        self.assertIn('class="lb-info"', body)
+        self.assertIn('id="lb-counter"', body)
+        self.assertIn('id="lb-exp-value"', body)
+        self.assertIn('id="lb-save-jpeg"', body)
+        self.assertIn('id="lb-keep"', body)
+        self.assertIn('id="lb-reject"', body)
+        # The info row's own text is black on its own light backing, not the
+        # light-on-dark colour the old floating top bar used.
+        info_rule = re.search(r"\.lb-info\{([^}]*)\}", CSS)
+        self.assertIsNotNone(info_rule, "no .lb-info CSS rule")
+        self.assertIn("color:#000", info_rule.group(1))
 
     def test_exposure_is_a_css_filter_never_a_decision_or_a_network_call(self):
         """The whole point of "display only": adjustExposure()/applyExposure()

@@ -136,7 +136,7 @@ font-weight:650;pointer-events:none}
 .lb-badge.auto_selected{background:rgba(16,185,129,.2);color:#6ee7b7;border:1px solid var(--good)}
 .lb-badge.auto_rejected{background:rgba(148,163,184,.15);color:#cbd5e1;border:1px solid #475569}
 .lb-badge.unranked{background:rgba(245,158,11,.18);color:#fcd34d;border:1px solid var(--warn)}
-/* z-index:5 on every piece of overlay chrome (close/nav/top bar/bottom bar):
+/* z-index:5 on every piece of overlay chrome (close/nav/bottom bar):
    a CSS transform doesn't resize .lb-img-wrap's own layout box, so once the
    image is zoomed past fit it can paint outside that box - and img-wrap
    comes after this chrome in the markup, so without an explicit z-index the
@@ -149,16 +149,23 @@ cursor:pointer}
 .lb-close{top:16px;right:20px;width:38px;height:38px;font-size:20px;line-height:1}
 .lb-nav{top:50%;margin-top:-26px;width:52px;height:52px;font-size:24px}
 .lb-nav.prev{left:16px}.lb-nav.next{right:16px}
-.lb-top{position:absolute;z-index:5;top:0;left:70px;right:70px;padding:16px 0;display:flex;justify-content:center;
-align-items:center;gap:16px;font-size:12.5px;color:#cbd5e1;flex-wrap:wrap;font-variant-numeric:tabular-nums}
+/* The info row: lives in the bottom bar now, alongside Keep/Reject, rather
+   than floating over the top of the image - so it needs its own light,
+   opaque backing (the dark viewer behind it is what the old floating top
+   bar's light-on-dark text used to rely on for contrast, and black text
+   needs the opposite). */
+.lb-info{display:flex;justify-content:center;align-items:center;gap:16px;flex-wrap:wrap;
+font-size:12.5px;color:#000;font-variant-numeric:tabular-nums;
+background:rgba(255,255,255,.92);border-radius:20px;padding:8px 18px;
+box-shadow:0 2px 10px rgba(0,0,0,.35)}
 .lb-exp{display:flex;align-items:center;gap:6px}
 .lb-exp button{width:22px;height:22px;padding:0;border-radius:50%;font-size:14px;line-height:1;
-background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.25);color:#fff;cursor:pointer}
-.lb-exp button:hover{background:rgba(255,255,255,.2)}
+background:rgba(0,0,0,.06);border:1px solid rgba(0,0,0,.2);color:#000;cursor:pointer}
+.lb-exp button:hover{background:rgba(0,0,0,.14)}
 .lb-exp .val{min-width:56px;text-align:center}
-.lb-save{background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.25);color:#e2e8f0;
+.lb-save{background:rgba(0,0,0,.06);border:1px solid rgba(0,0,0,.2);color:#000;
 border-radius:7px;padding:4px 10px;font-size:12px;cursor:pointer}
-.lb-save:hover{background:rgba(255,255,255,.2)}
+.lb-save:hover{background:rgba(0,0,0,.14)}
 .lb-bottom{position:absolute;z-index:5;left:0;right:0;bottom:0;display:flex;flex-direction:column;
 align-items:center;gap:10px;padding:12px 16px 18px;background:linear-gradient(to top,rgba(0,0,0,.5),transparent)}
 .lb-acts{display:flex;gap:12px}
@@ -920,19 +927,6 @@ def build_page(title: str = "PickLikeMe review") -> str:
 
 <dialog id="lightbox">
   <div class="lb-stage" id="lb-stage">
-    <div class="lb-top">
-      <span id="lb-counter"></span>
-      <span id="lb-filename"></span>
-      <span id="lb-score"></span>
-      <span id="lb-zoom">Fit</span>
-      <span class="lb-exp" id="lb-exp" title="Display only - never written to the RAW file or saved anywhere">
-        <span aria-hidden="true">&#9728;</span>
-        <button id="lb-exp-down" type="button" aria-label="Decrease exposure">&minus;</button>
-        <span class="val" id="lb-exp-value">+0.0 EV</span>
-        <button id="lb-exp-up" type="button" aria-label="Increase exposure">+</button>
-      </span>
-      <button class="lb-save" id="lb-save-jpeg" type="button" title="Save the camera's own JPEG for sharing">Save JPEG</button>
-    </div>
     <button class="lb-close" id="lb-close" aria-label="Close" title="Close (Esc)">&times;</button>
     <button class="lb-nav prev" id="lb-prev" aria-label="Previous image" title="Previous">&#8249;</button>
     <button class="lb-nav next" id="lb-next" aria-label="Next image" title="Next">&#8250;</button>
@@ -942,6 +936,19 @@ def build_page(title: str = "PickLikeMe review") -> str:
       <div class="lb-spinner" id="lb-spinner" style="display:none"></div>
     </div>
     <div class="lb-bottom">
+      <div class="lb-info">
+        <span id="lb-counter"></span>
+        <span id="lb-filename"></span>
+        <span id="lb-score"></span>
+        <span id="lb-zoom">Fit</span>
+        <span class="lb-exp" id="lb-exp" title="Display only - never written to the RAW file or saved anywhere">
+          <span aria-hidden="true">&#9728;</span>
+          <button id="lb-exp-down" type="button" aria-label="Decrease exposure">&minus;</button>
+          <span class="val" id="lb-exp-value">+0.0 EV</span>
+          <button id="lb-exp-up" type="button" aria-label="Increase exposure">+</button>
+        </span>
+        <button class="lb-save" id="lb-save-jpeg" type="button" title="Save the camera's own JPEG for sharing">Save JPEG</button>
+      </div>
       <div class="lb-film" id="lb-film"></div>
       <div class="lb-acts">
         <button class="keep" id="lb-keep">Keep</button>
