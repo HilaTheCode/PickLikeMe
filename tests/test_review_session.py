@@ -384,5 +384,65 @@ class IdentityRecoveryTests(SessionTestCase):
         self.assertEqual(reopened._image_for(str(moved)).reason, "clear_eyes_seen")
 
 
+class OpenFolderTests(SessionTestCase):
+    """Switching a live session to a different folder - the way a photo
+    folder that was never ranked at all gets reviewed, without restarting the
+    server or losing the one shared annotations store."""
+
+    def test_opening_a_different_folder_replaces_the_gallery(self):
+        shoot, images, _ = build_shoot(self.root, ranked=3)
+        session = self.session(shoot)
+
+        other = self.root / "unranked"
+        other.mkdir()
+        (other / "a.jpg").write_bytes(b"a")
+        (other / "b.jpg").write_bytes(b"b")
+        session.open_folder(other)
+
+        self.assertEqual(session.input_folder, other.resolve())
+        self.assertEqual(session.counts()["total"], 2)
+        self.assertEqual(session.counts()["untouched"], 2)
+        self.assertTrue(session.warnings, "the new folder has no ranking of its own")
+
+    def test_a_manual_decision_in_the_new_folder_is_unaffected_by_the_old_one(self):
+        shoot, images, _ = build_shoot(self.root, ranked=3)
+        session = self.session(shoot)
+        session.set_decision(str(images[0]), "keep")
+
+        other = self.root / "unranked"
+        other.mkdir()
+        photo = other / "a.jpg"
+        photo.write_bytes(b"a")
+        session.open_folder(other)
+
+        self.assertIsNone(session._image_for(str(photo)).decision)
+
+    def test_a_decision_already_recorded_for_the_new_folder_is_picked_up(self):
+        """Re-opening a folder reviewed before (e.g. switching away and back)
+        must not look like a first visit - the store remembers regardless."""
+        other = self.root / "unranked"
+        other.mkdir()
+        photo = other / "a.jpg"
+        photo.write_bytes(b"a")
+        session = self.session(other)
+        session.set_decision(str(photo), "reject")
+
+        shoot, _, _ = build_shoot(self.root, ranked=2)
+        session.open_folder(shoot)
+        session.open_folder(other)
+
+        self.assertEqual(session._image_for(str(photo)).decision, "reject")
+
+    def test_the_ranking_file_is_recomputed_for_the_new_folder(self):
+        shoot, _, _ = build_shoot(self.root, ranked=2)
+        session = self.session(shoot)
+
+        other = self.root / "unranked"
+        other.mkdir()
+        session.open_folder(other)
+
+        self.assertEqual(session.ranking_file, ranking_path(other))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -26,3 +26,29 @@ def open_in_file_manager(path: Path) -> None:
         subprocess.run(["open", str(path)], check=True)
     else:
         subprocess.run(["xdg-open", str(path)], check=True)
+
+
+def choose_folder(initial_dir: Path | None = None) -> Path | None:
+    """Show the OS's native "choose a folder" dialog and return what the
+    photographer picked, or None if they cancelled.
+
+    A browser has no API for picking an arbitrary local folder by path (only
+    an upload picker, which never yields a real filesystem path) - so, like
+    `open_in_file_manager`, this bridges the served page to the OS on its
+    behalf. tkinter ships with the standard library; a throwaway hidden root
+    window is the documented way to use its dialogs without a full Tk app.
+    """
+    import tkinter as tk
+    from tkinter import filedialog
+
+    root = tk.Tk()
+    root.withdraw()
+    root.attributes("-topmost", True)
+    try:
+        selected = filedialog.askdirectory(
+            initialdir=str(initial_dir) if initial_dir and initial_dir.is_dir() else None,
+            title="Choose a folder to review",
+        )
+    finally:
+        root.destroy()
+    return Path(selected) if selected else None

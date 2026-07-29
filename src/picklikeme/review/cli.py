@@ -85,13 +85,14 @@ def run_review(args: argparse.Namespace) -> int:
     if not folder.is_dir():
         raise SystemExit(f"Folder not found: {folder}")
 
-    # The one place the two-command flow can break down, so it says exactly how
-    # to fix it rather than failing on a missing file deeper in.
+    # An unranked folder is not an error - ReviewSession already handles it
+    # (every image comes up unranked, sorted for manual Keep/Reject only) -
+    # just worth a heads-up, since `rank` first is the common case.
     if not args.ranking and not has_ranking(folder):
-        raise SystemExit(
-            f"No ranking found for {folder}.\n"
+        print(
+            f"No ranking found for {folder}; every image will be unranked.\n"
             f"  Expected: {ranking_path(folder)}\n"
-            f"  Rank it first:  {cli_prefix()} rank --input \"{folder}\"\n"
+            f"  To rank it first:  {cli_prefix()} rank --input \"{folder}\"\n"
             f"  Or point at an existing ranking:  --ranking <csv>"
         )
 

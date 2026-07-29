@@ -752,5 +752,79 @@ class InheritedBehaviourTests(ReviewServerTestCase):
         self.assertEqual(self.server.server_address[0], "127.0.0.1")
 
 
+class OpenFolderEndpointTests(ReviewServerTestCase):
+    """Switching the whole review to a different folder - the main way a
+    folder that was never ranked at all gets reviewed."""
+
+    def test_opening_a_folder_by_path_skips_the_native_dialog(self):
+        other = self.root / "unranked_shoot"
+        other.mkdir()
+        make_real_images([other / "IMG_0001.jpg"])
+
+        with mock.patch("picklikeme.review.server.choose_folder") as dialog:
+            payload = self.post("/api/review/open-folder", {"path": str(other)})
+
+        dialog.assert_not_called()
+        self.assertTrue(payload["ok"])
+        self.assertEqual(Path(payload["state"]["input_folder"]).resolve(), other.resolve())
+        self.assertEqual(len(payload["state"]["images"]), 1)
+        self.assertEqual(payload["state"]["images"][0]["state"], "unranked")
+        self.assertIn("recovered", payload)
+
+    def test_omitting_the_path_shows_the_native_dialog(self):
+        original = self.session.input_folder
+        other = self.root / "unranked_shoot"
+        other.mkdir()
+        make_real_images([other / "IMG_0001.jpg"])
+
+        with mock.patch("picklikeme.review.server.choose_folder", return_value=other) as dialog:
+            payload = self.post("/api/review/open-folder", {})
+
+        dialog.assert_called_once()
+        self.assertEqual(dialog.call_args.kwargs["initial_dir"], original)
+        self.assertEqual(Path(payload["state"]["input_folder"]).resolve(), other.resolve())
+
+    def test_cancelling_the_dialog_leaves_the_current_folder_untouched(self):
+        with mock.patch("picklikeme.review.server.choose_folder", return_value=None):
+            payload = self.post("/api/review/open-folder", {})
+
+        self.assertTrue(payload["cancelled"])
+        self.assertEqual(Path(payload["state"]["input_folder"]).resolve(), self.shoot.resolve())
+
+    def test_a_path_that_is_not_a_folder_is_refused(self):
+        missing = self.root / "does_not_exist"
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            self.post("/api/review/open-folder", {"path": str(missing)})
+        self.assertEqual(ctx.exception.code, 404)
+
+    def test_a_non_string_path_is_rejected(self):
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            self.post("/api/review/open-folder", {"path": 123})
+        self.assertEqual(ctx.exception.code, 400)
+
+    def test_after_switching_the_new_folder_s_own_images_become_servable(self):
+        """The dataset confinement `/thumb`, `/source` etc. all enforce must
+        move with the session - otherwise every endpoint would keep refusing
+        the very folder the photographer just opened."""
+        other = self.root / "unranked_shoot"
+        other.mkdir()
+        photo = other / "IMG_0001.jpg"
+        make_real_images([photo])
+        self.post("/api/review/open-folder", {"path": str(other)})
+
+        with urllib.request.urlopen(self.base + "/thumb?path=" + quote(str(photo), safe="")) as response:
+            self.assertEqual(response.status, 200)
+
+    def test_after_switching_the_old_folder_s_images_are_no_longer_servable(self):
+        other = self.root / "unranked_shoot"
+        other.mkdir()
+        make_real_images([other / "IMG_0001.jpg"])
+        self.post("/api/review/open-folder", {"path": str(other)})
+
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            urllib.request.urlopen(self.base + "/thumb?path=" + quote(str(self.images[0]), safe=""))
+        self.assertEqual(ctx.exception.code, 403)
+
+
 if __name__ == "__main__":
     unittest.main()

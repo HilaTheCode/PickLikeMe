@@ -90,16 +90,29 @@ class ReviewSession:
         ranking_file: str | Path | None = None,
         keep_percent: float = DEFAULT_SELECTION_PERCENTAGE,
     ):
-        self.input_folder = Path(input_folder).resolve()
         self.store = store
-        self.ranking_file = Path(ranking_file) if ranking_file else ranking_path(self.input_folder)
         self.keep_percent = validate_selection_percentage(keep_percent)
-        self.run_metadata = read_run_metadata(self.input_folder)
-        self.warnings: list[str] = []
-        self.images: list[ReviewImage] = []
-        self.load()
+        self.open_folder(input_folder, ranking_file=ranking_file)
 
     # -- loading ------------------------------------------------------------
+
+    def open_folder(self, input_folder: str | Path, *, ranking_file: str | Path | None = None) -> None:
+        """Point this session at a different folder - including one that has
+        never been ranked at all. `_load_ranked` already treats a missing
+        ranking as "every image unranked" rather than an error (see below),
+        which is exactly what browsing a fresh, un-ranked shoot needs: it
+        shows up with nothing but manual Keep/Reject to sort it.
+
+        Manual decisions already on record for images under the new folder
+        are picked up the same way any reload finds them, by path (see
+        `_apply_decisions`) - opening a folder is not a reason to lose a
+        photographer's prior work in it.
+        """
+        self.input_folder = Path(input_folder).resolve()
+        self.ranking_file = Path(ranking_file) if ranking_file else ranking_path(self.input_folder)
+        self.run_metadata = read_run_metadata(self.input_folder)
+        self.warnings: list[str] = []
+        self.load()
 
     def load(self) -> None:
         """(Re)build the gallery from the ranking, the folder, and the store."""

@@ -25,6 +25,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from ..analyzer.annotations import AnnotationStore, InvalidReviewDecision, InvalidReviewReason
+from ..analyzer.os_actions import choose_folder
 from ..analyzer.server import HOST, AnnotationRequestHandler
 from ..identity import IdentityUnavailable
 from .page import build_page
@@ -186,6 +187,7 @@ class ReviewRequestHandler(AnnotationRequestHandler):
             "/api/review/keep-percent": self._post_keep_percent,
             "/api/review/arrange": self._post_arrange,
             "/api/review/reconcile": self._post_reconcile,
+            "/api/review/open-folder": self._post_open_folder,
         }
         handler = handlers.get(route)
         if handler is None:
@@ -258,6 +260,40 @@ class ReviewRequestHandler(AnnotationRequestHandler):
         )
 
     def _post_reconcile(self, payload: dict) -> None:
+        recovered = self.session.reconcile_by_identity()
+        self._send_json({"ok": True, "recovered": recovered, "state": self.session.as_dict()})
+
+    def _post_open_folder(self, payload: dict) -> None:
+        """Switch the review to a different folder - typically one that has
+        never been ranked, so its photos can only be sorted by hand.
+
+        `path` lets a caller (a test, or a photographer who'd rather paste a
+        path than click through a dialog) skip the native picker entirely.
+        Without it, `choose_folder` shows the OS's own folder browser - the
+        server-side bridge a served page needs to reach the OS at all (see
+        os_actions.py) - seeded at the folder currently under review.
+        """
+        raw_path = payload.get("path")
+        if raw_path is not None and not isinstance(raw_path, str):
+            raise ValueError("path must be a string or null")
+        if raw_path:
+            folder = Path(raw_path)
+        else:
+            folder = choose_folder(initial_dir=self.session.input_folder)
+            if folder is None:
+                self._send_json({"ok": True, "cancelled": True, "state": self.session.as_dict()})
+                return
+        if not folder.is_dir():
+            self._send_json({"error": f"folder not found: {folder}"}, status=404)
+            return
+        self.session.open_folder(folder)
+        # The dataset confinement `/source`, `/thumb`, `/preview` and
+        # `/open-folder` all check - set on the class, not `self`, since a
+        # fresh handler instance is built per request (see the class
+        # docstring) and every one of them must see the new folder.
+        cls = type(self)
+        cls.root = self.session.input_folder
+        cls.source_roots = (self.session.input_folder,)
         recovered = self.session.reconcile_by_identity()
         self._send_json({"ok": True, "recovered": recovered, "state": self.session.as_dict()})
 

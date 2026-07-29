@@ -847,6 +847,32 @@ async function openFolder(){
   }catch(e){ say('Could not open the folder: ' + e.message, true); }
 }
 
+// Shows the OS's own folder-browser dialog (the server bridges it - a
+// browser cannot show one itself, see os_actions.py's choose_folder) and, if
+// the photographer picked something, switches the whole review to it. Meant
+// for a folder that was never ranked at all: it still loads, just with every
+// image unranked, so Keep/Reject is the only way to sort it. PLM.busy guards
+// against the dialog (which blocks the request on the server) being opened
+// twice from a second click.
+async function switchFolder(){
+  if(PLM.busy) return;
+  PLM.busy = true;
+  q('#switch-folder').disabled = true;
+  say('Choose a folder…');
+  try{
+    const j = await api('api/review/open-folder', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({}),
+    });
+    if(j.cancelled){ say(''); return; }
+    PLM.state = j.state;
+    render();
+    say('Opened ' + j.state.input_folder + (j.recovered ? ' — ' + j.recovered + ' decision(s) recovered.' : '.'));
+  }catch(e){ say('Could not open a folder: ' + e.message, true); }
+  finally{ PLM.busy = false; q('#switch-folder').disabled = false; }
+}
+
 // Nothing moves until the photographer has seen the exact plan, so the dialog
 // is populated from a real dry run rather than from the counters on screen.
 async function confirmArrange(){
@@ -911,6 +937,7 @@ async function boot(){
     render();
   });
   q('#open').addEventListener('click', openFolder);
+  q('#switch-folder').addEventListener('click', switchFolder);
   q('#go').addEventListener('click', confirmArrange);
   q('#dlg-cancel').addEventListener('click', () => q('#dlg').close());
   q('#dlg-go').addEventListener('click', doArrange);
@@ -992,8 +1019,9 @@ def build_page(title: str = "PickLikeMe review") -> str:
       <button class="filter" data-filter="rejected">Rejected</button>
     </div>
     <div class="group">
+      <button id="switch-folder">Open Folder&hellip;</button>
       <button id="boxes">Show detector boxes</button>
-      <button id="open">Open Folder</button>
+      <button id="open">Reveal in Explorer</button>
       <button id="go" class="primary">Arrange Files On Disk</button>
     </div>
     <div class="counts">
@@ -1046,14 +1074,14 @@ def build_page(title: str = "PickLikeMe review") -> str:
           <button id="lb-exp-up" type="button" aria-label="Increase exposure">+</button>
         </span>
         <button class="lb-save" id="lb-save-jpeg" type="button" title="Save the camera's own JPEG for sharing">Save JPEG</button>
-        <div class="lb-acts">
-          <button class="keep" id="lb-keep">Keep</button>
-          <button class="rej" id="lb-reject">Reject</button>
-        </div>
         <select id="lb-reason" aria-label="Reason for overriding the model" title="Why you kept or rejected this, if you want to record it">
           {_reason_options_html()}
         </select>
         <input type="text" id="lb-reason-note" style="display:none" placeholder="Describe why..." aria-label="Describe the reason">
+        <div class="lb-acts">
+          <button class="keep" id="lb-keep">Keep</button>
+          <button class="rej" id="lb-reject">Reject</button>
+        </div>
         <div class="lb-status" id="lb-status"></div>
       </div>
       <div class="lb-film" id="lb-film"></div>
