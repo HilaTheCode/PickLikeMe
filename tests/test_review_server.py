@@ -465,12 +465,12 @@ class LightboxMarkupTests(unittest.TestCase):
         self.assertIsNotNone(info_rule, "no .lb-info CSS rule")
         self.assertIn("color:#000", info_rule.group(1))
 
-    def test_the_toolbar_row_sits_above_the_film_strip_with_keep_reject_on_the_right(self):
-        """Redesigned per feedback: three stacked rows (info bar, film strip,
-        keep/reject) hid too much of the image. Now there are two: the film
-        strip pinned to the very bottom, and one row above it holding the
-        info box on the left and Keep/Reject pushed to the right by the
-        status spacer."""
+    def test_keep_reject_live_inside_the_same_white_box_centred_above_the_film_strip(self):
+        """Redesigned twice per feedback: first Keep/Reject moved into the
+        bottom bar next to a separate info pill, then per this round they
+        were folded into that same pill entirely, with no extra wrapper -
+        .lb-info is centred by .lb-bottom's own align-items:center, and the
+        film strip is the pill's only sibling, so it stays pinned below."""
         from picklikeme.review.page import CSS, build_page
 
         html = build_page()
@@ -478,22 +478,21 @@ class LightboxMarkupTests(unittest.TestCase):
         self.assertIsNotNone(bottom, "lb-bottom not found")
         body = bottom.group(1)
 
-        toolbar = re.search(r'<div class="lb-toolbar">(.*?)</div>\s*<div class="lb-film"', body, re.S)
-        self.assertIsNotNone(toolbar, "lb-toolbar not found directly above the film strip")
-        toolbar_body = toolbar.group(1)
-        self.assertLess(
-            toolbar_body.index('id="lb-save-jpeg"'),
-            toolbar_body.index('id="lb-keep"'),
-            "the info box (with Save JPEG) must come before Keep/Reject in the row",
-        )
+        info = re.search(r'<div class="lb-info">(.*?)</div>\s*<div class="lb-film"', body, re.S)
+        self.assertIsNotNone(info, "lb-info not found directly above the film strip")
+        info_body = info.group(1)
+        self.assertIn('id="lb-save-jpeg"', info_body)
+        self.assertIn('id="lb-keep"', info_body)
+        self.assertIn('id="lb-reject"', info_body)
+        self.assertIn('id="lb-status"', info_body)
 
-        # The film strip must be the last thing in .lb-bottom - "pinned to the
-        # very bottom" of the whole viewer, below the toolbar row.
-        self.assertLess(body.index("lb-toolbar"), body.index('id="lb-film"'))
+        # No separate row wrapper any more - .lb-info is the only thing
+        # .lb-bottom needs to centre, and the film strip its only sibling.
+        self.assertNotIn("lb-toolbar", html)
 
-        status_rule = re.search(r"\.lb-status\{([^}]*)\}", CSS)
-        self.assertIsNotNone(status_rule, "no .lb-status CSS rule")
-        self.assertIn("flex:1", status_rule.group(1), "status must be a flex spacer, not a row of its own")
+        info_rule = re.search(r"\.lb-info\{([^}]*)\}", CSS)
+        self.assertIsNotNone(info_rule, "no .lb-info CSS rule")
+        self.assertIn("justify-content:center", info_rule.group(1))
 
     def test_exposure_is_a_css_filter_never_a_decision_or_a_network_call(self):
         """The whole point of "display only": adjustExposure()/applyExposure()

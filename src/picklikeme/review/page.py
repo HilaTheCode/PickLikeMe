@@ -151,14 +151,12 @@ cursor:pointer}
 .lb-nav.prev{left:16px}.lb-nav.next{right:16px}
 .lb-bottom{position:absolute;z-index:5;left:0;right:0;bottom:0;display:flex;flex-direction:column;
 align-items:center;gap:10px;padding:12px 16px 18px;background:linear-gradient(to top,rgba(0,0,0,.5),transparent)}
-/* One row, film strip pinned to the very bottom below it: the info box (its
-   own light pill, so black text has something to contrast against - the
-   dark viewer behind it is what light-on-dark text used to rely on) sits to
-   the left, Keep/Reject to the right - #lb-status is the flex-grow spacer
-   between them, so an empty status never disturbs the layout and a message
-   never needs a row of its own. */
-.lb-toolbar{display:flex;align-items:center;gap:16px;width:100%}
-.lb-info{display:flex;align-items:center;gap:16px;flex-wrap:wrap;
+/* One box holding everything (info, exposure, Save JPEG, Keep/Reject,
+   status), centred above the film strip by .lb-bottom's own
+   align-items:center - no extra wrapper needed for that. It is opaque and
+   light so black text has something to contrast against; the dark viewer
+   behind it is what light-on-dark text used to rely on instead. */
+.lb-info{display:flex;justify-content:center;align-items:center;gap:16px;flex-wrap:wrap;
 font-size:12.5px;color:#000;font-variant-numeric:tabular-nums;
 background:rgba(255,255,255,.92);border-radius:20px;padding:8px 18px;
 box-shadow:0 2px 10px rgba(0,0,0,.35)}
@@ -170,14 +168,14 @@ background:rgba(0,0,0,.06);border:1px solid rgba(0,0,0,.2);color:#000;cursor:poi
 .lb-save{background:rgba(0,0,0,.06);border:1px solid rgba(0,0,0,.2);color:#000;
 border-radius:7px;padding:4px 10px;font-size:12px;cursor:pointer}
 .lb-save:hover{background:rgba(0,0,0,.14)}
-.lb-acts{display:flex;gap:12px;flex-shrink:0}
-.lb-acts button{font-size:15px;padding:11px 28px;border-radius:10px;font-weight:650;
-background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.25);color:#e2e8f0}
-.lb-acts .keep{border-color:var(--good);color:#6ee7b7}
+.lb-acts{display:flex;gap:10px}
+.lb-acts button{font-size:13px;padding:7px 18px;border-radius:10px;font-weight:650;
+background:rgba(0,0,0,.04);border:1px solid rgba(0,0,0,.15);color:#000}
+.lb-acts .keep{border-color:var(--good);color:#065f46}
 .lb-acts .keep.on{background:var(--good);color:#06281f}
-.lb-acts .rej{border-color:var(--bad);color:#fca5a5}
+.lb-acts .rej{border-color:var(--bad);color:#991b1b}
 .lb-acts .rej.on{background:var(--bad);color:#2a0a0a}
-.lb-status{flex:1;font-size:12px;color:#cbd5e1;min-height:15px}
+.lb-status{font-size:12px;color:#334155}
 .lb-status.error{color:var(--bad)}
 .lb-film{display:flex;gap:6px;max-width:96vw;overflow-x:auto;padding:2px}
 .lb-film img{width:50px;height:50px;object-fit:cover;border-radius:6px;opacity:.5;cursor:pointer;
@@ -938,25 +936,23 @@ def build_page(title: str = "PickLikeMe review") -> str:
       <div class="lb-spinner" id="lb-spinner" style="display:none"></div>
     </div>
     <div class="lb-bottom">
-      <div class="lb-toolbar">
-        <div class="lb-info">
-          <span id="lb-counter"></span>
-          <span id="lb-filename"></span>
-          <span id="lb-score"></span>
-          <span id="lb-zoom">Fit</span>
-          <span class="lb-exp" id="lb-exp" title="Display only - never written to the RAW file or saved anywhere">
-            <span aria-hidden="true">&#9728;</span>
-            <button id="lb-exp-down" type="button" aria-label="Decrease exposure">&minus;</button>
-            <span class="val" id="lb-exp-value">+0.0 EV</span>
-            <button id="lb-exp-up" type="button" aria-label="Increase exposure">+</button>
-          </span>
-          <button class="lb-save" id="lb-save-jpeg" type="button" title="Save the camera's own JPEG for sharing">Save JPEG</button>
-        </div>
-        <div class="lb-status" id="lb-status"></div>
+      <div class="lb-info">
+        <span id="lb-counter"></span>
+        <span id="lb-filename"></span>
+        <span id="lb-score"></span>
+        <span id="lb-zoom">Fit</span>
+        <span class="lb-exp" id="lb-exp" title="Display only - never written to the RAW file or saved anywhere">
+          <span aria-hidden="true">&#9728;</span>
+          <button id="lb-exp-down" type="button" aria-label="Decrease exposure">&minus;</button>
+          <span class="val" id="lb-exp-value">+0.0 EV</span>
+          <button id="lb-exp-up" type="button" aria-label="Increase exposure">+</button>
+        </span>
+        <button class="lb-save" id="lb-save-jpeg" type="button" title="Save the camera's own JPEG for sharing">Save JPEG</button>
         <div class="lb-acts">
           <button class="keep" id="lb-keep">Keep</button>
           <button class="rej" id="lb-reject">Reject</button>
         </div>
+        <div class="lb-status" id="lb-status"></div>
       </div>
       <div class="lb-film" id="lb-film"></div>
     </div>
