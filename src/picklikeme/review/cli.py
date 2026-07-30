@@ -94,12 +94,19 @@ def run_review(args: argparse.Namespace) -> int:
 
     folder = Path(args.input) if args.input else None
     if folder is not None and not folder.is_dir():
-        raise SystemExit(f"Folder not found: {folder}")
-
+        # Not fatal - ReviewSession opens it anyway (folder_missing=True) so
+        # the page can load and offer to relocate it (moved, renamed, or a
+        # changed drive letter): the photographer picks the new location once
+        # and every stored path is repointed automatically.
+        print(
+            f"Folder not found: {folder}\n"
+            "  Starting anyway - the page will ask where it went; every stored path "
+            "(the ranking, any review decisions) is repointed automatically once you pick it."
+        )
     # An unranked folder is not an error - ReviewSession already handles it
     # (every image starts Neutral, sorted for Keep/Reject/Neutral by hand) -
     # just worth a heads-up, since `rank` first is the common case.
-    if folder is not None and not args.ranking and not has_ranking(folder):
+    elif folder is not None and not args.ranking and not has_ranking(folder):
         print(
             f"No ranking found for {folder}; there is no AI suggestion for any image in it.\n"
             f"  Expected: {ranking_path(folder)}\n"

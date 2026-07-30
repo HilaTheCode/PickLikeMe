@@ -465,6 +465,19 @@ class AnnotationStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_review_path ON review_decisions(image_path);
 
+                -- Reading a capture timestamp costs a rawpy/PIL open per
+                -- file - cheap once, not free at review-session scale (tens
+                -- of thousands of images). Memoised against (path, size,
+                -- mtime) exactly like identity_cache; captured_at is
+                -- nullable because "this file has no EXIF capture time" is
+                -- itself a cacheable, permanent answer, not a miss to retry.
+                CREATE TABLE IF NOT EXISTS capture_time_cache (
+                    path        TEXT PRIMARY KEY,
+                    size        INTEGER NOT NULL,
+                    mtime_ns    INTEGER NOT NULL,
+                    captured_at TEXT
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_v2_filename ON annotations_v2(filename);
                 CREATE INDEX IF NOT EXISTS idx_v2_updated  ON annotations_v2(updated_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_v2_category ON annotation_categories_v2(category);
@@ -764,6 +777,40 @@ class AnnotationStore:
     def identity_of(self, image_path: str | Path) -> str:
         """Public identity lookup. Raises IdentityUnavailable."""
         return self._identity_of(image_path)
+
+    def capture_timestamp_of(self, image_path: str | Path) -> str | None:
+        """The image's own EXIF capture date/time, memoised against
+        (path, size, mtime) exactly like identity_of - see
+        contactsheets.read_capture_timestamp for what is actually read.
+
+        Unlike identity_of, never raises: a missing file, or one with no
+        readable capture time, simply has nothing to report - the absence is
+        cached too (see the schema comment on capture_time_cache), so it is
+        computed at most once per file, not once per lookup.
+        """
+        path = Path(image_path)
+        try:
+            stat = path.stat()
+        except OSError:
+            return None
+
+        key = str(path.resolve())
+        row = self._conn.execute(
+            "SELECT captured_at FROM capture_time_cache WHERE path = ? AND size = ? AND mtime_ns = ?",
+            (key, stat.st_size, stat.st_mtime_ns),
+        ).fetchone()
+        if row is not None:
+            return row["captured_at"]
+
+        from .contactsheets import read_capture_timestamp
+
+        captured_at = read_capture_timestamp(str(path))
+        with self._conn:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO capture_time_cache(path, size, mtime_ns, captured_at) VALUES (?, ?, ?, ?)",
+                (key, stat.st_size, stat.st_mtime_ns, captured_at),
+            )
+        return captured_at
 
     def close(self) -> None:
         self._conn.close()

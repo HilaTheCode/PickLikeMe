@@ -259,6 +259,77 @@ class StorageTests(unittest.TestCase):
         self.assertEqual(DEFAULT_ANNOTATIONS_DB.name, "false_negatives.db")
 
 
+def make_jpeg_with_capture_time(path: Path, timestamp: str | None = "2024:06:15 10:30:00", size: int = 4) -> Path:
+    """A real, decodable JPEG - unlike make_image's byte blob, this one
+    needs to actually open and (optionally) carry an EXIF DateTimeOriginal
+    tag, since capture_timestamp_of exercises the real read path, not just
+    the cache around it. `size` (pixel dimensions) is exposed so a test that
+    needs to force the cache key's `size` column to change - rather than
+    relying on filesystem mtime resolution, which can coincide within a
+    single test's runtime - can pick a different one."""
+    from PIL import Image
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    image = Image.new("RGB", (size, size), color="blue")
+    if timestamp is not None:
+        exif = image.getexif()
+        exif[36867] = timestamp  # DateTimeOriginal
+        image.save(path, format="JPEG", exif=exif)
+    else:
+        image.save(path, format="JPEG")
+    return path
+
+
+class CaptureTimestampTests(unittest.TestCase):
+    """The Lightbox's sort-by-capture-date feature - read once per file,
+    memoised the same way identity is."""
+
+    def test_reads_the_exif_datetimeoriginal_tag(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = make_jpeg_with_capture_time(Path(tmp) / "a.jpg")
+            with store_in(tmp) as store:
+                self.assertEqual(store.capture_timestamp_of(path), "2024-06-15T10:30:00")
+
+    def test_an_image_with_no_exif_has_no_capture_time(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = make_jpeg_with_capture_time(Path(tmp) / "a.jpg", timestamp=None)
+            with store_in(tmp) as store:
+                self.assertIsNone(store.capture_timestamp_of(path))
+
+    def test_a_missing_file_has_no_capture_time_and_does_not_raise(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = Path(tmp) / "gone.jpg"
+            with store_in(tmp) as store:
+                self.assertIsNone(store.capture_timestamp_of(missing))
+
+    def test_is_memoised_against_size_and_mtime_like_identity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = make_jpeg_with_capture_time(Path(tmp) / "a.jpg", timestamp="2024:01:01 00:00:00")
+            with store_in(tmp) as store:
+                first = store.capture_timestamp_of(path)
+                self.assertEqual(first, store.capture_timestamp_of(path))  # cache hit
+
+                # A new file at the same path, forced to a different byte
+                # size (bigger image => bigger JPEG - the same trick
+                # test_identity_is_memoised_against_size_and_mtime uses),
+                # must not keep answering with the stale, cached timestamp.
+                make_jpeg_with_capture_time(path, timestamp="2025:12:31 23:59:59", size=32)
+                self.assertEqual(store.capture_timestamp_of(path), "2025-12-31T23:59:59")
+
+    def test_the_absence_of_a_capture_time_is_cached_too(self):
+        """A file with no EXIF must not be re-read on every single lookup -
+        "no timestamp" is just as memoisable an answer as a real one."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = make_jpeg_with_capture_time(Path(tmp) / "a.jpg", timestamp=None)
+            with store_in(tmp) as store:
+                store.capture_timestamp_of(path)
+                row = store._conn.execute(
+                    "SELECT captured_at FROM capture_time_cache WHERE path = ?", (str(path.resolve()),)
+                ).fetchone()
+                self.assertIsNotNone(row, "a None result must still be written to the cache")
+                self.assertIsNone(row["captured_at"])
+
+
 class MigrationTests(unittest.TestCase):
     """v1 keyed on a path digest; those records must be re-keyed automatically."""
 

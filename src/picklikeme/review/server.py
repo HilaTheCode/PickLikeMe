@@ -152,6 +152,43 @@ class ReviewRequestHandler(AnnotationRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _serve_preview(self) -> None:
+        """The Lightbox's full-size preview - overrides the inherited
+        version (still used, unchanged, by the analysis report) to back it
+        with a persistent on-disk cache (see thumbnails.review_preview), so
+        revisiting the same image while flipping back and forth through a
+        burst doesn't redo a real RAW decode + JPEG re-encode every time.
+        Dispatched here automatically: `AnnotationRequestHandler.do_GET`
+        calls `self._serve_preview()` for `/preview`, and Python's normal
+        method resolution picks this override over the inherited one.
+        """
+        target = self._within_dataset(self._query_path())
+        if target is None:
+            return
+        if not target.is_file():
+            self._send_json({"error": "file not found (has the dataset moved?)"}, status=404)
+            return
+
+        from .thumbnails import review_preview
+
+        try:
+            cached = review_preview(str(target))
+        except Exception as exc:  # noqa: BLE001 - a bad frame must not break the viewer
+            logger.warning("Could not build a preview for %s: %s", target, exc)
+            self._send_json({"error": f"could not extract a preview: {exc}"}, status=500)
+            return
+
+        data = cached.read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", "image/jpeg")
+        self.send_header("Content-Length", str(len(data)))
+        # Safe to cache, unlike the inherited no-store version: content-
+        # addressed by resolved path (see thumbnails.review_preview), the
+        # same tradeoff the square thumbnail cache already makes.
+        self.send_header("Cache-Control", "max-age=300")
+        self.end_headers()
+        self.wfile.write(data)
+
     def do_GET(self) -> None:  # noqa: N802 - stdlib signature
         route = urlparse(self.path).path
         if route in ("/", "/review.html", "/index.html"):
@@ -190,6 +227,7 @@ class ReviewRequestHandler(AnnotationRequestHandler):
             "/api/review/arrange": self._post_arrange,
             "/api/review/reconcile": self._post_reconcile,
             "/api/review/open-folder": self._post_open_folder,
+            "/api/review/relocate-folder": self._post_relocate_folder,
         }
         handler = handlers.get(route)
         if handler is None:
@@ -252,13 +290,19 @@ class ReviewRequestHandler(AnnotationRequestHandler):
         self._send_json({"ok": True, **result, "state": self.session.as_dict()})
 
     def _post_apply_ai_suggestions(self, payload: dict) -> None:
-        """Bulk-accept the AI's current suggestion for every ranked image
-        still Neutral - see ReviewSession.apply_ai_suggestions. The one
-        endpoint that lets the AI ranking influence review_status at all,
-        and only because the photographer explicitly asked it to, once, for
-        images they had not yet looked at themselves.
+        """Bulk-accept the AI's current suggestion - see
+        ReviewSession.apply_ai_suggestions. The one endpoint that lets the AI
+        ranking influence review_status at all, and only because the
+        photographer explicitly asked it to.
+
+        `include_decided` defaults to False: a Neutral image is updated
+        either way (nothing manual is at risk there), but an already-decided
+        image is only overridden when the caller passes this explicitly true
+        - the page's own flow only does so after showing the photographer
+        how many images that would affect and asking first.
         """
-        result = self.session.apply_ai_suggestions()
+        include_decided = bool(payload.get("include_decided", False))
+        result = self.session.apply_ai_suggestions(include_decided=include_decided)
         self._send_json({"ok": True, **result, "state": self.session.as_dict()})
 
     def _post_keep_percent(self, payload: dict) -> None:
@@ -291,15 +335,20 @@ class ReviewRequestHandler(AnnotationRequestHandler):
         recovered = self.session.reconcile_by_identity()
         self._send_json({"ok": True, "recovered": recovered, "state": self.session.as_dict()})
 
-    def _post_open_folder(self, payload: dict) -> None:
-        """Switch the review to a different folder - typically one that has
-        never been ranked, so its photos can only be sorted by hand.
+    def _pick_folder(self, payload: dict) -> Path | None:
+        """Resolve which folder a caller means - shared by `/open-folder` and
+        `/relocate-folder`, since both boil down to the same "an explicit
+        `path`, else the native picker, else cancelled" resolution.
 
         `path` lets a caller (a test, or a photographer who'd rather paste a
         path than click through a dialog) skip the native picker entirely.
         Without it, `choose_folder` shows the OS's own folder browser - the
         server-side bridge a served page needs to reach the OS at all (see
         os_actions.py) - seeded at the folder currently under review.
+
+        Returns None once a response has already been sent (the dialog was
+        cancelled, or the chosen path is not a real directory) - the caller
+        should simply return at that point, like any other early exit.
         """
         raw_path = payload.get("path")
         if raw_path is not None and not isinstance(raw_path, str):
@@ -310,20 +359,44 @@ class ReviewRequestHandler(AnnotationRequestHandler):
             folder = choose_folder(initial_dir=self.session.input_folder)
             if folder is None:
                 self._send_json({"ok": True, "cancelled": True, "state": self.session.as_dict()})
-                return
+                return None
         if not folder.is_dir():
             self._send_json({"error": f"folder not found: {folder}"}, status=404)
-            return
-        self.session.open_folder(folder)
-        # The dataset confinement `/source`, `/thumb`, `/preview` and
-        # `/open-folder` all check - set on the class, not `self`, since a
-        # fresh handler instance is built per request (see the class
-        # docstring) and every one of them must see the new folder.
+            return None
+        return folder
+
+    def _retarget_dataset_roots(self) -> None:
+        """The dataset confinement `/source`, `/thumb`, `/preview` and
+        `/open-folder` all check - set on the class, not `self`, since a
+        fresh handler instance is built per request (see the class
+        docstring) and every one of them must see the new folder."""
         cls = type(self)
         cls.root = self.session.input_folder
         cls.source_roots = (self.session.input_folder,)
+
+    def _post_open_folder(self, payload: dict) -> None:
+        """Switch the review to a different folder - typically one that has
+        never been ranked, so its photos can only be sorted by hand."""
+        folder = self._pick_folder(payload)
+        if folder is None:
+            return
+        self.session.open_folder(folder)
+        self._retarget_dataset_roots()
         recovered = self.session.reconcile_by_identity()
         self._send_json({"ok": True, "recovered": recovered, "state": self.session.as_dict()})
+
+    def _post_relocate_folder(self, payload: dict) -> None:
+        """The folder this session was reviewing can no longer be found at
+        its old location (moved, renamed, or a changed drive letter) - see
+        ReviewSession.relocate_folder. Shares `_pick_folder` with
+        `_post_open_folder`: picking a folder to point at is the same
+        problem either way."""
+        folder = self._pick_folder(payload)
+        if folder is None:
+            return
+        result = self.session.relocate_folder(folder)
+        self._retarget_dataset_roots()
+        self._send_json({"ok": True, **result, "state": self.session.as_dict()})
 
 
 def make_review_server(

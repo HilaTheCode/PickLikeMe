@@ -66,6 +66,9 @@ class ReviewImage:
     # affected by anything the photographer does in it.
     score: float | None = None
     rank: int | None = None
+    # The file's own EXIF capture date/time (ISO-8601), or None if it has
+    # none - a sort key, nothing more. See AnnotationStore.capture_timestamp_of.
+    captured_at: str | None = None
     # The photographer's own verdict: REVIEW_KEEP, REVIEW_REJECT, or None.
     # None *is* Neutral - see review_status - not "no opinion yet from
     # somewhere else". Meaningless without a decision, and always cleared
@@ -96,6 +99,7 @@ class ReviewImage:
             "filename": self.filename,
             "score": self.score,
             "rank": self.rank,
+            "captured_at": self.captured_at,
             "review_status": self.review_status,
             # What the AI ranking alone would recommend at the current
             # threshold - "keep"/"reject", or None if unranked. Informational
@@ -172,6 +176,10 @@ class ReviewSession:
             if _key(str(path)) in seen:
                 continue
             images.append(ReviewImage(image_path=str(path), filename=path.name))
+
+        for image in images:
+            if not image.missing_file:
+                image.captured_at = self.store.capture_timestamp_of(image.image_path)
 
         # Best first; unranked last, since they have no score to place them by.
         images.sort(key=lambda i: (i.score is None, -(i.score or 0.0), i.filename))
@@ -276,6 +284,71 @@ class ReviewSession:
             logger.info("Recovered %d review decision(s) by content identity", recovered)
         return recovered
 
+    @property
+    def folder_missing(self) -> bool:
+        """True when a folder is set but can no longer be found there -
+        moved, renamed, or its drive letter changed. Distinct from no folder
+        ever having been opened (`input_folder is None`, the ordinary empty-
+        gallery start state) - this is the one that needs a photographer's
+        attention (see relocate_folder)."""
+        return self.input_folder is not None and not self.input_folder.is_dir()
+
+    def relocate_folder(self, new_folder: str | Path) -> dict:
+        """The folder this session was reviewing can no longer be found at
+        its old location, and the photographer has pointed at where it went
+        instead - moved, renamed, or found on a drive that changed letter.
+
+        Assuming the same relative layout survived the move (the ordinary
+        case: this is the exact same shoot, just found somewhere else), every
+        ranked image's stored path is repointed at `new_folder` automatically
+        by substituting the old root for the new one - nothing new needs
+        deciding by hand, and this is transparent to the photographer, who
+        only ever sees the gallery load correctly again.
+
+        Reuses exactly the machinery `arrange()` already uses to keep the
+        ranking and the store's review decisions correct after files move
+        (`rewrite_ranking_paths`, `repoint_review_decisions`), plus
+        `reconcile_by_identity` as the same fallback it already is for
+        anything the prefix substitution below could not map - a file
+        renamed during the move, or one never in the ranking to begin with
+        (an "extra" image the folder enumeration found, not the CSV).
+
+        The ranking CSV itself is read from `new_folder` (via `ranking_path`),
+        not from `self.ranking_file` (the OLD, now-unreachable location) -
+        the CSV moved along with everything else, so it now lives at the new
+        location, still full of the OLD absolute paths that need rewriting.
+        """
+        old_folder = self.input_folder
+        new_folder = Path(new_folder).resolve()
+
+        moves: dict[str, str] = {}
+        if old_folder is not None:
+            new_ranking_file = ranking_path(new_folder)
+            if new_ranking_file.is_file():
+                from ..analyzer.io import load_ranking
+
+                try:
+                    ranking = load_ranking(new_ranking_file)
+                except Exception as exc:  # noqa: BLE001 - a broken ranking must not block relocating
+                    logger.warning("Could not read %s while relocating: %s", new_ranking_file, exc)
+                else:
+                    for image in ranking.images:
+                        try:
+                            relative = Path(image.image_path).resolve().relative_to(old_folder)
+                        except (OSError, ValueError):
+                            continue
+                        candidate = new_folder / relative
+                        if candidate.is_file():
+                            moves[image.image_path] = str(candidate)
+
+        if moves:
+            rewrite_ranking_paths(new_folder, moves)
+            self.store.repoint_review_decisions(moves)
+
+        self.open_folder(new_folder)
+        recovered = self.reconcile_by_identity()
+        return {"relocated": len(moves), "recovered": recovered}
+
     # -- AI metadata (read-only) ---------------------------------------------
 
     def set_keep_percent(self, percent: float) -> float:
@@ -310,6 +383,44 @@ class ReviewSession:
                 suggestions[image.image_path] = None
         return suggestions
 
+    def agreement_stats(self) -> dict:
+        """How often the photographer's own review status agrees with the
+        AI's suggestion, among images where a real comparison is possible -
+        ranked AND actually decided. Neutral is "no opinion formed yet", not
+        a disagreement, so it is excluded from the comparison entirely, the
+        same way it is excluded from `_ai_suggestions`'s own reasoning.
+
+        Purely informational - for evaluating the model against real human
+        judgement over time, e.g. across successive training runs. Never
+        read by review_status, ai_suggestion, or arrange().
+        """
+        suggestions = self._ai_suggestions()
+        compared = 0
+        agree = 0
+        ai_keep_user_reject = 0
+        ai_reject_user_keep = 0
+        for image in self.images:
+            suggestion = suggestions.get(image.image_path)
+            if suggestion is None or image.review_status == REVIEW_STATUS_NEUTRAL:
+                continue
+            compared += 1
+            if image.review_status == suggestion:
+                agree += 1
+            elif suggestion == REVIEW_STATUS_KEEP:
+                ai_keep_user_reject += 1
+            else:
+                ai_reject_user_keep += 1
+        disagree = compared - agree
+        return {
+            "compared": compared,
+            "agree": agree,
+            "disagree": disagree,
+            "agree_percent": round(100 * agree / compared, 1) if compared else None,
+            "disagree_percent": round(100 * disagree / compared, 1) if compared else None,
+            "ai_keep_user_reject": ai_keep_user_reject,
+            "ai_reject_user_keep": ai_reject_user_keep,
+        }
+
     # -- the photographer's review status ------------------------------------
 
     def keep_paths(self) -> list[str]:
@@ -334,10 +445,12 @@ class ReviewSession:
         ai_suggestions = self._ai_suggestions()
         return {
             "input_folder": str(self.input_folder) if self.input_folder else None,
+            "folder_missing": self.folder_missing,
             "ranking_file": str(self.ranking_file) if self.ranking_file else None,
             "has_ranking": bool(self.ranking_file and self.ranking_file.is_file()),
             "keep_percent": self.keep_percent,
             "counts": self.counts(),
+            "agreement": self.agreement_stats(),
             "warnings": list(self.warnings),
             "run": self.run_metadata,
             "images": [image.as_dict(ai_suggestions.get(image.image_path)) for image in self.images],
@@ -415,29 +528,44 @@ class ReviewSession:
                 applied += 1
         return {"applied": applied, "failed": failed}
 
-    def apply_ai_suggestions(self) -> dict:
-        """Bulk-accept the AI's CURRENT suggestion for every ranked image
-        still Neutral - a fast starting point for a very large shoot: review
-        the exceptions by hand, let this handle the rest.
+    def apply_ai_suggestions(self, *, include_decided: bool = False) -> dict:
+        """Bulk-accept the AI's CURRENT suggestion for every ranked image -
+        a fast starting point for a very large shoot: review the exceptions
+        by hand, let this handle the rest.
 
-        Every image it touches becomes a real, independent, explicit Keep or
-        Reject the moment this runs, indistinguishable afterwards from one
-        set by hand - not an ongoing tie to the model or the threshold. Never
-        touches an image the photographer has already ruled on (Keep or
-        Reject), and never touches one the AI has no opinion about
-        (unranked) - both are left exactly as they were.
+        A Neutral image has nothing manual at risk, so it is always updated
+        immediately - no confirmation needed for that part, here or in the
+        page. An image the photographer has ALREADY marked Keep or Reject is
+        only touched when `include_decided=True`; the caller (review/server.py's
+        endpoint, and the page's own two-step flow) is responsible for
+        getting that explicit confirmation first. This method never
+        overwrites manual work silently - it either leaves a decided image
+        alone, or the caller has already agreed to override it.
+
+        `conflicts` in the result is the number of already-decided images
+        whose review_status disagrees with the AI's own suggestion - counted
+        on every call, even with `include_decided=False`, so a caller can
+        decide whether asking about a second, confirmed call is even worth
+        it. `overridden` is how many of those were actually changed this
+        call (always 0 unless `include_decided=True`).
         """
         suggestions = self._ai_suggestions()
         applied = 0
+        overridden = 0
+        conflicts = 0
         for image in self.images:
-            if image.review_status != REVIEW_STATUS_NEUTRAL:
-                continue
             suggestion = suggestions.get(image.image_path)
             if suggestion is None:
                 continue
-            self.set_review_status(image.image_path, suggestion)
-            applied += 1
-        return {"applied": applied}
+            if image.review_status == REVIEW_STATUS_NEUTRAL:
+                self.set_review_status(image.image_path, suggestion)
+                applied += 1
+            elif image.review_status != suggestion:
+                conflicts += 1
+                if include_decided:
+                    self.set_review_status(image.image_path, suggestion)
+                    overridden += 1
+        return {"applied": applied, "overridden": overridden, "conflicts": conflicts}
 
     def _image_for(self, image_path: str) -> ReviewImage:
         key = _key(image_path)

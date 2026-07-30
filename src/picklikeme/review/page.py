@@ -70,18 +70,21 @@ font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial
 header{position:sticky;top:0;z-index:20;background:var(--panel);border-bottom:1px solid var(--border);
 padding:10px 20px;box-shadow:0 1px 3px var(--shadow)}
 
-/* One wrapping row of labelled groups - Folder / View / AI Suggests / Tools -
-   plus Statistics and Appearance pinned to the right. A thin vertical rule
-   between groups substitutes for the visual weight a heading would otherwise
-   need, without spending a whole line on it (see the toolbar-redesign notes
-   in this module's docstring: no app/page name is shown here at all - the
-   window/tab title already carries that). */
+/* One wrapping row of labelled groups - Folder / AI Suggests / Tools - plus
+   Statistics and Appearance pinned to the right. View/Filter/Sort live in the
+   collapsible side panel instead (see .panel below), keeping this row short
+   even as the app grows. A thin vertical rule between groups substitutes for
+   the visual weight a heading would otherwise need, without spending a whole
+   line on it (see the toolbar-redesign notes in this module's docstring: no
+   app/page name is shown here at all - the window/tab title already carries
+   that). */
 .toolbar{display:flex;align-items:center;gap:14px;flex-wrap:wrap}
 .group{display:flex;gap:6px;align-items:center}
 .glabel{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em;margin-right:2px}
 .divider{width:1px;align-self:stretch;min-height:22px;background:var(--border)}
 .folder-name{font-size:12.5px;color:var(--muted);font-family:ui-monospace,Consolas,monospace;
 max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.folder-name.missing{color:var(--bad);font-weight:600}
 button{font:inherit;font-size:13px;padding:6px 12px;border-radius:7px;border:1px solid var(--border);
 background:var(--panel-2);color:var(--text);cursor:pointer}
 button:hover{border-color:var(--accent)}
@@ -111,8 +114,6 @@ padding:8px 16px;border-radius:10px;border:1px solid var(--accent);background:va
 .bk{display:flex;align-items:center;gap:5px}
 .bk .ic{font-size:14px;line-height:1}
 .bk.keep .ic{color:var(--good)}.bk.reject .ic{color:var(--bad)}.bk.neutral .ic{color:var(--muted)}
-.bk.ghost{background:transparent;border-color:transparent;color:var(--muted)}
-.bk.ghost:hover{border-color:var(--border)}
 
 .notice{margin:12px 20px 0;padding:10px 14px;border-radius:8px;border:1px dashed var(--warn);
 background:var(--panel-2);font-size:13px}
@@ -120,7 +121,28 @@ background:var(--panel-2);font-size:13px}
 .status{font-size:12.5px;color:var(--muted)}
 .status.error{color:var(--bad)}
 
-.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:12px;padding:16px 20px 60px}
+/* Filters, sorting and view options live here rather than in the toolbar
+   (Phase 7 of the redesign) - contextual to the gallery it controls, and
+   collapsible so a photographer who wants every last pixel for the grid can
+   tuck it away; the toggle's own state persists like the theme does. */
+.layout{display:flex;align-items:flex-start;gap:0}
+.grid{flex:1;min-width:0;display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));
+gap:12px;padding:16px 20px 60px}
+.panel{width:250px;flex-shrink:0;padding:16px 20px 20px 4px;position:sticky;top:0;
+max-height:100vh;overflow-y:auto}
+.panel.collapsed{display:none}
+.panel-section{margin-bottom:20px}
+.panel-section h3{font-size:11px;margin:0 0 8px;color:var(--muted);text-transform:uppercase;letter-spacing:.05em}
+.panel-filters{display:flex;flex-direction:column;gap:5px}
+.panel-filters button{text-align:left;justify-content:flex-start}
+.panel-row{display:flex;align-items:center;gap:8px;margin-top:10px}
+.panel-hint{font-size:12px;color:var(--muted)}
+.panel select{font:inherit;font-size:13px;padding:6px 8px;border-radius:7px;
+border:1px solid var(--border);background:var(--panel);color:var(--text);flex:1}
+.agreement-stats{display:grid;grid-template-columns:1fr auto;gap:4px 10px;font-size:12.5px}
+.agreement-stats b{font-variant-numeric:tabular-nums}
+.agreement-stats b.agree{color:var(--good)}
+.agreement-stats b.disagree{color:var(--bad)}
 .card{position:relative;background:var(--panel);border:1px solid var(--border);border-radius:11px;overflow:hidden;
 display:flex;flex-direction:column;box-shadow:0 1px 2px var(--shadow)}
 .card.keep{border-color:var(--good);border-width:2px}
@@ -250,17 +272,56 @@ const PLM = {
   state: null,
   boxes: false,
   busy: false,
-  filter: 'all',  // 'all' | 'keep' | 'reject' | 'neutral' - client-side only, survives state refreshes
+  // 'all' | 'keep' | 'reject' | 'neutral' | 'ai_keep' | 'ai_reject' | 'differences'
+  // - client-side only, survives state refreshes.
+  filter: 'all',
+  sort: {key: 'score', dir: 'desc'},  // key: 'score'|'name'|'date' - 'score'/'desc' matches the server's own default order
   picked: new Set(),      // image_path set, for the multi-select bulk actions bar
-  bulkDismissed: false,   // Dismiss hides the bar without clearing picks; any new pick reveals it again
   labels: __STATUS_LABELS__,
   reasons: __REASON_LABELS__,
+  relocateDismissed: false,  // "Not Now" on the folder-missing dialog; a folder change resets this
+  lastFolderSeen: undefined,
 };
 
+// Filter, then sort - "Select All Visible" and the Lightbox's own next/
+// previous both read this same list, so "visible" always means exactly what
+// the photographer is currently looking at under both.
 function visibleImages(){
   const images = (PLM.state && PLM.state.images) || [];
+  return sortImages(filterImages(images));
+}
+
+function filterImages(images){
   if(PLM.filter === 'all') return images;
+  if(PLM.filter === 'ai_keep') return images.filter(i => i.ai_suggestion === 'keep');
+  if(PLM.filter === 'ai_reject') return images.filter(i => i.ai_suggestion === 'reject');
+  // A real difference of opinion: the AI has one, the photographer has
+  // decided (Neutral is "no opinion yet", not a disagreement), and the two
+  // don't match.
+  if(PLM.filter === 'differences') {
+    return images.filter(i => i.ai_suggestion != null && i.review_status !== 'neutral' && i.review_status !== i.ai_suggestion);
+  }
   return images.filter(i => i.review_status === PLM.filter);
+}
+
+// A missing sort value (no score, no capture date) always sorts last,
+// regardless of direction - there is no meaningful position for "unknown"
+// within an ascending or descending order, in either direction.
+function sortImages(images){
+  const key = PLM.sort.key, factor = PLM.sort.dir === 'desc' ? -1 : 1;
+  const valueOf = image => key === 'name' ? image.filename.toLowerCase()
+    : key === 'date' ? image.captured_at
+    : image.score;
+  return images.slice().sort((a, b) => {
+    const va = valueOf(a), vb = valueOf(b);
+    const missingA = va == null, missingB = vb == null;
+    if(missingA && missingB) return 0;  // Array.sort is stable - keeps the server's own tiebreak order
+    if(missingA) return 1;
+    if(missingB) return -1;
+    if(va < vb) return -1 * factor;
+    if(va > vb) return 1 * factor;
+    return 0;
+  });
 }
 
 const esc = s => { const d = document.createElement('div'); d.textContent = s == null ? '' : s; return d.innerHTML; };
@@ -313,6 +374,7 @@ function render(){
   const folderEl = q('#folder');
   folderEl.textContent = s.input_folder || 'No folder open';
   folderEl.title = s.input_folder || '';
+  folderEl.classList.toggle('missing', !!s.folder_missing);
   q('#c-total').textContent = s.counts.total.toLocaleString();
   q('#c-keep').textContent = s.counts.keep.toLocaleString();
   q('#c-reject').textContent = s.counts.reject.toLocaleString();
@@ -336,15 +398,29 @@ function render(){
     notice.style.display = 'none';
   }
 
+  // The folder this session thinks it has can no longer be found - moved,
+  // renamed, or a changed drive letter. Auto-prompt once per such episode:
+  // "Not Now" is remembered until either the folder changes again or it
+  // relocates successfully, so it does not nag on every re-render.
+  if(s.input_folder !== PLM.lastFolderSeen) PLM.relocateDismissed = false;
+  PLM.lastFolderSeen = s.input_folder;
+  if(s.folder_missing && !PLM.relocateDismissed && !q('#relocate-dlg').open){
+    q('#relocate-dlg').showModal();
+  }
+
   document.querySelectorAll('.filter').forEach(b => {
     b.classList.toggle('on', b.dataset.filter === PLM.filter);
   });
+  q('#sort-key').value = PLM.sort.key;
+  q('#sort-dir').textContent = PLM.sort.dir === 'desc' ? '↓' : '↑';
+  q('#sort-dir').title = PLM.sort.dir === 'desc' ? 'Descending (click for ascending)' : 'Ascending (click for descending)';
 
-  // Neither has anywhere to point without a folder open - "Reveal in
-  // Explorer" would otherwise send the literal string "null" to the server
-  // (see openFolder), and Arrange has nothing to file.
-  q('#open').disabled = !hasFolder;
-  q('#go').disabled = !hasFolder;
+  // Neither has anywhere to point without a real, present folder -
+  // "Reveal" would otherwise send the literal string "null" to the server
+  // (see openFolder) or fail outright on one that cannot be found, and
+  // Arrange has nothing to file.
+  q('#open').disabled = !hasFolder || s.folder_missing;
+  q('#go').disabled = !hasFolder || s.folder_missing;
 
   // A pick can outlive the image it names - arranging or switching folders
   // both replace s.images wholesale (arrange repoints paths, a new folder is
@@ -354,9 +430,11 @@ function render(){
   const present = new Set(s.images.map(i => i.image_path));
   for(const path of PLM.picked){ if(!present.has(path)) PLM.picked.delete(path); }
   updateBulkBar();
+  renderAgreementStats(s.agreement);
 
   const grid = q('#grid');
   if(!s.images.length){
+    q('#visible-count').textContent = '0 of 0 visible';
     grid.innerHTML = hasFolder
       ? '<div class="empty">No images found in this folder.</div>'
       : '<div class="empty">No folder open yet. Click &ldquo;Open Folder&hellip;&rdquo; above to choose one.</div>';
@@ -365,6 +443,7 @@ function render(){
   // Index into the filtered, displayed list - not s.images - so the lightbox
   // opened from a filtered view navigates only what is actually on screen.
   const visible = visibleImages();
+  q('#visible-count').textContent = visible.length.toLocaleString() + ' of ' + s.images.length.toLocaleString() + ' visible';
   if(!visible.length){
     grid.innerHTML = '<div class="empty">No images match this filter.</div>';
     return;
@@ -376,7 +455,7 @@ function render(){
   grid.querySelectorAll('input[data-pick]').forEach(cb => {
     cb.addEventListener('change', () => {
       const path = cb.dataset.pick;
-      if(cb.checked){ PLM.picked.add(path); PLM.bulkDismissed = false; }
+      if(cb.checked) PLM.picked.add(path);
       else PLM.picked.delete(path);
       cb.closest('.card').classList.toggle('picked', cb.checked);
       updateBulkBar();
@@ -388,6 +467,24 @@ function render(){
   grid.querySelectorAll('.thumb-link[data-index]').forEach(el => {
     el.addEventListener('click', () => Lightbox.open(Number(el.dataset.index)));
   });
+}
+
+// Purely informational (see session.py's agreement_stats): never read by
+// review_status, ai_suggestion, or arrange() - just a way to see, over time,
+// how often the model's own opinion matches what the photographer actually
+// decided, and where it doesn't.
+function renderAgreementStats(agreement){
+  const section = q('#agreement-section');
+  if(!agreement || !agreement.compared){
+    section.style.display = 'none';
+    return;
+  }
+  section.style.display = '';
+  q('#agreement-stats').innerHTML =
+    '<span>AI agrees</span><b class="agree">' + agreement.agree_percent.toFixed(1) + '%</b>' +
+    '<span>AI disagrees</span><b class="disagree">' + agreement.disagree_percent.toFixed(1) + '%</b>' +
+    '<span>AI Keep / You Reject</span><b>' + agreement.ai_keep_user_reject.toLocaleString() + '</b>' +
+    '<span>AI Reject / You Keep</span><b>' + agreement.ai_reject_user_keep.toLocaleString() + '</b>';
 }
 
 function card(image, index){
@@ -495,10 +592,21 @@ const Lightbox = (function(){
   let exposureSteps = 0;
   // path -> blob object URL for the full-size decode. Bounded to a small
   // window around the current index and revoked on eviction, so a session of
-  // thousands of images cannot leak memory. This exists at all because
-  // /preview is Cache-Control: no-store (shared with the analysis report's
-  // own use of it), so the browser's own HTTP cache cannot do the job.
+  // thousands of images cannot leak memory.
   const cache = new Map();
+  // path -> in-flight Promise<url>, so two callers requesting the SAME image
+  // before either has resolved (renderImage() for the now-current image,
+  // preloadAround() for a neighbour that becomes current a moment later)
+  // share one fetch instead of firing a duplicate network request and a
+  // duplicate server-side decode. Profiling the "Lightbox gets slower while
+  // browsing quickly" report traced it here and to review/server.py's
+  // `_serve_preview`: /preview re-ran a full RAW decode + JPEG re-encode on
+  // every request (it is `Cache-Control: no-store`, correctly, for the
+  // analysis report's own long-lived use of the same endpoint - see
+  // thumbnails.review_preview for why the review app can safely cache it
+  // instead), and rapid navigation was requesting the same handful of
+  // images over and over as the reviewer flipped back and forth.
+  const pending = new Map();
 
   // The same filtered list the gallery is currently showing - see
   // visibleImages() - so opening from a filtered view and pressing
@@ -657,14 +765,27 @@ const Lightbox = (function(){
   function fetchPreview(path){
     const existing = cache.get(path);
     if(existing) return Promise.resolve(existing);
-    return fetch(previewUrl(path), {cache: 'no-store'})
+    const inFlight = pending.get(path);
+    if(inFlight) return inFlight;
+
+    // No {cache: 'no-store'} here any more: review/server.py's
+    // _serve_preview override sends a real Cache-Control for THIS app's own
+    // /preview, so the browser's native HTTP cache is a second, free layer
+    // underneath this Map - a blob URL evicted from here (see
+    // evictFarFromCurrent) can still come back without a server round trip
+    // at all if the browser still has it, let alone without re-decoding it.
+    const promise = fetch(previewUrl(path))
       .then(r => { if(!r.ok) throw new Error('HTTP ' + r.status); return r.blob(); })
       .then(blob => {
         const url = URL.createObjectURL(blob);
+        pending.delete(path);
         cache.set(path, url);
         evictFarFromCurrent();
         return url;
-      });
+      })
+      .catch(err => { pending.delete(path); throw err; });
+    pending.set(path, promise);
+    return promise;
   }
 
   function evictFarFromCurrent(){
@@ -954,6 +1075,28 @@ function setFilter(name){
   render();
 }
 
+function setSortKey(key){
+  PLM.sort.key = key;
+  render();
+}
+
+function toggleSortDir(){
+  PLM.sort.dir = PLM.sort.dir === 'desc' ? 'asc' : 'desc';
+  render();
+}
+
+// Collapsible per Phase 7 of the redesign - persisted like the theme, so a
+// photographer who tucks it away to maximise the grid does not have to redo
+// that every time the page loads.
+function setPanelOpen(open){
+  q('#side-panel').classList.toggle('collapsed', !open);
+  q('#panel-toggle').classList.toggle('on', open);
+  try{ localStorage.setItem('plm-panel-open', open ? '1' : '0') }catch(e){}
+}
+function togglePanel(){
+  setPanelOpen(q('#side-panel').classList.contains('collapsed'));
+}
+
 // -- one generic confirmation dialog, reused by every action below that
 // needs "are you sure?" before it touches many images or the disk at once
 // (multi-select bulk actions, Apply AI Suggestions) - Arrange keeps its own
@@ -984,17 +1127,23 @@ function updateBulkBar(){
   const n = PLM.picked.size;
   const bar = q('#bulk-bar');
   // Gone from the layout entirely with nothing picked - not merely
-  // disabled - so it never sits there as dead chrome (Phase 2). Dismiss
-  // hides it early without discarding the picks themselves; checking any
-  // NEW box always brings it back (see the checkbox handler in render()).
-  if(n === 0 || PLM.bulkDismissed){ bar.style.display = 'none'; return; }
+  // disabled - so it never sits there as dead chrome (Phase 2).
+  if(n === 0){ bar.style.display = 'none'; return; }
   bar.style.display = '';
   q('#bulk-count').textContent = n === 1 ? '1 image selected' : n.toLocaleString() + ' images selected';
 }
 
 function clearPicked(){
   PLM.picked.clear();
-  PLM.bulkDismissed = false;
+  render();
+}
+
+// The primary way to start a bulk selection (Phase 1 of this round): every
+// image currently on screen - after BOTH the active filter and the active
+// sort - joins the pick set in one click, exactly matching what "visible"
+// means to the gallery and the Lightbox alike (see visibleImages()).
+function selectAllVisible(){
+  for(const image of visibleImages()){ PLM.picked.add(image.image_path); }
   render();
 }
 
@@ -1027,30 +1176,49 @@ async function runBulkStatus(status){
   }catch(e){ say('Could not apply the bulk action: ' + e.message, true); }
 }
 
-// -- AI suggestions (still entirely read-only until this one, explicit,
-// confirmed action) -----------------------------------------------------
+// -- AI suggestions (still entirely read-only until this runs, and even
+// then never overrides a photographer's own Keep/Reject without asking
+// first) --------------------------------------------------------------
 
-function confirmApplyAiSuggestions(){
-  const pct = PLM.state.keep_percent;
-  askConfirm(
-    'Apply AI suggestions?',
-    'Every ranked image still Neutral is set to Keep or Reject, matching the AI ranking at the current '
-      + pct + '% threshold. Images you have already marked, and any with no ranking at all, are untouched.',
-    runApplyAiSuggestions
-  );
-}
-
-async function runApplyAiSuggestions(){
+// A Neutral image has nothing manual at risk, so applying the AI's current
+// suggestion to it happens immediately - no confirmation needed. Only if
+// that leaves some already-decided images disagreeing with the AI does a
+// second, explicit question follow, since THAT step would overwrite real
+// manual work.
+async function applyAiSuggestions(){
   try{
     const j = await api('api/review/apply-ai-suggestions', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: '{}',
+      body: JSON.stringify({include_decided: false}),
     });
     PLM.state = j.state;
     render();
-    say('Applied the AI suggestion to ' + j.applied.toLocaleString() + ' image(s).');
+    if(j.conflicts > 0){
+      askConfirm(
+        "Override " + j.conflicts + " manually-marked image(s)?",
+        (j.applied ? j.applied + " Neutral image(s) were just updated automatically. " : "")
+          + j.conflicts + " image(s) you already marked Keep or Reject differ from the AI's current suggestion. "
+          + "Override those too, to match the AI?",
+        applyAiSuggestionsToDecided
+      );
+    } else {
+      say('Applied the AI suggestion to ' + j.applied.toLocaleString() + ' image(s).');
+    }
   }catch(e){ say('Could not apply AI suggestions: ' + e.message, true); }
+}
+
+async function applyAiSuggestionsToDecided(){
+  try{
+    const j = await api('api/review/apply-ai-suggestions', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({include_decided: true}),
+    });
+    PLM.state = j.state;
+    render();
+    say('Overrode ' + j.overridden.toLocaleString() + ' manually-marked image(s) to match the AI.');
+  }catch(e){ say('Could not override: ' + e.message, true); }
 }
 
 async function openFolder(){
@@ -1084,6 +1252,31 @@ async function switchFolder(){
     say('Opened ' + j.state.input_folder + (j.recovered ? ' — ' + j.recovered + ' decision(s) recovered.' : '.'));
   }catch(e){ say('Could not open a folder: ' + e.message, true); }
   finally{ PLM.busy = false; q('#switch-folder').disabled = false; }
+}
+
+// The folder this session was reviewing can no longer be found - moved,
+// renamed, or a changed drive letter (see the relocate-dlg auto-shown by
+// render()). Reuses the same native folder picker as switchFolder(), but
+// every stored path (the ranking, any review decisions) is repointed at the
+// new location automatically - see ReviewSession.relocate_folder - rather
+// than starting the folder over as if it had never been reviewed.
+async function relocateFolder(){
+  if(PLM.busy) return;
+  PLM.busy = true;
+  say("Choose the folder's new location…");
+  try{
+    const j = await api('api/review/relocate-folder', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({}),
+    });
+    if(j.cancelled){ say(''); return; }
+    PLM.state = j.state;
+    render();
+    say('Folder relocated: ' + j.relocated.toLocaleString() + ' path(s) updated'
+      + (j.recovered ? ', ' + j.recovered.toLocaleString() + ' decision(s) recovered' : '') + '.');
+  }catch(e){ say('Could not relocate the folder: ' + e.message, true); }
+  finally{ PLM.busy = false; }
 }
 
 // Nothing moves until the photographer has seen the exact plan, so the dialog
@@ -1148,9 +1341,18 @@ async function boot(){
     q('#boxes').classList.toggle('on', PLM.boxes);
     render();
   });
+  q('#sort-key').addEventListener('change', e => setSortKey(e.target.value));
+  q('#sort-dir').addEventListener('click', toggleSortDir);
+  q('#select-all-visible').addEventListener('click', selectAllVisible);
+  q('#panel-toggle').addEventListener('click', togglePanel);
+  let panelOpen = true;
+  try{ panelOpen = localStorage.getItem('plm-panel-open') !== '0' }catch(e){}
+  setPanelOpen(panelOpen);
   q('#open').addEventListener('click', openFolder);
   q('#switch-folder').addEventListener('click', switchFolder);
-  q('#apply-ai').addEventListener('click', confirmApplyAiSuggestions);
+  q('#relocate-go').addEventListener('click', () => { q('#relocate-dlg').close(); relocateFolder(); });
+  q('#relocate-later').addEventListener('click', () => { PLM.relocateDismissed = true; q('#relocate-dlg').close(); });
+  q('#apply-ai').addEventListener('click', applyAiSuggestions);
   q('#go').addEventListener('click', confirmArrange);
   q('#dlg-cancel').addEventListener('click', () => q('#dlg').close());
   q('#dlg-go').addEventListener('click', doArrange);
@@ -1158,7 +1360,6 @@ async function boot(){
   q('#bulk-reject').addEventListener('click', () => confirmBulkStatus('reject'));
   q('#bulk-neutral').addEventListener('click', () => confirmBulkStatus('neutral'));
   q('#bulk-clear-sel').addEventListener('click', clearPicked);
-  q('#bulk-dismiss').addEventListener('click', () => { PLM.bulkDismissed = true; updateBulkBar(); });
   q('#confirm-cancel').addEventListener('click', () => { pendingConfirm = null; q('#confirm-dlg').close(); });
   q('#confirm-go').addEventListener('click', runPendingConfirm);
   Lightbox.bind();
@@ -1233,15 +1434,6 @@ def build_page(title: str = "PickLikeMe Review") -> str:
       <button id="open" title="Reveal the current folder in the OS file manager">Reveal</button>
     </div>
     <span class="divider"></span>
-    <div class="group" data-group="view">
-      <span class="glabel">View</span>
-      <button class="filter on" data-filter="all">All</button>
-      <button class="filter" data-filter="keep">Keep</button>
-      <button class="filter" data-filter="reject">Reject</button>
-      <button class="filter" data-filter="neutral">Neutral</button>
-      <button id="boxes" title="Show/hide the detector's bounding boxes on thumbnails">Detector Boxes</button>
-    </div>
-    <span class="divider"></span>
     <div class="group" id="ai-group" data-group="ai">
       <span class="glabel">AI Suggests</span>
       {_presets_html()}
@@ -1253,6 +1445,7 @@ def build_page(title: str = "PickLikeMe Review") -> str:
     <div class="group" data-group="tools">
       <span class="glabel">Tools</span>
       <button id="go" class="primary" title="Move Keep to _Selected and Reject to _Rejected. Neutral is never moved.">Arrange Files</button>
+      <button id="panel-toggle" class="on" title="Show/hide filters, sorting and view options">Filters &amp; Sorting</button>
     </div>
     <div class="stats" id="stats">
       <span class="stat"><b id="c-total">0</b><span class="glabel">Total</span></span>
@@ -1272,14 +1465,68 @@ def build_page(title: str = "PickLikeMe Review") -> str:
     </div>
     <div class="bulkacts">
       <button id="bulk-clear-sel">Clear Selection</button>
-      <button class="bk ghost" id="bulk-dismiss" aria-label="Dismiss">Dismiss</button>
     </div>
   </div>
 
   <div class="statusbar"><span class="status" id="status"></span></div>
 </header>
 <div class="notice" id="notice" style="display:none"></div>
-<div class="grid" id="grid"><div class="empty">Loading...</div></div>
+
+<div class="layout">
+  <div class="grid" id="grid"><div class="empty">Loading...</div></div>
+
+  <aside class="panel" id="side-panel">
+    <div class="panel-section">
+      <h3>View</h3>
+      <div class="panel-filters">
+        <button class="filter on" data-filter="all">All</button>
+        <button class="filter" data-filter="keep">Keep</button>
+        <button class="filter" data-filter="reject">Reject</button>
+        <button class="filter" data-filter="neutral">Neutral</button>
+        <button class="filter" data-filter="ai_keep">AI Keep</button>
+        <button class="filter" data-filter="ai_reject">AI Reject</button>
+        <button class="filter" data-filter="differences" title="Where the AI and your own review status disagree">AI &harr; User Differences</button>
+      </div>
+      <div class="panel-row">
+        <button id="boxes" title="Show/hide the detector's bounding boxes on thumbnails">Detector Boxes</button>
+      </div>
+    </div>
+
+    <div class="panel-section">
+      <h3>Sort</h3>
+      <div class="panel-row">
+        <select id="sort-key" aria-label="Sort by">
+          <option value="score">AI Score</option>
+          <option value="name">File Name</option>
+          <option value="date">Capture Date</option>
+        </select>
+        <button id="sort-dir" aria-label="Toggle ascending/descending" title="Descending (click for ascending)">&darr;</button>
+      </div>
+    </div>
+
+    <div class="panel-section">
+      <h3>Selection</h3>
+      <button id="select-all-visible" title="Select every image currently shown, after the active filter and sort">Select All Visible</button>
+      <div class="panel-row"><span class="panel-hint" id="visible-count">0 of 0 visible</span></div>
+    </div>
+
+    <div class="panel-section" id="agreement-section" style="display:none">
+      <h3>AI Agreement</h3>
+      <div class="agreement-stats" id="agreement-stats"></div>
+    </div>
+  </aside>
+</div>
+
+<dialog id="relocate-dlg"><div class="dlg">
+  <h2>Folder Not Found</h2>
+  <div class="sub">This folder could not be found - it may have moved, been renamed, or its drive letter
+  may have changed. Please select its new location; every stored path (the ranking, any review
+  decisions) will be updated automatically.</div>
+  <div class="dlg-acts">
+    <button id="relocate-later">Not Now</button>
+    <button id="relocate-go" class="primary">Locate Folder&hellip;</button>
+  </div>
+</div></dialog>
 
 <dialog id="dlg"><div class="dlg">
   <h2>Arrange Files</h2>

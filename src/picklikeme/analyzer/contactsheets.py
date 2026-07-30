@@ -178,6 +178,55 @@ def export_jpeg_bytes(image_path: str) -> bytes:
     return buffer.getvalue()
 
 
+def read_capture_timestamp(image_path: str) -> str | None:
+    """The image's own EXIF capture date/time, as cheaply as the format
+    allows - never a demosaic, never exiftool (that is the ingest
+    pipeline's own, batch-oriented tool, spawning a subprocess per archive
+    rather than per file; this has to answer for one image at a time, on
+    demand, for a review session that may hold tens of thousands of them).
+
+    A RAW's `other.timestamp` - LibRaw's own parsed EXIF DateTimeOriginal,
+    read straight from the file's header via `rawpy.imread` with no
+    demosaic - for RAW formats; PIL's own EXIF DateTimeOriginal (falling
+    back to the plain DateTime tag) for everything else. Returns an
+    ISO-8601 string, or None if the file has no readable capture time at
+    all (not every image carries EXIF - a screenshot, a re-saved copy).
+    """
+    from datetime import datetime
+
+    source = Path(image_path)
+    if not source.exists():
+        return None
+
+    if source.suffix.lower() in STANDARD_IMAGE_SUFFIXES:
+        try:
+            with Image.open(source) as image:
+                exif = image.getexif()
+                raw_value = exif.get(36867) or exif.get(306)  # DateTimeOriginal, else DateTime
+        except Exception:  # noqa: BLE001 - no EXIF is not an error, just nothing to report
+            return None
+        if not raw_value:
+            return None
+        try:
+            return datetime.strptime(str(raw_value), "%Y:%m:%d %H:%M:%S").isoformat(timespec="seconds")
+        except ValueError:
+            return None
+
+    import rawpy
+
+    try:
+        with rawpy.imread(str(source)) as raw:
+            epoch = raw.other.timestamp
+    except Exception:  # noqa: BLE001 - an unreadable RAW header is not fatal here
+        return None
+    if not epoch:
+        return None
+    try:
+        return datetime.fromtimestamp(epoch).isoformat(timespec="seconds")
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
 def build_thumbnail(image_path: str, size: int, cache_dir: Path) -> Path | None:
     """Return a cached square thumbnail of the full frame, generating it if needed."""
     target = _thumbnail_cache_path(cache_dir, image_path, size)

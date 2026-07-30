@@ -31,6 +31,36 @@ from .evaluate import compute_metrics, format_metrics, score_items, write_metric
 from .model import DINOV3_BACKBONE, ModelConfig, PreferenceHead
 
 
+class ExistingCheckpointError(RuntimeError):
+    """A fresh start was requested but a checkpoint already exists at the
+    target path - see check_fresh_start_is_safe."""
+
+
+def check_fresh_start_is_safe(checkpoint_path: str | Path | None, resume: bool) -> None:
+    """Refuse to proceed if starting fresh (`resume=False`) would silently
+    overwrite a checkpoint that already exists there.
+
+    Called as the very first thing `train()` does - before the dataset,
+    backbone or optimizer are even constructed - so a mistaken `--fresh-start`
+    against a real checkpoint fails in milliseconds, not after minutes of GPU
+    work, and so every caller of `train()` gets this protection for free
+    regardless of how they got there (the CLI's `--fresh-start`, a script, a
+    notebook). A checkpoint often represents days, weeks or months of
+    training; there is no code path in this module that overwrites one
+    without the caller passing `resume=True` first.
+    """
+    if checkpoint_path is None or resume:
+        return
+    checkpoint_path = Path(checkpoint_path)
+    if checkpoint_path.exists():
+        raise ExistingCheckpointError(
+            f"Refusing to start fresh: a checkpoint already exists at {checkpoint_path.resolve()}.\n"
+            "This likely represents real, possibly irreplaceable training progress. Move, rename, "
+            "or delete it first if you really do want to start over, then run again - or pass "
+            "--resume (or drop --fresh-start) to continue training from it instead."
+        )
+
+
 class ImageTensorDataset(Dataset):
     def __init__(self, dataset: LabelDataset, loader):
         self.dataset = dataset
@@ -324,6 +354,8 @@ def train(
     epochs_this_run: int | None = None,
     counts: RunCounts | None = None,
 ) -> PreferenceHead:
+    check_fresh_start_is_safe(checkpoint_path, resume)
+
     if dataset is None:
         dataset = LabelDataset(config.manifest_path, config.raw_root)
 
@@ -370,8 +402,9 @@ def train(
             start_epoch = checkpoint.get("epoch") or 0
             best_loss = checkpoint.get("best_loss", math.inf)
             resumed = True
-        elif not resume and checkpoint_path.exists():
-            print(f"Overwriting existing checkpoint at {checkpoint_path}")
+        # A fresh start (resume=False) with an existing checkpoint already
+        # raised in check_fresh_start_is_safe above - there is no third case
+        # to handle here.
 
     # Per-run target: fresh start (start_epoch == 0) runs epochs 1..N; resuming
     # from a checkpoint at epoch K runs K+1..K+N, keeping the epoch numbering
@@ -660,7 +693,12 @@ def build_arg_parser(add_help: bool = True) -> argparse.ArgumentParser:
     parser.add_argument("--status-interval-minutes", type=int, default=10)
     parser.add_argument("--checkpoint-interval-minutes", type=int, default=15)
     parser.add_argument("--resume", action="store_true", help="Resume from the existing checkpoint if present")
-    parser.add_argument("--fresh-start", action="store_true", help="Start training from scratch instead of resuming")
+    parser.add_argument(
+        "--fresh-start",
+        action="store_true",
+        help="Start training from scratch instead of resuming. Refuses (does not start) if a "
+        "checkpoint already exists at --checkpoint-path - move, rename, or delete it first.",
+    )
     parser.add_argument("--split", default=None, help="Frozen split CSV (see picklikeme.split); trains on train rows, evaluates on test rows")
     parser.add_argument(
         "--metrics-json",

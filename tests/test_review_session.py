@@ -16,6 +16,7 @@ The rules that matter, and that the rest of the app depends on being exact:
 """
 
 import csv
+import shutil
 import sys
 import tempfile
 import unittest
@@ -373,6 +374,92 @@ class ApplyAiSuggestionsTests(SessionTestCase):
 
         self.assertEqual(again["applied"], 0, "nothing is Neutral any more")
 
+    def test_conflicts_are_reported_but_not_touched_by_default(self):
+        """Phase 9: never silently overwrite a photographer's own Keep/Reject
+        - a disagreeing, already-decided image is counted, not changed,
+        unless include_decided is explicitly True."""
+        shoot, images, _ = build_shoot(self.root, ranked=10)
+        session = self.session(shoot, keep_percent=30)
+        best = str(images[0])  # the AI's own top pick
+        session.set_review_status(best, REVIEW_STATUS_REJECT)  # disagrees on purpose
+
+        result = session.apply_ai_suggestions()
+
+        self.assertEqual(result["conflicts"], 1)
+        self.assertEqual(result["overridden"], 0)
+        self.assertEqual(session._image_for(best).review_status, REVIEW_STATUS_REJECT)
+        # The other 9 Neutral images were still applied normally.
+        self.assertEqual(result["applied"], 9)
+
+    def test_include_decided_overrides_only_the_disagreeing_images(self):
+        shoot, images, _ = build_shoot(self.root, ranked=10)
+        session = self.session(shoot, keep_percent=30)
+        best = str(images[0])
+        agreeing = str(images[1])  # also AI-suggested Keep; agree with it up front
+        session.set_review_status(best, REVIEW_STATUS_REJECT)
+        session.set_review_status(agreeing, REVIEW_STATUS_KEEP)
+
+        result = session.apply_ai_suggestions(include_decided=True)
+
+        self.assertEqual(result["conflicts"], 1)
+        self.assertEqual(result["overridden"], 1)
+        self.assertEqual(session._image_for(best).review_status, REVIEW_STATUS_KEEP, "now matches the AI")
+        self.assertEqual(session._image_for(agreeing).review_status, REVIEW_STATUS_KEEP, "already agreed, untouched")
+
+    def test_include_decided_still_leaves_agreeing_decided_images_alone(self):
+        shoot, images, _ = build_shoot(self.root, ranked=4)
+        session = self.session(shoot, keep_percent=50)
+        agreeing = str(images[0])
+        session.set_review_status(agreeing, REVIEW_STATUS_KEEP)  # matches the AI's own top-half suggestion
+
+        result = session.apply_ai_suggestions(include_decided=True)
+
+        self.assertEqual(result["conflicts"], 0)
+        self.assertEqual(result["overridden"], 0)
+        self.assertEqual(session._image_for(agreeing).review_status, REVIEW_STATUS_KEEP)
+
+
+class AgreementStatsTests(SessionTestCase):
+    """How often the photographer's own review status matches the AI's
+    suggestion - informational, for evaluating the model over time."""
+
+    def test_neutral_images_are_excluded_from_the_comparison(self):
+        shoot, images, _ = build_shoot(self.root, ranked=4)
+        session = self.session(shoot, keep_percent=50)
+
+        stats = session.agreement_stats()
+
+        self.assertEqual(stats["compared"], 0)
+        self.assertIsNone(stats["agree_percent"])
+        self.assertIsNone(stats["disagree_percent"])
+
+    def test_agreement_and_disagreement_are_counted_correctly(self):
+        shoot, images, _ = build_shoot(self.root, ranked=4)
+        session = self.session(shoot, keep_percent=50)  # AI keeps images[0:2], rejects images[2:4]
+        session.set_review_status(str(images[0]), REVIEW_STATUS_KEEP)     # agrees (AI: keep)
+        session.set_review_status(str(images[1]), REVIEW_STATUS_REJECT)   # disagrees (AI: keep, user: reject)
+        session.set_review_status(str(images[2]), REVIEW_STATUS_KEEP)     # disagrees (AI: reject, user: keep)
+        # images[3] left Neutral - excluded entirely.
+
+        stats = session.agreement_stats()
+
+        self.assertEqual(stats["compared"], 3)
+        self.assertEqual(stats["agree"], 1)
+        self.assertEqual(stats["disagree"], 2)
+        self.assertEqual(stats["ai_keep_user_reject"], 1)
+        self.assertEqual(stats["ai_reject_user_keep"], 1)
+        self.assertAlmostEqual(stats["agree_percent"], 100 / 3, places=1)
+        self.assertAlmostEqual(stats["disagree_percent"], 200 / 3, places=1)
+
+    def test_unranked_images_are_excluded_even_if_decided(self):
+        shoot, _, extra = build_shoot(self.root, ranked=2, unranked=1)
+        session = self.session(shoot, keep_percent=50)
+        session.set_review_status(str(extra[0]), REVIEW_STATUS_KEEP)
+
+        stats = session.agreement_stats()
+
+        self.assertEqual(stats["compared"], 0, "the AI has no opinion about an unranked image")
+
 
 class MissingDataTests(SessionTestCase):
     def test_an_image_absent_from_the_ranking_still_appears(self):
@@ -625,6 +712,98 @@ class OpenFolderTests(SessionTestCase):
         session.open_folder(other)
 
         self.assertEqual(session.ranking_file, ranking_path(other))
+
+
+class FolderRelocationTests(SessionTestCase):
+    """The folder moved, was renamed, or its drive letter changed - the
+    photographer points at the new location and every stored path (the
+    ranking, any review decisions) is repointed automatically."""
+
+    def test_folder_missing_is_false_for_a_folder_that_exists(self):
+        shoot, _, _ = build_shoot(self.root, ranked=2)
+        session = self.session(shoot)
+
+        self.assertFalse(session.folder_missing)
+
+    def test_folder_missing_is_true_once_the_folder_is_gone(self):
+        shoot, _, _ = build_shoot(self.root, ranked=2)
+        session = self.session(shoot)
+
+        shutil.rmtree(shoot)
+
+        self.assertTrue(session.folder_missing)
+
+    def test_folder_missing_is_false_with_no_folder_open_at_all(self):
+        """Distinct states: never having opened a folder is not an error,
+        unlike one that was opened and then disappeared."""
+        session = self.session(None)
+
+        self.assertFalse(session.folder_missing)
+
+    def test_relocating_repoints_the_ranking_and_reloads_correctly(self):
+        shoot, images, _ = build_shoot(self.root, ranked=4)
+        session = self.session(shoot, keep_percent=50)
+
+        moved_to = self.root / "moved_shoot"
+        shutil.move(str(shoot), str(moved_to))
+
+        result = session.relocate_folder(moved_to)
+
+        self.assertEqual(result["relocated"], 4)
+        self.assertEqual(session.input_folder, moved_to.resolve())
+        self.assertFalse(session.folder_missing)
+        self.assertEqual(session.counts()["total"], 4)
+        self.assertEqual(session.counts()["missing_file"], 0, "every path was repointed, nothing looks missing")
+
+    def test_relocating_preserves_ai_suggestions_after_the_move(self):
+        """The ranking itself (scores) must survive the move too, not just
+        the file existing - otherwise every image would silently lose its
+        AI suggestion."""
+        shoot, images, _ = build_shoot(self.root, ranked=6)
+        session = self.session(shoot, keep_percent=33)
+        moved_to = self.root / "moved_shoot"
+        shutil.move(str(shoot), str(moved_to))
+
+        session.relocate_folder(moved_to)
+
+        best = str(moved_to / images[0].name)
+        self.assertEqual(session._ai_suggestions()[best], REVIEW_STATUS_KEEP)
+
+    def test_relocating_recovers_a_manual_decision_by_identity(self):
+        shoot, images, _ = build_shoot(self.root, ranked=4)
+        session = self.session(shoot, keep_percent=25)
+        session.set_review_status(str(images[0]), REVIEW_STATUS_KEEP, reason="clear_eyes_seen")
+
+        moved_to = self.root / "moved_shoot"
+        shutil.move(str(shoot), str(moved_to))
+        result = session.relocate_folder(moved_to)
+
+        moved_image = moved_to / images[0].name
+        self.assertEqual(session._image_for(str(moved_image)).review_status, REVIEW_STATUS_KEEP)
+        self.assertEqual(session._image_for(str(moved_image)).reason, "clear_eyes_seen")
+        # Repointed directly via the ranking-derived move map, not the
+        # (slower) content-identity fallback - recovered should be 0.
+        self.assertEqual(result["recovered"], 0)
+
+    def test_relocating_a_folder_with_no_ranking_still_works(self):
+        """The common case for a folder that was never ranked at all -
+        nothing to repoint in a ranking that doesn't exist, but the
+        photographer's own decisions still follow by content identity."""
+        original = self.root / "unranked_shoot"
+        original.mkdir()
+        photo = original / "a.jpg"
+        photo.write_bytes(b"a")
+        session = self.session(original)
+        session.set_review_status(str(photo), REVIEW_STATUS_REJECT)
+
+        moved_to = self.root / "moved_unranked"
+        shutil.move(str(original), str(moved_to))
+        result = session.relocate_folder(moved_to)
+
+        self.assertEqual(result["relocated"], 0)
+        moved_photo = moved_to / "a.jpg"
+        self.assertEqual(session._image_for(str(moved_photo)).review_status, REVIEW_STATUS_REJECT)
+        self.assertEqual(result["recovered"], 1)
 
 
 class NoFolderOpenTests(SessionTestCase):

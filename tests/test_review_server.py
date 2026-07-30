@@ -484,6 +484,52 @@ class ApplyAiSuggestionsEndpointTests(ReviewServerTestCase):
 
         self.assertEqual(payload["applied"], 0)
 
+    def test_conflicts_are_reported_but_never_overridden_by_default(self):
+        """Phase 9: never silently overwrite a photographer's own Keep/Reject."""
+        best = str(self.images[0])
+        self.post("/api/review/status", {"image_path": best, "status": "reject"})
+
+        payload = self.post("/api/review/apply-ai-suggestions", {})
+
+        self.assertEqual(payload["conflicts"], 1)
+        self.assertEqual(payload["overridden"], 0)
+        by_path = {i["image_path"]: i for i in payload["state"]["images"]}
+        self.assertEqual(by_path[best]["review_status"], "reject")
+
+    def test_include_decided_overrides_the_disagreeing_image(self):
+        best = str(self.images[0])
+        self.post("/api/review/status", {"image_path": best, "status": "reject"})
+
+        payload = self.post("/api/review/apply-ai-suggestions", {"include_decided": True})
+
+        self.assertEqual(payload["overridden"], 1)
+        by_path = {i["image_path"]: i for i in payload["state"]["images"]}
+        self.assertEqual(by_path[best]["review_status"], "keep")
+
+
+class AgreementStatsEndpointTests(ReviewServerTestCase):
+    """AI <-> user agreement, surfaced for evaluating the model over time -
+    see ReviewSession.agreement_stats."""
+
+    def test_state_reports_agreement_once_images_are_actually_decided(self):
+        best = str(self.images[0])  # the AI's own top pick at keep_percent=33
+        worst = str(self.images[-1])
+        self.post("/api/review/status", {"image_path": best, "status": "keep"})  # agrees
+        self.post("/api/review/status", {"image_path": worst, "status": "keep"})  # disagrees (AI: reject)
+
+        payload = self.get("/api/review/state")["state"]
+
+        self.assertEqual(payload["agreement"]["compared"], 2)
+        self.assertEqual(payload["agreement"]["agree"], 1)
+        self.assertEqual(payload["agreement"]["disagree"], 1)
+        self.assertEqual(payload["agreement"]["ai_reject_user_keep"], 1)
+
+    def test_agreement_is_null_percent_with_nothing_compared_yet(self):
+        payload = self.get("/api/review/state")["state"]
+
+        self.assertEqual(payload["agreement"]["compared"], 0)
+        self.assertIsNone(payload["agreement"]["agree_percent"])
+
 
 class KeepPercentEndpointTests(ReviewServerTestCase):
     def test_changing_the_percentage_changes_the_ai_suggestion_not_review_status(self):
@@ -536,12 +582,17 @@ class ThumbnailEndpointTests(ReviewServerTestCase):
 
 class ClickThroughToFullSizeTests(ReviewServerTestCase):
     """Clicking a card's thumbnail opens the in-app Lightbox, which decodes
-    the RAW's own full-size preview via /preview - the same endpoint the
-    analysis report uses for "Open Preview", inherited unchanged from
-    AnnotationRequestHandler and confined to the reviewed folder by the same
-    `source_roots` check as /thumb and /open-folder. The photographer never
-    leaves the page (no target="_blank" any more - see Lightbox in page.py
-    for the markup-level checks on that)."""
+    the RAW's own full-size preview via /preview. Unlike the analysis
+    report's own use of the same URL (still `Cache-Control: no-store`,
+    inherited from AnnotationRequestHandler unchanged), the review server
+    overrides `_serve_preview` to back it with a persistent on-disk cache
+    (see thumbnails.review_preview) - the fix for the Lightbox getting
+    slower the longer a session ran, traced to a full RAW decode + JPEG
+    re-encode on every single request for images the reviewer had often
+    only just looked at. Still confined to the reviewed folder by the same
+    `source_roots` check as /thumb and /open-folder, and the photographer
+    never leaves the page (no target="_blank" any more - see Lightbox in
+    page.py for the markup-level checks on that)."""
 
     def test_the_preview_endpoint_serves_the_full_frame_not_the_square_thumb(self):
         url = "/preview?path=" + quote(str(self.images[0]), safe="")
@@ -560,6 +611,33 @@ class ClickThroughToFullSizeTests(ReviewServerTestCase):
         with self.assertRaises(urllib.error.HTTPError) as ctx:
             urllib.request.urlopen(self.base + "/preview?path=" + quote(str(secret), safe=""))
         self.assertEqual(ctx.exception.code, 403)
+
+    def test_the_review_preview_is_cacheable_unlike_the_reports_own_use_of_it(self):
+        """The whole point of the override: this /preview may be cached
+        (content-addressed by resolved path, see review_preview), unlike the
+        analysis report's, which must stay no-store."""
+        url = "/preview?path=" + quote(str(self.images[0]), safe="")
+        with urllib.request.urlopen(self.base + url) as response:
+            self.assertIn("max-age", response.headers["Cache-Control"])
+
+    def test_a_second_request_for_the_same_image_is_served_from_the_disk_cache(self):
+        """Not just an HTTP header - load_source_image (the expensive rawpy/
+        PIL path) must not run a second time for a request the on-disk cache
+        already has an answer for."""
+        url = "/preview?path=" + quote(str(self.images[0]), safe="")
+        with urllib.request.urlopen(self.base + url):
+            pass  # first request populates the cache
+
+        with mock.patch("picklikeme.analyzer.contactsheets.load_source_image") as load:
+            with urllib.request.urlopen(self.base + url) as response:
+                self.assertEqual(response.status, 200)
+            load.assert_not_called()
+
+    def test_a_missing_file_is_a_clean_404_not_a_crash(self):
+        missing = self.shoot / "gone.jpg"
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            urllib.request.urlopen(self.base + "/preview?path=" + quote(str(missing), safe=""))
+        self.assertEqual(ctx.exception.code, 404)
 
 
 class SaveJpegEndpointTests(ReviewServerTestCase):
@@ -911,11 +989,28 @@ class GalleryFilterTests(unittest.TestCase):
         from picklikeme.review.page import build_js
 
         js = build_js()
-        visible_images = re.search(r"function visibleImages\(\)\{(.*?)\n\}", js, re.S)
-        self.assertIsNotNone(visible_images)
-        body = visible_images.group(1)
+        filter_images = re.search(r"function filterImages\(images\)\{(.*?)\n\}", js, re.S)
+        self.assertIsNotNone(filter_images)
+        body = filter_images.group(1)
         self.assertIn("if(PLM.filter === 'all') return images;", body)
         self.assertIn("i.review_status === PLM.filter", body)
+
+    def test_ai_keep_ai_reject_and_differences_filters_exist(self):
+        from picklikeme.review.page import build_page, build_js
+
+        html = build_page()
+        self.assertIn('data-filter="ai_keep"', html)
+        self.assertIn('data-filter="ai_reject"', html)
+        self.assertIn('data-filter="differences"', html)
+
+        js = build_js()
+        filter_images = re.search(r"function filterImages\(images\)\{(.*?)\n\}", js, re.S)
+        body = filter_images.group(1)
+        self.assertIn("i.ai_suggestion === 'keep'", body)
+        self.assertIn("i.ai_suggestion === 'reject'", body)
+        # A difference requires the AI to have an opinion AND the photographer
+        # to have actually decided (Neutral is "no opinion", not disagreement).
+        self.assertIn("i.ai_suggestion != null && i.review_status !== 'neutral' && i.review_status !== i.ai_suggestion", body)
 
     def test_filter_buttons_are_wired_to_set_filter(self):
         from picklikeme.review.page import build_js
@@ -980,8 +1075,15 @@ class BulkActionsMarkupTests(unittest.TestCase):
         bar = re.search(r'<div class="bulkbar" id="bulk-bar"([^>]*)>', html)
         self.assertIsNotNone(bar, "bulk-bar not found")
         self.assertIn("display:none", bar.group(1))
-        for control in ("bulk-count", "bulk-keep", "bulk-reject", "bulk-neutral", "bulk-clear-sel", "bulk-dismiss"):
+        for control in ("bulk-count", "bulk-keep", "bulk-reject", "bulk-neutral", "bulk-clear-sel"):
             self.assertIn(f'id="{control}"', html)
+
+    def test_the_dismiss_button_was_removed(self):
+        """Clear Selection is sufficient on its own (Phase 8 of this round) -
+        a second, similar-but-different button next to it was just clutter."""
+        from picklikeme.review.page import build_page
+
+        self.assertNotIn('id="bulk-dismiss"', build_page())
 
     def test_the_bar_is_shown_or_hidden_by_updatebulkbar_from_the_picked_count(self):
         from picklikeme.review.page import build_js
@@ -990,21 +1092,16 @@ class BulkActionsMarkupTests(unittest.TestCase):
         fn = re.search(r"function updateBulkBar\(\)\{(.*?)\n\}", js, re.S)
         self.assertIsNotNone(fn, "updateBulkBar not found")
         body = fn.group(1)
-        self.assertIn("n === 0 || PLM.bulkDismissed", body)
+        self.assertIn("n === 0", body)
         self.assertIn("bar.style.display = 'none'", body)
 
-    def test_clear_selection_and_dismiss_are_distinct_actions(self):
-        """Clear Selection empties the picked set; Dismiss only hides the bar
-        without discarding picks - checking any new box brings it back."""
+    def test_clear_selection_empties_the_picked_set(self):
         from picklikeme.review.page import build_js
 
         js = build_js()
         clear_fn = re.search(r"function clearPicked\(\)\{(.*?)\n\}", js, re.S)
         self.assertIsNotNone(clear_fn, "clearPicked not found")
         self.assertIn("PLM.picked.clear()", clear_fn.group(1))
-
-        self.assertIn("q('#bulk-dismiss').addEventListener('click', () => { PLM.bulkDismissed = true", js)
-        self.assertIn("PLM.bulkDismissed = false", js, "a new pick must reveal a dismissed bar again")
 
     def test_the_confirmation_dialog_exists_and_is_wired_before_any_request(self):
         """The whole point of the feature: a bulk action must never reach the
@@ -1032,15 +1129,183 @@ class BulkActionsMarkupTests(unittest.TestCase):
         self.assertIn("confirmBulkStatus('reject')", js)
         self.assertIn("confirmBulkStatus('neutral')", js)
 
-    def test_apply_ai_suggestions_reuses_the_same_confirmation_dialog(self):
-        """Phase 5: no second, near-duplicate dialog for this action."""
+    def test_apply_ai_suggestions_only_confirms_before_overriding_manual_work(self):
+        """Neutral images are updated immediately - nothing manual is at risk
+        there. Only overriding an already-decided image goes through the
+        shared confirmation dialog (Phase 5: no second, near-duplicate
+        dialog for this action; Phase 9: never silently overwrite a
+        photographer's own Keep/Reject)."""
         from picklikeme.review.page import build_js
 
         js = build_js()
-        fn = re.search(r"function confirmApplyAiSuggestions\(\)\{(.*?)\n\}", js, re.S)
-        self.assertIsNotNone(fn, "confirmApplyAiSuggestions not found")
-        self.assertIn("askConfirm(", fn.group(1))
-        self.assertNotIn("showModal", fn.group(1), "must go through askConfirm, not open a dialog directly")
+        apply_fn = re.search(r"async function applyAiSuggestions\(\)\{(.*?)\n\}", js, re.S)
+        self.assertIsNotNone(apply_fn, "applyAiSuggestions not found")
+        body = apply_fn.group(1)
+        self.assertIn("include_decided: false", body)
+        self.assertIn("if(j.conflicts > 0)", body)
+        self.assertIn("askConfirm(", body)
+
+        decided_fn = re.search(r"async function applyAiSuggestionsToDecided\(\)\{(.*?)\n\}", js, re.S)
+        self.assertIsNotNone(decided_fn, "applyAiSuggestionsToDecided not found")
+        self.assertIn("include_decided: true", decided_fn.group(1))
+        self.assertNotIn("showModal", decided_fn.group(1), "must go through askConfirm, not open a dialog directly")
+
+
+class SelectAllVisibleMarkupTests(unittest.TestCase):
+    """The primary bulk-selection command (Phase 1 of this round): every
+    image currently on screen, after both the active filter and sort."""
+
+    def test_the_button_exists_and_is_wired(self):
+        from picklikeme.review.page import build_js, build_page
+
+        self.assertIn('id="select-all-visible"', build_page())
+        js = build_js()
+        self.assertIn("q('#select-all-visible').addEventListener('click', selectAllVisible)", js)
+
+    def test_it_picks_exactly_visibleimages_never_the_unfiltered_full_list(self):
+        from picklikeme.review.page import build_js
+
+        js = build_js()
+        fn = re.search(r"function selectAllVisible\(\)\{(.*?)\n\}", js, re.S)
+        self.assertIsNotNone(fn, "selectAllVisible not found")
+        self.assertIn("visibleImages()", fn.group(1))
+        self.assertNotIn("s.images", fn.group(1), "must not bypass the active filter/sort")
+
+    def test_the_word_all_is_kept_in_the_command_s_name(self):
+        """Explicit per the request: the label must keep saying "All"."""
+        from picklikeme.review.page import build_page
+
+        self.assertIn(">Select All Visible<", build_page())
+
+
+class SortingMarkupTests(unittest.TestCase):
+    """Sort by file name, capture date, or AI score, each ascending or
+    descending - a missing value (no date, no score) always sorts last."""
+
+    def test_the_three_sort_keys_are_offered(self):
+        from picklikeme.review.page import build_page
+
+        html = build_page()
+        self.assertIn('id="sort-key"', html)
+        for key in ("score", "name", "date"):
+            self.assertIn(f'value="{key}"', html)
+
+    def test_default_sort_matches_the_server_s_own_default_ordering(self):
+        """Preserves the existing default (best AI score first) rather than
+        surprising anyone who never touches the new sort controls at all."""
+        from picklikeme.review.page import build_js
+
+        js = build_js()
+        self.assertIn("sort: {key: 'score', dir: 'desc'}", js)
+
+    def test_a_missing_value_always_sorts_last_regardless_of_direction(self):
+        from picklikeme.review.page import build_js
+
+        js = build_js()
+        fn = re.search(r"function sortImages\(images\)\{(.*?)\n\}", js, re.S)
+        self.assertIsNotNone(fn, "sortImages not found")
+        body = fn.group(1)
+        self.assertIn("if(missingA) return 1;", body)
+        self.assertIn("if(missingB) return -1;", body)
+
+    def test_toggling_direction_and_changing_key_both_trigger_a_rerender(self):
+        from picklikeme.review.page import build_js
+
+        js = build_js()
+        self.assertIn("function setSortKey(key){\n  PLM.sort.key = key;\n  render();\n}", js)
+        self.assertIn("function toggleSortDir(){", js)
+        self.assertIn("q('#sort-key').addEventListener('change', e => setSortKey(e.target.value))", js)
+        self.assertIn("q('#sort-dir').addEventListener('click', toggleSortDir)", js)
+
+
+class FiltersPanelMarkupTests(unittest.TestCase):
+    """Filters, sorting and view options live in a dedicated, collapsible
+    side panel (Phase 7 of this round) rather than crowding the toolbar."""
+
+    def test_the_panel_exists_and_holds_the_filter_buttons(self):
+        from picklikeme.review.page import build_page
+
+        html = build_page()
+        panel = re.search(r'<aside class="panel" id="side-panel">(.*?)</aside>', html, re.S)
+        self.assertIsNotNone(panel, "side-panel not found")
+        body = panel.group(1)
+        self.assertIn('data-filter="all"', body)
+        self.assertIn('id="boxes"', body)
+        self.assertIn('id="sort-key"', body)
+        self.assertIn('id="select-all-visible"', body)
+
+    def test_the_toolbar_itself_no_longer_holds_the_view_group(self):
+        """Decluttered per Phase 7 - View moved out entirely, not duplicated."""
+        from picklikeme.review.page import build_page
+
+        html = build_page()
+        toolbar = re.search(r'<div class="toolbar">(.*?)</div>\s*<div class="bulkbar"', html, re.S)
+        self.assertIsNotNone(toolbar, "toolbar not found")
+        self.assertNotIn('data-filter=', toolbar.group(1))
+
+    def test_the_panel_is_collapsible_and_its_state_persists(self):
+        from picklikeme.review.page import build_js, build_page
+
+        self.assertIn('id="panel-toggle"', build_page())
+        js = build_js()
+        self.assertIn("function togglePanel(){", js)
+        self.assertIn("localStorage.setItem('plm-panel-open'", js)
+        self.assertIn("q('#panel-toggle').addEventListener('click', togglePanel)", js)
+
+
+class AgreementStatsMarkupTests(unittest.TestCase):
+    """The AI <-> user agreement readout in the panel - purely
+    informational, built from session.py's agreement_stats()."""
+
+    def test_the_section_exists_and_starts_hidden(self):
+        from picklikeme.review.page import build_page
+
+        html = build_page()
+        section = re.search(r'<div class="panel-section" id="agreement-section"([^>]*)>', html)
+        self.assertIsNotNone(section, "agreement-section not found")
+        self.assertIn("display:none", section.group(1))
+
+    def test_it_is_hidden_again_whenever_nothing_has_been_compared_yet(self):
+        from picklikeme.review.page import build_js
+
+        js = build_js()
+        fn = re.search(r"function renderAgreementStats\(agreement\)\{(.*?)\n\}", js, re.S)
+        self.assertIsNotNone(fn, "renderAgreementStats not found")
+        self.assertIn("!agreement.compared", fn.group(1))
+        self.assertIn("section.style.display = 'none'", fn.group(1))
+
+
+class RelocateFolderMarkupTests(unittest.TestCase):
+    """The "folder could not be found" recovery dialog - see
+    ReviewSession.relocate_folder for the backend side of this."""
+
+    def test_the_dialog_exists_with_the_requested_wording(self):
+        from picklikeme.review.page import build_page
+
+        html = build_page()
+        self.assertIn('<dialog id="relocate-dlg">', html)
+        self.assertIn("could not be found", html)
+        self.assertIn("select its new location", html)
+        self.assertIn('id="relocate-go"', html)
+        self.assertIn('id="relocate-later"', html)
+
+    def test_it_auto_shows_when_the_folder_is_missing_and_not_yet_dismissed(self):
+        from picklikeme.review.page import build_js
+
+        js = build_js()
+        render_fn = re.search(r"^function render\(\)\{(.*?)\n\}", js, re.S | re.M)
+        self.assertIsNotNone(render_fn, "render() not found")
+        body = render_fn.group(1)
+        self.assertIn("s.folder_missing && !PLM.relocateDismissed", body)
+        self.assertIn("q('#relocate-dlg').showModal()", body)
+
+    def test_relocating_reuses_the_native_folder_picker_flow(self):
+        from picklikeme.review.page import build_js
+
+        js = build_js()
+        fn = re.search(r"async function relocateFolder\(\)\{(.*?)\n\}", js, re.S)
+        self.assertIsNotNone(fn, "relocateFolder not found")
+        self.assertIn("api/review/relocate-folder", fn.group(1))
 
 
 class ArrangeEndpointTests(ReviewServerTestCase):
@@ -1218,6 +1483,58 @@ class OpenFolderEndpointTests(ReviewServerTestCase):
         with self.assertRaises(urllib.error.HTTPError) as ctx:
             urllib.request.urlopen(self.base + "/thumb?path=" + quote(str(self.images[0]), safe=""))
         self.assertEqual(ctx.exception.code, 403)
+
+
+class RelocateFolderEndpointTests(ReviewServerTestCase):
+    """The folder this session was reviewing can no longer be found - moved,
+    renamed, or a changed drive letter - and the photographer has pointed at
+    where it went. Shares its path/dialog resolution with /open-folder, but
+    every stored path is repointed automatically rather than starting over."""
+
+    def test_relocating_by_path_repoints_the_ranking_and_reloads(self):
+        moved_to = self.root / "moved_shoot"
+        shutil.move(str(self.shoot), str(moved_to))
+
+        with mock.patch("picklikeme.review.server.choose_folder") as dialog:
+            payload = self.post("/api/review/relocate-folder", {"path": str(moved_to)})
+
+        dialog.assert_not_called()
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["relocated"], 6)
+        self.assertEqual(Path(payload["state"]["input_folder"]).resolve(), moved_to.resolve())
+        self.assertFalse(payload["state"]["folder_missing"])
+        self.assertEqual(payload["state"]["counts"]["missing_file"], 0)
+
+    def test_omitting_the_path_shows_the_native_dialog_seeded_at_the_old_folder(self):
+        original = self.session.input_folder
+        moved_to = self.root / "moved_shoot"
+        shutil.move(str(self.shoot), str(moved_to))
+
+        with mock.patch("picklikeme.review.server.choose_folder", return_value=moved_to) as dialog:
+            payload = self.post("/api/review/relocate-folder", {})
+
+        dialog.assert_called_once()
+        self.assertEqual(dialog.call_args.kwargs["initial_dir"], original)
+        self.assertEqual(Path(payload["state"]["input_folder"]).resolve(), moved_to.resolve())
+
+    def test_cancelling_leaves_the_missing_folder_state_untouched(self):
+        shutil.rmtree(self.shoot)
+
+        with mock.patch("picklikeme.review.server.choose_folder", return_value=None):
+            payload = self.post("/api/review/relocate-folder", {})
+
+        self.assertTrue(payload["cancelled"])
+        self.assertTrue(payload["state"]["folder_missing"])
+
+    def test_after_relocating_the_new_folder_s_images_become_servable(self):
+        moved_to = self.root / "moved_shoot"
+        shutil.move(str(self.shoot), str(moved_to))
+        moved_image = moved_to / Path(self.images[0]).name
+
+        self.post("/api/review/relocate-folder", {"path": str(moved_to)})
+
+        with urllib.request.urlopen(self.base + "/thumb?path=" + quote(str(moved_image), safe="")) as response:
+            self.assertEqual(response.status, 200)
 
 
 class NoFolderOpenServerTests(unittest.TestCase):
