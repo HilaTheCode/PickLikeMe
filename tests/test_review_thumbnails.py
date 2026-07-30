@@ -1,0 +1,147 @@
+"""review/thumbnails.py: the review app's own preview cache - its
+size-budget/LRU eviction. Built on top of the analyzer's shared detection
+cache, tested separately in test_bird_crop.py/test_fn_overlay.py.
+"""
+
+import os
+import sys
+import tempfile
+import time
+import unittest
+from pathlib import Path
+from unittest import mock
+
+from PIL import Image
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+
+from picklikeme.review import thumbnails as thumbnails_module
+from picklikeme.review.thumbnails import (
+    _cache_entries,
+    _enforce_cache_budget,
+    review_preview,
+)
+
+
+def _write_fake_cache_file(cache_dir: Path, name: str, size_bytes: int, age_seconds: float) -> Path:
+    """A file inside the cache's own sharded layout (cache_dir/xx/name.jpg),
+    with a controlled size and mtime - the two things LRU eviction reads,
+    without needing a real JPEG or a real detector for these tests."""
+    shard = cache_dir / name[:2]
+    shard.mkdir(parents=True, exist_ok=True)
+    target = shard / f"{name}.jpg"
+    target.write_bytes(b"0" * size_bytes)
+    when = time.time() - age_seconds
+    os.utime(target, (when, when))
+    return target
+
+
+class CacheBudgetTests(unittest.TestCase):
+    """The preview cache's own size accounting and least-recently-used
+    eviction - see _enforce_cache_budget. Independent of review_preview
+    itself, which just calls this at the right moments."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.cache_dir = Path(self._tmp.name) / "cache"
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_cache_entries_finds_every_sharded_file_with_size_and_mtime(self):
+        _write_fake_cache_file(self.cache_dir, "aaa1", size_bytes=100, age_seconds=10)
+        _write_fake_cache_file(self.cache_dir, "bbb2", size_bytes=200, age_seconds=5)
+
+        entries = _cache_entries(self.cache_dir)
+
+        self.assertEqual(len(entries), 2)
+        self.assertEqual(sorted(size for _, size, _ in entries), [100, 200])
+
+    def test_a_nonexistent_cache_dir_is_simply_empty(self):
+        self.assertEqual(_cache_entries(self.cache_dir), [])
+
+    def test_does_nothing_when_already_under_budget(self):
+        path = _write_fake_cache_file(self.cache_dir, "aaa1", size_bytes=100, age_seconds=1)
+
+        removed = _enforce_cache_budget(self.cache_dir, max_bytes=1_000_000)
+
+        self.assertEqual(removed, 0)
+        self.assertTrue(path.exists())
+
+    def test_evicts_the_least_recently_used_files_first(self):
+        oldest = _write_fake_cache_file(self.cache_dir, "aaa1", size_bytes=100, age_seconds=100)
+        middle = _write_fake_cache_file(self.cache_dir, "bbb2", size_bytes=100, age_seconds=50)
+        newest = _write_fake_cache_file(self.cache_dir, "ccc3", size_bytes=100, age_seconds=1)
+
+        # Budget for only one file's worth - two of the three must go.
+        removed = _enforce_cache_budget(self.cache_dir, max_bytes=100)
+
+        self.assertEqual(removed, 2)
+        self.assertFalse(oldest.exists(), "least recently used must go first")
+        self.assertFalse(middle.exists())
+        self.assertTrue(newest.exists(), "most recently used survives")
+
+    def test_stops_as_soon_as_it_is_back_under_budget(self):
+        _write_fake_cache_file(self.cache_dir, "aaa1", size_bytes=100, age_seconds=100)
+        newer = _write_fake_cache_file(self.cache_dir, "bbb2", size_bytes=100, age_seconds=1)
+
+        removed = _enforce_cache_budget(self.cache_dir, max_bytes=100)
+
+        self.assertEqual(removed, 1, "only the one oldest file needed removing")
+        self.assertTrue(newer.exists())
+
+
+class ReviewPreviewCacheTests(unittest.TestCase):
+    """review_preview()'s own use of the budget/LRU machinery: a hit
+    refreshes "recently used" standing, and a miss occasionally checks the
+    budget rather than on every single write."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.cache_dir = Path(self._tmp.name) / "cache"
+        self.source = Path(self._tmp.name) / "photo.jpg"
+        Image.new("RGB", (4, 4), color="blue").save(self.source, format="JPEG")
+        thumbnails_module._writes_since_sweep.clear()
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_a_cache_hit_refreshes_the_file_s_mtime(self):
+        first = review_preview(str(self.source), cache_dir=self.cache_dir)
+        old_mtime = first.stat().st_mtime
+        os.utime(first, (old_mtime - 1000, old_mtime - 1000))  # simulate it aging
+
+        with mock.patch("picklikeme.analyzer.contactsheets.load_source_image") as load:
+            second = review_preview(str(self.source), cache_dir=self.cache_dir)
+
+        load.assert_not_called()
+        self.assertGreater(second.stat().st_mtime, old_mtime - 1000)
+
+    def test_a_miss_checks_the_budget_only_every_n_writes_not_every_time(self):
+        with mock.patch("picklikeme.review.thumbnails.PREVIEW_CACHE_SWEEP_INTERVAL_WRITES", 3):
+            with mock.patch("picklikeme.review.thumbnails._enforce_cache_budget") as enforce:
+                for index in range(5):
+                    source = Path(self._tmp.name) / f"photo{index}.jpg"
+                    Image.new("RGB", (4, 4), color="red").save(source, format="JPEG")
+                    review_preview(str(source), cache_dir=self.cache_dir, max_bytes=10_000)
+
+                # 5 writes at an interval of 3: one check after the 3rd write,
+                # not after the 1st, 2nd, 4th or 5th.
+                self.assertEqual(enforce.call_count, 1)
+
+    def test_the_cache_is_actually_kept_under_budget_over_many_writes(self):
+        """End to end, no mocking of the budget enforcement itself: write
+        enough distinct images that eviction must actually run, then check
+        the real on-disk total."""
+        with mock.patch("picklikeme.review.thumbnails.PREVIEW_CACHE_SWEEP_INTERVAL_WRITES", 2):
+            for index in range(10):
+                source = Path(self._tmp.name) / f"photo{index}.jpg"
+                Image.new("RGB", (4, 4), color="green").save(source, format="JPEG")
+                review_preview(str(source), cache_dir=self.cache_dir, max_bytes=2000)
+
+        total = sum(size for _, size, _ in _cache_entries(self.cache_dir))
+        self.assertLessEqual(total, 2000)
+
+
+if __name__ == "__main__":
+    unittest.main()

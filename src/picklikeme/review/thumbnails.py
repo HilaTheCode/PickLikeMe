@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 from pathlib import Path
 
 from ..config import DEFAULT_CROP_CACHE_DIR, PROJECT_ROOT
@@ -41,20 +42,101 @@ REVIEW_THUMBNAIL_SIZE = 400
 # Bumped whenever a change makes previously cached previews wrong.
 REVIEW_PREVIEW_CACHE_VERSION = 1
 
+# A library of hundreds of thousands of photos would otherwise let this cache
+# grow forever - each entry is a full-size JPEG, not a thumbnail. Configurable
+# via `picklikeme review --preview-cache-max-gb` (see review/cli.py); the
+# default is a reasonable desktop budget, not a hard technical limit.
+DEFAULT_PREVIEW_CACHE_MAX_BYTES = 20 * 1024**3  # 20 GB
+
+# How many new cache WRITES pass between budget checks. A cache HIT (the
+# overwhelming majority of requests once a folder has been browsed once)
+# never triggers this at all - only a miss, which just paid for a real RAW
+# decode, so an occasional extra directory walk is proportionally cheap
+# there. Checking on every single write would mean walking a cache that may
+# hold hundreds of thousands of files on every one of them; checking this
+# rarely instead bounds the possible overshoot to a handful of files' worth
+# of bytes - negligible against a multi-GB budget - in exchange for that cost
+# being paid only once every N misses.
+PREVIEW_CACHE_SWEEP_INTERVAL_WRITES = 25
+
 _detection_cache = None
+_writes_since_sweep: dict[Path, int] = {}
 
 
 def _preview_cache_path(cache_dir: Path, image_path: str) -> Path:
     # Same convention as contactsheets._thumbnail_cache_path: resolved path +
-    # a version stamp, no mtime. These are camera RAW files a photographer
-    # reviews, not documents someone re-saves in place, so that tradeoff -
-    # already accepted for the square thumbnails - applies here unchanged.
+    # a version stamp, no mtime-based invalidation. These are camera RAW
+    # files a photographer reviews, not documents someone re-saves in place,
+    # so that tradeoff - already accepted for the square thumbnails - applies
+    # here unchanged. mtime is instead repurposed for LRU eviction (see
+    # _enforce_cache_budget): free to do, since nothing here uses it for
+    # invalidation.
     key = f"{Path(image_path).resolve()}|v{REVIEW_PREVIEW_CACHE_VERSION}"
     digest = hashlib.sha1(key.encode("utf-8")).hexdigest()[:20]
     return cache_dir / digest[:2] / f"{digest}.jpg"
 
 
-def review_preview(image_path: str, *, cache_dir: Path | None = None) -> Path:
+def _cache_entries(cache_dir: Path) -> list[tuple[Path, int, float]]:
+    """(path, size_bytes, mtime) for every cached preview - the raw material
+    for both size accounting and LRU eviction. Not resolved via the digest
+    scheme (unlike a normal read/write) because this one operation
+    genuinely needs to see every entry at once; every other function in this
+    module still computes its path directly and never walks the directory.
+    """
+    entries: list[tuple[Path, int, float]] = []
+    if not cache_dir.is_dir():
+        return entries
+    for entry in cache_dir.glob("*/*.jpg"):
+        try:
+            stat = entry.stat()
+        except OSError:
+            continue
+        entries.append((entry, stat.st_size, stat.st_mtime))
+    return entries
+
+
+def _enforce_cache_budget(cache_dir: Path, max_bytes: int) -> int:
+    """Delete the least-recently-used cached previews until `cache_dir` is
+    back under `max_bytes`. "Recently used" is each file's own mtime -
+    touched on every cache hit (see review_preview) - not filesystem atime,
+    which Windows disables updating by default and so cannot be relied on
+    for this. Returns the number of files removed (0 if already under
+    budget, which is the common case and costs one directory walk).
+    """
+    entries = _cache_entries(cache_dir)
+    total = sum(size for _, size, _ in entries)
+    if total <= max_bytes:
+        return 0
+    entries.sort(key=lambda entry: entry[2])  # oldest (least recently used) first
+    removed = 0
+    freed = 0
+    for path, size, _ in entries:
+        if total <= max_bytes:
+            break
+        try:
+            path.unlink()
+        except OSError:
+            continue
+        total -= size
+        freed += size
+        removed += 1
+    if removed:
+        logger.info(
+            "Preview cache over budget (%.1f GB > %.1f GB): removed %d least-recently-used file(s), freed %.1f GB",
+            (total + freed) / 1024**3,
+            max_bytes / 1024**3,
+            removed,
+            freed / 1024**3,
+        )
+    return removed
+
+
+def review_preview(
+    image_path: str,
+    *,
+    cache_dir: Path | None = None,
+    max_bytes: int = DEFAULT_PREVIEW_CACHE_MAX_BYTES,
+) -> Path:
     """A cached full-size preview JPEG for one image - the Lightbox's own
     persistent counterpart to the analysis report's `/preview` endpoint
     (analyzer/server.py's `_serve_preview`, `Cache-Control: no-store`).
@@ -72,16 +154,33 @@ def review_preview(image_path: str, *, cache_dir: Path | None = None) -> Path:
     result once. Raises whatever `load_source_image` raises; the caller
     reports that as a normal per-image failure, same as before this cache
     existed.
+
+    Bounded to `max_bytes` (default DEFAULT_PREVIEW_CACHE_MAX_BYTES) by
+    deleting the least-recently-used entries once it grows past that - see
+    _enforce_cache_budget. A hit refreshes this file's own "recently used"
+    standing (its mtime) so it is not immediately in line for eviction the
+    next time the budget is checked.
     """
     from ..analyzer.contactsheets import load_source_image
 
     cache_dir = cache_dir or REVIEW_PREVIEW_CACHE
     target = _preview_cache_path(cache_dir, image_path)
     if target.exists():
+        try:
+            os.utime(target, None)  # mark "recently used" - see _enforce_cache_budget
+        except OSError:
+            pass
         return target
+
     image = load_source_image(image_path)
     target.parent.mkdir(parents=True, exist_ok=True)
     image.save(target, format="JPEG", quality=92)
+
+    count = _writes_since_sweep.get(cache_dir, 0) + 1
+    if count >= PREVIEW_CACHE_SWEEP_INTERVAL_WRITES:
+        _enforce_cache_budget(cache_dir, max_bytes)
+        count = 0
+    _writes_since_sweep[cache_dir] = count
     return target
 
 

@@ -30,6 +30,7 @@ from ..analyzer.server import HOST, AnnotationRequestHandler
 from ..identity import IdentityUnavailable
 from .page import build_page
 from .session import InvalidReviewStatus, ReviewSession
+from .thumbnails import DEFAULT_PREVIEW_CACHE_MAX_BYTES
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +50,10 @@ class ReviewRequestHandler(AnnotationRequestHandler):
     # Serialises writes. The session is a single mutable object and the server
     # is threaded, so two decisions arriving together must not interleave.
     lock: threading.Lock = threading.Lock()
+    # The preview cache's size budget (see thumbnails.review_preview) -
+    # configurable via `picklikeme review --preview-cache-max-gb`, set as a
+    # class attribute by make_review_server() the same way session/store are.
+    preview_cache_max_bytes: int = DEFAULT_PREVIEW_CACHE_MAX_BYTES
 
     # -- helpers ------------------------------------------------------------
 
@@ -172,7 +177,7 @@ class ReviewRequestHandler(AnnotationRequestHandler):
         from .thumbnails import review_preview
 
         try:
-            cached = review_preview(str(target))
+            cached = review_preview(str(target), max_bytes=self.preview_cache_max_bytes)
         except Exception as exc:  # noqa: BLE001 - a bad frame must not break the viewer
             logger.warning("Could not build a preview for %s: %s", target, exc)
             self._send_json({"error": f"could not extract a preview: {exc}"}, status=500)
@@ -400,7 +405,10 @@ class ReviewRequestHandler(AnnotationRequestHandler):
 
 
 def make_review_server(
-    session: ReviewSession, store: AnnotationStore, port: int = DEFAULT_REVIEW_PORT
+    session: ReviewSession,
+    store: AnnotationStore,
+    port: int = DEFAULT_REVIEW_PORT,
+    preview_cache_max_bytes: int = DEFAULT_PREVIEW_CACHE_MAX_BYTES,
 ) -> HTTPServer:
     """Build (but do not start) the loopback review server.
 
@@ -430,6 +438,7 @@ def make_review_server(
             "root": folder or Path("."),
             "source_roots": (folder,) if folder else (),
             "lock": threading.Lock(),
+            "preview_cache_max_bytes": preview_cache_max_bytes,
         },
     )
     return ThreadingHTTPServer((HOST, port), handler)
@@ -440,9 +449,10 @@ def serve_review(
     store: AnnotationStore,
     port: int = DEFAULT_REVIEW_PORT,
     open_browser: bool = True,
+    preview_cache_max_bytes: int = DEFAULT_PREVIEW_CACHE_MAX_BYTES,
 ) -> None:
     """Serve a review session until interrupted."""
-    server = make_review_server(session, store, port)
+    server = make_review_server(session, store, port, preview_cache_max_bytes=preview_cache_max_bytes)
     url = f"http://{HOST}:{server.server_address[1]}/"
     counts = session.counts()
 
@@ -451,9 +461,19 @@ def serve_review(
     print(f"  ranking:  {session.ranking_file or '(none)'}")
     print(f"  images:   {counts['total']:,} ({counts['neutral']:,} still Neutral)")
     print(f"  database: {store.db_path}")
+    print(f"  preview cache: max {preview_cache_max_bytes / 1024**3:.1f} GB")
     print("  Ctrl+C to stop. No file is moved until you click Arrange.")
     for warning in session.warnings:
         print(f"  ! {warning}")
+
+    # A one-time check at startup, unthrottled (unlike the one review_preview
+    # itself does on every Nth write - see PREVIEW_CACHE_SWEEP_INTERVAL_WRITES):
+    # if the budget was lowered since the last run, or the cache simply grew
+    # past it while the app was closed, the invariant should hold again
+    # immediately, not only once enough new previews trickle in to trigger it.
+    from .thumbnails import REVIEW_PREVIEW_CACHE, _enforce_cache_budget
+
+    _enforce_cache_budget(REVIEW_PREVIEW_CACHE, preview_cache_max_bytes)
 
     if open_browser:
         # From a thread so a slow browser launch cannot delay serving.

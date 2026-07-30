@@ -68,6 +68,15 @@ def build_review_parser(add_help: bool = True) -> argparse.ArgumentParser:
     )
     parser.add_argument("--port", type=int, default=None, help="Port to listen on (default: 8757)")
     parser.add_argument("--no-browser", action="store_true", help="Do not open a browser")
+    parser.add_argument(
+        "--preview-cache-max-gb",
+        type=float,
+        default=None,
+        help="Maximum size of the Lightbox's on-disk full-size preview cache (default: 20 GB). "
+        "Once exceeded, the least-recently-viewed previews are deleted first, automatically, "
+        "down to this size - never anything you have not looked at recently, and never a "
+        "source photo, only the cached copy.",
+    )
     parser.add_argument("-v", "--verbose", action="store_true", help="Debug logging")
     return parser
 
@@ -85,7 +94,7 @@ def run_review(args: argparse.Namespace) -> int:
     from ..analyzer.annotations import DEFAULT_ANNOTATIONS_DB, AnnotationStore
     from .server import DEFAULT_REVIEW_PORT, serve_review
     from .session import ReviewSession
-    from .thumbnails import close_detections
+    from .thumbnails import DEFAULT_PREVIEW_CACHE_MAX_BYTES, close_detections
 
     _configure_logging(getattr(args, "verbose", False))
 
@@ -128,11 +137,17 @@ def run_review(args: argparse.Namespace) -> int:
             ranking_file=Path(args.ranking) if args.ranking else None,
             keep_percent=args.keep_percent,
         )
+        preview_cache_max_bytes = (
+            int(args.preview_cache_max_gb * 1024**3)
+            if args.preview_cache_max_gb is not None
+            else DEFAULT_PREVIEW_CACHE_MAX_BYTES
+        )
         serve_review(
             session,
             store,
             args.port or DEFAULT_REVIEW_PORT,
             open_browser=not args.no_browser,
+            preview_cache_max_bytes=preview_cache_max_bytes,
         )
     finally:
         close_detections()
