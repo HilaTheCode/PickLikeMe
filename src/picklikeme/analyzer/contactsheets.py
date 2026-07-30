@@ -222,8 +222,15 @@ def read_capture_timestamp(image_path: str) -> str | None:
     if not epoch:
         return None
     try:
+        # rawpy's own docs describe other.timestamp as a Unix epoch (int/float),
+        # but which type it actually returns has been observed to vary by
+        # rawpy/LibRaw version - some return a datetime.datetime directly.
+        # Checked by type rather than assumed, so either is handled regardless
+        # of which library version is installed.
+        if isinstance(epoch, datetime):
+            return epoch.isoformat(timespec="seconds")
         return datetime.fromtimestamp(epoch).isoformat(timespec="seconds")
-    except (OverflowError, OSError, ValueError):
+    except (OverflowError, OSError, ValueError, TypeError):
         return None
 
 

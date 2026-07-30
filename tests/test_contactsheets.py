@@ -133,6 +133,27 @@ class ReadCaptureTimestampTests(unittest.TestCase):
 
         self.assertEqual(result, moment.isoformat(timespec="seconds"))
 
+    def test_reads_a_raws_timestamp_when_rawpy_returns_a_datetime_directly(self):
+        """Regression test: rawpy's docs describe other.timestamp as a Unix
+        epoch, but some rawpy/LibRaw versions return a datetime.datetime
+        instead - datetime.fromtimestamp() then raises TypeError. Must
+        produce the same ISO string either way, without assuming either
+        library version."""
+        from datetime import datetime
+
+        source = self.root / "photo.nef"
+        source.write_bytes(b"not a real NEF - rawpy.imread is mocked below")
+        moment = datetime(2024, 6, 15, 10, 30, 0)
+
+        fake_raw = mock.MagicMock()
+        fake_raw.__enter__.return_value = fake_raw
+        fake_raw.other = mock.Mock(timestamp=moment)  # a datetime, not a float
+
+        with mock.patch("rawpy.imread", return_value=fake_raw):
+            result = read_capture_timestamp(str(source))
+
+        self.assertEqual(result, moment.isoformat(timespec="seconds"))
+
     def test_a_raw_with_no_timestamp_has_no_capture_time(self):
         source = self.root / "photo.nef"
         source.write_bytes(b"not a real NEF")
