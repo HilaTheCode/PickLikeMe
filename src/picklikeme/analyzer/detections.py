@@ -40,7 +40,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
-from ..bird_crop import CROP_CACHE_VERSION, coco_class_name, read_detections
+from ..bird_crop import CROP_CACHE_VERSION, coco_class_name, detection_category, read_detections
 from ..config import PROJECT_ROOT
 from ..identity import IdentityUnavailable
 
@@ -72,12 +72,19 @@ class Box:
     def class_name(self) -> str:
         return coco_class_name(self.label)
 
+    @property
+    def category(self) -> str | None:
+        """This box's taxonomy category (see bird_crop.DETECTION_CATEGORIES),
+        or None if its class is not catalogued at all."""
+        return detection_category(self.label)
+
     def as_dict(self) -> dict:
         return {
             "box": [self.x1, self.y1, self.x2, self.y2],
             "score": self.score,
             "label": self.label,
             "class_name": self.class_name,
+            "category": self.category,
             "selected": self.selected,
         }
 

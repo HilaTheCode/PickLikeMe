@@ -244,7 +244,10 @@ class StateEndpointTests(ReviewServerTestCase):
         self.assertEqual(payload["counts"]["neutral"], 7)
         self.assertEqual(len(payload["images"]), 7)
         first = payload["images"][0]
-        for key in ("image_path", "filename", "score", "rank", "review_status", "ai_suggestion", "missing_file"):
+        for key in (
+            "image_path", "filename", "score", "rank", "captured_at", "detected_category",
+            "review_status", "ai_suggestion", "missing_file",
+        ):
             self.assertIn(key, first)
 
     def test_images_arrive_best_first(self):
@@ -1059,6 +1062,62 @@ class GalleryFilterTests(unittest.TestCase):
         js = build_js()
         self.assertIn("function visibleImages()", js)
         self.assertIn("function images(){ return visibleImages(); }", js)
+
+
+class DetectedCategoryMarkupTests(unittest.TestCase):
+    """The subject-category chip and its dynamic panel filters - structured
+    metadata, not a judgement (see bird_crop.DETECTION_CATEGORIES)."""
+
+    def test_the_category_section_exists_and_starts_hidden(self):
+        """Data-driven, not a fixed list (Phase 3): with no categories
+        present in the folder at all (the common case today - most folders
+        have never been preprocessed), the section shows nothing."""
+        from picklikeme.review.page import build_page
+
+        html = build_page()
+        section = re.search(r'<div class="panel-section" id="category-section"([^>]*)>', html)
+        self.assertIsNotNone(section, "category-section not found")
+        self.assertIn("display:none", section.group(1))
+        self.assertIn('id="category-filters"', html)
+
+    def test_filter_buttons_are_generated_per_category_actually_present(self):
+        from picklikeme.review.page import build_js
+
+        js = build_js()
+        fn = re.search(r"function renderCategoryFilters\(images\)\{(.*?)\n\}", js, re.S)
+        self.assertIsNotNone(fn, "renderCategoryFilters not found")
+        body = fn.group(1)
+        self.assertIn("images.map(i => i.detected_category)", body)
+        self.assertIn("if(!present.length){ section.style.display = 'none'; return; }", body)
+
+    def test_a_category_filter_matches_on_detected_category(self):
+        from picklikeme.review.page import build_js
+
+        js = build_js()
+        filter_images = re.search(r"function filterImages\(images\)\{(.*?)\n\}", js, re.S)
+        body = filter_images.group(1)
+        self.assertIn("PLM.filter.indexOf('category:') === 0", body)
+        self.assertIn("i.detected_category === category", body)
+
+    def test_every_card_shows_a_category_chip_when_one_is_recorded(self):
+        from picklikeme.review.page import build_js
+
+        js = build_js()
+        card_fn = re.search(r"function card\(image, index\)\{(.*?)\n\}", js, re.S)
+        self.assertIsNotNone(card_fn)
+        body = card_fn.group(1)
+        self.assertIn("image.detected_category", body)
+        self.assertIn("category-chip", body)
+
+    def test_the_category_chip_is_visually_distinct_from_the_ai_chip(self):
+        from picklikeme.review.page import CSS
+
+        self.assertIn(".category-chip{", CSS)
+        ai_rule = re.search(r"\.ai-chip\{([^}]*)\}", CSS)
+        category_rule = re.search(r"\.category-chip\{([^}]*)\}", CSS)
+        self.assertIsNotNone(ai_rule)
+        self.assertIsNotNone(category_rule)
+        self.assertNotEqual(ai_rule.group(1), category_rule.group(1))
 
 
 class BulkActionsMarkupTests(unittest.TestCase):

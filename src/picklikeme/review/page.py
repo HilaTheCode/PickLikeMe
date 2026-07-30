@@ -166,6 +166,11 @@ display:flex;align-items:center;flex-wrap:wrap;gap:6px}
    can never be mistaken for each other at a glance. */
 .ai-chip{font-size:10.5px;padding:1px 7px;border-radius:20px;border:1px solid var(--accent);
 color:var(--accent);white-space:nowrap}
+/* Structured subject metadata (bird/mammal/human/...), not a judgement of
+   any kind - its own neutral, muted style so it is never mistaken for
+   either the AI-suggestion chip or the review-status badge. */
+.category-chip{font-size:10.5px;padding:1px 7px;border-radius:20px;border:1px solid var(--muted);
+color:var(--muted);white-space:nowrap}
 .badge{display:inline-block;font-size:11.5px;padding:2px 8px;border-radius:20px;
 border:1px solid var(--border);background:var(--panel-2);width:fit-content}
 .badge.keep{background:var(--good);color:#fff;border-color:var(--good)}
@@ -301,7 +306,31 @@ function filterImages(images){
   if(PLM.filter === 'differences') {
     return images.filter(i => i.ai_suggestion != null && i.review_status !== 'neutral' && i.review_status !== i.ai_suggestion);
   }
+  // Subject category (bird/mammal/human/...) - one dynamic filter per
+  // category actually present in this folder, see renderCategoryFilters().
+  if(PLM.filter.indexOf('category:') === 0){
+    const category = PLM.filter.slice('category:'.length);
+    return images.filter(i => i.detected_category === category);
+  }
   return images.filter(i => i.review_status === PLM.filter);
+}
+
+// The panel's Subject filters are data-driven, not a fixed list: only
+// categories actually present in this folder get a button, so the section
+// simply grows (or shows nothing at all, on a folder with no recorded
+// detections) as the detector's own coverage grows, with no UI code change.
+function renderCategoryFilters(images){
+  const section = q('#category-section');
+  const present = Array.from(new Set(images.map(i => i.detected_category).filter(Boolean))).sort();
+  if(!present.length){ section.style.display = 'none'; return; }
+  section.style.display = '';
+  const container = q('#category-filters');
+  container.innerHTML = present.map(category =>
+    '<button class="filter' + (PLM.filter === 'category:' + category ? ' on' : '') + '" data-filter="'
+      + esc('category:' + category) + '">' + esc(cap(category)) + '</button>'
+  ).join('');
+  container.querySelectorAll('.filter').forEach(b =>
+    b.addEventListener('click', () => setFilter(b.dataset.filter)));
 }
 
 // A missing sort value (no score, no capture date) always sorts last,
@@ -411,6 +440,7 @@ function render(){
   document.querySelectorAll('.filter').forEach(b => {
     b.classList.toggle('on', b.dataset.filter === PLM.filter);
   });
+  renderCategoryFilters(s.images);
   q('#sort-key').value = PLM.sort.key;
   q('#sort-dir').textContent = PLM.sort.dir === 'desc' ? '↓' : '↑';
   q('#sort-dir').title = PLM.sort.dir === 'desc' ? 'Descending (click for ascending)' : 'Ascending (click for descending)';
@@ -507,6 +537,12 @@ function card(image, index){
   const aiChip = image.ai_suggestion
     ? '<span class="ai-chip">AI ' + cap(image.ai_suggestion) + '</span>'
     : '';
+  // The recorded subject category - structured metadata, not a judgement -
+  // kept visually distinct from both the AI-suggestion chip and the review
+  // status badge (its own neutral-outlined style, see .category-chip).
+  const categoryChip = image.detected_category
+    ? '<span class="category-chip">' + esc(cap(image.detected_category)) + '</span>'
+    : '';
   // A sibling of .thumb-link, not inside it - a click on the checkbox must
   // never also open the lightbox, and its own click listener is bound
   // straight to .thumb-link (see render()), so a sibling target simply never
@@ -517,7 +553,7 @@ function card(image, index){
   return '<div class="card ' + status + (picked ? ' picked' : '') + '">' + pick + visual +
     '<div class="meta">' +
       '<div class="name" title="' + esc(image.image_path) + '">' + esc(image.filename) + '</div>' +
-      '<div class="nums">' + score + aiChip + '</div>' +
+      '<div class="nums">' + score + aiChip + categoryChip + '</div>' +
       '<span class="badge ' + status + '">' + esc(PLM.labels[status] || status) + '</span>' +
     '</div>' +
     '<div class="acts">' +
@@ -1506,6 +1542,11 @@ def build_page(title: str = "PickLikeMe Review") -> str:
       <div class="panel-row">
         <button id="boxes" title="Show/hide the detector's bounding boxes on thumbnails">Detector Boxes</button>
       </div>
+    </div>
+
+    <div class="panel-section" id="category-section" style="display:none">
+      <h3>Subject</h3>
+      <div class="panel-filters" id="category-filters"></div>
     </div>
 
     <div class="panel-section">

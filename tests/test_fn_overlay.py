@@ -805,5 +805,24 @@ class MetricIsolationTests(unittest.TestCase):
             self.assertEqual(without.confusion.as_dict(), with_boxes.confusion.as_dict())
 
 
+class BoxCategoryTests(unittest.TestCase):
+    """Box.category - the review app's structured subject metadata, derived
+    from the same COCO label the overlay already draws from."""
+
+    def test_a_bird_box_reports_the_bird_category(self):
+        box = Box(0, 0, 10, 10, 0.9, 16, selected=True)  # COCO_BIRD_CLASS
+        self.assertEqual(box.category, "bird")
+        self.assertEqual(box.as_dict()["category"], "bird")
+
+    def test_a_person_box_reports_the_human_category(self):
+        box = Box(0, 0, 10, 10, 0.9, 1, selected=False)  # COCO_PERSON_CLASS
+        self.assertEqual(box.category, "human")
+
+    def test_an_uncatalogued_class_has_no_category(self):
+        box = Box(0, 0, 10, 10, 0.9, 999, selected=False)
+        self.assertIsNone(box.category)
+        self.assertIsNone(box.as_dict()["category"])
+
+
 if __name__ == "__main__":
     unittest.main()

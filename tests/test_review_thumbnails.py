@@ -1,6 +1,9 @@
-"""review/thumbnails.py: the review app's own preview cache - its
-size-budget/LRU eviction. Built on top of the analyzer's shared detection
-cache, tested separately in test_bird_crop.py/test_fn_overlay.py.
+"""review/thumbnails.py: the review app's own caches (thumbnail overlay,
+preview, category lookup) built on top of the analyzer's shared detection
+cache. Box/detection_category themselves are tested directly in
+test_bird_crop.py and test_fn_overlay.py; this covers the thin wiring that
+turns a detection record into detected_category_for()'s answer, plus the
+preview cache's own size-budget/LRU eviction.
 """
 
 import os
@@ -19,8 +22,47 @@ from picklikeme.review import thumbnails as thumbnails_module
 from picklikeme.review.thumbnails import (
     _cache_entries,
     _enforce_cache_budget,
+    detected_category_for,
     review_preview,
 )
+
+
+class DetectedCategoryForTests(unittest.TestCase):
+    def test_reads_the_selected_detection_s_category(self):
+        record = mock.Mock(selected=mock.Mock(category="bird"))
+        with mock.patch("picklikeme.review.thumbnails._detections") as detections:
+            detections.return_value.get.return_value = record
+            self.assertEqual(detected_category_for("some/path.jpg"), "bird")
+            detections.return_value.get.assert_called_once_with("some/path.jpg", allow_detect=False)
+
+    def test_no_selected_detection_means_no_category(self):
+        """A recorded box that lost the crop-selection (a runner-up) must
+        never be mistaken for the subject - only .selected counts."""
+        record = mock.Mock(selected=None)
+        with mock.patch("picklikeme.review.thumbnails._detections") as detections:
+            detections.return_value.get.return_value = record
+            self.assertIsNone(detected_category_for("some/path.jpg"))
+
+    def test_an_uncatalogued_selected_detection_has_no_category(self):
+        record = mock.Mock(selected=mock.Mock(category=None))
+        with mock.patch("picklikeme.review.thumbnails._detections") as detections:
+            detections.return_value.get.return_value = record
+            self.assertIsNone(detected_category_for("some/path.jpg"))
+
+    def test_an_unreadable_cache_is_not_fatal(self):
+        """A bad detection cache must not break loading the gallery, exactly
+        like review_thumbnail's own overlay lookup."""
+        with mock.patch("picklikeme.review.thumbnails._detections", side_effect=RuntimeError("boom")):
+            self.assertIsNone(detected_category_for("some/path.jpg"))
+
+    def test_never_runs_the_detector_itself(self):
+        """Review must only ever read what preprocessing (or an earlier
+        backfill) already computed - allow_detect=False is not optional."""
+        with mock.patch("picklikeme.review.thumbnails._detections") as detections:
+            detections.return_value.get.return_value = mock.Mock(selected=None)
+            detected_category_for("some/path.jpg")
+            _, kwargs = detections.return_value.get.call_args
+            self.assertFalse(kwargs.get("allow_detect", True))
 
 
 def _write_fake_cache_file(cache_dir: Path, name: str, size_bytes: int, age_seconds: float) -> Path:

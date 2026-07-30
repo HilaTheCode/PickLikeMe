@@ -118,10 +118,81 @@ DOMESTIC_ANIMAL_CLASSES: dict[int, str] = {
 
 SUPPORTED_ANIMAL_CLASSES: dict[int, str] = {**WILDLIFE_CLASSES, **DOMESTIC_ANIMAL_CLASSES}
 
+# A person in frame - never a crop target (see BirdDetector.catalogue_classes
+# below for why this is not folded into SUPPORTED_ANIMAL_CLASSES), but a
+# subject worth cataloguing: a birder, a ranger, a researcher handling an
+# animal are all common in a wildlife archive, and "who else is in this
+# photo" is exactly the kind of thing the review app's filtering/search
+# should be able to answer.
+COCO_PERSON_CLASS = 1
+
+# Every class this project catalogues at all, for the review app's
+# structured subject metadata (see detection_category) - a strict superset of
+# SUPPORTED_ANIMAL_CLASSES. Kept as a separate set rather than folding person
+# into SUPPORTED_ANIMAL_CLASSES itself: that set also gates crop-TARGET
+# eligibility (BirdDetector.classes, via select_best_detection), and a person
+# standing near the actual wildlife subject must never be able to win that
+# selection and crop the training input to the wrong thing. Cataloguing and
+# crop-target selection are related but different questions - see
+# BirdDetector.detect_with_all, which answers both from one forward pass.
+CATALOGUED_CLASSES: dict[int, str] = {COCO_PERSON_CLASS: "person", **SUPPORTED_ANIMAL_CLASSES}
+
 
 def coco_class_name(label: int) -> str:
-    """Human-readable name for a supported COCO animal class (for logging)."""
-    return SUPPORTED_ANIMAL_CLASSES.get(int(label), f"class {int(label)}")
+    """Human-readable name for a catalogued COCO class (for logging)."""
+    return CATALOGUED_CLASSES.get(int(label), f"class {int(label)}")
+
+
+# ---------------------------------------------------------------------------
+# Subject category taxonomy - the review app's own vocabulary, broader than
+# any one detector's class list, so a future detector (trained beyond COCO)
+# can populate categories this one structurally cannot recognize without
+# changing the taxonomy or anything downstream of it (the review app's
+# filters, statistics, and eventual "smart collections" all read the
+# category string, never a raw COCO class id).
+# ---------------------------------------------------------------------------
+
+DETECTION_CATEGORY_BIRD = "bird"
+DETECTION_CATEGORY_MAMMAL = "mammal"
+DETECTION_CATEGORY_REPTILE = "reptile"
+DETECTION_CATEGORY_AMPHIBIAN = "amphibian"
+DETECTION_CATEGORY_FISH = "fish"
+DETECTION_CATEGORY_INSECT = "insect"
+DETECTION_CATEGORY_ARACHNID = "arachnid"
+DETECTION_CATEGORY_HUMAN = "human"
+
+# Every category PickLikeMe knows how to talk about. Order is display order
+# (roughly: wildlife first, by how often this project's archives feature
+# them, then human last).
+DETECTION_CATEGORIES: tuple[str, ...] = (
+    DETECTION_CATEGORY_BIRD,
+    DETECTION_CATEGORY_MAMMAL,
+    DETECTION_CATEGORY_REPTILE,
+    DETECTION_CATEGORY_AMPHIBIAN,
+    DETECTION_CATEGORY_FISH,
+    DETECTION_CATEGORY_INSECT,
+    DETECTION_CATEGORY_ARACHNID,
+    DETECTION_CATEGORY_HUMAN,
+)
+
+# COCO class id -> category. Only bird/mammal/human are actually reachable
+# with the current COCO-pretrained detector - COCO has no reptile, amphibian,
+# fish, insect or arachnid class at all, full stop, so this project cannot
+# honestly report those categories until a different (wildlife-specific)
+# detector backs it. The taxonomy above already has a slot for each, ready
+# for that day; this mapping is the one place that would grow to fill them.
+COCO_CLASS_CATEGORY: dict[int, str] = {
+    COCO_PERSON_CLASS: DETECTION_CATEGORY_HUMAN,
+    COCO_BIRD_CLASS: DETECTION_CATEGORY_BIRD,
+    **{class_id: DETECTION_CATEGORY_MAMMAL for class_id in DOMESTIC_ANIMAL_CLASSES},
+    **{class_id: DETECTION_CATEGORY_MAMMAL for class_id in WILDLIFE_CLASSES if class_id != COCO_BIRD_CLASS},
+}
+
+
+def detection_category(label: int) -> str | None:
+    """The taxonomy category (see DETECTION_CATEGORIES) for a COCO class id,
+    or None if this detector does not catalogue it at all."""
+    return COCO_CLASS_CATEGORY.get(int(label))
 
 
 CROP_CACHE_VERSION = "v4"
@@ -357,6 +428,12 @@ class BirdDetection:
     score: float
     label: int = COCO_BIRD_CLASS
 
+    @property
+    def category(self) -> str | None:
+        """This detection's taxonomy category (see DETECTION_CATEGORIES), or
+        None if its class is not catalogued at all."""
+        return detection_category(self.label)
+
 
 def _group_scene_detection(candidates: Sequence[BirdDetection]) -> BirdDetection:
     """A synthetic detection representing an entire group, for select_best_detection()'s
@@ -466,9 +543,19 @@ class NormalizedCrop:
 class BirdDetector:
     """COCO-pretrained Faster R-CNN v2 restricted to a set of animal classes.
 
-    Defaults to SUPPORTED_ANIMAL_CLASSES (wildlife + the remaining COCO
-    animals); pass `classes` to restrict it (e.g. WILDLIFE_CLASSES, or
-    {COCO_BIRD_CLASS} to reproduce the original bird-only behavior).
+    Two class sets, deliberately kept separate:
+
+    - `classes` (default SUPPORTED_ANIMAL_CLASSES: wildlife + the remaining
+      COCO animals) gates crop-TARGET eligibility - what `select_best_detection`
+      is even allowed to consider. Pass `classes` to restrict it (e.g.
+      WILDLIFE_CLASSES, or {COCO_BIRD_CLASS} to reproduce the original
+      bird-only behavior).
+    - `catalogue_classes` (default CATALOGUED_CLASSES: `classes` plus person)
+      gates what gets RECORDED at all, for the review app's structured
+      subject metadata (see detection_category). A person must never win the
+      crop - a birder or ranger standing near the actual subject stealing the
+      training crop would be a real bug - but is still worth cataloguing, so
+      it is recorded without ever being a crop candidate.
 
     torch/torchvision are imported lazily so that modules which only need the
     bbox math or cache-path helpers (e.g. RawImageLoader) don't pull the heavy
@@ -480,6 +567,7 @@ class BirdDetector:
         device: str = "cpu",
         conf_threshold: float = 0.30,
         classes: "dict[int, str] | set[int] | None" = None,
+        catalogue_classes: "dict[int, str] | set[int] | None" = None,
         area_tie_frac: float = DEFAULT_AREA_TIE_FRAC,
         group_scene_threshold: int = DEFAULT_GROUP_SCENE_THRESHOLD,
     ):
@@ -493,18 +581,32 @@ class BirdDetector:
         self.device = device
         self.conf_threshold = conf_threshold
         self.classes = frozenset(SUPPORTED_ANIMAL_CLASSES if classes is None else classes)
+        # Always a superset of `classes`: cataloguing must never be narrower
+        # than what can win the crop, or a real crop target would go
+        # unrecorded. Whatever the caller passes for `classes` still applies
+        # (a caller restricting to WILDLIFE_CLASSES gets a matching narrower
+        # catalogue too, unless it also passes its own catalogue_classes).
+        self.catalogue_classes = frozenset(
+            (CATALOGUED_CLASSES if classes is None else self.classes)
+            if catalogue_classes is None
+            else catalogue_classes
+        )
         self.area_tie_frac = area_tie_frac
         self.group_scene_threshold = group_scene_threshold
         weights = FasterRCNN_ResNet50_FPN_V2_Weights.COCO_V1
         self.model = fasterrcnn_resnet50_fpn_v2(weights=weights).to(device).eval()
 
     def detect_with_all(self, image_rgb: np.ndarray) -> "tuple[BirdDetection | None, list[BirdDetection]]":
-        """(winner, every accepted detection) from a **single** forward pass.
+        """(winner, every catalogued detection) from a **single** forward pass.
 
         Exists so a caller that wants the runners-up - the false-negative
-        diagnostic overlay - does not have to run inference a second time. The
-        winner is chosen by select_best_detection(), the same function
-        detect_best_bird() delegates to, so the two can never disagree.
+        diagnostic overlay, or the review app's subject cataloguing - does
+        not have to run inference a second time. The winner is chosen by
+        select_best_detection() from the `classes`-eligible subset only, the
+        same function detect_best_bird() delegates to, so the two can never
+        disagree; the full returned list may be broader (see
+        catalogue_classes) and can include detections (e.g. a person) that
+        were never in contention for it.
         """
         torch = self._torch
         with PROFILE.stage("detector preprocess"):
@@ -521,13 +623,14 @@ class BirdDetector:
             labels = output["labels"].cpu().numpy()
             scores = output["scores"].cpu().numpy()
 
-            accepted: list[BirdDetection] = [
+            catalogued: list[BirdDetection] = [
                 BirdDetection(box=tuple(float(v) for v in box), score=float(score), label=int(label))
                 for box, label, score in zip(boxes, labels, scores)
-                if int(label) in self.classes and score >= self.conf_threshold
+                if int(label) in self.catalogue_classes and score >= self.conf_threshold
             ]
-            best = select_best_detection(accepted, self.area_tie_frac, self.group_scene_threshold)
-        return best, accepted
+            crop_candidates = [d for d in catalogued if d.label in self.classes]
+            best = select_best_detection(crop_candidates, self.area_tie_frac, self.group_scene_threshold)
+        return best, catalogued
 
     def detect_best_bird(self, image_rgb: np.ndarray) -> BirdDetection | None:
         """The detection build_crop should crop to, or None if nothing

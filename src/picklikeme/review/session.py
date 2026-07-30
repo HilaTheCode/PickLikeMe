@@ -69,6 +69,12 @@ class ReviewImage:
     # The file's own EXIF capture date/time (ISO-8601), or None if it has
     # none - a sort key, nothing more. See AnnotationStore.capture_timestamp_of.
     captured_at: str | None = None
+    # The subject category already recorded for this image (see
+    # bird_crop.DETECTION_CATEGORIES: "bird", "mammal", "human", ...), or
+    # None if nothing was ever detected/recorded. Read-only, exactly like
+    # score/rank - structured metadata for filtering/search/statistics, never
+    # written by this application. See thumbnails.detected_category_for.
+    detected_category: str | None = None
     # The photographer's own verdict: REVIEW_KEEP, REVIEW_REJECT, or None.
     # None *is* Neutral - see review_status - not "no opinion yet from
     # somewhere else". Meaningless without a decision, and always cleared
@@ -100,6 +106,7 @@ class ReviewImage:
             "score": self.score,
             "rank": self.rank,
             "captured_at": self.captured_at,
+            "detected_category": self.detected_category,
             "review_status": self.review_status,
             # What the AI ranking alone would recommend at the current
             # threshold - "keep"/"reject", or None if unranked. Informational
@@ -177,9 +184,12 @@ class ReviewSession:
                 continue
             images.append(ReviewImage(image_path=str(path), filename=path.name))
 
+        from .thumbnails import detected_category_for
+
         for image in images:
             if not image.missing_file:
                 image.captured_at = self.store.capture_timestamp_of(image.image_path)
+                image.detected_category = detected_category_for(image.image_path)
 
         # Best first; unranked last, since they have no score to place them by.
         images.sort(key=lambda i: (i.score is None, -(i.score or 0.0), i.filename))

@@ -10,9 +10,15 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from picklikeme.bird_crop import (
+    CATALOGUED_CLASSES,
     COCO_BIRD_CLASS,
+    COCO_PERSON_CLASS,
     DEFAULT_AREA_TIE_FRAC,
     DEFAULT_GROUP_SCENE_THRESHOLD,
+    DETECTION_CATEGORIES,
+    DETECTION_CATEGORY_BIRD,
+    DETECTION_CATEGORY_HUMAN,
+    DETECTION_CATEGORY_MAMMAL,
     DOMESTIC_ANIMAL_CLASSES,
     SUPPORTED_ANIMAL_CLASSES,
     WILDLIFE_CLASSES,
@@ -23,6 +29,7 @@ from picklikeme.bird_crop import (
     build_crop,
     crop_cache_path,
     crop_to_box,
+    detection_category,
     downscale_long_side,
     enclosing_box,
     expand_and_clamp_box,
@@ -40,6 +47,7 @@ def _detector_with_fake_model(
     scores,
     conf_threshold=0.3,
     classes=None,
+    catalogue_classes=None,
     area_tie_frac=DEFAULT_AREA_TIE_FRAC,
     group_scene_threshold=DEFAULT_GROUP_SCENE_THRESHOLD,
 ):
@@ -52,6 +60,11 @@ def _detector_with_fake_model(
     detector.device = "cpu"
     detector.conf_threshold = conf_threshold
     detector.classes = frozenset(SUPPORTED_ANIMAL_CLASSES if classes is None else classes)
+    detector.catalogue_classes = frozenset(
+        (CATALOGUED_CLASSES if classes is None else detector.classes)
+        if catalogue_classes is None
+        else catalogue_classes
+    )
     detector.area_tie_frac = area_tie_frac
     detector.group_scene_threshold = group_scene_threshold
     output = {
@@ -323,6 +336,91 @@ class DetectBestBirdTests(unittest.TestCase):
         detection = detector.detect_best_bird(self.IMG)
         expected = enclosing_box([tuple(float(v) for v in b) for b in boxes[:10]])
         self.assertEqual(detection.box, expected)
+
+
+class CatalogueClassesTests(unittest.TestCase):
+    """A person is catalogued (recorded, exposed as metadata) but must never
+    be a crop TARGET - the two are different questions BirdDetector answers
+    from the same forward pass (see catalogue_classes vs classes)."""
+
+    IMG = np.zeros((40, 40, 3), dtype=np.uint8)
+
+    def test_a_person_is_recorded_in_all_detections_but_never_wins(self):
+        detector = _detector_with_fake_model(
+            boxes=[[0, 0, 10, 10], [0, 0, 39, 39]],  # small bird, huge person
+            labels=[COCO_BIRD_CLASS, COCO_PERSON_CLASS],
+            scores=[0.5, 0.99],
+        )
+        winner, catalogued = detector.detect_with_all(self.IMG)
+
+        self.assertEqual(winner.label, COCO_BIRD_CLASS, "the person must never win the crop, however large/confident")
+        self.assertEqual(len(catalogued), 2, "but both are still catalogued")
+        self.assertIn(COCO_PERSON_CLASS, [d.label for d in catalogued])
+
+    def test_catalogue_classes_defaults_to_a_superset_of_classes(self):
+        detector = _detector_with_fake_model(boxes=[], labels=[], scores=[])
+        self.assertTrue(detector.classes <= detector.catalogue_classes)
+        self.assertIn(COCO_PERSON_CLASS, detector.catalogue_classes)
+        self.assertNotIn(COCO_PERSON_CLASS, detector.classes, "a person is never a crop target by default")
+
+    def test_restricting_classes_also_narrows_the_default_catalogue(self):
+        """Passing a restricted `classes` (e.g. WILDLIFE_CLASSES) without an
+        explicit catalogue_classes must not silently catalogue the full
+        default set - the caller asked for a narrower detector."""
+        detector = _detector_with_fake_model(
+            boxes=[], labels=[], scores=[], classes=WILDLIFE_CLASSES
+        )
+        self.assertEqual(detector.catalogue_classes, frozenset(WILDLIFE_CLASSES))
+
+    def test_an_explicit_catalogue_classes_is_honoured_even_when_classes_is_restricted(self):
+        detector = _detector_with_fake_model(
+            boxes=[], labels=[], scores=[], classes={COCO_BIRD_CLASS}, catalogue_classes=CATALOGUED_CLASSES
+        )
+        self.assertEqual(detector.catalogue_classes, frozenset(CATALOGUED_CLASSES))
+
+    def test_only_a_person_present_yields_no_crop_winner(self):
+        detector = _detector_with_fake_model(
+            boxes=[[0, 0, 39, 39]], labels=[COCO_PERSON_CLASS], scores=[0.99]
+        )
+        self.assertIsNone(detector.detect_best_bird(self.IMG))
+        _, catalogued = detector.detect_with_all(self.IMG)
+        self.assertEqual(len(catalogued), 1, "still catalogued, even with no crop winner at all")
+
+
+class DetectionCategoryTests(unittest.TestCase):
+    """The review app's own taxonomy - broader than any one detector's class
+    list, so a future detector can populate categories this one cannot."""
+
+    def test_bird_maps_to_the_bird_category(self):
+        self.assertEqual(detection_category(COCO_BIRD_CLASS), DETECTION_CATEGORY_BIRD)
+
+    def test_person_maps_to_the_human_category(self):
+        self.assertEqual(detection_category(COCO_PERSON_CLASS), DETECTION_CATEGORY_HUMAN)
+
+    def test_every_supported_animal_class_except_bird_maps_to_mammal(self):
+        """COCO simply has no reptile/amphibian/fish/insect/arachnid class -
+        every other animal it recognizes (cat..giraffe) is a mammal."""
+        for class_id in SUPPORTED_ANIMAL_CLASSES:
+            if class_id == COCO_BIRD_CLASS:
+                continue
+            self.assertEqual(detection_category(class_id), DETECTION_CATEGORY_MAMMAL)
+
+    def test_an_uncatalogued_class_has_no_category(self):
+        self.assertIsNone(detection_category(999))
+
+    def test_every_catalogued_class_has_a_valid_category(self):
+        for class_id in CATALOGUED_CLASSES:
+            self.assertIn(detection_category(class_id), DETECTION_CATEGORIES)
+
+    def test_the_taxonomy_has_a_slot_for_categories_no_current_model_can_reach(self):
+        """Reptile/amphibian/fish/insect/arachnid are real, named categories
+        in the taxonomy even though COCO cannot populate them today - the
+        whole point of designing this as an extensible vocabulary rather than
+        a raw COCO class list."""
+        reachable_today = {detection_category(class_id) for class_id in CATALOGUED_CLASSES}
+        for category in ("reptile", "amphibian", "fish", "insect", "arachnid"):
+            self.assertIn(category, DETECTION_CATEGORIES)
+            self.assertNotIn(category, reachable_today)
 
 
 class SupportedClassTests(unittest.TestCase):

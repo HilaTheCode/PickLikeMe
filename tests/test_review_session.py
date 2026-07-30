@@ -21,6 +21,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -602,6 +603,44 @@ class MissingDataTests(SessionTestCase):
         self.assertEqual(session.counts()["total"], 3, "images are still found on disk")
         self.assertEqual(session.counts()["neutral"], 3)
         self.assertTrue(any("ranking" in w.lower() for w in session.warnings))
+
+
+class DetectedCategoryTests(SessionTestCase):
+    """The subject category (bird/mammal/human/...) already recorded for an
+    image - structured, read-only metadata, populated the same way
+    captured_at is: once per load, never by running the detector itself."""
+
+    def test_a_recorded_category_is_attached_to_the_matching_image(self):
+        shoot, images, _ = build_shoot(self.root, ranked=3)
+        with mock.patch(
+            "picklikeme.review.thumbnails.detected_category_for",
+            side_effect=lambda path: "bird" if path == str(images[0]) else None,
+        ):
+            session = self.session(shoot)
+
+        self.assertEqual(session._image_for(str(images[0])).detected_category, "bird")
+        self.assertIsNone(session._image_for(str(images[1])).detected_category)
+
+    def test_a_missing_file_is_never_asked_for_a_category(self):
+        """Consistent with captured_at: there is nothing to read a category
+        from for a file that is not there, and it must not raise."""
+        shoot, images, _ = build_shoot(self.root, ranked=4)
+        images[1].unlink()
+
+        with mock.patch("picklikeme.review.thumbnails.detected_category_for") as detected:
+            session = self.session(shoot)
+
+        queried_paths = [call.args[0] for call in detected.call_args_list]
+        self.assertNotIn(str(images[1]), queried_paths, "a missing file has nothing to read a category from")
+        self.assertIsNone(session._image_for(str(images[1])).detected_category)
+
+    def test_is_exposed_in_the_wire_format(self):
+        shoot, images, _ = build_shoot(self.root, ranked=1)
+        with mock.patch("picklikeme.review.thumbnails.detected_category_for", return_value="mammal"):
+            session = self.session(shoot)
+
+        payload = session.as_dict()
+        self.assertEqual(payload["images"][0]["detected_category"], "mammal")
 
 
 class ArrangeTests(SessionTestCase):

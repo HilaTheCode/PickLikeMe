@@ -233,6 +233,23 @@ def review_thumbnail(
     return annotate_thumbnail(plain, record, overlaid, size) or plain
 
 
+def detected_category_for(image_path: str) -> str | None:
+    """The subject category (see bird_crop.DETECTION_CATEGORIES) already
+    recorded for this image, or None if nothing was ever detected/recorded
+    for it. Reuses the same shared, allow_detect=False detection cache
+    review_thumbnail's overlay already reads from - review must never run
+    the detector itself, only ever read what preprocessing (or an earlier
+    false-negative diagnostic backfill) already computed.
+    """
+    try:
+        record = _detections().get(image_path, allow_detect=False)
+    except Exception as exc:  # noqa: BLE001 - an unreadable cache is not fatal
+        logger.debug("No detections for %s: %s", image_path, exc)
+        return None
+    selected = record.selected
+    return selected.category if selected is not None else None
+
+
 def close_detections() -> None:
     """Release the detector-box cache connection, for a clean shutdown."""
     global _detection_cache
