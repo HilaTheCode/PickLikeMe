@@ -29,7 +29,7 @@ from ..analyzer.os_actions import choose_folder
 from ..analyzer.server import HOST, AnnotationRequestHandler
 from ..identity import IdentityUnavailable
 from .page import build_page
-from .session import ReviewSession
+from .session import InvalidReviewStatus, ReviewSession
 
 logger = logging.getLogger(__name__)
 
@@ -183,7 +183,9 @@ class ReviewRequestHandler(AnnotationRequestHandler):
             return
 
         handlers = {
-            "/api/review/decision": self._post_decision,
+            "/api/review/status": self._post_status,
+            "/api/review/bulk-status": self._post_bulk_status,
+            "/api/review/apply-ai-suggestions": self._post_apply_ai_suggestions,
             "/api/review/keep-percent": self._post_keep_percent,
             "/api/review/arrange": self._post_arrange,
             "/api/review/reconcile": self._post_reconcile,
@@ -211,27 +213,53 @@ class ReviewRequestHandler(AnnotationRequestHandler):
                 },
                 status=409,
             )
-        except (InvalidReviewDecision, InvalidReviewReason, KeyError, ValueError) as exc:
+        except (InvalidReviewDecision, InvalidReviewReason, InvalidReviewStatus, KeyError, ValueError) as exc:
             self._send_json({"error": str(exc)}, status=400)
         except Exception as exc:  # noqa: BLE001 - reported to the UI, never fatal
             logger.exception("Review request failed")
             self._send_json({"error": f"{type(exc).__name__}: {exc}"}, status=500)
 
-    def _post_decision(self, payload: dict) -> None:
+    def _post_status(self, payload: dict) -> None:
         image_path = (payload.get("image_path") or "").strip()
         if not image_path:
             raise ValueError("image_path is required")
-        decision = payload.get("decision")
-        if decision is not None and not isinstance(decision, str):
-            raise ValueError("decision must be 'keep', 'reject', or null")
+        status = payload.get("status")
+        if not isinstance(status, str):
+            raise ValueError("status must be a string ('keep', 'reject', or 'neutral')")
         reason = payload.get("reason")
         if reason is not None and not isinstance(reason, str):
             raise ValueError("reason must be a string or null")
         reason_note = payload.get("reason_note")
         if reason_note is not None and not isinstance(reason_note, str):
             raise ValueError("reason_note must be a string or null")
-        self.session.set_decision(image_path, decision, reason=reason, reason_note=reason_note)
+        self.session.set_review_status(image_path, status, reason=reason, reason_note=reason_note)
         self._send_json(self._state_payload())
+
+    def _post_bulk_status(self, payload: dict) -> None:
+        """The multi-select toolbar's one request for many images - see
+        ReviewSession.set_review_statuses. No `reason`: a bulk action is not
+        the place to record a per-image judgement call.
+        """
+        image_paths = payload.get("image_paths")
+        if not isinstance(image_paths, list) or not image_paths or not all(
+            isinstance(p, str) for p in image_paths
+        ):
+            raise ValueError("image_paths must be a non-empty list of strings")
+        status = payload.get("status")
+        if not isinstance(status, str):
+            raise ValueError("status must be a string ('keep', 'reject', or 'neutral')")
+        result = self.session.set_review_statuses(image_paths, status)
+        self._send_json({"ok": True, **result, "state": self.session.as_dict()})
+
+    def _post_apply_ai_suggestions(self, payload: dict) -> None:
+        """Bulk-accept the AI's current suggestion for every ranked image
+        still Neutral - see ReviewSession.apply_ai_suggestions. The one
+        endpoint that lets the AI ranking influence review_status at all,
+        and only because the photographer explicitly asked it to, once, for
+        images they had not yet looked at themselves.
+        """
+        result = self.session.apply_ai_suggestions()
+        self._send_json({"ok": True, **result, "state": self.session.as_dict()})
 
     def _post_keep_percent(self, payload: dict) -> None:
         self.session.set_keep_percent(payload.get("keep_percent"))
@@ -306,9 +334,15 @@ def make_review_server(
     Unlike `analyzer.server.make_server` there is no `report.html`
     precondition: the review page is generated per request, and the folder
     being reviewed is a shoot rather than a report directory.
+
+    `session.input_folder` may be None - `picklikeme review` with no
+    `--input` starts with nothing open at all. `source_roots` is then empty,
+    so every path-taking endpoint refuses everything (correctly: there is no
+    folder yet), until `/api/review/open-folder` sets a real one (see
+    `ReviewRequestHandler._post_open_folder`).
     """
     folder = session.input_folder
-    if not folder.is_dir():
+    if folder is not None and not folder.is_dir():
         raise SystemExit(f"Folder not found: {folder}")
 
     handler = type(
@@ -318,8 +352,10 @@ def make_review_server(
             "session": session,
             "store": store,
             # Everything path-taking is confined to the reviewed folder.
-            "root": folder,
-            "source_roots": (folder,),
+            # `root` is never actually used to serve a file here (see
+            # ReviewRequestHandler._resolve) - it just needs a real Path.
+            "root": folder or Path("."),
+            "source_roots": (folder,) if folder else (),
             "lock": threading.Lock(),
         },
     )
@@ -338,9 +374,9 @@ def serve_review(
     counts = session.counts()
 
     print(f"Review: {url}")
-    print(f"  folder:   {session.input_folder}")
-    print(f"  ranking:  {session.ranking_file}")
-    print(f"  images:   {counts['total']:,} ({counts['untouched']:,} without a ranking)")
+    print(f"  folder:   {session.input_folder or '(none yet - use Open Folder in the page)'}")
+    print(f"  ranking:  {session.ranking_file or '(none)'}")
+    print(f"  images:   {counts['total']:,} ({counts['neutral']:,} still Neutral)")
     print(f"  database: {store.db_path}")
     print("  Ctrl+C to stop. No file is moved until you click Arrange.")
     for warning in session.warnings:
@@ -357,4 +393,4 @@ def serve_review(
     finally:
         server.server_close()
         final = session.counts()
-        print(f"{final['manual']:,} manual decision(s) recorded in {store.db_path}")
+        print(f"{final['keep']:,} kept, {final['reject']:,} rejected, in {store.db_path}")

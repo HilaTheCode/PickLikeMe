@@ -2,11 +2,17 @@
 
 The rules that matter, and that the rest of the app depends on being exact:
 
-- a manual Keep/Reject always beats the threshold, however the threshold moves;
-- an image with no ranking is never selected automatically and never filed
-  without an explicit decision;
+- every image's review_status is always exactly Keep, Reject or Neutral -
+  the photographer's own, independent verdict;
+- the AI ranking (score, rank, ai_suggestion) is read-only metadata and never
+  changes review_status by itself - only apply_ai_suggestions does, and only
+  because the photographer explicitly asked it to;
+- clearing a review status (one image, or a bulk selection) always lands on
+  Neutral - never silently on whatever the AI would have picked;
 - an image on disk but absent from the ranking still appears in the gallery;
-- a decision, once made, survives arranging - the files move underneath it.
+- arrange() files Keep/Reject only; Neutral is never moved, ranked highly or
+  not; a review status, once set, survives arranging - the files move
+  underneath it.
 """
 
 import csv
@@ -20,11 +26,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from picklikeme.analyzer.annotations import AnnotationStore
 from picklikeme.organize import REJECTED_DIRNAME, SELECTED_DIRNAME, selection_count
 from picklikeme.review.session import (
-    STATE_AUTO_REJECTED,
-    STATE_AUTO_SELECTED,
-    STATE_MANUAL_KEEP,
-    STATE_MANUAL_REJECT,
-    STATE_UNRANKED,
+    REVIEW_STATUS_KEEP,
+    REVIEW_STATUS_NEUTRAL,
+    REVIEW_STATUS_REJECT,
+    InvalidReviewStatus,
     ReviewSession,
 )
 from picklikeme.sidecar import ranking_path
@@ -33,8 +38,9 @@ from picklikeme.sidecar import ranking_path
 def build_shoot(root: Path, ranked: int = 10, unranked: int = 0) -> tuple[Path, list[Path], list[Path]]:
     """A folder with a ranking, plus optionally images the ranking never saw.
 
-    Scores descend with the index, so `images[0]` is the model's best pick and
-    `images[-1]` its worst - which is what makes the override tests legible.
+    Scores descend with the index, so `images[0]` is the AI's best pick and
+    `images[-1]` its worst - which is what makes the independence tests
+    legible (a Keep on the worst-ranked image, a Reject on the best one).
     """
     shoot = root / "shoot"
     shoot.mkdir(parents=True, exist_ok=True)
@@ -80,143 +86,292 @@ class SessionTestCase(unittest.TestCase):
         return ReviewSession(shoot, self.store, **kwargs)
 
 
-class ThresholdTests(SessionTestCase):
+class AiSuggestionTests(SessionTestCase):
+    """The AI's own opinion - read-only, purely informational. review_status
+    never depends on it; only ai_suggestion (and, if invoked,
+    apply_ai_suggestions) does."""
+
     def test_the_cut_matches_organize_s_own_arithmetic(self):
-        """The UI's count and the arrange must never disagree, so both come
-        from selection_count rather than each rounding for themselves."""
+        """The AI-suggestion count and organize's own selection_count must
+        never disagree, so both come from the same function."""
         shoot, _, _ = build_shoot(self.root, ranked=10)
         for percent in (0, 5, 10, 25, 33.3, 50, 100):
             session = self.session(shoot, keep_percent=percent)
             self.assertEqual(session.cut, selection_count(10, percent))
-            self.assertEqual(len(session.selected_paths()), session.cut)
+            keep_suggestions = sum(1 for v in session._ai_suggestions().values() if v == REVIEW_STATUS_KEEP)
+            self.assertEqual(keep_suggestions, session.cut)
 
-    def test_the_highest_scoring_images_are_the_selected_ones(self):
+    def test_the_highest_scoring_images_get_the_keep_suggestion(self):
         shoot, images, _ = build_shoot(self.root, ranked=10)
         session = self.session(shoot, keep_percent=30)
-        selected = session.selected_paths()
-        self.assertEqual(selected, [str(p) for p in images[:3]])
+        suggestions = session._ai_suggestions()
+        for path in images[:3]:
+            self.assertEqual(suggestions[str(path)], REVIEW_STATUS_KEEP)
+        for path in images[3:]:
+            self.assertEqual(suggestions[str(path)], REVIEW_STATUS_REJECT)
 
-    def test_moving_the_percentage_reclassifies_without_any_inference(self):
-        shoot, _, _ = build_shoot(self.root, ranked=10)
-        session = self.session(shoot, keep_percent=10)
-        self.assertEqual(session.counts()["selected"], 1)
-        session.set_keep_percent(50)
-        self.assertEqual(session.counts()["selected"], 5)
-        session.set_keep_percent(0)
-        self.assertEqual(session.counts()["selected"], 0)
-        self.assertEqual(session.counts()["rejected"], 10)
-
-    def test_states_explain_every_image(self):
-        shoot, images, _ = build_shoot(self.root, ranked=4)
-        states = self.session(shoot, keep_percent=50).states()
-        self.assertEqual(states[str(images[0])], STATE_AUTO_SELECTED)
-        self.assertEqual(states[str(images[3])], STATE_AUTO_REJECTED)
-
-
-class ManualOverrideTests(SessionTestCase):
-    def test_a_manual_keep_beats_the_threshold(self):
+    def test_moving_the_threshold_changes_the_suggestion_never_the_review_status(self):
         shoot, images, _ = build_shoot(self.root, ranked=10)
         session = self.session(shoot, keep_percent=10)
+        best = str(images[0])
+        self.assertEqual(session._ai_suggestions()[best], REVIEW_STATUS_KEEP)
+
+        session.set_keep_percent(0)
+
+        self.assertEqual(session._ai_suggestions()[best], REVIEW_STATUS_REJECT)
+        self.assertEqual(session._image_for(best).review_status, REVIEW_STATUS_NEUTRAL)
+
+    def test_an_unranked_image_gets_no_suggestion(self):
+        shoot, _, extra = build_shoot(self.root, ranked=4, unranked=2)
+        session = self.session(shoot, keep_percent=50)
+        suggestions = session._ai_suggestions()
+        for path in extra:
+            self.assertIsNone(suggestions[str(path)])
+
+
+class ReviewStatusTests(SessionTestCase):
+    """The photographer's own verdict - always exactly Keep, Reject or
+    Neutral, completely independent of whatever the AI suggests."""
+
+    def test_every_image_starts_neutral(self):
+        shoot, images, _ = build_shoot(self.root, ranked=5)
+        session = self.session(shoot)
+        for path in images:
+            self.assertEqual(session._image_for(str(path)).review_status, REVIEW_STATUS_NEUTRAL)
+
+    def test_setting_a_status_is_independent_of_the_ai_suggestion(self):
+        """The AI's own top pick can be Rejected, and its own bottom pick can
+        be Kept - review_status and ai_suggestion never have to agree."""
+        shoot, images, _ = build_shoot(self.root, ranked=10)
+        session = self.session(shoot, keep_percent=10)
+        best = str(images[0])
         worst = str(images[-1])
 
-        state = session.set_decision(worst, "keep")
+        session.set_review_status(best, REVIEW_STATUS_REJECT)
+        session.set_review_status(worst, REVIEW_STATUS_KEEP)
 
-        self.assertEqual(state, STATE_MANUAL_KEEP)
-        self.assertIn(worst, session.selected_paths())
-        self.assertEqual(session.counts()["selected"], 2, "the auto pick plus the manual one")
+        self.assertEqual(session._image_for(best).review_status, REVIEW_STATUS_REJECT)
+        self.assertEqual(session._image_for(worst).review_status, REVIEW_STATUS_KEEP)
+        suggestions = session._ai_suggestions()
+        self.assertEqual(suggestions[best], REVIEW_STATUS_KEEP, "the AI's own opinion is untouched")
+        self.assertEqual(suggestions[worst], REVIEW_STATUS_REJECT)
 
-    def test_a_manual_reject_beats_the_threshold(self):
+    def test_clearing_a_status_returns_to_neutral_never_to_the_ai_suggestion(self):
+        """The bug this model exists to fix: Neutral must be a real, distinct
+        status, never silently replaced by whatever the AI would have picked
+        at the current threshold."""
         shoot, images, _ = build_shoot(self.root, ranked=10)
-        session = self.session(shoot, keep_percent=50)
+        session = self.session(shoot, keep_percent=90)  # the AI would keep nearly all of these
         best = str(images[0])
+        session.set_review_status(best, REVIEW_STATUS_REJECT)
 
-        self.assertEqual(session.set_decision(best, "reject"), STATE_MANUAL_REJECT)
-        self.assertIn(best, session.rejected_paths())
-        self.assertNotIn(best, session.selected_paths())
+        status = session.set_review_status(best, REVIEW_STATUS_NEUTRAL)
 
-    def test_manual_decisions_survive_the_percentage_changing(self):
-        """The threshold re-sorts everything the photographer has not ruled on,
-        and nothing they have."""
+        self.assertEqual(status, REVIEW_STATUS_NEUTRAL)
+        self.assertEqual(session._image_for(best).review_status, REVIEW_STATUS_NEUTRAL)
+        self.assertIn(best, session.neutral_paths())
+        self.assertNotIn(best, session.keep_paths())
+        self.assertNotIn(best, session.reject_paths())
+
+    def test_moving_the_ai_threshold_never_changes_an_existing_review_status(self):
         shoot, images, _ = build_shoot(self.root, ranked=10)
         session = self.session(shoot, keep_percent=10)
-        session.set_decision(str(images[-1]), "keep")
-        session.set_decision(str(images[0]), "reject")
+        session.set_review_status(str(images[-1]), REVIEW_STATUS_KEEP)
+        session.set_review_status(str(images[0]), REVIEW_STATUS_REJECT)
 
         for percent in (0, 25, 50, 100):
             session.set_keep_percent(percent)
-            states = session.states()
-            self.assertEqual(states[str(images[-1])], STATE_MANUAL_KEEP)
-            self.assertEqual(states[str(images[0])], STATE_MANUAL_REJECT)
-
-    def test_clearing_a_decision_returns_the_image_to_the_threshold(self):
-        shoot, images, _ = build_shoot(self.root, ranked=10)
-        session = self.session(shoot, keep_percent=50)
-        best = str(images[0])
-        session.set_decision(best, "reject")
-        self.assertEqual(session.states()[best], STATE_MANUAL_REJECT)
-
-        self.assertEqual(session.set_decision(best, None), STATE_AUTO_SELECTED)
-        self.assertEqual(session.counts()["manual"], 0)
+            self.assertEqual(session._image_for(str(images[-1])).review_status, REVIEW_STATUS_KEEP)
+            self.assertEqual(session._image_for(str(images[0])).review_status, REVIEW_STATUS_REJECT)
 
     def test_decisions_are_persisted_immediately_not_held_in_memory(self):
         """Refreshing the page must restore everything; a browser tab is not
         where a photographer's work is allowed to live."""
         shoot, images, _ = build_shoot(self.root, ranked=6)
         session = self.session(shoot, keep_percent=25)
-        session.set_decision(str(images[4]), "keep")
+        session.set_review_status(str(images[4]), REVIEW_STATUS_KEEP)
 
         reopened = self.session(shoot, keep_percent=25)
 
-        self.assertEqual(reopened.states()[str(images[4])], STATE_MANUAL_KEEP)
-        self.assertEqual(reopened.counts()["manual"], 1)
+        self.assertEqual(reopened._image_for(str(images[4])).review_status, REVIEW_STATUS_KEEP)
+        self.assertEqual(reopened.counts()["keep"], 1)
 
     def test_an_unknown_path_is_refused(self):
         shoot, _, _ = build_shoot(self.root, ranked=3)
         session = self.session(shoot)
         with self.assertRaises(KeyError):
-            session.set_decision(str(self.root / "elsewhere.jpg"), "keep")
+            session.set_review_status(str(self.root / "elsewhere.jpg"), REVIEW_STATUS_KEEP)
 
-    def test_a_reason_travels_with_the_override(self):
+    def test_an_invalid_status_is_refused(self):
+        shoot, images, _ = build_shoot(self.root, ranked=3)
+        session = self.session(shoot)
+        with self.assertRaises(InvalidReviewStatus):
+            session.set_review_status(str(images[0]), "maybe")
+
+    def test_a_reason_travels_with_the_status(self):
         shoot, images, _ = build_shoot(self.root, ranked=10)
         session = self.session(shoot, keep_percent=10)
         worst = str(images[-1])
 
-        session.set_decision(worst, "reject", reason="eyes_not_seen")
+        session.set_review_status(worst, REVIEW_STATUS_REJECT, reason="eyes_not_seen")
 
         image = next(i for i in session.images if i.image_path == worst)
         self.assertEqual(image.reason, "eyes_not_seen")
-        self.assertEqual(image.as_dict("manual_reject")["reason"], "eyes_not_seen")
+        self.assertEqual(image.as_dict(None)["reason"], "eyes_not_seen")
 
     def test_a_reason_is_optional_and_defaults_to_none(self):
         shoot, images, _ = build_shoot(self.root, ranked=3)
         session = self.session(shoot)
         path = str(images[0])
 
-        session.set_decision(path, "keep")
+        session.set_review_status(path, REVIEW_STATUS_KEEP)
 
         image = next(i for i in session.images if i.image_path == path)
         self.assertIsNone(image.reason)
 
-    def test_clearing_a_decision_clears_its_reason_too(self):
+    def test_setting_neutral_clears_any_reason(self):
         shoot, images, _ = build_shoot(self.root, ranked=3)
         session = self.session(shoot)
         path = str(images[0])
-        session.set_decision(path, "keep", reason="clear_eyes_seen")
+        session.set_review_status(path, REVIEW_STATUS_KEEP, reason="clear_eyes_seen")
 
-        session.set_decision(path, None)
+        session.set_review_status(path, REVIEW_STATUS_NEUTRAL)
 
         image = next(i for i in session.images if i.image_path == path)
         self.assertIsNone(image.reason)
 
-    def test_a_reason_is_persisted_immediately_like_the_decision_it_belongs_to(self):
+    def test_a_reason_is_persisted_immediately_like_the_status_it_belongs_to(self):
         shoot, images, _ = build_shoot(self.root, ranked=6)
         session = self.session(shoot, keep_percent=25)
-        session.set_decision(str(images[4]), "reject", reason="eyes_not_seen")
+        session.set_review_status(str(images[4]), REVIEW_STATUS_REJECT, reason="eyes_not_seen")
 
         reopened = self.session(shoot, keep_percent=25)
 
         image = next(i for i in reopened.images if i.image_path == str(images[4]))
         self.assertEqual(image.reason, "eyes_not_seen")
+
+
+class BulkReviewStatusTests(SessionTestCase):
+    """The multi-select toolbar's backend - the same set_review_status,
+    applied to many images under one call instead of one request per image."""
+
+    def test_applies_the_same_status_to_every_path(self):
+        shoot, images, _ = build_shoot(self.root, ranked=4)
+        session = self.session(shoot, keep_percent=25)
+
+        result = session.set_review_statuses([str(images[0]), str(images[1])], REVIEW_STATUS_KEEP)
+
+        self.assertEqual(result["applied"], 2)
+        self.assertEqual(result["failed"], [])
+        self.assertEqual(session._image_for(str(images[0])).review_status, REVIEW_STATUS_KEEP)
+        self.assertEqual(session._image_for(str(images[1])).review_status, REVIEW_STATUS_KEEP)
+
+    def test_bulk_clearing_returns_every_path_to_neutral(self):
+        """The bulk half of the same bug fix as ReviewStatusTests' single-
+        image version: Neutral, never whatever the AI would have picked."""
+        shoot, images, _ = build_shoot(self.root, ranked=4)
+        session = self.session(shoot, keep_percent=90)  # the AI would keep almost all of these
+        session.set_review_statuses([str(images[0]), str(images[1])], REVIEW_STATUS_REJECT)
+
+        session.set_review_statuses([str(images[0]), str(images[1])], REVIEW_STATUS_NEUTRAL)
+
+        self.assertEqual(session._image_for(str(images[0])).review_status, REVIEW_STATUS_NEUTRAL)
+        self.assertEqual(session._image_for(str(images[1])).review_status, REVIEW_STATUS_NEUTRAL)
+
+    def test_a_path_not_in_the_gallery_is_reported_and_skipped(self):
+        shoot, images, _ = build_shoot(self.root, ranked=3)
+        session = self.session(shoot, keep_percent=25)
+
+        result = session.set_review_statuses(
+            [str(images[0]), str(self.root / "nowhere.jpg")], REVIEW_STATUS_KEEP
+        )
+
+        self.assertEqual(result["applied"], 1)
+        self.assertEqual(result["failed"], [str(self.root / "nowhere.jpg")])
+        self.assertEqual(session._image_for(str(images[0])).review_status, REVIEW_STATUS_KEEP)
+
+    def test_each_status_is_persisted_immediately_not_only_in_memory(self):
+        shoot, images, _ = build_shoot(self.root, ranked=3)
+        session = self.session(shoot, keep_percent=25)
+
+        session.set_review_statuses([str(images[0]), str(images[1])], REVIEW_STATUS_KEEP)
+        reopened = self.session(shoot, keep_percent=25)
+
+        self.assertEqual(reopened._image_for(str(images[0])).review_status, REVIEW_STATUS_KEEP)
+        self.assertEqual(reopened._image_for(str(images[1])).review_status, REVIEW_STATUS_KEEP)
+
+    def test_no_reason_is_ever_recorded_by_a_bulk_action(self):
+        shoot, images, _ = build_shoot(self.root, ranked=2)
+        session = self.session(shoot, keep_percent=25)
+
+        session.set_review_statuses([str(images[0])], REVIEW_STATUS_KEEP)
+
+        self.assertIsNone(session._image_for(str(images[0])).reason)
+
+    def test_an_invalid_status_raises_before_writing_anything(self):
+        shoot, images, _ = build_shoot(self.root, ranked=3)
+        session = self.session(shoot)
+
+        with self.assertRaises(InvalidReviewStatus):
+            session.set_review_statuses([str(images[0]), str(images[1])], "maybe")
+
+        for path in images[:2]:
+            self.assertEqual(session._image_for(str(path)).review_status, REVIEW_STATUS_NEUTRAL)
+
+
+class ApplyAiSuggestionsTests(SessionTestCase):
+    """Bulk-accepting the AI's current suggestion - the ONE path by which the
+    ranking is ever allowed to set a review status, and only because the
+    photographer explicitly asked for it, once."""
+
+    def test_applies_the_suggestion_to_every_neutral_ranked_image(self):
+        shoot, images, _ = build_shoot(self.root, ranked=10)
+        session = self.session(shoot, keep_percent=30)
+
+        result = session.apply_ai_suggestions()
+
+        self.assertEqual(result["applied"], 10)
+        for path in images[:3]:
+            self.assertEqual(session._image_for(str(path)).review_status, REVIEW_STATUS_KEEP)
+        for path in images[3:]:
+            self.assertEqual(session._image_for(str(path)).review_status, REVIEW_STATUS_REJECT)
+
+    def test_never_touches_an_image_already_decided(self):
+        shoot, images, _ = build_shoot(self.root, ranked=10)
+        session = self.session(shoot, keep_percent=30)
+        # Deliberately disagree with the AI on its own top pick.
+        session.set_review_status(str(images[0]), REVIEW_STATUS_REJECT)
+
+        session.apply_ai_suggestions()
+
+        self.assertEqual(session._image_for(str(images[0])).review_status, REVIEW_STATUS_REJECT)
+
+    def test_never_touches_an_unranked_image(self):
+        shoot, _, extra = build_shoot(self.root, ranked=4, unranked=2)
+        session = self.session(shoot, keep_percent=50)
+
+        result = session.apply_ai_suggestions()
+
+        self.assertEqual(result["applied"], 4, "only the ranked images have a suggestion to apply")
+        for path in extra:
+            self.assertEqual(session._image_for(str(path)).review_status, REVIEW_STATUS_NEUTRAL)
+
+    def test_is_persisted_immediately(self):
+        shoot, images, _ = build_shoot(self.root, ranked=4)
+        session = self.session(shoot, keep_percent=50)
+        session.apply_ai_suggestions()
+
+        reopened = self.session(shoot, keep_percent=50)
+        self.assertEqual(reopened._image_for(str(images[0])).review_status, REVIEW_STATUS_KEEP)
+
+    def test_running_it_twice_is_a_no_op_the_second_time(self):
+        shoot, _, _ = build_shoot(self.root, ranked=6)
+        session = self.session(shoot, keep_percent=33)
+        session.apply_ai_suggestions()
+
+        again = session.apply_ai_suggestions()
+
+        self.assertEqual(again["applied"], 0, "nothing is Neutral any more")
 
 
 class MissingDataTests(SessionTestCase):
@@ -225,27 +380,32 @@ class MissingDataTests(SessionTestCase):
         session = self.session(shoot, keep_percent=50)
 
         self.assertEqual(session.counts()["total"], 6)
-        states = session.states()
         for path in extra:
-            self.assertEqual(states[str(path)], STATE_UNRANKED)
+            self.assertEqual(session._image_for(str(path)).review_status, REVIEW_STATUS_NEUTRAL)
 
     def test_unranked_images_are_never_selected_automatically(self):
+        """Ranked images start Neutral too now - a high AI threshold suggests
+        nothing about review_status by itself - so all 7 (4 ranked + 3
+        unranked) are Neutral until someone actually decides."""
         shoot, _, extra = build_shoot(self.root, ranked=4, unranked=3)
         session = self.session(shoot, keep_percent=100)
 
         for path in extra:
-            self.assertNotIn(str(path), session.selected_paths())
-            self.assertNotIn(str(path), session.rejected_paths())
-        self.assertEqual(session.counts()["untouched"], 3)
+            self.assertNotIn(str(path), session.keep_paths())
+            self.assertNotIn(str(path), session.reject_paths())
+            self.assertIn(str(path), session.neutral_paths())
+        self.assertEqual(session.counts()["neutral"], 7)
 
     def test_a_manual_decision_gives_an_unranked_image_a_destination(self):
-        shoot, _, extra = build_shoot(self.root, ranked=4, unranked=1)
+        shoot, ranked, extra = build_shoot(self.root, ranked=4, unranked=1)
         session = self.session(shoot, keep_percent=25)
 
-        session.set_decision(str(extra[0]), "keep")
+        session.set_review_status(str(extra[0]), REVIEW_STATUS_KEEP)
 
-        self.assertIn(str(extra[0]), session.selected_paths())
-        self.assertEqual(session.counts()["untouched"], 0)
+        self.assertIn(str(extra[0]), session.keep_paths())
+        # Only the one explicitly decided image left Neutral - the 4 ranked
+        # ones are untouched by the AI's own opinion of them.
+        self.assertEqual(session.counts()["neutral"], len(ranked))
 
     def test_a_ranking_row_whose_file_is_gone_is_shown_not_dropped(self):
         shoot, images, _ = build_shoot(self.root, ranked=4)
@@ -257,7 +417,7 @@ class MissingDataTests(SessionTestCase):
         self.assertEqual(session.counts()["missing_file"], 1)
 
     def test_a_folder_with_no_ranking_still_opens(self):
-        """Every image unranked is a reviewable state, not a crash."""
+        """Every image Neutral is a reviewable state, not a crash."""
         shoot = self.root / "bare"
         shoot.mkdir()
         (shoot / "a.jpg").write_bytes(b"a")
@@ -265,7 +425,7 @@ class MissingDataTests(SessionTestCase):
         session = self.session(shoot)
 
         self.assertEqual(session.counts()["total"], 1)
-        self.assertEqual(session.counts()["untouched"], 1)
+        self.assertEqual(session.counts()["neutral"], 1)
         self.assertTrue(session.warnings)
 
     def test_an_unreadable_ranking_degrades_instead_of_failing(self):
@@ -275,7 +435,7 @@ class MissingDataTests(SessionTestCase):
         session = self.session(shoot)
 
         self.assertEqual(session.counts()["total"], 3, "images are still found on disk")
-        self.assertEqual(session.counts()["untouched"], 3)
+        self.assertEqual(session.counts()["neutral"], 3)
         self.assertTrue(any("ranking" in w.lower() for w in session.warnings))
 
 
@@ -283,6 +443,10 @@ class ArrangeTests(SessionTestCase):
     def test_dry_run_reports_the_plan_and_moves_nothing(self):
         shoot, images, _ = build_shoot(self.root, ranked=8)
         session = self.session(shoot, keep_percent=25)
+        session.set_review_status(str(images[0]), REVIEW_STATUS_KEEP)
+        session.set_review_status(str(images[1]), REVIEW_STATUS_KEEP)
+        for path in images[2:]:
+            session.set_review_status(str(path), REVIEW_STATUS_REJECT)
 
         result = session.arrange(dry_run=True)
 
@@ -292,51 +456,68 @@ class ArrangeTests(SessionTestCase):
             self.assertTrue(path.exists(), "a dry run must not move a file")
         self.assertFalse((shoot / SELECTED_DIRNAME).exists())
 
-    def test_arranging_files_by_the_final_verdict_including_overrides(self):
+    def test_neutral_is_never_filed_no_matter_how_highly_the_ai_ranked_it(self):
+        """The central behaviour this UX model is built around: an
+        unreviewed (Neutral) image is never moved by Arrange, however highly
+        the AI ranked it - only an explicit Keep or Reject does."""
+        shoot, images, _ = build_shoot(self.root, ranked=6)
+        session = self.session(shoot, keep_percent=100)  # the AI "suggests" keeping all 6
+        # Nobody has reviewed any of them - every image is still Neutral.
+
+        result = session.arrange()
+
+        self.assertEqual(result.moved, 0)
+        for path in images:
+            self.assertTrue(path.exists())
+            self.assertEqual(path.parent, shoot)
+
+    def test_arranging_files_by_review_status_alone(self):
         shoot, images, _ = build_shoot(self.root, ranked=6)
         session = self.session(shoot, keep_percent=33)
-        session.set_decision(str(images[5]), "keep")   # worst, kept anyway
-        session.set_decision(str(images[0]), "reject")  # best, rejected anyway
+        session.set_review_status(str(images[5]), REVIEW_STATUS_KEEP)  # worst-ranked, kept anyway
+        session.set_review_status(str(images[0]), REVIEW_STATUS_REJECT)  # best-ranked, rejected anyway
 
         session.arrange()
 
         self.assertTrue((shoot / SELECTED_DIRNAME / "IMG_0005.jpg").exists())
         self.assertTrue((shoot / REJECTED_DIRNAME / "IMG_0000.jpg").exists())
 
-    def test_unranked_undecided_images_are_left_where_they_are(self):
-        shoot, _, extra = build_shoot(self.root, ranked=4, unranked=2)
+    def test_unranked_neutral_images_are_left_where_they_are(self):
+        shoot, ranked, extra = build_shoot(self.root, ranked=4, unranked=2)
         session = self.session(shoot, keep_percent=50)
+        for path in ranked:
+            session.set_review_status(str(path), REVIEW_STATUS_REJECT)
 
         result = session.arrange()
 
-        self.assertEqual(result.ranked, 4, "only the ranked images were filed")
+        self.assertEqual(result.ranked, 4, "only the reviewed images were filed")
         for path in extra:
             self.assertTrue(path.exists())
             self.assertEqual(path.parent, shoot)
 
     def test_decisions_and_ranking_both_follow_the_files(self):
         """The load-bearing re-review test: arrange moves everything, so both
-        the ranking and the stored decisions must be repointed or the next
-        review would look like a folder nobody had ever touched."""
+        the ranking and the stored review status must be repointed or the
+        next review would look like a folder nobody had ever touched."""
         shoot, images, _ = build_shoot(self.root, ranked=6)
         session = self.session(shoot, keep_percent=33)
-        session.set_decision(str(images[5]), "keep")
+        session.set_review_status(str(images[5]), REVIEW_STATUS_KEEP)
 
         session.arrange()
         reopened = self.session(shoot, keep_percent=33)
 
-        self.assertEqual(reopened.counts()["total"], 6, "the arranged files are found again")
+        self.assertEqual(reopened.counts()["total"], 6, "the arranged file is found again")
         self.assertEqual(reopened.counts()["missing_file"], 0, "the ranking was repointed")
-        self.assertEqual(reopened.counts()["manual"], 1, "the decision followed its file")
         moved = shoot / SELECTED_DIRNAME / "IMG_0005.jpg"
-        self.assertEqual(reopened.states()[str(moved)], STATE_MANUAL_KEEP)
+        self.assertEqual(reopened._image_for(str(moved)).review_status, REVIEW_STATUS_KEEP)
 
     def test_arranging_twice_is_a_no_op_rather_than_a_shuffle(self):
-        shoot, _, _ = build_shoot(self.root, ranked=6)
+        shoot, images, _ = build_shoot(self.root, ranked=6)
         session = self.session(shoot, keep_percent=50)
+        session.set_review_status(str(images[0]), REVIEW_STATUS_KEEP)
         session.arrange()
 
-        again = self.session(shoot, keep_percent=50).arrange()
+        again = session.arrange()
 
         self.assertEqual(again.moved, 0)
         self.assertEqual(again.errors, 0)
@@ -345,35 +526,37 @@ class ArrangeTests(SessionTestCase):
 class IdentityRecoveryTests(SessionTestCase):
     def test_a_decision_is_recovered_after_the_file_moves_behind_our_back(self):
         """Path matching is the fast path; content identity is the truth. A
-        file moved outside the app still carries its decision."""
+        file moved outside the app still carries its review status."""
         shoot, images, _ = build_shoot(self.root, ranked=4)
         session = self.session(shoot, keep_percent=25)
-        session.set_decision(str(images[3]), "keep")
+        session.set_review_status(str(images[3]), REVIEW_STATUS_KEEP)
 
         moved = shoot / "renamed_by_hand.jpg"
         images[3].rename(moved)
 
         reopened = self.session(shoot, keep_percent=25)
-        self.assertIsNone(reopened._image_for(str(moved)).decision, "path match cannot find it")
+        self.assertEqual(
+            reopened._image_for(str(moved)).review_status, REVIEW_STATUS_NEUTRAL, "path match cannot find it"
+        )
 
         recovered = reopened.reconcile_by_identity()
 
         self.assertEqual(recovered, 1)
-        self.assertEqual(reopened.states()[str(moved)], STATE_MANUAL_KEEP)
+        self.assertEqual(reopened._image_for(str(moved)).review_status, REVIEW_STATUS_KEEP)
 
     def test_reconciling_costs_nothing_when_nothing_moved(self):
         shoot, images, _ = build_shoot(self.root, ranked=4)
         session = self.session(shoot, keep_percent=25)
-        session.set_decision(str(images[0]), "keep")
+        session.set_review_status(str(images[0]), REVIEW_STATUS_KEEP)
 
         reopened = self.session(shoot, keep_percent=25)
 
         self.assertEqual(reopened.reconcile_by_identity(), 0)
 
-    def test_a_reason_is_recovered_along_with_the_decision_it_belongs_to(self):
+    def test_a_reason_is_recovered_along_with_the_status_it_belongs_to(self):
         shoot, images, _ = build_shoot(self.root, ranked=4)
         session = self.session(shoot, keep_percent=25)
-        session.set_decision(str(images[3]), "keep", reason="clear_eyes_seen")
+        session.set_review_status(str(images[3]), REVIEW_STATUS_KEEP, reason="clear_eyes_seen")
 
         moved = shoot / "renamed_by_hand.jpg"
         images[3].rename(moved)
@@ -401,13 +584,13 @@ class OpenFolderTests(SessionTestCase):
 
         self.assertEqual(session.input_folder, other.resolve())
         self.assertEqual(session.counts()["total"], 2)
-        self.assertEqual(session.counts()["untouched"], 2)
+        self.assertEqual(session.counts()["neutral"], 2)
         self.assertTrue(session.warnings, "the new folder has no ranking of its own")
 
     def test_a_manual_decision_in_the_new_folder_is_unaffected_by_the_old_one(self):
         shoot, images, _ = build_shoot(self.root, ranked=3)
         session = self.session(shoot)
-        session.set_decision(str(images[0]), "keep")
+        session.set_review_status(str(images[0]), REVIEW_STATUS_KEEP)
 
         other = self.root / "unranked"
         other.mkdir()
@@ -415,7 +598,7 @@ class OpenFolderTests(SessionTestCase):
         photo.write_bytes(b"a")
         session.open_folder(other)
 
-        self.assertIsNone(session._image_for(str(photo)).decision)
+        self.assertEqual(session._image_for(str(photo)).review_status, REVIEW_STATUS_NEUTRAL)
 
     def test_a_decision_already_recorded_for_the_new_folder_is_picked_up(self):
         """Re-opening a folder reviewed before (e.g. switching away and back)
@@ -425,13 +608,13 @@ class OpenFolderTests(SessionTestCase):
         photo = other / "a.jpg"
         photo.write_bytes(b"a")
         session = self.session(other)
-        session.set_decision(str(photo), "reject")
+        session.set_review_status(str(photo), REVIEW_STATUS_REJECT)
 
         shoot, _, _ = build_shoot(self.root, ranked=2)
         session.open_folder(shoot)
         session.open_folder(other)
 
-        self.assertEqual(session._image_for(str(photo)).decision, "reject")
+        self.assertEqual(session._image_for(str(photo)).review_status, REVIEW_STATUS_REJECT)
 
     def test_the_ranking_file_is_recomputed_for_the_new_folder(self):
         shoot, _, _ = build_shoot(self.root, ranked=2)
@@ -442,6 +625,46 @@ class OpenFolderTests(SessionTestCase):
         session.open_folder(other)
 
         self.assertEqual(session.ranking_file, ranking_path(other))
+
+
+class NoFolderOpenTests(SessionTestCase):
+    """`picklikeme review` with no --input at all: the session has to exist
+    and answer every query before any folder has ever been opened."""
+
+    def test_starts_empty_rather_than_failing(self):
+        session = self.session(None)
+
+        self.assertIsNone(session.input_folder)
+        self.assertIsNone(session.ranking_file)
+        self.assertEqual(session.images, [])
+        self.assertEqual(session.counts()["total"], 0)
+        self.assertTrue(session.warnings, "must prompt the photographer to open one")
+
+    def test_as_dict_is_json_safe_with_nothing_open(self):
+        session = self.session(None)
+
+        payload = session.as_dict()
+
+        self.assertIsNone(payload["input_folder"])
+        self.assertIsNone(payload["ranking_file"])
+        self.assertFalse(payload["has_ranking"])
+        self.assertEqual(payload["images"], [])
+
+    def test_arranging_with_nothing_open_is_a_clean_error_not_a_crash(self):
+        session = self.session(None)
+
+        with self.assertRaises(ValueError):
+            session.arrange(dry_run=True)
+
+    def test_opening_a_folder_afterwards_populates_the_gallery(self):
+        session = self.session(None)
+        shoot, images, _ = build_shoot(self.root, ranked=2)
+
+        session.open_folder(shoot)
+
+        self.assertEqual(session.input_folder, shoot.resolve())
+        self.assertEqual(session.counts()["total"], 2)
+        self.assertFalse(session.warnings)
 
 
 if __name__ == "__main__":

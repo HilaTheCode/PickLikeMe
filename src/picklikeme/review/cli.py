@@ -7,6 +7,11 @@ The second command takes the same argument as the first and nothing else. That
 is the whole point of the sidecar: `rank` leaves the ranking inside the folder
 it ranked, so `review` finds it by computing one path rather than searching
 history, and the photographer never types a timestamp or an internal path.
+
+`--input` is optional: `picklikeme review` with nothing after it starts with
+an empty gallery, and the "Open Folder..." button in the page picks a folder
+from there instead - the only way to review a folder that was never ranked
+at all, since there is no ranking to compute a path from.
 """
 
 from __future__ import annotations
@@ -27,16 +32,18 @@ def build_review_parser(add_help: bool = True) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="picklikeme review",
         description=(
-            "Review a ranked folder and file it. Shows the model's ordering, lets you "
-            "override it, and moves the files into _Selected / _Rejected when you say so. "
-            "Never runs the model."
+            "Review a folder and file it. The AI ranking, if any, is shown as a read-only "
+            "suggestion; every image is independently Keep, Reject or Neutral, and only that "
+            "verdict ever moves a file, into _Selected / _Rejected, when you say so. Never "
+            "runs the model."
         ),
         add_help=add_help,
     )
     parser.add_argument(
         "--input",
-        required=True,
-        help="The folder to review. Must already have been ranked by `picklikeme rank`.",
+        default=None,
+        help="The folder to review. Omit to start empty and pick one from the page's own "
+        "'Open Folder...' button instead.",
     )
     parser.add_argument(
         "--ranking",
@@ -49,8 +56,9 @@ def build_review_parser(add_help: bool = True) -> argparse.ArgumentParser:
         "--keep-percent",
         type=float,
         default=DEFAULT_SELECTION_PERCENTAGE,
-        help=f"Percentage of the ranking selected on open (default: {DEFAULT_SELECTION_PERCENTAGE:g}). "
-        "Changeable in the page; manual decisions always win over it.",
+        help=f"The AI's suggestion threshold on open (default: {DEFAULT_SELECTION_PERCENTAGE:g}) - what "
+        "fraction of ranked images it hints should be kept. Purely informational: it never sets "
+        "anyone's review status by itself. Changeable in the page.",
     )
     parser.add_argument("--annotations-db", default=None, help="Knowledge-base SQLite file")
     parser.add_argument(
@@ -81,16 +89,19 @@ def run_review(args: argparse.Namespace) -> int:
 
     _configure_logging(getattr(args, "verbose", False))
 
-    folder = Path(args.input)
-    if not folder.is_dir():
+    if args.ranking and not args.input:
+        raise SystemExit("--ranking requires --input (it says which ranking belongs to that folder).")
+
+    folder = Path(args.input) if args.input else None
+    if folder is not None and not folder.is_dir():
         raise SystemExit(f"Folder not found: {folder}")
 
     # An unranked folder is not an error - ReviewSession already handles it
-    # (every image comes up unranked, sorted for manual Keep/Reject only) -
+    # (every image starts Neutral, sorted for Keep/Reject/Neutral by hand) -
     # just worth a heads-up, since `rank` first is the common case.
-    if not args.ranking and not has_ranking(folder):
+    if folder is not None and not args.ranking and not has_ranking(folder):
         print(
-            f"No ranking found for {folder}; every image will be unranked.\n"
+            f"No ranking found for {folder}; there is no AI suggestion for any image in it.\n"
             f"  Expected: {ranking_path(folder)}\n"
             f"  To rank it first:  {cli_prefix()} rank --input \"{folder}\"\n"
             f"  Or point at an existing ranking:  --ranking <csv>"

@@ -9,6 +9,8 @@ not have opened a way to read files outside the folder under review.
 
 import json
 import re
+import shutil
+import subprocess
 import sys
 import tempfile
 import threading
@@ -81,9 +83,10 @@ class PageTests(ReviewServerTestCase):
             self.assertEqual(response.headers["Content-Type"], "text/html; charset=utf-8")
             body = response.read().decode("utf-8")
 
-        self.assertIn("Arrange Files On Disk", body)
+        self.assertIn("Arrange Files", body)
         self.assertIn("Keep", body)
         self.assertIn("Reject", body)
+        self.assertIn("Neutral", body)
         # Offline and dependency-free: no CDN, no external asset of any kind.
         self.assertNotIn("https://", body)
         self.assertNotIn("<script src=", body)
@@ -97,6 +100,20 @@ class PageTests(ReviewServerTestCase):
         self.assertIn("api/review/state", body)
         for image in self.images:
             self.assertNotIn(str(image), body)
+
+    def test_the_toolbar_never_repeats_the_application_s_own_name(self):
+        """The window/tab title (<title>) already identifies the app - the
+        in-page toolbar must not duplicate it (Phase 3 of the redesign)."""
+        with urllib.request.urlopen(self.base + "/") as response:
+            body = response.read().decode("utf-8")
+
+        # <title> is allowed to say it; strip that one occurrence and check
+        # the rest of the document (the visible toolbar/body) does not.
+        title_match = re.search(r"<title>(.*?)</title>", body)
+        self.assertIsNotNone(title_match)
+        body_without_title = body.replace(title_match.group(0), "", 1)
+        self.assertNotIn("PickLikeMe", body_without_title)
+        self.assertNotIn("<h1>", body_without_title)
 
 
 class PageMarkupTests(unittest.TestCase):
@@ -142,6 +159,40 @@ class PageMarkupTests(unittest.TestCase):
         self.assertIn("const button = q('#theme');", js)
         self.assertIn("if(button) button.textContent", js)
 
+    def test_the_generated_script_is_syntactically_valid_javascript(self):
+        """The same failure mode as the class docstring's #theme bug, from a
+        different cause: an unescaped apostrophe inside a JS string literal
+        (e.g. an f-string/Python-string writer using `\\'` where `\\\\'` was
+        needed - Python's own parser silently eats the single backslash,
+        leaving a bare `'` that ends the JS string early) also aborts the
+        whole script at parse time before DOMContentLoaded is ever
+        registered, and every other test here only pattern-matches source
+        text, so none of them would notice. `node --check` parses without
+        executing, so this needs no DOM and stays fast; skipped if `node`
+        is not on PATH rather than failing the suite over a missing tool.
+        """
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node is not on PATH")
+
+        from picklikeme.review.page import build_js
+
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".js", delete=False, encoding="utf-8"
+        ) as handle:
+            handle.write(build_js())
+            script_path = handle.name
+        try:
+            result = subprocess.run(
+                [node, "--check", script_path],
+                capture_output=True,
+                text=True,
+            )
+        finally:
+            Path(script_path).unlink(missing_ok=True)
+
+        self.assertEqual(result.returncode, 0, f"generated JS has a syntax error:\n{result.stderr}")
+
     def test_every_endpoint_answers_with_an_envelope_not_the_state_itself(self):
         """Every review endpoint answers `{ok, ..., state}` - arrange and
         reconcile carry a sibling (`result`, `recovered`) alongside `state`,
@@ -184,11 +235,14 @@ class StateEndpointTests(ReviewServerTestCase):
         payload = self.get("/api/review/state")["state"]
 
         self.assertEqual(payload["counts"]["total"], 7)
-        self.assertEqual(payload["counts"]["selected"], 2)
-        self.assertEqual(payload["counts"]["untouched"], 1)
+        # Nobody has reviewed anything yet - every image starts Neutral,
+        # regardless of what the AI ranking would suggest.
+        self.assertEqual(payload["counts"]["keep"], 0)
+        self.assertEqual(payload["counts"]["reject"], 0)
+        self.assertEqual(payload["counts"]["neutral"], 7)
         self.assertEqual(len(payload["images"]), 7)
         first = payload["images"][0]
-        for key in ("image_path", "filename", "score", "rank", "decision", "state", "missing_file"):
+        for key in ("image_path", "filename", "score", "rank", "review_status", "ai_suggestion", "missing_file"):
             self.assertIn(key, first)
 
     def test_images_arrive_best_first(self):
@@ -197,38 +251,73 @@ class StateEndpointTests(ReviewServerTestCase):
         self.assertEqual(scores, sorted(scores, reverse=True))
         self.assertIsNone(images[-1]["score"], "unranked images sort last")
 
+    def test_every_image_starts_neutral_with_an_independent_ai_suggestion(self):
+        """The AI's own opinion (ai_suggestion) is present from the very
+        first load, but never pre-decides review_status."""
+        images = self.get("/api/review/state")["state"]["images"]
+        ranked = [i for i in images if i["score"] is not None]
+        unranked = [i for i in images if i["score"] is None]
 
-class DecisionEndpointTests(ReviewServerTestCase):
-    def test_a_decision_is_saved_and_the_new_state_returned(self):
+        self.assertTrue(all(i["review_status"] == "neutral" for i in images))
+        self.assertTrue(all(i["ai_suggestion"] in ("keep", "reject") for i in ranked))
+        self.assertTrue(all(i["ai_suggestion"] is None for i in unranked))
+
+
+class StatusEndpointTests(ReviewServerTestCase):
+    """The photographer's own Keep/Reject/Neutral for a single image."""
+
+    def test_a_status_is_saved_and_the_new_state_returned(self):
         worst = str(self.images[-1])
 
-        payload = self.post("/api/review/decision", {"image_path": worst, "decision": "keep"})
+        payload = self.post("/api/review/status", {"image_path": worst, "status": "keep"})
 
         self.assertTrue(payload["ok"])
-        self.assertEqual(payload["state"]["counts"]["manual"], 1)
-        self.assertIn(worst, self.session.selected_paths())
+        self.assertEqual(payload["state"]["counts"]["keep"], 1)
+        self.assertIn(worst, self.session.keep_paths())
         # Persisted, not just echoed.
         self.assertEqual(self.store.review_decision_count(), 1)
 
-    def test_a_decision_can_be_cleared_with_null(self):
+    def test_a_status_can_be_cleared_back_to_neutral(self):
         best = str(self.images[0])
-        self.post("/api/review/decision", {"image_path": best, "decision": "reject"})
+        self.post("/api/review/status", {"image_path": best, "status": "reject"})
 
-        payload = self.post("/api/review/decision", {"image_path": best, "decision": None})
+        payload = self.post("/api/review/status", {"image_path": best, "status": "neutral"})
 
-        self.assertEqual(payload["state"]["counts"]["manual"], 0)
+        by_path = {i["image_path"]: i for i in payload["state"]["images"]}
+        self.assertEqual(by_path[best]["review_status"], "neutral")
+        self.assertEqual(payload["state"]["counts"]["keep"], 0)
+        self.assertEqual(payload["state"]["counts"]["reject"], 0)
         self.assertEqual(self.store.review_decision_count(), 0)
 
-    def test_an_invalid_decision_is_refused_and_nothing_is_stored(self):
+    def test_clearing_returns_to_neutral_even_when_the_ai_would_suggest_otherwise(self):
+        """The bug this whole model exists to fix, at the HTTP boundary: a
+        cleared status must read back as Neutral, never as whatever the AI's
+        own ranking would have picked at the current threshold."""
+        self.post("/api/review/keep-percent", {"keep_percent": 100})  # AI "suggests" keeping everything
+        best = str(self.images[0])
+        self.post("/api/review/status", {"image_path": best, "status": "reject"})
+
+        payload = self.post("/api/review/status", {"image_path": best, "status": "neutral"})
+
+        by_path = {i["image_path"]: i for i in payload["state"]["images"]}
+        self.assertEqual(by_path[best]["review_status"], "neutral")
+        self.assertEqual(by_path[best]["ai_suggestion"], "keep", "the AI's own opinion is untouched")
+
+    def test_an_invalid_status_is_refused_and_nothing_is_stored(self):
         with self.assertRaises(urllib.error.HTTPError) as ctx:
-            self.post("/api/review/decision", {"image_path": str(self.images[0]), "decision": "maybe"})
+            self.post("/api/review/status", {"image_path": str(self.images[0]), "status": "maybe"})
 
         self.assertEqual(ctx.exception.code, 400)
         self.assertEqual(self.store.review_decision_count(), 0)
 
     def test_a_missing_image_path_is_a_bad_request(self):
         with self.assertRaises(urllib.error.HTTPError) as ctx:
-            self.post("/api/review/decision", {"decision": "keep"})
+            self.post("/api/review/status", {"status": "keep"})
+        self.assertEqual(ctx.exception.code, 400)
+
+    def test_a_missing_status_is_a_bad_request(self):
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            self.post("/api/review/status", {"image_path": str(self.images[0])})
         self.assertEqual(ctx.exception.code, 400)
 
     def test_an_image_outside_the_session_is_refused(self):
@@ -236,16 +325,16 @@ class DecisionEndpointTests(ReviewServerTestCase):
         outside.write_bytes(b"not part of this shoot")
 
         with self.assertRaises(urllib.error.HTTPError) as ctx:
-            self.post("/api/review/decision", {"image_path": str(outside), "decision": "keep"})
+            self.post("/api/review/status", {"image_path": str(outside), "status": "keep"})
 
         self.assertEqual(ctx.exception.code, 400)
         self.assertEqual(self.store.review_decision_count(), 0)
 
-    def test_a_reason_is_saved_alongside_the_decision(self):
+    def test_a_reason_is_saved_alongside_keep_or_reject(self):
         worst = str(self.images[-1])
 
         payload = self.post(
-            "/api/review/decision", {"image_path": worst, "decision": "reject", "reason": "eyes_not_seen"}
+            "/api/review/status", {"image_path": worst, "status": "reject", "reason": "eyes_not_seen"}
         )
 
         image = next(i for i in payload["state"]["images"] if i["image_path"] == worst)
@@ -255,27 +344,157 @@ class DecisionEndpointTests(ReviewServerTestCase):
     def test_an_invalid_reason_is_refused_and_nothing_is_stored(self):
         with self.assertRaises(urllib.error.HTTPError) as ctx:
             self.post(
-                "/api/review/decision",
-                {"image_path": str(self.images[0]), "decision": "keep", "reason": "squinting"},
+                "/api/review/status",
+                {"image_path": str(self.images[0]), "status": "keep", "reason": "squinting"},
             )
 
         self.assertEqual(ctx.exception.code, 400)
         self.assertEqual(self.store.review_decision_count(), 0)
 
-    def test_clearing_a_decision_clears_its_reason_too(self):
+    def test_clearing_to_neutral_clears_its_reason_too(self):
         best = str(self.images[0])
-        self.post("/api/review/decision", {"image_path": best, "decision": "keep", "reason": "clear_eyes_seen"})
+        self.post("/api/review/status", {"image_path": best, "status": "keep", "reason": "clear_eyes_seen"})
 
-        self.post("/api/review/decision", {"image_path": best, "decision": None})
+        self.post("/api/review/status", {"image_path": best, "status": "neutral"})
 
         self.assertEqual(self.store.review_decision_count(), 0)
 
 
+class BulkStatusEndpointTests(ReviewServerTestCase):
+    """The multi-select toolbar's one request for many images."""
+
+    def test_marking_several_images_keep_in_one_call(self):
+        paths = [str(self.images[4]), str(self.images[5])]
+
+        payload = self.post("/api/review/bulk-status", {"image_paths": paths, "status": "keep"})
+
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["applied"], 2)
+        self.assertEqual(payload["failed"], [])
+        by_path = {i["image_path"]: i for i in payload["state"]["images"]}
+        for path in paths:
+            self.assertEqual(by_path[path]["review_status"], "keep")
+
+    def test_marking_several_images_reject_in_one_call(self):
+        paths = [str(self.images[0]), str(self.images[1])]
+
+        payload = self.post("/api/review/bulk-status", {"image_paths": paths, "status": "reject"})
+
+        by_path = {i["image_path"]: i for i in payload["state"]["images"]}
+        for path in paths:
+            self.assertEqual(by_path[path]["review_status"], "reject")
+
+    def test_bulk_clearing_returns_every_path_to_neutral(self):
+        """The bulk half of the same bug fix as StatusEndpointTests' single-
+        image version - both single and multiple images must return to a
+        real Neutral, not silently to whatever the AI would have picked."""
+        paths = [str(self.images[0]), str(self.images[1])]
+        self.post("/api/review/keep-percent", {"keep_percent": 100})
+        self.post("/api/review/bulk-status", {"image_paths": paths, "status": "reject"})
+
+        payload = self.post("/api/review/bulk-status", {"image_paths": paths, "status": "neutral"})
+
+        by_path = {i["image_path"]: i for i in payload["state"]["images"]}
+        for path in paths:
+            self.assertEqual(by_path[path]["review_status"], "neutral")
+
+    def test_a_stale_path_is_reported_not_fatal_to_the_rest_of_the_batch(self):
+        good = str(self.images[0])
+        stale = str(self.root / "moved_away.jpg")
+
+        payload = self.post("/api/review/bulk-status", {"image_paths": [good, stale], "status": "keep"})
+
+        self.assertEqual(payload["applied"], 1)
+        self.assertEqual(payload["failed"], [stale])
+        by_path = {i["image_path"]: i for i in payload["state"]["images"]}
+        self.assertEqual(by_path[good]["review_status"], "keep")
+
+    def test_an_empty_list_is_refused(self):
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            self.post("/api/review/bulk-status", {"image_paths": [], "status": "keep"})
+        self.assertEqual(ctx.exception.code, 400)
+
+    def test_a_non_list_image_paths_is_refused(self):
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            self.post("/api/review/bulk-status", {"image_paths": str(self.images[0]), "status": "keep"})
+        self.assertEqual(ctx.exception.code, 400)
+
+    def test_a_non_string_entry_is_refused(self):
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            self.post(
+                "/api/review/bulk-status", {"image_paths": [str(self.images[0]), 123], "status": "keep"}
+            )
+        self.assertEqual(ctx.exception.code, 400)
+
+    def test_a_missing_status_is_refused(self):
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            self.post("/api/review/bulk-status", {"image_paths": [str(self.images[0])]})
+        self.assertEqual(ctx.exception.code, 400)
+
+    def test_an_invalid_status_is_refused(self):
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            self.post(
+                "/api/review/bulk-status",
+                {"image_paths": [str(self.images[0])], "status": "maybe"},
+            )
+        self.assertEqual(ctx.exception.code, 400)
+
+    def test_no_reason_can_be_sent_with_a_bulk_action(self):
+        """A bulk action never records a per-image reason - see
+        ReviewSession.set_review_statuses - so a caller trying to sneak one
+        in is simply ignored, not an error."""
+        payload = self.post(
+            "/api/review/bulk-status",
+            {"image_paths": [str(self.images[0])], "status": "keep", "reason": "clear_eyes_seen"},
+        )
+        by_path = {i["image_path"]: i for i in payload["state"]["images"]}
+        self.assertIsNone(by_path[str(self.images[0])]["reason"])
+
+
+class ApplyAiSuggestionsEndpointTests(ReviewServerTestCase):
+    """Bulk-accepting the AI's current suggestion - the one endpoint that
+    lets the ranking set a review status at all, and only because the
+    photographer explicitly asked for it."""
+
+    def test_applies_the_suggestion_to_every_neutral_ranked_image(self):
+        payload = self.post("/api/review/apply-ai-suggestions", {})
+
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["applied"], 6, "the 6 ranked images; the 1 unranked has no suggestion")
+        by_path = {i["image_path"]: i for i in payload["state"]["images"]}
+        for image in payload["state"]["images"]:
+            if image["ai_suggestion"] is not None:
+                self.assertEqual(image["review_status"], image["ai_suggestion"])
+        self.assertEqual(by_path[str(self.extra[0])]["review_status"], "neutral")
+
+    def test_never_touches_an_image_already_decided(self):
+        best = str(self.images[0])
+        self.post("/api/review/status", {"image_path": best, "status": "reject"})
+
+        self.post("/api/review/apply-ai-suggestions", {})
+
+        payload = self.get("/api/review/state")["state"]
+        by_path = {i["image_path"]: i for i in payload["images"]}
+        self.assertEqual(by_path[best]["review_status"], "reject")
+
+    def test_running_it_twice_is_a_no_op_the_second_time(self):
+        self.post("/api/review/apply-ai-suggestions", {})
+
+        payload = self.post("/api/review/apply-ai-suggestions", {})
+
+        self.assertEqual(payload["applied"], 0)
+
+
 class KeepPercentEndpointTests(ReviewServerTestCase):
-    def test_changing_the_percentage_reclassifies(self):
+    def test_changing_the_percentage_changes_the_ai_suggestion_not_review_status(self):
+        """keep_percent is the AI's own threshold - read-only metadata. It
+        must never set anyone's review status by itself."""
         payload = self.post("/api/review/keep-percent", {"keep_percent": 100})
-        self.assertEqual(payload["state"]["counts"]["selected"], 6)
-        self.assertEqual(payload["state"]["counts"]["rejected"], 0)
+
+        images = payload["state"]["images"]
+        ranked = [i for i in images if i["score"] is not None]
+        self.assertTrue(all(i["ai_suggestion"] == "keep" for i in ranked))
+        self.assertTrue(all(i["review_status"] == "neutral" for i in images), "nobody has reviewed anything")
 
     def test_an_out_of_range_percentage_is_refused(self):
         with self.assertRaises(urllib.error.HTTPError) as ctx:
@@ -377,11 +596,11 @@ class LightboxMarkupTests(unittest.TestCase):
     """Structural checks on the Lightbox module, with no server involved.
 
     Like PageMarkupTests, these exist because the suite has no JS engine (the
-    actual interactive behaviour - zoom math, pan clamping, keep/reject then
-    advance, drag-vs-click disambiguation - is verified separately by
-    executing the real generated JS in Node; that harness is not committed
-    since this project's test stack has none, see the .state-bug fix commit
-    for the precedent). What runs here is what a plain source-pattern check
+    actual interactive behaviour - zoom math, pan clamping, keep/reject/
+    neutral then advance, drag-vs-click disambiguation - is verified
+    separately by executing the real generated JS in Node/jsdom during
+    development; that harness is not committed since this project's test
+    stack has none). What runs here is what a plain source-pattern check
     actually can catch: the wiring between the gallery and the viewer, and
     that nothing needed by that wiring was left out of the markup.
     """
@@ -408,13 +627,14 @@ class LightboxMarkupTests(unittest.TestCase):
         missing = sorted(wanted - present)
         self.assertEqual(missing, [], f"the script queries element(s) the markup never defines: {missing}")
 
-    def test_keep_reject_reuse_the_existing_decide_function(self):
-        """Not a second POST implementation - decideAndAdvance calls the same
-        decide() the gallery cards use, so validation, PLM.state refresh and
-        status reporting can never drift between the two surfaces."""
+    def test_keep_reject_neutral_reuse_the_existing_setstatus_function(self):
+        """Not three separate POST implementations - decideAndAdvance calls
+        the same setStatus() the gallery cards use, so validation, PLM.state
+        refresh and status reporting can never drift between the two
+        surfaces."""
         from picklikeme.review.page import build_js
 
-        self.assertIn("await decide(image.image_path, action, reason, reasonNote)", build_js())
+        self.assertIn("await setStatus(image.image_path, status, reason, reasonNote)", build_js())
 
     def test_the_dialog_element_is_used_for_native_escape_and_focus_handling(self):
         """Reuses the platform's own modal semantics (already established by
@@ -428,6 +648,40 @@ class LightboxMarkupTests(unittest.TestCase):
         from picklikeme.review.page import build_js
 
         self.assertIn("addEventListener('cancel'", build_js())
+
+    def test_keep_reject_neutral_have_keyboard_shortcuts(self):
+        """5/K keep, 0/R reject, U neutral - 5/0 mirror a lot of RAW viewers'
+        star-rating keys, K/R are the mnemonic pair, and U is the same
+        "unflag/undecided" convention Lightroom's own U key uses."""
+        from picklikeme.review.page import build_js
+
+        js = build_js()
+        handler = re.search(r"function onKeyDown\(e\)\{(.*?)\n  \}", js, re.S)
+        self.assertIsNotNone(handler, "onKeyDown not found")
+        body = handler.group(1)
+        self.assertIn("key === '5' || key === 'k'", body)
+        self.assertIn("decideAndAdvance('keep')", body)
+        self.assertIn("key === '0' || key === 'r'", body)
+        self.assertIn("decideAndAdvance('reject')", body)
+        self.assertIn("key === 'u'", body)
+        self.assertIn("decideAndAdvance('neutral')", body)
+
+    def test_keyboard_shortcuts_do_not_hijack_the_reason_note_or_dropdown(self):
+        """Typing "reject" as a free-text note, or using the reason
+        dropdown's own letter/arrow handling, must not also fire a
+        Keep/Reject/Neutral or navigate away from the image being
+        annotated."""
+        from picklikeme.review.page import build_js
+
+        js = build_js()
+        handler = re.search(r"function onKeyDown\(e\)\{(.*?)\n  \}", js, re.S)
+        body = handler.group(1)
+        self.assertIn("if(isTypingTarget(e.target)) return", body)
+
+        guard = re.search(r"function isTypingTarget\(target\)\{(.*?)\n  \}", js, re.S)
+        self.assertIsNotNone(guard, "isTypingTarget not found")
+        self.assertIn("'SELECT'", guard.group(1))
+        self.assertIn("'INPUT'", guard.group(1))
 
     def test_a_bounded_preload_cache_is_used_instead_of_relying_on_http_caching(self):
         """/preview is Cache-Control: no-store (shared with the analysis
@@ -473,9 +727,7 @@ class LightboxMarkupTests(unittest.TestCase):
             self.assertIsNotNone(rule, f"no CSS rule for {selector}")
             self.assertIn("z-index", rule.group(1), f"{selector} has no z-index to stay above the zoomed image")
 
-    def test_the_info_row_lives_in_the_bottom_bar_with_keep_reject(self):
-        """Moved down per feedback: previously a separate floating bar over
-        the top of the image, now one toolbar with Keep/Reject at the bottom."""
+    def test_the_info_row_lives_in_the_bottom_bar_with_keep_reject_neutral(self):
         from picklikeme.review.page import CSS, build_page
 
         html = build_page()
@@ -488,18 +740,13 @@ class LightboxMarkupTests(unittest.TestCase):
         self.assertIn('id="lb-save-jpeg"', body)
         self.assertIn('id="lb-keep"', body)
         self.assertIn('id="lb-reject"', body)
-        # The info row's own text is black on its own light backing, not the
-        # light-on-dark colour the old floating top bar used.
+        self.assertIn('id="lb-neutral"', body)
+        # The info row's own text is black on its own light backing.
         info_rule = re.search(r"\.lb-info\{([^}]*)\}", CSS)
         self.assertIsNotNone(info_rule, "no .lb-info CSS rule")
         self.assertIn("color:#000", info_rule.group(1))
 
-    def test_keep_reject_live_inside_the_same_white_box_centred_above_the_film_strip(self):
-        """Redesigned twice per feedback: first Keep/Reject moved into the
-        bottom bar next to a separate info pill, then per this round they
-        were folded into that same pill entirely, with no extra wrapper -
-        .lb-info is centred by .lb-bottom's own align-items:center, and the
-        film strip is the pill's only sibling, so it stays pinned below."""
+    def test_keep_reject_neutral_live_inside_the_same_white_box_centred_above_the_film_strip(self):
         from picklikeme.review.page import CSS, build_page
 
         html = build_page()
@@ -513,11 +760,8 @@ class LightboxMarkupTests(unittest.TestCase):
         self.assertIn('id="lb-save-jpeg"', info_body)
         self.assertIn('id="lb-keep"', info_body)
         self.assertIn('id="lb-reject"', info_body)
+        self.assertIn('id="lb-neutral"', info_body)
         self.assertIn('id="lb-status"', info_body)
-
-        # No separate row wrapper any more - .lb-info is the only thing
-        # .lb-bottom needs to centre, and the film strip its only sibling.
-        self.assertNotIn("lb-toolbar", html)
 
         info_rule = re.search(r"\.lb-info\{([^}]*)\}", CSS)
         self.assertIsNotNone(info_rule, "no .lb-info CSS rule")
@@ -525,8 +769,9 @@ class LightboxMarkupTests(unittest.TestCase):
 
     def test_exposure_is_a_css_filter_never_a_decision_or_a_network_call(self):
         """The whole point of "display only": adjustExposure()/applyExposure()
-        must never call decide(), api(), or fetch - if it ever needed to, that
-        would mean exposure had started writing something down somewhere."""
+        must never call setStatus(), api(), or fetch - if it ever needed to,
+        that would mean exposure had started writing something down
+        somewhere."""
         from picklikeme.review.page import build_js
 
         js = build_js()
@@ -539,7 +784,7 @@ class LightboxMarkupTests(unittest.TestCase):
         body = exposure_block.group(1)
         self.assertIn("style.filter", body)
         self.assertIn("brightness(", body)
-        for forbidden in ("fetch(", "api(", "decide(", "PLM.state ="):
+        for forbidden in ("fetch(", "api(", "setStatus(", "PLM.state ="):
             self.assertNotIn(forbidden, body)
 
     def test_exposure_is_clamped_to_plus_minus_three_ev(self):
@@ -572,9 +817,8 @@ class LightboxMarkupTests(unittest.TestCase):
 
 
 class ReasonFieldTests(unittest.TestCase):
-    """The override-reason dropdown next to Keep/Reject - structural checks
-    only, same rationale as LightboxMarkupTests: the interactive behaviour is
-    verified separately by executing the real generated JS in Node."""
+    """The override-reason dropdown next to Keep/Reject/Neutral - structural
+    checks only, same rationale as LightboxMarkupTests."""
 
     def test_both_reasons_are_offered_as_options(self):
         from picklikeme.review.page import build_page
@@ -596,22 +840,22 @@ class ReasonFieldTests(unittest.TestCase):
         from picklikeme.review.page import build_js
 
         js = build_js()
-        self.assertIn("await decide(image.image_path, action, reason, reasonNote)", js)
+        self.assertIn("await setStatus(image.image_path, status, reason, reasonNote)", js)
         self.assertIn("const reason = q('#lb-reason').value || null", js)
 
-    def test_changing_the_reason_after_a_decision_updates_it_without_re_deciding(self):
-        """onReasonChange must call postDecision directly - reusing decide()
-        here would misread "same decision again" as the toggle-off gesture
-        and clear the decision instead of just updating its reason."""
+    def test_changing_the_reason_updates_it_without_re_advancing(self):
+        """onReasonChange must call setStatus() directly rather than
+        decideAndAdvance(), which would also move to the next image - only a
+        real Keep/Reject click should ever advance."""
         from picklikeme.review.page import build_js
 
         js = build_js()
         handler = re.search(r"async function onReasonChange\(\)\{(.*?)\n  \}", js, re.S)
         self.assertIsNotNone(handler, "onReasonChange not found")
         body = handler.group(1)
-        self.assertIn("if(!image || !image.decision) return", body)
-        self.assertIn("postDecision(image.image_path, image.decision, reason, null)", body)
-        self.assertNotIn("await decide(", body, "must not go through decide()'s toggle logic")
+        self.assertIn("if(!image || image.review_status === 'neutral') return", body)
+        self.assertIn("setStatus(image.image_path, image.review_status, reason, null)", body)
+        self.assertNotIn("decideAndAdvance(", body, "must not advance to the next image")
 
     def test_the_dropdown_resets_to_the_current_image_s_own_reason_on_every_navigation(self):
         """Otherwise a reason picked for one image (even if never saved,
@@ -621,35 +865,57 @@ class ReasonFieldTests(unittest.TestCase):
 
         js = build_js()
         self.assertIn("function updateReasonSelect(image)", js)
-        self.assertIn("updateReasonSelect(image);", js, "must run on every renderAll(), not just on decide")
+        self.assertIn("updateReasonSelect(image);", js, "must run on every renderAll(), not just on a decision")
         select_fn = re.search(r"function updateReasonSelect\(image\)\{(.*?)\n  \}", js, re.S)
         self.assertIsNotNone(select_fn)
         self.assertIn("(image && image.reason) || ''", select_fn.group(1))
 
+    def test_a_reason_is_meaningless_and_disabled_for_a_neutral_image(self):
+        from picklikeme.review.page import build_js
+
+        js = build_js()
+        select_fn = re.search(r"function updateReasonSelect\(image\)\{(.*?)\n  \}", js, re.S)
+        self.assertIsNotNone(select_fn)
+        self.assertIn("image.review_status === 'neutral'", select_fn.group(1))
+
     def test_reason_is_never_used_by_the_gallery_cards_only_the_lightbox(self):
-        """The grid has no reason control - a card's Keep/Reject click must
+        """The grid has no reason control - a card's status button click must
         not silently invent one."""
         from picklikeme.review.page import build_js
 
         js = build_js()
         card_click_binding = re.search(
-            r"b\.addEventListener\('click', \(\) => decide\(b\.dataset\.path, b\.dataset\.act\)\);", js
+            r"b\.addEventListener\('click', \(\) => setStatus\(b\.dataset\.path, b\.dataset\.status\)\);", js
         )
-        self.assertIsNotNone(card_click_binding, "gallery card decide() call changed shape unexpectedly")
+        self.assertIsNotNone(card_click_binding, "gallery card setStatus() call changed shape unexpectedly")
 
 
 class GalleryFilterTests(unittest.TestCase):
-    """Structural checks for the Selected/Rejected/All filter, with no server
-    involved - same rationale as LightboxMarkupTests: the interactive part is
-    covered by the uncommitted Node harness, this covers the wiring."""
+    """Structural checks for the Keep/Reject/Neutral/All filter, with no
+    server involved - same rationale as LightboxMarkupTests: the interactive
+    part is covered by a Node/jsdom harness during development."""
 
-    def test_filter_buttons_exist_for_all_selected_and_rejected(self):
+    def test_filter_buttons_exist_for_all_keep_reject_and_neutral(self):
         from picklikeme.review.page import build_page
 
         html = build_page()
         self.assertIn('data-filter="all"', html)
-        self.assertIn('data-filter="selected"', html)
-        self.assertIn('data-filter="rejected"', html)
+        self.assertIn('data-filter="keep"', html)
+        self.assertIn('data-filter="reject"', html)
+        self.assertIn('data-filter="neutral"', html)
+
+    def test_the_filter_values_match_review_status_directly(self):
+        """No separate classification function any more - a card's CSS class
+        IS image.review_status, so a filter value and a review_status value
+        are the exact same string; there is nothing left that could disagree."""
+        from picklikeme.review.page import build_js
+
+        js = build_js()
+        visible_images = re.search(r"function visibleImages\(\)\{(.*?)\n\}", js, re.S)
+        self.assertIsNotNone(visible_images)
+        body = visible_images.group(1)
+        self.assertIn("if(PLM.filter === 'all') return images;", body)
+        self.assertIn("i.review_status === PLM.filter", body)
 
     def test_filter_buttons_are_wired_to_set_filter(self):
         from picklikeme.review.page import build_js
@@ -658,24 +924,132 @@ class GalleryFilterTests(unittest.TestCase):
         self.assertIn("querySelectorAll('.filter')", js)
         self.assertIn("setFilter(b.dataset.filter)", js)
 
-    def test_the_gallery_and_the_lightbox_share_one_classification_and_one_filtered_list(self):
-        """cardClass() is the single source of truth for what counts as
-        selected/rejected (it is also what colours a card's border), and
-        visibleImages() is what both render() and the Lightbox's navigation
-        read - so a card can never appear under a filter its own border colour
-        disagrees with, and the viewer can never step outside what is on
-        screen."""
+    def test_the_gallery_and_the_lightbox_share_one_filtered_list(self):
+        """visibleImages() is what both render() and the Lightbox's own
+        navigation read - so the viewer can never step outside what is
+        currently on screen under the active filter."""
         from picklikeme.review.page import build_js
 
         js = build_js()
-        self.assertIn("function cardClass(image)", js)
-        self.assertIn("const cls = cardClass(image);", js)
         self.assertIn("function visibleImages()", js)
         self.assertIn("function images(){ return visibleImages(); }", js)
 
 
+class BulkActionsMarkupTests(unittest.TestCase):
+    """Structural checks for the multi-select bulk actions bar, with no
+    server involved - same rationale as GalleryFilterTests/LightboxMarkupTests."""
+
+    def test_every_card_gets_a_tri_state_status_row_not_a_toggle(self):
+        """Keep/Reject/Neutral are three explicit buttons, each setting an
+        exact target status - no hidden "click again to undo" gesture."""
+        from picklikeme.review.page import build_js
+
+        js = build_js()
+        card_fn = re.search(r"function card\(image, index\)\{(.*?)\n\}", js, re.S)
+        self.assertIsNotNone(card_fn)
+        body = card_fn.group(1)
+        self.assertIn('data-status="keep"', body)
+        self.assertIn('data-status="reject"', body)
+        self.assertIn('data-status="neutral"', body)
+
+    def test_every_card_gets_a_pick_checkbox(self):
+        from picklikeme.review.page import build_js
+
+        js = build_js()
+        card_fn = re.search(r"function card\(image, index\)\{(.*?)\n\}", js, re.S)
+        self.assertIn("data-pick=", card_fn.group(1))
+
+    def test_the_checkbox_is_not_inside_the_thumb_link(self):
+        """A click on the checkbox must never also open the lightbox - see
+        the pick/thumb-link sibling comment in card(). Checked structurally:
+        the returned markup concatenates pick as a sibling BEFORE visual
+        (which contains the thumb-link), not inside visual's own string."""
+        from picklikeme.review.page import build_js
+
+        js = build_js()
+        card_fn = re.search(r"function card\(image, index\)\{(.*?)\n\}", js, re.S)
+        body = card_fn.group(1)
+        self.assertIn("+ pick + visual", body)
+
+    def test_the_bulk_bar_is_entirely_absent_from_the_layout_by_default(self):
+        """Phase 2: hidden, not merely disabled - there must be no dead
+        chrome sitting on screen when nothing is picked."""
+        from picklikeme.review.page import build_page
+
+        html = build_page()
+        bar = re.search(r'<div class="bulkbar" id="bulk-bar"([^>]*)>', html)
+        self.assertIsNotNone(bar, "bulk-bar not found")
+        self.assertIn("display:none", bar.group(1))
+        for control in ("bulk-count", "bulk-keep", "bulk-reject", "bulk-neutral", "bulk-clear-sel", "bulk-dismiss"):
+            self.assertIn(f'id="{control}"', html)
+
+    def test_the_bar_is_shown_or_hidden_by_updatebulkbar_from_the_picked_count(self):
+        from picklikeme.review.page import build_js
+
+        js = build_js()
+        fn = re.search(r"function updateBulkBar\(\)\{(.*?)\n\}", js, re.S)
+        self.assertIsNotNone(fn, "updateBulkBar not found")
+        body = fn.group(1)
+        self.assertIn("n === 0 || PLM.bulkDismissed", body)
+        self.assertIn("bar.style.display = 'none'", body)
+
+    def test_clear_selection_and_dismiss_are_distinct_actions(self):
+        """Clear Selection empties the picked set; Dismiss only hides the bar
+        without discarding picks - checking any new box brings it back."""
+        from picklikeme.review.page import build_js
+
+        js = build_js()
+        clear_fn = re.search(r"function clearPicked\(\)\{(.*?)\n\}", js, re.S)
+        self.assertIsNotNone(clear_fn, "clearPicked not found")
+        self.assertIn("PLM.picked.clear()", clear_fn.group(1))
+
+        self.assertIn("q('#bulk-dismiss').addEventListener('click', () => { PLM.bulkDismissed = true", js)
+        self.assertIn("PLM.bulkDismissed = false", js, "a new pick must reveal a dismissed bar again")
+
+    def test_the_confirmation_dialog_exists_and_is_wired_before_any_request(self):
+        """The whole point of the feature: a bulk action must never reach the
+        server before the photographer has confirmed it in this dialog - the
+        same generic dialog Apply AI Suggestions also reuses."""
+        from picklikeme.review.page import build_js, build_page
+
+        html = build_page()
+        self.assertIn('<dialog id="confirm-dlg">', html)
+
+        js = build_js()
+        self.assertIn("function askConfirm(title, body, action)", js)
+        self.assertIn("q('#confirm-dlg').showModal()", js)
+        confirm_fn = re.search(r"function confirmBulkStatus\(status\)\{(.*?)\n\}", js, re.S)
+        self.assertIsNotNone(confirm_fn, "confirmBulkStatus not found")
+        self.assertNotIn("api(", confirm_fn.group(1), "confirmBulkStatus must only stage the dialog, never post")
+        self.assertIn("async function runBulkStatus(status)", js)
+        self.assertIn("api/review/bulk-status", js)
+
+    def test_the_three_bulk_actions_map_to_keep_reject_and_neutral(self):
+        from picklikeme.review.page import build_js
+
+        js = build_js()
+        self.assertIn("confirmBulkStatus('keep')", js)
+        self.assertIn("confirmBulkStatus('reject')", js)
+        self.assertIn("confirmBulkStatus('neutral')", js)
+
+    def test_apply_ai_suggestions_reuses_the_same_confirmation_dialog(self):
+        """Phase 5: no second, near-duplicate dialog for this action."""
+        from picklikeme.review.page import build_js
+
+        js = build_js()
+        fn = re.search(r"function confirmApplyAiSuggestions\(\)\{(.*?)\n\}", js, re.S)
+        self.assertIsNotNone(fn, "confirmApplyAiSuggestions not found")
+        self.assertIn("askConfirm(", fn.group(1))
+        self.assertNotIn("showModal", fn.group(1), "must go through askConfirm, not open a dialog directly")
+
+
 class ArrangeEndpointTests(ReviewServerTestCase):
     def test_a_dry_run_reports_the_plan_without_moving_anything(self):
+        self.post("/api/review/status", {"image_path": str(self.images[0]), "status": "keep"})
+        self.post("/api/review/status", {"image_path": str(self.images[1]), "status": "keep"})
+        for image in self.images[2:]:
+            self.post("/api/review/status", {"image_path": str(image), "status": "reject"})
+
         payload = self.post("/api/review/arrange", {"dry_run": True})
 
         self.assertTrue(payload["dry_run"])
@@ -685,7 +1059,24 @@ class ArrangeEndpointTests(ReviewServerTestCase):
         for path in self.images:
             self.assertTrue(path.exists(), "a dry run must not move a file")
 
+    def test_neutral_images_are_never_moved_no_matter_how_the_ai_ranked_them(self):
+        """Arrange reads review_status alone - an all-Neutral gallery (the
+        default, before anyone reviews anything) must move nothing."""
+        self.post("/api/review/keep-percent", {"keep_percent": 100})
+
+        payload = self.post("/api/review/arrange", {"dry_run": False})
+
+        self.assertEqual(payload["result"]["moved"], 0)
+        for path in self.images + [self.extra[0]]:
+            self.assertTrue(path.exists())
+            self.assertEqual(path.parent, self.shoot)
+
     def test_arranging_moves_the_files_and_returns_fresh_state(self):
+        for image in self.images[:2]:
+            self.post("/api/review/status", {"image_path": str(image), "status": "keep"})
+        for image in self.images[2:]:
+            self.post("/api/review/status", {"image_path": str(image), "status": "reject"})
+
         payload = self.post("/api/review/arrange", {"dry_run": False})
 
         self.assertEqual(payload["result"]["moved"], 6)
@@ -694,15 +1085,18 @@ class ArrangeEndpointTests(ReviewServerTestCase):
         # The gallery now describes the new locations.
         self.assertEqual(payload["state"]["counts"]["missing_file"], 0)
 
-    def test_unranked_images_are_left_in_place_by_arranging(self):
+    def test_neutral_undecided_images_are_left_in_place_by_arranging(self):
+        for image in self.images:
+            self.post("/api/review/status", {"image_path": str(image), "status": "reject"})
+
         self.post("/api/review/arrange", {"dry_run": False})
 
         self.assertTrue(self.extra[0].exists())
         self.assertEqual(self.extra[0].parent, self.shoot)
 
-    def test_manual_decisions_are_honoured_by_arranging(self):
+    def test_a_keep_on_the_ai_s_own_worst_pick_is_honoured_by_arranging(self):
         worst = str(self.images[-1])
-        self.post("/api/review/decision", {"image_path": worst, "decision": "keep"})
+        self.post("/api/review/status", {"image_path": worst, "status": "keep"})
 
         self.post("/api/review/arrange", {"dry_run": False})
 
@@ -768,7 +1162,7 @@ class OpenFolderEndpointTests(ReviewServerTestCase):
         self.assertTrue(payload["ok"])
         self.assertEqual(Path(payload["state"]["input_folder"]).resolve(), other.resolve())
         self.assertEqual(len(payload["state"]["images"]), 1)
-        self.assertEqual(payload["state"]["images"][0]["state"], "unranked")
+        self.assertEqual(payload["state"]["images"][0]["review_status"], "neutral")
         self.assertIn("recovered", payload)
 
     def test_omitting_the_path_shows_the_native_dialog(self):
@@ -824,6 +1218,76 @@ class OpenFolderEndpointTests(ReviewServerTestCase):
         with self.assertRaises(urllib.error.HTTPError) as ctx:
             urllib.request.urlopen(self.base + "/thumb?path=" + quote(str(self.images[0]), safe=""))
         self.assertEqual(ctx.exception.code, 403)
+
+
+class NoFolderOpenServerTests(unittest.TestCase):
+    """`picklikeme review` with no --input at all: the server must come up
+    and serve a working page with nothing open yet, purely so
+    /api/review/open-folder has something to switch away from."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.root = Path(self._tmp.name)
+        self.store = AnnotationStore(self.root / "kb.db")
+        self.session = ReviewSession(None, self.store)
+        self.server = make_review_server(self.session, self.store, port=0)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.base = f"http://127.0.0.1:{self.server.server_address[1]}"
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.store.close()
+        self._tmp.cleanup()
+
+    def get(self, path: str):
+        with urllib.request.urlopen(self.base + path) as response:
+            return json.load(response)
+
+    def post(self, path: str, payload: dict):
+        request = urllib.request.Request(
+            self.base + path,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(request) as response:
+            return json.load(response)
+
+    def test_the_page_still_loads(self):
+        with urllib.request.urlopen(self.base + "/") as response:
+            self.assertEqual(response.status, 200)
+
+    def test_the_state_endpoint_reports_an_empty_folder_less_gallery(self):
+        payload = self.get("/api/review/state")
+
+        self.assertIsNone(payload["state"]["input_folder"])
+        self.assertEqual(payload["state"]["images"], [])
+        self.assertTrue(payload["state"]["warnings"])
+
+    def test_every_path_taking_endpoint_refuses_until_a_folder_is_opened(self):
+        somewhere = self.root / "irrelevant.jpg"
+        somewhere.write_bytes(b"x")
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            urllib.request.urlopen(self.base + "/thumb?path=" + quote(str(somewhere), safe=""))
+        self.assertEqual(ctx.exception.code, 403)
+
+    def test_arranging_with_nothing_open_is_a_clean_400_not_a_crash(self):
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            self.post("/api/review/arrange", {"dry_run": True})
+        self.assertEqual(ctx.exception.code, 400)
+
+    def test_opening_a_folder_makes_it_reviewable(self):
+        shoot = self.root / "shoot"
+        shoot.mkdir()
+        make_real_images([shoot / "IMG_0001.jpg"])
+
+        payload = self.post("/api/review/open-folder", {"path": str(shoot)})
+
+        self.assertEqual(Path(payload["state"]["input_folder"]).resolve(), shoot.resolve())
+        self.assertEqual(len(payload["state"]["images"]), 1)
+        with urllib.request.urlopen(self.base + "/thumb?path=" + quote(str(shoot / "IMG_0001.jpg"), safe="")) as response:
+            self.assertEqual(response.status, 200)
 
 
 if __name__ == "__main__":

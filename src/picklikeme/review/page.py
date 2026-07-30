@@ -12,6 +12,12 @@ would be a liability rather than an artifact.
 The document ships empty and fills itself from `api/review/state`, so the
 initial response is instant however many thousands of images the folder holds;
 thumbnails then load lazily as the browser scrolls them into view.
+
+UX model (see session.py for the backend side of this): the AI ranking is
+read-only metadata, shown as a small "AI Keep/Reject" suggestion chip. The
+photographer's own review status is always exactly one of Keep, Reject or
+Neutral, set explicitly - never inferred from the ranking, never a toggle
+that silently falls back to whatever the model would have picked.
 """
 
 from __future__ import annotations
@@ -25,31 +31,26 @@ from ..analyzer.annotations import (
     REVIEW_REASON_GOOD_QUALITY,
     REVIEW_REASON_OTHER,
 )
-from .session import (
-    STATE_AUTO_REJECTED,
-    STATE_AUTO_SELECTED,
-    STATE_MANUAL_KEEP,
-    STATE_MANUAL_REJECT,
-    STATE_UNRANKED,
-)
+from .session import REVIEW_STATUS_KEEP, REVIEW_STATUS_NEUTRAL, REVIEW_STATUS_REJECT
 
 # Keep-percentage presets. 25 is DEFAULT_SELECTION_PERCENTAGE, so the default
 # is always one of the buttons rather than an invisible custom value.
 KEEP_PRESETS = (5, 10, 20, 25, 35)
 
-# Badge text per state. The wording says what happened and who decided it, so
-# the photographer never has to work out why an image sits where it does.
-STATE_LABELS = {
-    STATE_MANUAL_KEEP: "You kept this",
-    STATE_MANUAL_REJECT: "You rejected this",
-    STATE_AUTO_SELECTED: "Selected by model",
-    STATE_AUTO_REJECTED: "Rejected by model",
-    STATE_UNRANKED: "No ranking",
+# Badge/filter text for the photographer's own review status - always exactly
+# these three words, everywhere the status appears (card badge, filter
+# buttons, bulk action bar, Lightbox). One vocabulary, never "Selected" in one
+# place and "Keep" in another.
+REVIEW_STATUS_LABELS = {
+    REVIEW_STATUS_KEEP: "Keep",
+    REVIEW_STATUS_REJECT: "Reject",
+    REVIEW_STATUS_NEUTRAL: "Neutral",
 }
 
-# Why a manual Keep/Reject overrides the model - optional, shown as a dropdown
-# next to Keep/Reject in the Lightbox. Fixed, like the decision itself: see
+# Why a Keep/Reject overrides the model - optional, shown as a dropdown next
+# to Keep/Reject/Neutral in the Lightbox. Fixed, like the status itself: see
 # REVIEW_REASONS in analyzer/annotations.py for why this isn't config-driven.
+# Meaningless for Neutral - "no opinion" needs no justification.
 REASON_LABELS = {
     REVIEW_REASON_EYES_NOT_SEEN: "Eyes not seen",
     REVIEW_REASON_CLEAR_EYES_SEEN: "Clear Eyes Seen",
@@ -67,55 +68,92 @@ CSS = """
 body{margin:0;background:var(--bg);color:var(--text);
 font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
 header{position:sticky;top:0;z-index:20;background:var(--panel);border-bottom:1px solid var(--border);
-padding:12px 20px;box-shadow:0 1px 3px var(--shadow)}
-.title{display:flex;align-items:baseline;gap:12px;flex-wrap:wrap}
-.title #theme{margin-left:auto;flex-shrink:0}
-h1{font-size:17px;margin:0;font-weight:650}
-.folder{font-size:12.5px;color:var(--muted);font-family:ui-monospace,Consolas,monospace}
-.bar{display:flex;gap:16px;align-items:center;flex-wrap:wrap;margin-top:10px}
+padding:10px 20px;box-shadow:0 1px 3px var(--shadow)}
+
+/* One wrapping row of labelled groups - Folder / View / AI Suggests / Tools -
+   plus Statistics and Appearance pinned to the right. A thin vertical rule
+   between groups substitutes for the visual weight a heading would otherwise
+   need, without spending a whole line on it (see the toolbar-redesign notes
+   in this module's docstring: no app/page name is shown here at all - the
+   window/tab title already carries that). */
+.toolbar{display:flex;align-items:center;gap:14px;flex-wrap:wrap}
 .group{display:flex;gap:6px;align-items:center}
-.group>.lbl{font-size:12.5px;color:var(--muted);margin-right:2px}
+.glabel{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em;margin-right:2px}
+.divider{width:1px;align-self:stretch;min-height:22px;background:var(--border)}
+.folder-name{font-size:12.5px;color:var(--muted);font-family:ui-monospace,Consolas,monospace;
+max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 button{font:inherit;font-size:13px;padding:6px 12px;border-radius:7px;border:1px solid var(--border);
 background:var(--panel-2);color:var(--text);cursor:pointer}
 button:hover{border-color:var(--accent)}
 button.on{background:var(--accent);color:#fff;border-color:var(--accent)}
 button.primary{background:var(--accent);color:#fff;border-color:var(--accent);font-weight:600}
 button:disabled{opacity:.5;cursor:not-allowed}
-input[type=number]{font:inherit;font-size:13px;width:64px;padding:6px 8px;border-radius:7px;
+input[type=number]{font:inherit;font-size:13px;width:60px;padding:6px 8px;border-radius:7px;
 border:1px solid var(--border);background:var(--panel);color:var(--text)}
-.counts{display:flex;gap:14px;margin-left:auto;font-size:13px;flex-wrap:wrap}
-.count{display:flex;gap:5px;align-items:baseline}
-.count b{font-variant-numeric:tabular-nums;font-size:15px}
-.count.sel b{color:var(--good)}.count.rej b{color:var(--bad)}.count.unt b{color:var(--warn)}
+.gunit{font-size:12.5px;color:var(--muted)}
+
+/* Statistics: plain numbers, not buttons - nothing here is clickable, so
+   nothing here looks clickable. Pinned right by the toolbar's own wrapping;
+   Appearance (the theme toggle) sits just past it, the last thing in the row. */
+.stats{display:flex;gap:14px;margin-left:auto;font-size:13px;flex-wrap:wrap}
+.stat{display:flex;gap:5px;align-items:baseline}
+.stat b{font-variant-numeric:tabular-nums;font-size:15px}
+.stat.keep b{color:var(--good)}.stat.reject b{color:var(--bad)}.stat.neutral b{color:var(--muted)}
+
+/* Multi-select bulk action bar (Phase 2): entirely absent from the layout -
+   not merely disabled - whenever nothing is picked, so it never sits there
+   as dead chrome. Its own accent border marks it as contextual/temporary,
+   distinct from the always-present toolbar above it. */
+.bulkbar{display:flex;align-items:center;gap:16px;flex-wrap:wrap;margin-top:10px;
+padding:8px 16px;border-radius:10px;border:1px solid var(--accent);background:var(--panel-2)}
+.bulkcount{font-size:13px;font-weight:600}
+.bulkacts{display:flex;gap:8px}
+.bk{display:flex;align-items:center;gap:5px}
+.bk .ic{font-size:14px;line-height:1}
+.bk.keep .ic{color:var(--good)}.bk.reject .ic{color:var(--bad)}.bk.neutral .ic{color:var(--muted)}
+.bk.ghost{background:transparent;border-color:transparent;color:var(--muted)}
+.bk.ghost:hover{border-color:var(--border)}
+
 .notice{margin:12px 20px 0;padding:10px 14px;border-radius:8px;border:1px dashed var(--warn);
 background:var(--panel-2);font-size:13px}
-.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(232px,1fr));gap:14px;padding:16px 20px 60px}
-.card{background:var(--panel);border:1px solid var(--border);border-radius:11px;overflow:hidden;
+.statusbar{margin-top:8px}
+.status{font-size:12.5px;color:var(--muted)}
+.status.error{color:var(--bad)}
+
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:12px;padding:16px 20px 60px}
+.card{position:relative;background:var(--panel);border:1px solid var(--border);border-radius:11px;overflow:hidden;
 display:flex;flex-direction:column;box-shadow:0 1px 2px var(--shadow)}
-.card.sel{border-color:var(--good);border-width:2px}
-.card.rej{border-color:var(--bad);border-width:2px}
-.card.unt{border-style:dashed;border-color:var(--warn)}
+.card.keep{border-color:var(--good);border-width:2px}
+.card.reject{border-color:var(--bad);border-width:2px}
+.card.neutral{border-style:dashed}
+.card.picked{outline:3px solid var(--accent);outline-offset:-3px}
+.pick{position:absolute;top:8px;left:8px;z-index:2;width:24px;height:24px;display:flex;
+align-items:center;justify-content:center;background:rgba(15,23,42,.55);border-radius:6px;cursor:pointer}
+.pick input{width:16px;height:16px;margin:0;cursor:pointer;accent-color:var(--accent)}
 .thumb-link{display:block;position:relative;cursor:zoom-in}
 .thumb-link:hover .thumb{filter:brightness(1.06)}
 .thumb{width:100%;aspect-ratio:1;background:var(--panel-2);object-fit:cover;display:block}
 .ph{width:100%;aspect-ratio:1;background:var(--panel-2);display:flex;align-items:center;
 justify-content:center;color:var(--muted);font-size:12.5px;text-align:center;padding:12px}
-.meta{padding:9px 11px;display:flex;flex-direction:column;gap:5px;flex:1}
+.meta{padding:8px 10px;display:flex;flex-direction:column;gap:4px;flex:1}
 .name{font-size:12.5px;font-family:ui-monospace,Consolas,monospace;word-break:break-all}
-.nums{font-size:12px;color:var(--muted);font-variant-numeric:tabular-nums}
+.nums{font-size:12px;color:var(--muted);font-variant-numeric:tabular-nums;
+display:flex;align-items:center;flex-wrap:wrap;gap:6px}
+/* The AI's suggestion, not the photographer's status - kept visually
+   distinct (its own accent-outlined chip, never green/red/grey) so the two
+   can never be mistaken for each other at a glance. */
+.ai-chip{font-size:10.5px;padding:1px 7px;border-radius:20px;border:1px solid var(--accent);
+color:var(--accent);white-space:nowrap}
 .badge{display:inline-block;font-size:11.5px;padding:2px 8px;border-radius:20px;
 border:1px solid var(--border);background:var(--panel-2);width:fit-content}
-.badge.manual_keep{background:var(--good);color:#fff;border-color:var(--good)}
-.badge.manual_reject{background:var(--bad);color:#fff;border-color:var(--bad)}
-.badge.auto_selected{color:var(--good);border-color:var(--good)}
-.badge.auto_rejected{color:var(--muted)}
-.badge.unranked{color:var(--warn);border-color:var(--warn)}
-.acts{display:flex;gap:6px;padding:0 11px 11px}
-.acts button{flex:1;padding:6px 4px}
-.acts .keep.on{background:var(--good);border-color:var(--good);color:#fff}
-.acts .rej.on{background:var(--bad);border-color:var(--bad);color:#fff}
-.status{font-size:12.5px;color:var(--muted)}
-.status.error{color:var(--bad)}
+.badge.keep{background:var(--good);color:#fff;border-color:var(--good)}
+.badge.reject{background:var(--bad);color:#fff;border-color:var(--bad)}
+.badge.neutral{color:var(--muted)}
+.acts{display:flex;gap:6px;padding:0 10px 10px}
+.acts button{flex:1;padding:6px 4px;font-size:15px;line-height:1}
+.acts .a-keep.on{background:var(--good);border-color:var(--good);color:#fff}
+.acts .a-reject.on{background:var(--bad);border-color:var(--bad);color:#fff}
+.acts .a-neutral.on{background:var(--muted);border-color:var(--muted);color:#fff}
 dialog{border:1px solid var(--border);border-radius:12px;background:var(--panel);color:var(--text);
 padding:0;max-width:520px;width:92%;box-shadow:0 12px 40px var(--shadow)}
 dialog::backdrop{background:rgba(2,6,23,.55)}
@@ -149,11 +187,10 @@ transform-origin:center center;display:block;transition:transform .08s ease-out}
 color:#cbd5e1;font-size:13px;text-align:center;padding:20px}
 .lb-badge{position:absolute;top:10px;left:10px;font-size:12px;padding:4px 10px;border-radius:20px;
 font-weight:650;pointer-events:none}
-.lb-badge.manual_keep{background:var(--good);color:#06281f}
-.lb-badge.manual_reject{background:var(--bad);color:#2a0a0a}
-.lb-badge.auto_selected{background:rgba(16,185,129,.2);color:#6ee7b7;border:1px solid var(--good)}
-.lb-badge.auto_rejected{background:rgba(148,163,184,.15);color:#cbd5e1;border:1px solid #475569}
-.lb-badge.unranked{background:rgba(245,158,11,.18);color:#fcd34d;border:1px solid var(--warn)}
+.lb-badge.keep{background:var(--good);color:#06281f}
+.lb-badge.reject{background:var(--bad);color:#2a0a0a}
+.lb-badge.neutral{background:rgba(148,163,184,.18);color:#e2e8f0;border:1px solid #475569}
+.lb-ai{font-size:11.5px;padding:2px 9px;border-radius:20px;border:1px solid #60a5fa;color:#93c5fd}
 /* z-index:5 on every piece of overlay chrome (close/nav/bottom bar):
    a CSS transform doesn't resize .lb-img-wrap's own layout box, so once the
    image is zoomed past fit it can paint outside that box - and img-wrap
@@ -169,12 +206,12 @@ cursor:pointer}
 .lb-nav.prev{left:16px}.lb-nav.next{right:16px}
 .lb-bottom{position:absolute;z-index:5;left:0;right:0;bottom:0;display:flex;flex-direction:column;
 align-items:center;gap:10px;padding:12px 16px 18px;background:linear-gradient(to top,rgba(0,0,0,.5),transparent)}
-/* One box holding everything (info, exposure, Save JPEG, Keep/Reject,
+/* One box holding everything (info, exposure, Save JPEG, Keep/Reject/Neutral,
    status), centred above the film strip by .lb-bottom's own
    align-items:center - no extra wrapper needed for that. It is opaque and
    light so black text has something to contrast against; the dark viewer
    behind it is what light-on-dark text used to rely on instead. */
-.lb-info{display:flex;justify-content:center;align-items:center;gap:16px;flex-wrap:wrap;
+.lb-info{display:flex;justify-content:center;align-items:center;gap:14px;flex-wrap:wrap;
 font-size:12.5px;color:#000;font-variant-numeric:tabular-nums;
 background:rgba(255,255,255,.92);border-radius:20px;padding:8px 18px;
 box-shadow:0 2px 10px rgba(0,0,0,.35)}
@@ -190,13 +227,15 @@ border-radius:7px;padding:4px 10px;font-size:12px;cursor:pointer}
 border:1px solid rgba(0,0,0,.2);border-radius:7px;padding:4px 8px;cursor:pointer}
 #lb-reason-note{font:inherit;font-size:12px;color:#000;background:rgba(0,0,0,.06);
 border:1px solid rgba(0,0,0,.2);border-radius:7px;padding:4px 8px;width:160px}
-.lb-acts{display:flex;gap:10px}
-.lb-acts button{font-size:13px;padding:7px 18px;border-radius:10px;font-weight:650;
+.lb-acts{display:flex;gap:8px}
+.lb-acts button{font-size:13px;padding:7px 16px;border-radius:10px;font-weight:650;
 background:rgba(0,0,0,.04);border:1px solid rgba(0,0,0,.15);color:#000}
 .lb-acts .keep{border-color:var(--good);color:#065f46}
 .lb-acts .keep.on{background:var(--good);color:#06281f}
-.lb-acts .rej{border-color:var(--bad);color:#991b1b}
-.lb-acts .rej.on{background:var(--bad);color:#2a0a0a}
+.lb-acts .reject{border-color:var(--bad);color:#991b1b}
+.lb-acts .reject.on{background:var(--bad);color:#2a0a0a}
+.lb-acts .neutral{border-color:var(--muted);color:#334155}
+.lb-acts .neutral.on{background:var(--muted);color:#0b1220}
 .lb-status{font-size:12px;color:#334155}
 .lb-status.error{color:var(--bad)}
 .lb-film{display:flex;gap:6px;max-width:96vw;overflow-x:auto;padding:2px}
@@ -211,27 +250,22 @@ const PLM = {
   state: null,
   boxes: false,
   busy: false,
-  filter: 'all',  // 'all' | 'selected' | 'rejected' - client-side only, survives state refreshes
-  labels: __STATE_LABELS__,
+  filter: 'all',  // 'all' | 'keep' | 'reject' | 'neutral' - client-side only, survives state refreshes
+  picked: new Set(),      // image_path set, for the multi-select bulk actions bar
+  bulkDismissed: false,   // Dismiss hides the bar without clearing picks; any new pick reveals it again
+  labels: __STATUS_LABELS__,
   reasons: __REASON_LABELS__,
 };
 
-// Same classification the card's border colour uses, so the filter and what a
-// card visually looks like can never disagree.
-function cardClass(image){
-  return image.state === 'manual_keep' || image.state === 'auto_selected' ? 'sel'
-       : image.state === 'unranked' ? 'unt' : 'rej';
-}
-
 function visibleImages(){
   const images = (PLM.state && PLM.state.images) || [];
-  if(PLM.filter === 'selected') return images.filter(i => cardClass(i) === 'sel');
-  if(PLM.filter === 'rejected') return images.filter(i => cardClass(i) === 'rej');
-  return images;
+  if(PLM.filter === 'all') return images;
+  return images.filter(i => i.review_status === PLM.filter);
 }
 
 const esc = s => { const d = document.createElement('div'); d.textContent = s == null ? '' : s; return d.innerHTML; };
 const q = s => document.querySelector(s);
+const cap = s => s.charAt(0).toUpperCase() + s.slice(1);
 
 function setTheme(t){
   document.documentElement.setAttribute('data-theme', t);
@@ -241,7 +275,7 @@ function setTheme(t){
   // Nothing cosmetic is allowed to throw here - an exception at this point
   // would abort the whole script and the gallery would never load at all.
   const button = q('#theme');
-  if(button) button.textContent = t === 'dark' ? 'Light mode' : 'Dark mode';
+  if(button) button.textContent = t === 'dark' ? 'Light Mode' : 'Dark Mode';
 }
 (function(){
   let t; try{ t = localStorage.getItem('plm-theme') }catch(e){}
@@ -275,16 +309,24 @@ function say(message, isError){
 function render(){
   const s = PLM.state;
   if(!s) return;
-  q('#folder').textContent = s.input_folder;
+  const hasFolder = !!s.input_folder;
+  const folderEl = q('#folder');
+  folderEl.textContent = s.input_folder || 'No folder open';
+  folderEl.title = s.input_folder || '';
   q('#c-total').textContent = s.counts.total.toLocaleString();
-  q('#c-sel').textContent = s.counts.selected.toLocaleString();
-  q('#c-rej').textContent = s.counts.rejected.toLocaleString();
-  q('#c-unt').textContent = s.counts.untouched.toLocaleString();
+  q('#c-keep').textContent = s.counts.keep.toLocaleString();
+  q('#c-reject').textContent = s.counts.reject.toLocaleString();
+  q('#c-neutral').textContent = s.counts.neutral.toLocaleString();
 
   document.querySelectorAll('.preset').forEach(b => {
     b.classList.toggle('on', Number(b.dataset.percent) === s.keep_percent);
   });
   q('#percent').value = s.keep_percent;
+  // The AI Suggests group (threshold + Apply Suggestions) has nothing to act
+  // on without a ranking at all - hidden rather than shown inert, per the
+  // same "disappear until needed" rule the bulk bar follows.
+  q('#ai-group').style.display = s.has_ranking ? '' : 'none';
+  q('#apply-ai').disabled = !s.has_ranking || s.counts.neutral === 0;
 
   const notice = q('#notice');
   if(s.warnings && s.warnings.length){
@@ -298,9 +340,26 @@ function render(){
     b.classList.toggle('on', b.dataset.filter === PLM.filter);
   });
 
+  // Neither has anywhere to point without a folder open - "Reveal in
+  // Explorer" would otherwise send the literal string "null" to the server
+  // (see openFolder), and Arrange has nothing to file.
+  q('#open').disabled = !hasFolder;
+  q('#go').disabled = !hasFolder;
+
+  // A pick can outlive the image it names - arranging or switching folders
+  // both replace s.images wholesale (arrange repoints paths, a new folder is
+  // a different set of files entirely) - so anything no longer present is
+  // dropped rather than left to bulk-decide a path that isn't in this
+  // gallery any more.
+  const present = new Set(s.images.map(i => i.image_path));
+  for(const path of PLM.picked){ if(!present.has(path)) PLM.picked.delete(path); }
+  updateBulkBar();
+
   const grid = q('#grid');
   if(!s.images.length){
-    grid.innerHTML = '<div class="empty">No images found in this folder.</div>';
+    grid.innerHTML = hasFolder
+      ? '<div class="empty">No images found in this folder.</div>'
+      : '<div class="empty">No folder open yet. Click &ldquo;Open Folder&hellip;&rdquo; above to choose one.</div>';
     return;
   }
   // Index into the filtered, displayed list - not s.images - so the lightbox
@@ -311,8 +370,17 @@ function render(){
     return;
   }
   grid.innerHTML = visible.map((image, i) => card(image, i)).join('');
-  grid.querySelectorAll('button[data-act]').forEach(b => {
-    b.addEventListener('click', () => decide(b.dataset.path, b.dataset.act));
+  grid.querySelectorAll('button[data-status]').forEach(b => {
+    b.addEventListener('click', () => setStatus(b.dataset.path, b.dataset.status));
+  });
+  grid.querySelectorAll('input[data-pick]').forEach(cb => {
+    cb.addEventListener('change', () => {
+      const path = cb.dataset.pick;
+      if(cb.checked){ PLM.picked.add(path); PLM.bulkDismissed = false; }
+      else PLM.picked.delete(path);
+      cb.closest('.card').classList.toggle('picked', cb.checked);
+      updateBulkBar();
+    });
   });
   // Index into s.images, not image.rank: the lightbox navigates the gallery's
   // own displayed order (best-first, unranked last), which is what "next" and
@@ -323,7 +391,8 @@ function render(){
 }
 
 function card(image, index){
-  const cls = cardClass(image);
+  const status = image.review_status;
+  const picked = PLM.picked.has(image.image_path);
   const url = 'thumb?path=' + encodeURIComponent(image.image_path) + (PLM.boxes ? '&boxes=1' : '');
   // Opens the in-app Lightbox rather than navigating anywhere - see Lightbox
   // below. Not an <a> any more: this is a click handler, not a link.
@@ -334,66 +403,73 @@ function card(image, index){
         ' onerror="this.outerHTML=\\'<div class=ph>No preview available</div>\\'">' +
       '</div>';
   const score = image.score == null
-    ? 'no score'
-    : 'score ' + image.score.toFixed(4) + (image.rank ? ' &middot; rank ' + image.rank.toLocaleString() : '');
-  return '<div class="card ' + cls + '">' + visual +
+    ? 'No score'
+    : 'Score ' + image.score.toFixed(4) + (image.rank ? ' &middot; Rank ' + image.rank.toLocaleString() : '');
+  // The AI's own suggestion, kept visually separate from review_status (see
+  // .ai-chip) - it is a hint, never the photographer's actual decision.
+  const aiChip = image.ai_suggestion
+    ? '<span class="ai-chip">AI ' + cap(image.ai_suggestion) + '</span>'
+    : '';
+  // A sibling of .thumb-link, not inside it - a click on the checkbox must
+  // never also open the lightbox, and its own click listener is bound
+  // straight to .thumb-link (see render()), so a sibling target simply never
+  // reaches it; no stopPropagation needed.
+  const pick = '<label class="pick" title="Select for a bulk action">' +
+      '<input type="checkbox" data-pick="' + esc(image.image_path) + '"' + (picked ? ' checked' : '') + '>' +
+    '</label>';
+  return '<div class="card ' + status + (picked ? ' picked' : '') + '">' + pick + visual +
     '<div class="meta">' +
       '<div class="name" title="' + esc(image.image_path) + '">' + esc(image.filename) + '</div>' +
-      '<div class="nums">' + score + '</div>' +
-      '<span class="badge ' + esc(image.state) + '">' + esc(PLM.labels[image.state] || image.state) + '</span>' +
+      '<div class="nums">' + score + aiChip + '</div>' +
+      '<span class="badge ' + status + '">' + esc(PLM.labels[status] || status) + '</span>' +
     '</div>' +
     '<div class="acts">' +
-      '<button class="keep' + (image.decision === 'keep' ? ' on' : '') + '"' +
-        ' data-act="keep" data-path="' + esc(image.image_path) + '">Keep</button>' +
-      '<button class="rej' + (image.decision === 'reject' ? ' on' : '') + '"' +
-        ' data-act="reject" data-path="' + esc(image.image_path) + '">Reject</button>' +
+      '<button class="a-keep' + (status === 'keep' ? ' on' : '') + '"' +
+        ' data-status="keep" data-path="' + esc(image.image_path) + '" title="Keep">&#10003;</button>' +
+      '<button class="a-reject' + (status === 'reject' ? ' on' : '') + '"' +
+        ' data-status="reject" data-path="' + esc(image.image_path) + '" title="Reject">&#10005;</button>' +
+      '<button class="a-neutral' + (status === 'neutral' ? ' on' : '') + '"' +
+        ' data-status="neutral" data-path="' + esc(image.image_path) + '" title="Neutral">&#9675;</button>' +
     '</div></div>';
 }
 
-// Shared by decide() (which also decides whether to toggle) and the Lightbox's
-// reason dropdown/note (which must save a new reason for the SAME decision
-// without re-running that toggle logic - see onReasonChange). reason_note
-// only ever reaches the server alongside reason === 'other', mirroring what
-// the store itself enforces (annotations.py's set_review_decision) - this is
-// just the same rule applied before the request even goes out.
-async function postDecision(path, decision, reason, reason_note){
+// Shared by every caller that sets a review status - a gallery card button,
+// the Lightbox's Keep/Reject/Neutral row, and its reason dropdown/note
+// (which must save a new reason for the SAME status without re-triggering
+// Lightbox's advance-to-next behaviour). Always sets the exact status given;
+// there is no toggle any more; PLM.labels'/the card's own "on" class is what
+// shows the CURRENT status, so a second click on the same button is simply a
+// no-op re-save, never a hidden "clear" gesture. reason_note only ever
+// reaches the server alongside reason === 'other', mirroring what the store
+// itself enforces (annotations.py's set_review_decision).
+async function setStatus(path, status, reason, reason_note){
   try{
-    const j = await api('api/review/decision', {
+    const j = await api('api/review/status', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({
         image_path: path,
-        decision: decision,
-        reason: decision ? (reason || null) : null,
-        reason_note: decision && reason === 'other' ? (reason_note || null) : null,
+        status: status,
+        reason: status !== 'neutral' ? (reason || null) : null,
+        reason_note: status !== 'neutral' && reason === 'other' ? (reason_note || null) : null,
       }),
     });
     PLM.state = j.state;
     render();
-    say(decision ? 'Saved.' : 'Back to the model\\'s decision.');
+    say('Marked ' + (PLM.labels[status] || status) + '.');
   }catch(e){ say('Could not save: ' + e.message, true); }
-}
-
-// Clicking the button an image already carries clears the override, so the
-// image returns to whatever the threshold says. That is the only way back to
-// automatic, so it must be the obvious one. `reason`/`reason_note` are
-// optional and only the Lightbox ever supplies them (the gallery cards have
-// no reason control).
-async function decide(path, action, reason, reason_note){
-  const image = PLM.state.images.find(i => i.image_path === path);
-  const decision = image && image.decision === action ? null : action;
-  await postDecision(path, decision, reason, reason_note);
 }
 
 // ===========================================================================
 // Lightbox: full-screen in-app viewer, opened by clicking a card's thumbnail.
 //
 // Self-contained on purpose - it reads the gallery's image list off
-// PLM.state and reuses decide() to persist Keep/Reject, but owns all of its
-// own state (current index, zoom, pan, a small preload cache) behind this one
-// object. Nothing outside this block touches that state directly, so the
-// viewer can be extended - or lifted into its own file, if this ever needs to
-// be reused elsewhere - without touching the gallery code above it.
+// PLM.state and reuses setStatus() to persist Keep/Reject/Neutral, but owns
+// all of its own state (current index, zoom, pan, a small preload cache)
+// behind this one object. Nothing outside this block touches that state
+// directly, so the viewer can be extended - or lifted into its own file, if
+// this ever needs to be reused elsewhere - without touching the gallery code
+// above it.
 // ===========================================================================
 const Lightbox = (function(){
   const MIN_SCALE = 1;        // 1 == fit-to-screen, what every image opens at
@@ -414,7 +490,7 @@ const Lightbox = (function(){
   // +-1/3 additions. Deliberately NOT reset by open()/go()/resetView() - it
   // is meant to stay applied while browsing, like FastRawViewer's exposure
   // preview, until the reviewer dials it back down themselves. Display only:
-  // never read by decide()/arrange(), never sent to the server, never
+  // never read by setStatus()/arrange(), never sent to the server, never
   // touches the RAW file.
   let exposureSteps = 0;
   // path -> blob object URL for the full-size decode. Bounded to a small
@@ -449,10 +525,16 @@ const Lightbox = (function(){
     scale = 1; pan = {x: 0, y: 0};
   }
 
+  // Navigating within an already-open lightbox keeps the current zoom level
+  // deliberately - a photographer zoomed in to check focus/eyes wants that
+  // same zoom on the next frame too, not to re-zoom after every arrow key.
+  // Only pan resets: a pan position is a spot on ONE photo's composition, and
+  // has no meaning carried over to a different one. Opening the lightbox
+  // fresh (open(), above) still starts every browsing session at Fit.
   function go(newIndex){
     if(newIndex < 0 || newIndex >= images().length) return;
     index = newIndex;
-    resetView();
+    pan = {x: 0, y: 0};
     renderAll();
     preloadAround();
   }
@@ -466,10 +548,12 @@ const Lightbox = (function(){
     q('#lb-next').disabled = index >= images().length - 1;
     q('#lb-counter').textContent = (index + 1) + ' / ' + images().length;
     q('#lb-filename').textContent = image.filename;
-    q('#lb-score').textContent = image.score == null ? 'no score'
-      : 'score ' + image.score.toFixed(4) + (image.rank ? ' · rank ' + image.rank.toLocaleString() : '');
+    q('#lb-score').textContent = image.score == null ? 'No score'
+      : 'Score ' + image.score.toFixed(4) + (image.rank ? ' · Rank ' + image.rank.toLocaleString() : '');
+    q('#lb-ai').textContent = image.ai_suggestion ? 'AI suggests ' + cap(image.ai_suggestion) : '';
+    q('#lb-ai').style.display = image.ai_suggestion ? '' : 'none';
     updateZoomIndicator();
-    updateDecisionButtons(image);
+    updateStatusButtons(image);
     updateBadge(image);
     updateSaveButton(image);
     updateReasonSelect(image);
@@ -483,10 +567,11 @@ const Lightbox = (function(){
 
   // Reset to this image's own stored reason (and note, and note visibility)
   // on every navigation, so a reason picked for one image can never leak
-  // onto the next one it was never actually saved against.
+  // onto the next one it was never actually saved against. Meaningless (and
+  // disabled) for a Neutral image - there is no override to justify.
   function updateReasonSelect(image){
     const reason = (image && image.reason) || '';
-    const disabled = !image || !!image.missing_file;
+    const disabled = !image || !!image.missing_file || (image && image.review_status === 'neutral');
     q('#lb-reason').value = reason;
     q('#lb-reason').disabled = disabled;
     const note = q('#lb-reason-note');
@@ -497,13 +582,14 @@ const Lightbox = (function(){
 
   function updateBadge(image){
     const badge = q('#lb-badge');
-    badge.className = 'lb-badge ' + image.state;
-    badge.textContent = PLM.labels[image.state] || image.state;
+    badge.className = 'lb-badge ' + image.review_status;
+    badge.textContent = PLM.labels[image.review_status] || image.review_status;
   }
 
-  function updateDecisionButtons(image){
-    q('#lb-keep').classList.toggle('on', image.decision === 'keep');
-    q('#lb-reject').classList.toggle('on', image.decision === 'reject');
+  function updateStatusButtons(image){
+    q('#lb-keep').classList.toggle('on', image.review_status === 'keep');
+    q('#lb-reject').classList.toggle('on', image.review_status === 'reject');
+    q('#lb-neutral').classList.toggle('on', image.review_status === 'neutral');
   }
 
   function updateZoomIndicator(){
@@ -533,6 +619,13 @@ const Lightbox = (function(){
     const spinner = q('#lb-spinner');
     img.style.transform = 'none';
     img.classList.toggle('grabbable', false);
+    // The zoom indicator's % reading depends on THIS image's own
+    // naturalWidth/offsetWidth (see hundredPercentScale) - a carried-over
+    // zoom level applied to a differently-sized photo needs those measured
+    // fresh once it has actually decoded and laid out, not the outgoing
+    // image's, which is all that is on screen the instant renderAll() calls
+    // updateZoomIndicator() above.
+    img.onload = updateZoomIndicator;
     if(image.missing_file){
       img.removeAttribute('src');
       spinner.textContent = 'File not found (has it moved?)';
@@ -612,38 +705,38 @@ const Lightbox = (function(){
     if(activeEl && activeEl.scrollIntoView) activeEl.scrollIntoView({inline: 'center', block: 'nearest'});
   }
 
-  // Reuses decide() rather than posting again: same validation, same
+  // Reuses setStatus() rather than posting again: same validation, same
   // PLM.state refresh, same status reporting - the lightbox just also
   // advances afterwards, which is the one thing the gallery view never needs.
   // Whatever the reason dropdown (and, for "Other", its note) currently show
   // travel with this decision - that is the only place a fresh reason ever
-  // comes from.
-  async function decideAndAdvance(action){
+  // comes from, and only for Keep/Reject (see setStatus).
+  async function decideAndAdvance(status){
     const image = current();
     if(!image) return;
     const wasLast = index >= images().length - 1;
     const reason = q('#lb-reason').value || null;
     const reasonNote = reason === 'other' ? (q('#lb-reason-note').value || null) : null;
-    await decide(image.image_path, action, reason, reasonNote);
-    updateDecisionButtons(current());
+    await setStatus(image.image_path, status, reason, reasonNote);
+    updateStatusButtons(current());
     updateBadge(current());
     updateReasonSelect(current());
     if(!wasLast) next();
   }
 
   // Lets the reason be changed (or added) for an image that already carries a
-  // decision, without re-clicking Keep/Reject - postDecision() directly,
-  // bypassing decide()'s toggle logic, since re-supplying the SAME decision
-  // here must never be read as "clear it". Picking "Other" only reveals the
-  // note field and waits - see onReasonNoteCommit - rather than saving an
-  // empty explanation the instant it's chosen.
+  // Keep/Reject, without re-clicking either - setStatus() directly, with the
+  // SAME status the image already has, rather than decideAndAdvance()'s
+  // advance-to-next behaviour. Picking "Other" only reveals the note field
+  // and waits - see onReasonNoteCommit - rather than saving an empty
+  // explanation the instant it's chosen.
   async function onReasonChange(){
     const image = current();
     const reason = q('#lb-reason').value || null;
     q('#lb-reason-note').style.display = reason === 'other' ? '' : 'none';
-    if(!image || !image.decision) return;
+    if(!image || image.review_status === 'neutral') return;
     if(reason === 'other'){ q('#lb-reason-note').focus(); return; }
-    await postDecision(image.image_path, image.decision, reason, null);
+    await setStatus(image.image_path, image.review_status, reason, null);
     updateReasonSelect(current());
   }
 
@@ -651,8 +744,8 @@ const Lightbox = (function(){
   // keystroke, so choosing a few words doesn't fire a save per character.
   async function onReasonNoteCommit(){
     const image = current();
-    if(!image || !image.decision || q('#lb-reason').value !== 'other') return;
-    await postDecision(image.image_path, image.decision, 'other', q('#lb-reason-note').value || null);
+    if(!image || image.review_status === 'neutral' || q('#lb-reason').value !== 'other') return;
+    await setStatus(image.image_path, image.review_status, 'other', q('#lb-reason-note').value || null);
     updateReasonSelect(current());
   }
 
@@ -785,10 +878,29 @@ const Lightbox = (function(){
     if(e.target === q('#lb-stage')) close();
   }
 
+  // <select> counts as a typing target too - its own arrow-key/letter
+  // handling (opening it, jumping to an option) must not be fought with next
+  // in the same keystroke.
+  function isTypingTarget(target){
+    const tag = target && target.tagName;
+    return tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || !!(target && target.isContentEditable);
+  }
+
   function onKeyDown(e){
     if(!q('#lightbox').open) return;
+    if(isTypingTarget(e.target)) return;  // never hijack the reason dropdown/note field
     if(e.key === 'ArrowRight') next();
     else if(e.key === 'ArrowLeft') prev();
+    else{
+      // 5/0 mirror a lot of RAW viewers' star-rating keys (5 stars = keep,
+      // 0 stars = reject); k/r are the mnemonic pair for the same two
+      // actions, so either hand position works. u is "unflag"/undecided -
+      // the same convention Lightroom's own U key uses - for Neutral.
+      const key = e.key.toLowerCase();
+      if(key === '5' || key === 'k') decideAndAdvance('keep');
+      else if(key === '0' || key === 'r') decideAndAdvance('reject');
+      else if(key === 'u') decideAndAdvance('neutral');
+    }
     // Escape is native <dialog> behaviour - see the 'cancel' listener below,
     // which only exists to route it through the same fade-out as every other
     // close, not to implement the key itself.
@@ -800,6 +912,7 @@ const Lightbox = (function(){
     q('#lb-next').addEventListener('click', next);
     q('#lb-keep').addEventListener('click', () => decideAndAdvance('keep'));
     q('#lb-reject').addEventListener('click', () => decideAndAdvance('reject'));
+    q('#lb-neutral').addEventListener('click', () => decideAndAdvance('neutral'));
     q('#lb-exp-down').addEventListener('click', () => adjustExposure(-1));
     q('#lb-exp-up').addEventListener('click', () => adjustExposure(1));
     q('#lb-save-jpeg').addEventListener('click', saveJpeg);
@@ -831,17 +944,117 @@ async function setPercent(value){
     })).state;
     render();
     say('');
-  }catch(e){ say('Could not change the percentage: ' + e.message, true); }
+  }catch(e){ say('Could not change the AI suggestion threshold: ' + e.message, true); }
 }
 
 // Client-side only - it doesn't round-trip through the server, so switching
-// filters is instant and never disturbs the underlying decisions.
+// filters is instant and never disturbs the underlying review status.
 function setFilter(name){
   PLM.filter = name;
   render();
 }
 
+// -- one generic confirmation dialog, reused by every action below that
+// needs "are you sure?" before it touches many images or the disk at once
+// (multi-select bulk actions, Apply AI Suggestions) - Arrange keeps its own
+// dialog, since that one shows a real computed plan (directories, counts),
+// not just a yes/no question. -----------------------------------------------
+
+let pendingConfirm = null;  // () => Promise<void> | void - staged until Confirm is actually clicked
+function askConfirm(title, body, action){
+  pendingConfirm = action;
+  q('#confirm-title').textContent = title;
+  q('#confirm-body').textContent = body;
+  q('#confirm-dlg').showModal();
+}
+async function runPendingConfirm(){
+  q('#confirm-dlg').close();
+  const action = pendingConfirm;
+  pendingConfirm = null;
+  if(action) await action();
+}
+
+// -- multi-select bulk actions ---------------------------------------------
+// Picking images is client-side only (see PLM.picked); nothing is sent until
+// the confirmation dialog above is confirmed, and even then it is one
+// request, not one per image - a slow network shouldn't mean a photographer
+// watches N separate saves for one gesture.
+
+function updateBulkBar(){
+  const n = PLM.picked.size;
+  const bar = q('#bulk-bar');
+  // Gone from the layout entirely with nothing picked - not merely
+  // disabled - so it never sits there as dead chrome (Phase 2). Dismiss
+  // hides it early without discarding the picks themselves; checking any
+  // NEW box always brings it back (see the checkbox handler in render()).
+  if(n === 0 || PLM.bulkDismissed){ bar.style.display = 'none'; return; }
+  bar.style.display = '';
+  q('#bulk-count').textContent = n === 1 ? '1 image selected' : n.toLocaleString() + ' images selected';
+}
+
+function clearPicked(){
+  PLM.picked.clear();
+  PLM.bulkDismissed = false;
+  render();
+}
+
+function confirmBulkStatus(status){
+  if(!PLM.picked.size) return;
+  const n = PLM.picked.size;
+  const label = PLM.labels[status] || status;
+  askConfirm(
+    'Mark ' + n + (n === 1 ? ' image ' : ' images ') + label + '?',
+    status === 'neutral'
+      ? 'This clears the review status on these images - each becomes Neutral. Nothing is moved or deleted.'
+      : 'This sets the review status on these images to ' + label + ', overriding whatever each currently has.',
+    () => runBulkStatus(status)
+  );
+}
+
+async function runBulkStatus(status){
+  const paths = Array.from(PLM.picked);
+  try{
+    const j = await api('api/review/bulk-status', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({image_paths: paths, status: status}),
+    });
+    PLM.picked.clear();
+    PLM.state = j.state;
+    render();
+    say('Updated ' + j.applied.toLocaleString() + ' image(s).'
+      + (j.failed.length ? ' ' + j.failed.length.toLocaleString() + ' could not be found (moved or deleted?).' : ''));
+  }catch(e){ say('Could not apply the bulk action: ' + e.message, true); }
+}
+
+// -- AI suggestions (still entirely read-only until this one, explicit,
+// confirmed action) -----------------------------------------------------
+
+function confirmApplyAiSuggestions(){
+  const pct = PLM.state.keep_percent;
+  askConfirm(
+    'Apply AI suggestions?',
+    'Every ranked image still Neutral is set to Keep or Reject, matching the AI ranking at the current '
+      + pct + '% threshold. Images you have already marked, and any with no ranking at all, are untouched.',
+    runApplyAiSuggestions
+  );
+}
+
+async function runApplyAiSuggestions(){
+  try{
+    const j = await api('api/review/apply-ai-suggestions', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: '{}',
+    });
+    PLM.state = j.state;
+    render();
+    say('Applied the AI suggestion to ' + j.applied.toLocaleString() + ' image(s).');
+  }catch(e){ say('Could not apply AI suggestions: ' + e.message, true); }
+}
+
 async function openFolder(){
+  if(!PLM.state.input_folder) return;  // nothing open - #open is disabled too, but belt and suspenders
   try{
     await api('open-folder?path=' + encodeURIComponent(PLM.state.input_folder));
   }catch(e){ say('Could not open the folder: ' + e.message, true); }
@@ -850,10 +1063,10 @@ async function openFolder(){
 // Shows the OS's own folder-browser dialog (the server bridges it - a
 // browser cannot show one itself, see os_actions.py's choose_folder) and, if
 // the photographer picked something, switches the whole review to it. Meant
-// for a folder that was never ranked at all: it still loads, just with every
-// image unranked, so Keep/Reject is the only way to sort it. PLM.busy guards
-// against the dialog (which blocks the request on the server) being opened
-// twice from a second click.
+// for a folder that was never ranked at all: it still loads, every image
+// Neutral, so Keep/Reject/Neutral is the only way to sort it. PLM.busy
+// guards against the dialog (which blocks the request on the server) being
+// opened twice from a second click.
 async function switchFolder(){
   if(PLM.busy) return;
   PLM.busy = true;
@@ -882,11 +1095,11 @@ async function confirmArrange(){
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({dry_run: true}),
     });
-    q('#p-sel').textContent = plan.result.selected.toLocaleString();
-    q('#p-rej').textContent = plan.result.rejected.toLocaleString();
-    q('#p-unt').textContent = PLM.state.counts.untouched.toLocaleString();
-    q('#p-sel-dir').textContent = plan.result.selected_dir;
-    q('#p-rej-dir').textContent = plan.result.rejected_dir;
+    q('#p-keep').textContent = plan.result.selected.toLocaleString();
+    q('#p-reject').textContent = plan.result.rejected.toLocaleString();
+    q('#p-neutral').textContent = PLM.state.counts.neutral.toLocaleString();
+    q('#p-keep-dir').textContent = plan.result.selected_dir;
+    q('#p-reject-dir').textContent = plan.result.rejected_dir;
     q('#dlg').showModal();
   }catch(e){ say('Could not prepare the plan: ' + e.message, true); }
 }
@@ -921,7 +1134,7 @@ async function boot(){
   // the gallery unable to load.
   if(theme){
     theme.textContent = document.documentElement.getAttribute('data-theme') === 'dark'
-      ? 'Light mode' : 'Dark mode';
+      ? 'Light Mode' : 'Dark Mode';
     theme.addEventListener('click', () =>
       setTheme(document.documentElement.getAttribute('data-theme') === 'dark' ? 'light' : 'dark'));
   }
@@ -933,14 +1146,21 @@ async function boot(){
   q('#boxes').addEventListener('click', () => {
     PLM.boxes = !PLM.boxes;
     q('#boxes').classList.toggle('on', PLM.boxes);
-    q('#boxes').textContent = PLM.boxes ? 'Hide detector boxes' : 'Show detector boxes';
     render();
   });
   q('#open').addEventListener('click', openFolder);
   q('#switch-folder').addEventListener('click', switchFolder);
+  q('#apply-ai').addEventListener('click', confirmApplyAiSuggestions);
   q('#go').addEventListener('click', confirmArrange);
   q('#dlg-cancel').addEventListener('click', () => q('#dlg').close());
   q('#dlg-go').addEventListener('click', doArrange);
+  q('#bulk-keep').addEventListener('click', () => confirmBulkStatus('keep'));
+  q('#bulk-reject').addEventListener('click', () => confirmBulkStatus('reject'));
+  q('#bulk-neutral').addEventListener('click', () => confirmBulkStatus('neutral'));
+  q('#bulk-clear-sel').addEventListener('click', clearPicked);
+  q('#bulk-dismiss').addEventListener('click', () => { PLM.bulkDismissed = true; updateBulkBar(); });
+  q('#confirm-cancel').addEventListener('click', () => { pendingConfirm = null; q('#confirm-dlg').close(); });
+  q('#confirm-go').addEventListener('click', runPendingConfirm);
   Lightbox.bind();
 
   try{
@@ -948,7 +1168,7 @@ async function boot(){
     // arrange and reconcile carry a sibling (result, recovered) alongside it,
     // which is why api() hands back the whole envelope rather than unwrapping
     // it for every caller. Every other call site extracts .state at the point
-    // of use (see decide/setPercent/doArrange below); this is the same thing.
+    // of use (see setStatus/setPercent/doArrange above); this is the same thing.
     PLM.state = (await api('api/review/state')).state;
     render();
   }catch(e){
@@ -981,73 +1201,107 @@ def _reason_options_html() -> str:
 
 
 def build_js() -> str:
-    """JS_TEMPLATE with its config-driven constant filled in.
+    """JS_TEMPLATE with its config-driven constants filled in.
 
     Plain substitution rather than an f-string: the template is full of literal
     braces (object literals, arrow functions), which an f-string would require
     escaping almost everywhere.
     """
-    return JS_TEMPLATE.replace("__STATE_LABELS__", json.dumps(STATE_LABELS)).replace(
+    return JS_TEMPLATE.replace("__STATUS_LABELS__", json.dumps(REVIEW_STATUS_LABELS)).replace(
         "__REASON_LABELS__", json.dumps(REASON_LABELS)
     )
 
 
-def build_page(title: str = "PickLikeMe review") -> str:
-    """The whole document. Empty of data - it fetches its own state on load."""
+def build_page(title: str = "PickLikeMe Review") -> str:
+    """The whole document. Empty of data - it fetches its own state on load.
+
+    `title` only ever reaches the browser's own tab/window chrome (the
+    <title> tag) - the toolbar itself never repeats the application's name,
+    since that chrome already identifies it.
+    """
     return f"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{title}</title>
 <style>{CSS}</style></head><body>
 <header>
-  <div class="title">
-    <h1>Review</h1>
-    <span class="folder" id="folder"></span>
-    <button id="theme">Dark mode</button>
-  </div>
-  <div class="bar">
-    <div class="group">
-      <span class="lbl">Keep</span>
-      {_presets_html()}
-      <input type="number" id="percent" min="0" max="100" step="1" aria-label="Keep percentage">
-      <span class="lbl">%</span>
+  <div class="toolbar">
+    <div class="group" data-group="folder">
+      <span class="glabel">Folder</span>
+      <span class="folder-name" id="folder">No folder open</span>
+      <button id="switch-folder">Open&hellip;</button>
+      <button id="open" title="Reveal the current folder in the OS file manager">Reveal</button>
     </div>
-    <div class="group">
-      <span class="lbl">Show</span>
+    <span class="divider"></span>
+    <div class="group" data-group="view">
+      <span class="glabel">View</span>
       <button class="filter on" data-filter="all">All</button>
-      <button class="filter" data-filter="selected">Selected</button>
-      <button class="filter" data-filter="rejected">Rejected</button>
+      <button class="filter" data-filter="keep">Keep</button>
+      <button class="filter" data-filter="reject">Reject</button>
+      <button class="filter" data-filter="neutral">Neutral</button>
+      <button id="boxes" title="Show/hide the detector's bounding boxes on thumbnails">Detector Boxes</button>
     </div>
-    <div class="group">
-      <button id="switch-folder">Open Folder&hellip;</button>
-      <button id="boxes">Show detector boxes</button>
-      <button id="open">Reveal in Explorer</button>
-      <button id="go" class="primary">Arrange Files On Disk</button>
+    <span class="divider"></span>
+    <div class="group" id="ai-group" data-group="ai">
+      <span class="glabel">AI Suggests</span>
+      {_presets_html()}
+      <input type="number" id="percent" min="0" max="100" step="1" aria-label="AI suggestion threshold, percent">
+      <span class="gunit">%</span>
+      <button id="apply-ai" title="Set every Neutral, ranked image to the AI's current suggestion">Apply Suggestions</button>
     </div>
-    <div class="counts">
-      <span class="count"><span class="lbl">Total</span><b id="c-total">0</b></span>
-      <span class="count sel"><span class="lbl">Selected</span><b id="c-sel">0</b></span>
-      <span class="count rej"><span class="lbl">Rejected</span><b id="c-rej">0</b></span>
-      <span class="count unt"><span class="lbl">No ranking</span><b id="c-unt">0</b></span>
+    <span class="divider"></span>
+    <div class="group" data-group="tools">
+      <span class="glabel">Tools</span>
+      <button id="go" class="primary" title="Move Keep to _Selected and Reject to _Rejected. Neutral is never moved.">Arrange Files</button>
+    </div>
+    <div class="stats" id="stats">
+      <span class="stat"><b id="c-total">0</b><span class="glabel">Total</span></span>
+      <span class="stat keep"><b id="c-keep">0</b><span class="glabel">Keep</span></span>
+      <span class="stat reject"><b id="c-reject">0</b><span class="glabel">Reject</span></span>
+      <span class="stat neutral"><b id="c-neutral">0</b><span class="glabel">Neutral</span></span>
+    </div>
+    <button id="theme">Dark Mode</button>
+  </div>
+
+  <div class="bulkbar" id="bulk-bar" style="display:none">
+    <span class="bulkcount" id="bulk-count">0 selected</span>
+    <div class="bulkacts">
+      <button class="bk keep" id="bulk-keep"><span class="ic">&#10003;</span> Keep</button>
+      <button class="bk reject" id="bulk-reject"><span class="ic">&#10005;</span> Reject</button>
+      <button class="bk neutral" id="bulk-neutral"><span class="ic">&#9675;</span> Neutral</button>
+    </div>
+    <div class="bulkacts">
+      <button id="bulk-clear-sel">Clear Selection</button>
+      <button class="bk ghost" id="bulk-dismiss" aria-label="Dismiss">Dismiss</button>
     </div>
   </div>
-  <div class="bar"><span class="status" id="status"></span></div>
+
+  <div class="statusbar"><span class="status" id="status"></span></div>
 </header>
 <div class="notice" id="notice" style="display:none"></div>
 <div class="grid" id="grid"><div class="empty">Loading...</div></div>
 
 <dialog id="dlg"><div class="dlg">
-  <h2>Arrange files on disk</h2>
+  <h2>Arrange Files</h2>
   <div class="sub">Files are moved, not copied. Nothing is ever overwritten - a name
-  collision gets a numbered suffix.</div>
+  collision gets a numbered suffix. Neutral images are never touched.</div>
   <div class="plan">
-    <b id="p-sel">0</b><span>Selected &rarr; <span class="dest" id="p-sel-dir"></span></span>
-    <b id="p-rej">0</b><span>Rejected &rarr; <span class="dest" id="p-rej-dir"></span></span>
-    <b id="p-unt">0</b><span>No ranking &rarr; <span class="dest">left where they are</span></span>
+    <b id="p-keep">0</b><span>Keep &rarr; <span class="dest" id="p-keep-dir"></span></span>
+    <b id="p-reject">0</b><span>Reject &rarr; <span class="dest" id="p-reject-dir"></span></span>
+    <b id="p-neutral">0</b><span>Neutral &rarr; <span class="dest">left where they are</span></span>
   </div>
   <div class="dlg-acts">
     <button id="dlg-cancel">Cancel</button>
     <button id="dlg-go" class="primary">Arrange</button>
+  </div>
+</div></dialog>
+
+<dialog id="confirm-dlg"><div class="dlg">
+  <h2 id="confirm-title">Confirm</h2>
+  <div class="sub" id="confirm-body"></div>
+  <div class="dlg-acts">
+    <button id="confirm-cancel">Cancel</button>
+    <button id="confirm-go" class="primary">Confirm</button>
   </div>
 </div></dialog>
 
@@ -1066,6 +1320,7 @@ def build_page(title: str = "PickLikeMe review") -> str:
         <span id="lb-counter"></span>
         <span id="lb-filename"></span>
         <span id="lb-score"></span>
+        <span class="lb-ai" id="lb-ai" style="display:none"></span>
         <span id="lb-zoom">Fit</span>
         <span class="lb-exp" id="lb-exp" title="Display only - never written to the RAW file or saved anywhere">
           <span aria-hidden="true">&#9728;</span>
@@ -1079,8 +1334,9 @@ def build_page(title: str = "PickLikeMe review") -> str:
         </select>
         <input type="text" id="lb-reason-note" style="display:none" placeholder="Describe why..." aria-label="Describe the reason">
         <div class="lb-acts">
-          <button class="keep" id="lb-keep">Keep</button>
-          <button class="rej" id="lb-reject">Reject</button>
+          <button class="keep" id="lb-keep" title="Keep (5 or K)">Keep</button>
+          <button class="reject" id="lb-reject" title="Reject (0 or R)">Reject</button>
+          <button class="neutral" id="lb-neutral" title="Neutral (U)">Neutral</button>
         </div>
         <div class="lb-status" id="lb-status"></div>
       </div>

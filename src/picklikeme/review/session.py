@@ -1,18 +1,25 @@
 """What the photographer is reviewing, and what would happen if they filed it.
 
-All of the review application's decisions live here: which images exist, where
-the keep-percentage cut falls, which manual overrides beat it, and what
-`Arrange` would move where. No HTTP and no SQL beyond the store's own methods,
-so every rule below is directly testable.
+All of the review application's decisions live here: which images exist, what
+the AI ranking merely suggests, which review status the photographer has
+actually given each image, and what `Arrange` would move where. No HTTP and no
+SQL beyond the store's own methods, so every rule below is directly testable.
 
-Two ideas do the work:
+Three ideas do the work:
 
 - **The gallery is the union of the ranking and the folder.** An image present
   on disk but absent from the ranking still appears, because the alternative is
   a photograph silently missing from a review of its own shoot.
-- **A manual decision always beats the threshold.** Moving the keep percentage
-  re-sorts everything the photographer has not personally ruled on, and touches
-  nothing they have.
+- **AI metadata and the photographer's review status are completely separate.**
+  A score, a rank, and the "AI suggests Keep/Reject" hint derived from them are
+  read-only information the model produced. Every image's `review_status` is
+  always exactly one of Keep, Reject or Neutral - the photographer's own,
+  independent verdict - and nothing about the ranking ever changes it by
+  itself. Clearing a decision (one image, or a whole bulk selection) always
+  lands on Neutral, never silently on whatever the model would have picked.
+- **Only Keep/Reject file anything.** `arrange()` reads `review_status` alone;
+  a Neutral image - ranked highly or not ranked at all - is never moved, since
+  "the photographer hasn't looked at it yet" is not a basis to sort it.
 """
 
 from __future__ import annotations
@@ -21,7 +28,7 @@ import logging
 from dataclasses import dataclass
 from pathlib import Path
 
-from ..analyzer.annotations import REVIEW_KEEP, REVIEW_REJECT, REVIEW_REASON_OTHER, AnnotationStore
+from ..analyzer.annotations import REVIEW_KEEP, REVIEW_REASON_OTHER, REVIEW_REJECT, AnnotationStore
 from ..identity import IdentityUnavailable
 from ..organize import (
     DEFAULT_SELECTION_PERCENTAGE,
@@ -34,12 +41,19 @@ from ..sidecar import ranking_path, read_run_metadata, rewrite_ranking_paths
 
 logger = logging.getLogger(__name__)
 
-# What an image's badge says, and why it is where it is.
-STATE_MANUAL_KEEP = "manual_keep"
-STATE_MANUAL_REJECT = "manual_reject"
-STATE_AUTO_SELECTED = "auto_selected"
-STATE_AUTO_REJECTED = "auto_rejected"
-STATE_UNRANKED = "unranked"
+# The photographer's review status - always exactly one of these three,
+# completely independent of the AI ranking. Reuses REVIEW_KEEP/REVIEW_REJECT
+# (the values AnnotationStore's `review_decisions` table already stores) so
+# writing one is a direct pass-through; REVIEW_STATUS_NEUTRAL has no row in
+# that table at all - "no decision recorded" *is* Neutral, not a fourth state.
+REVIEW_STATUS_KEEP = REVIEW_KEEP
+REVIEW_STATUS_REJECT = REVIEW_REJECT
+REVIEW_STATUS_NEUTRAL = "neutral"
+REVIEW_STATUSES: frozenset[str] = frozenset({REVIEW_STATUS_KEEP, REVIEW_STATUS_REJECT, REVIEW_STATUS_NEUTRAL})
+
+
+class InvalidReviewStatus(ValueError):
+    """Raised for a review status outside REVIEW_STATUSES."""
 
 
 @dataclass
@@ -48,11 +62,15 @@ class ReviewImage:
 
     image_path: str
     filename: str
+    # AI metadata - read-only, never written by this application, never
+    # affected by anything the photographer does in it.
     score: float | None = None
     rank: int | None = None
-    decision: str | None = None  # REVIEW_KEEP / REVIEW_REJECT, or None
-    # Why a manual decision overrides the model - one of REVIEW_REASONS, or
-    # None. Meaningless without a decision, and always cleared alongside one.
+    # The photographer's own verdict: REVIEW_KEEP, REVIEW_REJECT, or None.
+    # None *is* Neutral - see review_status - not "no opinion yet from
+    # somewhere else". Meaningless without a decision, and always cleared
+    # alongside one.
+    decision: str | None = None
     reason: str | None = None
     # Free text, only meaningful alongside REVIEW_REASON_OTHER - see
     # AnnotationStore.set_review_decision.
@@ -65,26 +83,36 @@ class ReviewImage:
     def is_ranked(self) -> bool:
         return self.score is not None
 
-    def as_dict(self, state: str) -> dict:
+    @property
+    def review_status(self) -> str:
+        """The one true tri-state status this application ever shows or
+        files by. Always Neutral until the photographer explicitly says
+        otherwise - never inferred from the ranking."""
+        return self.decision or REVIEW_STATUS_NEUTRAL
+
+    def as_dict(self, ai_suggestion: str | None) -> dict:
         return {
             "image_path": self.image_path,
             "filename": self.filename,
             "score": self.score,
             "rank": self.rank,
-            "decision": self.decision,
+            "review_status": self.review_status,
+            # What the AI ranking alone would recommend at the current
+            # threshold - "keep"/"reject", or None if unranked. Informational
+            # only; see ReviewSession._ai_suggestions.
+            "ai_suggestion": ai_suggestion,
             "reason": self.reason,
             "reason_note": self.reason_note,
-            "state": state,
             "missing_file": self.missing_file,
         }
 
 
 class ReviewSession:
-    """The reviewed folder, its ranking, and the photographer's overrides."""
+    """The reviewed folder, its ranking, and the photographer's own verdicts."""
 
     def __init__(
         self,
-        input_folder: str | Path,
+        input_folder: str | Path | None,
         store: AnnotationStore,
         *,
         ranking_file: str | Path | None = None,
@@ -92,16 +120,32 @@ class ReviewSession:
     ):
         self.store = store
         self.keep_percent = validate_selection_percentage(keep_percent)
-        self.open_folder(input_folder, ranking_file=ranking_file)
+        if input_folder is None:
+            # `picklikeme review` with no --input at all starts here: an
+            # empty, folder-less gallery, so the page still has something to
+            # render and the photographer picks a folder from inside it (see
+            # review.server's /api/review/open-folder) rather than the
+            # command failing to start.
+            self._clear()
+        else:
+            self.open_folder(input_folder, ranking_file=ranking_file)
+
+    def _clear(self) -> None:
+        self.input_folder = None
+        self.ranking_file = None
+        self.run_metadata: dict = {}
+        self.warnings: list[str] = ['No folder open yet. Click "Open Folder…" above to choose one.']
+        self.images: list[ReviewImage] = []
 
     # -- loading ------------------------------------------------------------
 
     def open_folder(self, input_folder: str | Path, *, ranking_file: str | Path | None = None) -> None:
         """Point this session at a different folder - including one that has
         never been ranked at all. `_load_ranked` already treats a missing
-        ranking as "every image unranked" rather than an error (see below),
-        which is exactly what browsing a fresh, un-ranked shoot needs: it
-        shows up with nothing but manual Keep/Reject to sort it.
+        ranking as "every image unranked" rather than an error (see below);
+        combined with every image always starting Neutral, that is exactly
+        what browsing a fresh, un-ranked shoot needs - nothing but Keep/Reject
+        to sort it, with no AI opinion in the mix at all.
 
         Manual decisions already on record for images under the new folder
         are picked up the same way any reload finds them, by path (see
@@ -136,7 +180,7 @@ class ReviewSession:
 
     def _load_ranked(self) -> list[ReviewImage]:
         if not self.ranking_file.is_file():
-            self.warnings.append(f"No ranking at {self.ranking_file}; every image is unranked.")
+            self.warnings.append(f"No ranking at {self.ranking_file}; every image starts Neutral.")
             return []
         from ..analyzer.io import load_ranking
 
@@ -144,7 +188,7 @@ class ReviewSession:
             ranking = load_ranking(self.ranking_file)
         except Exception as exc:  # noqa: BLE001 - a broken ranking must not end the session
             logger.warning("Could not read %s: %s", self.ranking_file, exc)
-            self.warnings.append(f"Could not read the ranking ({exc}); every image is unranked.")
+            self.warnings.append(f"Could not read the ranking ({exc}); every image starts Neutral.")
             return []
 
         self.warnings.extend(ranking.warnings)
@@ -232,111 +276,168 @@ class ReviewSession:
             logger.info("Recovered %d review decision(s) by content identity", recovered)
         return recovered
 
-    # -- classification -----------------------------------------------------
+    # -- AI metadata (read-only) ---------------------------------------------
 
     def set_keep_percent(self, percent: float) -> float:
+        """The AI suggestion threshold - what fraction of RANKED images the
+        model's own ordering alone would flag as "keep". Purely informational
+        (see _ai_suggestions): moving this never changes anyone's
+        review_status, only what the AI-suggestion hint next to each image
+        says, unless the photographer explicitly applies it (see
+        apply_ai_suggestions)."""
         self.keep_percent = validate_selection_percentage(percent)
         return self.keep_percent
 
     @property
     def cut(self) -> int:
-        """How many ranked images the threshold alone would select."""
+        """How many ranked images the AI threshold alone would flag as keep."""
         return selection_count(sum(1 for i in self.images if i.is_ranked), self.keep_percent)
 
-    def states(self) -> dict[str, str]:
-        """image path -> why it is where it is.
-
-        The single place the threshold and the overrides are combined; the
-        gallery, the counts and `arrange()` all read this, so the badge on a
-        card can never disagree with where its file would actually go.
-        """
+    def _ai_suggestions(self) -> dict[str, str | None]:
+        """What the AI ranking alone would recommend for each image at the
+        current threshold - "keep"/"reject" for a ranked image, None for one
+        the model never scored. Never written anywhere, never fed into
+        review_status or arrange() by itself - purely the hint shown next to
+        the photographer's own, independent verdict."""
         cut = self.cut
-        states: dict[str, str] = {}
+        suggestions: dict[str, str | None] = {}
         ranked_position = 0
         for image in self.images:
-            if image.decision == REVIEW_KEEP:
-                state = STATE_MANUAL_KEEP
-            elif image.decision == REVIEW_REJECT:
-                state = STATE_MANUAL_REJECT
-            elif image.is_ranked:
-                state = STATE_AUTO_SELECTED if ranked_position < cut else STATE_AUTO_REJECTED
-            else:
-                state = STATE_UNRANKED
             if image.is_ranked:
+                suggestions[image.image_path] = REVIEW_STATUS_KEEP if ranked_position < cut else REVIEW_STATUS_REJECT
                 ranked_position += 1
-            states[image.image_path] = state
-        return states
+            else:
+                suggestions[image.image_path] = None
+        return suggestions
 
-    def selected_paths(self) -> list[str]:
-        states = self.states()
-        return [i.image_path for i in self.images if states[i.image_path] in (STATE_MANUAL_KEEP, STATE_AUTO_SELECTED)]
+    # -- the photographer's review status ------------------------------------
 
-    def rejected_paths(self) -> list[str]:
-        states = self.states()
-        return [i.image_path for i in self.images if states[i.image_path] in (STATE_MANUAL_REJECT, STATE_AUTO_REJECTED)]
+    def keep_paths(self) -> list[str]:
+        return [i.image_path for i in self.images if i.review_status == REVIEW_STATUS_KEEP]
 
-    def untouched_paths(self) -> list[str]:
-        """Unranked and undecided: no basis to file them, so they stay put."""
-        states = self.states()
-        return [i.image_path for i in self.images if states[i.image_path] == STATE_UNRANKED]
+    def reject_paths(self) -> list[str]:
+        return [i.image_path for i in self.images if i.review_status == REVIEW_STATUS_REJECT]
+
+    def neutral_paths(self) -> list[str]:
+        return [i.image_path for i in self.images if i.review_status == REVIEW_STATUS_NEUTRAL]
 
     def counts(self) -> dict[str, int]:
         return {
             "total": len(self.images),
-            "selected": len(self.selected_paths()),
-            "rejected": len(self.rejected_paths()),
-            "untouched": len(self.untouched_paths()),
-            "manual": sum(1 for i in self.images if i.decision is not None),
+            "keep": len(self.keep_paths()),
+            "reject": len(self.reject_paths()),
+            "neutral": len(self.neutral_paths()),
             "missing_file": sum(1 for i in self.images if i.missing_file),
         }
 
     def as_dict(self) -> dict:
-        states = self.states()
+        ai_suggestions = self._ai_suggestions()
         return {
-            "input_folder": str(self.input_folder),
-            "ranking_file": str(self.ranking_file),
-            "has_ranking": self.ranking_file.is_file(),
+            "input_folder": str(self.input_folder) if self.input_folder else None,
+            "ranking_file": str(self.ranking_file) if self.ranking_file else None,
+            "has_ranking": bool(self.ranking_file and self.ranking_file.is_file()),
             "keep_percent": self.keep_percent,
             "counts": self.counts(),
             "warnings": list(self.warnings),
             "run": self.run_metadata,
-            "images": [image.as_dict(states[image.image_path]) for image in self.images],
+            "images": [image.as_dict(ai_suggestions.get(image.image_path)) for image in self.images],
         }
 
-    # -- writes -------------------------------------------------------------
+    # -- writes ---------------------------------------------------------------
 
-    def set_decision(
+    def set_review_status(
         self,
         image_path: str,
-        decision: str | None,
+        status: str,
+        *,
         reason: str | None = None,
         reason_note: str | None = None,
     ) -> str:
-        """Record (or clear) a manual Keep/Reject and update the gallery.
+        """Record the photographer's Keep/Reject/Neutral for one image.
 
-        `reason` says why the photographer overrode the model - meaningless
-        without a decision, so clearing the decision always clears it too,
-        and setting one without a reason clears any reason left over from a
-        previous decision on this image. `reason_note` is free text and only
-        means anything alongside REVIEW_REASON_OTHER; the store drops it
-        otherwise, and this mirrors that here too.
+        `status` is always one of REVIEW_STATUSES - Neutral is a real,
+        explicit choice here (clearing the stored decision), not the absence
+        of one. `reason`/`reason_note` only mean anything alongside Keep or
+        Reject - a reason is why an override was made, and Neutral is not an
+        override of anything, so either is dropped when `status` is Neutral,
+        and `reason_note` is dropped unless `reason` is REVIEW_REASON_OTHER
+        (mirroring what the store itself enforces).
 
         Persisted immediately - a review session's work must never exist only
-        in a browser tab.
+        in a browser tab. Returns the resulting review_status.
         """
+        if status not in REVIEW_STATUSES:
+            raise InvalidReviewStatus(f"status must be one of {sorted(REVIEW_STATUSES)}, got {status!r}")
         image = self._image_for(image_path)
-        if decision is None:
+        if status == REVIEW_STATUS_NEUTRAL:
             self.store.clear_review_decision(image.image_path)
             reason = None
             reason_note = None
         else:
             if reason != REVIEW_REASON_OTHER:
                 reason_note = None
-            self.store.set_review_decision(image.image_path, decision, reason=reason, reason_note=reason_note)
-        image.decision = decision
+            self.store.set_review_decision(image.image_path, status, reason=reason, reason_note=reason_note)
+        image.decision = None if status == REVIEW_STATUS_NEUTRAL else status
         image.reason = reason
         image.reason_note = reason_note
-        return self.states()[image.image_path]
+        return image.review_status
+
+    def set_review_statuses(self, image_paths: list[str], status: str) -> dict:
+        """Apply the same review status to many images at once - the
+        multi-select bulk action's backend.
+
+        No reason travels with a bulk action - reason fields exist to record
+        a photographer's own judgement about ONE frame (eyes, focus), which
+        does not generalise across an arbitrary batch. Reuses
+        `set_review_status` per image, so every invariant it enforces still
+        holds for each one; an invalid `status` raises immediately, before
+        anything is written, since that is a caller bug rather than a
+        per-image data issue.
+
+        A path no longer in this gallery (the file moved, or a folder switch
+        happened mid-selection) - or one whose identity can no longer be
+        established (see IdentityUnavailable) - is skipped and reported
+        rather than aborting the whole batch: a large multi-select is exactly
+        the case likely to include a few stale ones, and everything already
+        applied before that point has already been persisted (each
+        `set_review_status` commits on its own), so an abort would silently
+        throw away real, saved progress along with the report of what went
+        wrong.
+        """
+        applied = 0
+        failed: list[str] = []
+        for image_path in image_paths:
+            try:
+                self.set_review_status(image_path, status)
+            except (KeyError, IdentityUnavailable):
+                failed.append(image_path)
+            else:
+                applied += 1
+        return {"applied": applied, "failed": failed}
+
+    def apply_ai_suggestions(self) -> dict:
+        """Bulk-accept the AI's CURRENT suggestion for every ranked image
+        still Neutral - a fast starting point for a very large shoot: review
+        the exceptions by hand, let this handle the rest.
+
+        Every image it touches becomes a real, independent, explicit Keep or
+        Reject the moment this runs, indistinguishable afterwards from one
+        set by hand - not an ongoing tie to the model or the threshold. Never
+        touches an image the photographer has already ruled on (Keep or
+        Reject), and never touches one the AI has no opinion about
+        (unranked) - both are left exactly as they were.
+        """
+        suggestions = self._ai_suggestions()
+        applied = 0
+        for image in self.images:
+            if image.review_status != REVIEW_STATUS_NEUTRAL:
+                continue
+            suggestion = suggestions.get(image.image_path)
+            if suggestion is None:
+                continue
+            self.set_review_status(image.image_path, suggestion)
+            applied += 1
+        return {"applied": applied}
 
     def _image_for(self, image_path: str) -> ReviewImage:
         key = _key(image_path)
@@ -346,18 +447,20 @@ class ReviewSession:
         raise KeyError(f"{image_path} is not part of this review session")
 
     def arrange(self, *, dry_run: bool = False) -> OrganizeResult:
-        """File the shoot: selected to `_Selected`, rejected to `_Rejected`.
-
-        Unranked, undecided images are passed to neither list, so they are left
-        exactly where they are - the app never moves a file it has no basis for
-        classifying.
+        """File the shoot by the photographer's OWN review status alone: Keep
+        to `_Selected`, Reject to `_Rejected`, Neutral left exactly where it
+        is - ranked highly by the AI or not. The ranking never files anything
+        by itself; only an explicit Keep or Reject does, whether set one
+        image at a time or through a bulk action.
 
         On a real run the ranking and the stored decisions are both repointed
         at the new locations, so the folder can be reviewed again afterwards.
         """
+        if self.input_folder is None:
+            raise ValueError("No folder is open to arrange.")
         result = organize_by_decision(
-            self.selected_paths(),
-            self.rejected_paths(),
+            self.keep_paths(),
+            self.reject_paths(),
             self.input_folder,
             dry_run=dry_run,
             announce=False,
