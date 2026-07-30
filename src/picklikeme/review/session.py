@@ -392,34 +392,75 @@ class ReviewSession:
 
         Purely informational - for evaluating the model against real human
         judgement over time, e.g. across successive training runs. Never
-        read by review_status, ai_suggestion, or arrange().
+        read by review_status, ai_suggestion, or arrange(). The one place
+        this comparison is computed at all - the panel and
+        evaluation_report.py both read this same dict, so the two can never
+        disagree about a number.
+
+        The full 2x2 confusion matrix (AI Keep/Reject x User Keep/Reject)
+        and precision/recall/F1 treat Keep as the positive class and the
+        photographer's own review_status as ground truth: precision is "of
+        what the AI suggested keeping, how much did the photographer also
+        keep"; recall is "of what the photographer kept, how much did the
+        AI also suggest keeping".
         """
         suggestions = self._ai_suggestions()
         compared = 0
-        agree = 0
+        ai_keep_user_keep = 0
         ai_keep_user_reject = 0
         ai_reject_user_keep = 0
+        ai_reject_user_reject = 0
         for image in self.images:
             suggestion = suggestions.get(image.image_path)
             if suggestion is None or image.review_status == REVIEW_STATUS_NEUTRAL:
                 continue
             compared += 1
-            if image.review_status == suggestion:
-                agree += 1
+            if suggestion == REVIEW_STATUS_KEEP and image.review_status == REVIEW_STATUS_KEEP:
+                ai_keep_user_keep += 1
             elif suggestion == REVIEW_STATUS_KEEP:
                 ai_keep_user_reject += 1
-            else:
+            elif image.review_status == REVIEW_STATUS_KEEP:
                 ai_reject_user_keep += 1
-        disagree = compared - agree
+            else:
+                ai_reject_user_reject += 1
+
+        agree = ai_keep_user_keep + ai_reject_user_reject
+        disagree = ai_keep_user_reject + ai_reject_user_keep
+        predicted_keep = ai_keep_user_keep + ai_keep_user_reject
+        actual_keep = ai_keep_user_keep + ai_reject_user_keep
+        precision = ai_keep_user_keep / predicted_keep if predicted_keep else None
+        recall = ai_keep_user_keep / actual_keep if actual_keep else None
+        f1 = 2 * precision * recall / (precision + recall) if precision and recall else None
         return {
             "compared": compared,
             "agree": agree,
             "disagree": disagree,
             "agree_percent": round(100 * agree / compared, 1) if compared else None,
             "disagree_percent": round(100 * disagree / compared, 1) if compared else None,
+            "ai_keep_user_keep": ai_keep_user_keep,
             "ai_keep_user_reject": ai_keep_user_reject,
             "ai_reject_user_keep": ai_reject_user_keep,
+            "ai_reject_user_reject": ai_reject_user_reject,
+            "precision": precision,
+            "recall": recall,
+            "f1": f1,
         }
+
+    def disagreements(self) -> list["ReviewImage"]:
+        """Every image where the AI's suggestion and the photographer's own
+        review status are both present and do not match - the "Detailed
+        Differences" the evaluation report lists individually. Neutral is
+        excluded for the same reason agreement_stats() excludes it: it is
+        not a disagreement, it is no opinion yet."""
+        suggestions = self._ai_suggestions()
+        result = []
+        for image in self.images:
+            suggestion = suggestions.get(image.image_path)
+            if suggestion is None or image.review_status == REVIEW_STATUS_NEUTRAL:
+                continue
+            if image.review_status != suggestion:
+                result.append(image)
+        return result
 
     # -- the photographer's review status ------------------------------------
 
@@ -439,6 +480,17 @@ class ReviewSession:
             "reject": len(self.reject_paths()),
             "neutral": len(self.neutral_paths()),
             "missing_file": sum(1 for i in self.images if i.missing_file),
+        }
+
+    def ai_suggestion_counts(self) -> dict[str, int]:
+        """The AI's own tally - how many ranked images it currently suggests
+        Keep vs Reject, independent of anything the photographer has
+        decided. See _ai_suggestions; a public wrapper exists because
+        evaluation_report.py, outside this class, needs the same tally."""
+        suggestions = self._ai_suggestions().values()
+        return {
+            "keep": sum(1 for s in suggestions if s == REVIEW_STATUS_KEEP),
+            "reject": sum(1 for s in suggestions if s == REVIEW_STATUS_REJECT),
         }
 
     def as_dict(self) -> dict:

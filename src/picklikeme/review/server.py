@@ -157,6 +157,41 @@ class ReviewRequestHandler(AnnotationRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _serve_evaluation_report(self, fmt: str) -> None:
+        """The evaluation report - see evaluation_report.py - as a download.
+
+        Same `Content-Disposition: attachment` pattern as `_serve_save_jpeg`:
+        a real navigation (see page.py's `exportEvaluationReport`), not a
+        fetch, so the browser's own Save As/download handling takes over.
+        Standalone by design - meant to be archived next to a shoot or a
+        training run and compared against another version's report later.
+        """
+        from .evaluation_report import build_evaluation_report_csv, build_evaluation_report_html
+
+        folder = self.session.input_folder
+        stem = folder.name if folder else "review"
+        try:
+            if fmt == "csv":
+                body = build_evaluation_report_csv(self.session)
+                content_type = "text/csv; charset=utf-8"
+            else:
+                body = build_evaluation_report_html(self.session)
+                content_type = "text/html; charset=utf-8"
+        except Exception as exc:  # noqa: BLE001 - reported to the UI, never a crash
+            logger.exception("Could not build the evaluation report")
+            self._send_json({"error": f"could not build the evaluation report: {exc}"}, status=500)
+            return
+
+        data = body.encode("utf-8")
+        filename = f"{stem}_evaluation_report.{fmt}"
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(data)
+
     def _serve_preview(self) -> None:
         """The Lightbox's full-size preview - overrides the inherited
         version (still used, unchanged, by the analysis report) to back it
@@ -204,6 +239,12 @@ class ReviewRequestHandler(AnnotationRequestHandler):
             return
         if route == "/save-jpeg":
             self._serve_save_jpeg()
+            return
+        if route == "/evaluation-report.html":
+            self._serve_evaluation_report("html")
+            return
+        if route == "/evaluation-report.csv":
+            self._serve_evaluation_report("csv")
             return
         if route == "/api/review/state":
             self._send_json(self._state_payload())

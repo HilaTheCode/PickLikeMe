@@ -1320,6 +1320,20 @@ async function doArrange(){
   finally{ PLM.busy = false; q('#go').disabled = false; q('#dlg').close(); }
 }
 
+// A real navigation, exactly like Lightbox's saveJpeg: the server answers
+// with Content-Disposition: attachment (see server.py's
+// _serve_evaluation_report), so the browser's own download handling takes
+// over rather than this page trying to save the file itself.
+function exportEvaluationReport(fmt){
+  const a = document.createElement('a');
+  a.href = 'evaluation-report.' + fmt;
+  a.download = '';
+  a.rel = 'noopener';
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+}
+
 async function boot(){
   const theme = q('#theme');
   // The button exists (see build_page), and setTheme has already labelled it
@@ -1353,6 +1367,8 @@ async function boot(){
   q('#relocate-go').addEventListener('click', () => { q('#relocate-dlg').close(); relocateFolder(); });
   q('#relocate-later').addEventListener('click', () => { PLM.relocateDismissed = true; q('#relocate-dlg').close(); });
   q('#apply-ai').addEventListener('click', applyAiSuggestions);
+  q('#export-report').addEventListener('click', () => exportEvaluationReport('html'));
+  q('#export-report-csv').addEventListener('click', () => exportEvaluationReport('csv'));
   q('#go').addEventListener('click', confirmArrange);
   q('#dlg-cancel').addEventListener('click', () => q('#dlg').close());
   q('#dlg-go').addEventListener('click', doArrange);
@@ -1513,6 +1529,10 @@ def build_page(title: str = "PickLikeMe Review") -> str:
     <div class="panel-section" id="agreement-section" style="display:none">
       <h3>AI Agreement</h3>
       <div class="agreement-stats" id="agreement-stats"></div>
+      <div class="panel-row">
+        <button id="export-report" title="A standalone HTML report - agreement, confusion matrix, precision/recall/F1 and every disagreement - to archive and compare across model versions">Export Evaluation Report</button>
+        <button id="export-report-csv" title="Just the per-image differences table, as CSV">CSV</button>
+      </div>
     </div>
   </aside>
 </div>

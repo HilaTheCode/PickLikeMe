@@ -460,6 +460,84 @@ class AgreementStatsTests(SessionTestCase):
 
         self.assertEqual(stats["compared"], 0, "the AI has no opinion about an unranked image")
 
+    def test_the_full_confusion_matrix_is_reported(self):
+        shoot, images, _ = build_shoot(self.root, ranked=4)
+        session = self.session(shoot, keep_percent=50)  # AI keeps images[0:2], rejects images[2:4]
+        session.set_review_status(str(images[0]), REVIEW_STATUS_KEEP)     # AI keep / user keep
+        session.set_review_status(str(images[1]), REVIEW_STATUS_REJECT)  # AI keep / user reject
+        session.set_review_status(str(images[2]), REVIEW_STATUS_KEEP)    # AI reject / user keep
+        session.set_review_status(str(images[3]), REVIEW_STATUS_REJECT)  # AI reject / user reject
+
+        stats = session.agreement_stats()
+
+        self.assertEqual(stats["ai_keep_user_keep"], 1)
+        self.assertEqual(stats["ai_keep_user_reject"], 1)
+        self.assertEqual(stats["ai_reject_user_keep"], 1)
+        self.assertEqual(stats["ai_reject_user_reject"], 1)
+        self.assertEqual(stats["agree"], 2)
+        self.assertEqual(stats["disagree"], 2)
+
+    def test_precision_recall_and_f1_use_review_status_as_ground_truth(self):
+        """Precision: of what the AI suggested keeping, how much did the
+        photographer also keep. Recall: of what the photographer kept, how
+        much did the AI also suggest keeping. Keep is the positive class."""
+        shoot, images, _ = build_shoot(self.root, ranked=4)
+        session = self.session(shoot, keep_percent=50)
+        session.set_review_status(str(images[0]), REVIEW_STATUS_KEEP)     # TP
+        session.set_review_status(str(images[1]), REVIEW_STATUS_REJECT)  # FP (AI keep, user reject)
+        session.set_review_status(str(images[2]), REVIEW_STATUS_KEEP)    # FN (AI reject, user keep)
+        session.set_review_status(str(images[3]), REVIEW_STATUS_REJECT)  # TN
+
+        stats = session.agreement_stats()
+
+        # precision = TP / (TP + FP) = 1 / 2; recall = TP / (TP + FN) = 1 / 2
+        self.assertAlmostEqual(stats["precision"], 0.5)
+        self.assertAlmostEqual(stats["recall"], 0.5)
+        self.assertAlmostEqual(stats["f1"], 0.5)
+
+    def test_precision_recall_and_f1_are_none_when_nothing_is_comparable(self):
+        shoot, _, _ = build_shoot(self.root, ranked=4)
+        session = self.session(shoot, keep_percent=50)
+
+        stats = session.agreement_stats()
+
+        self.assertIsNone(stats["precision"])
+        self.assertIsNone(stats["recall"])
+        self.assertIsNone(stats["f1"])
+
+    def test_precision_is_none_when_the_ai_never_suggested_keep(self):
+        shoot, images, _ = build_shoot(self.root, ranked=2)
+        session = self.session(shoot, keep_percent=0)  # AI rejects everything
+        session.set_review_status(str(images[0]), REVIEW_STATUS_REJECT)
+        session.set_review_status(str(images[1]), REVIEW_STATUS_KEEP)
+
+        stats = session.agreement_stats()
+
+        self.assertIsNone(stats["precision"], "nothing was predicted keep, so precision is undefined")
+        self.assertEqual(stats["recall"], 0.0, "the one real keep was missed entirely")
+
+
+class DisagreementsTests(SessionTestCase):
+    """The evaluation report's "Detailed Differences" - every image where
+    the AI and the photographer's own review status disagree."""
+
+    def test_lists_only_the_disagreeing_images(self):
+        shoot, images, _ = build_shoot(self.root, ranked=4)
+        session = self.session(shoot, keep_percent=50)
+        session.set_review_status(str(images[0]), REVIEW_STATUS_KEEP)     # agrees
+        session.set_review_status(str(images[1]), REVIEW_STATUS_REJECT)  # disagrees
+
+        disagreeing = session.disagreements()
+
+        self.assertEqual([i.image_path for i in disagreeing], [str(images[1])])
+
+    def test_neutral_and_unranked_images_are_never_listed(self):
+        shoot, images, extra = build_shoot(self.root, ranked=2, unranked=1)
+        session = self.session(shoot, keep_percent=50)
+        session.set_review_status(str(extra[0]), REVIEW_STATUS_KEEP)
+
+        self.assertEqual(session.disagreements(), [])
+
 
 class MissingDataTests(SessionTestCase):
     def test_an_image_absent_from_the_ranking_still_appears(self):

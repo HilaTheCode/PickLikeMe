@@ -7,6 +7,8 @@ weaken it: the same path confinement must still apply, and the review page must
 not have opened a way to read files outside the folder under review.
 """
 
+import csv
+import io
 import json
 import re
 import shutil
@@ -670,6 +672,35 @@ class SaveJpegEndpointTests(ReviewServerTestCase):
         self.assertEqual(ctx.exception.code, 404)
 
 
+class EvaluationReportEndpointTests(ReviewServerTestCase):
+    """The "Export Evaluation Report" button - see evaluation_report.py.
+    Both formats are downloads, the same as /save-jpeg: the response must
+    carry Content-Disposition: attachment, not render inline."""
+
+    def test_the_html_report_is_offered_as_a_download(self):
+        with urllib.request.urlopen(self.base + "/evaluation-report.html") as response:
+            self.assertEqual(response.headers["Content-Type"], "text/html; charset=utf-8")
+            self.assertIn("attachment", response.headers["Content-Disposition"])
+            self.assertIn(".html", response.headers["Content-Disposition"])
+            body = response.read().decode("utf-8")
+        self.assertIn(self.shoot.name, body)
+        self.assertIn("Evaluation Report", body)
+
+    def test_the_csv_report_is_offered_as_a_download(self):
+        self.post("/api/review/status", {"image_path": str(self.images[0]), "status": "keep"})
+        self.post("/api/review/status", {"image_path": str(self.images[-1]), "status": "keep"})
+
+        with urllib.request.urlopen(self.base + "/evaluation-report.csv") as response:
+            self.assertEqual(response.headers["Content-Type"], "text/csv; charset=utf-8")
+            self.assertIn("attachment", response.headers["Content-Disposition"])
+            self.assertIn(".csv", response.headers["Content-Disposition"])
+            body = response.read().decode("utf-8")
+
+        rows = list(csv.reader(io.StringIO(body)))
+        self.assertEqual(rows[0], ["file_name", "ai_decision", "user_decision", "ai_score"])
+        self.assertEqual(len(rows) - 1, len(self.session.disagreements()))
+
+
 class LightboxMarkupTests(unittest.TestCase):
     """Structural checks on the Lightbox module, with no server involved.
 
@@ -1273,6 +1304,41 @@ class AgreementStatsMarkupTests(unittest.TestCase):
         self.assertIsNotNone(fn, "renderAgreementStats not found")
         self.assertIn("!agreement.compared", fn.group(1))
         self.assertIn("section.style.display = 'none'", fn.group(1))
+
+
+class EvaluationReportMarkupTests(unittest.TestCase):
+    """The "Export Evaluation Report" buttons - live in the same panel
+    section as AI Agreement, since a report only means something once there
+    is something to compare."""
+
+    def test_both_export_buttons_exist_in_the_agreement_section(self):
+        from picklikeme.review.page import build_page
+
+        html = build_page()
+        section = re.search(r'<div class="panel-section" id="agreement-section".*?</div>\s*</div>', html, re.S)
+        self.assertIsNotNone(section, "agreement-section not found")
+        self.assertIn('id="export-report"', section.group(0))
+        self.assertIn('id="export-report-csv"', section.group(0))
+
+    def test_both_buttons_are_wired_to_the_download_helper(self):
+        from picklikeme.review.page import build_js
+
+        js = build_js()
+        self.assertIn("function exportEvaluationReport(fmt){", js)
+        self.assertIn("q('#export-report').addEventListener('click', () => exportEvaluationReport('html'))", js)
+        self.assertIn("q('#export-report-csv').addEventListener('click', () => exportEvaluationReport('csv'))", js)
+
+    def test_the_download_is_a_real_navigation_not_a_fetch(self):
+        """Same pattern as saveJpeg: an <a download> click, so the browser's
+        own Content-Disposition handling takes over rather than JS trying to
+        save the response itself."""
+        from picklikeme.review.page import build_js
+
+        js = build_js()
+        fn = re.search(r"function exportEvaluationReport\(fmt\)\{(.*?)\n\}", js, re.S)
+        self.assertIsNotNone(fn, "exportEvaluationReport not found")
+        self.assertIn("a.href = 'evaluation-report.' + fmt", fn.group(1))
+        self.assertIn("a.download = ''", fn.group(1))
 
 
 class RelocateFolderMarkupTests(unittest.TestCase):
