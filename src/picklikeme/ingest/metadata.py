@@ -15,7 +15,10 @@ overhead negligible across a large archive.
 from __future__ import annotations
 
 import json
+import os
+import shutil
 import subprocess
+import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -55,14 +58,53 @@ class ExifToolNotFoundError(RuntimeError):
     pass
 
 
+def _resolve_exiftool_path(exiftool_path: str | None) -> str | None:
+    if exiftool_path:
+        candidate = Path(exiftool_path)
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+        if candidate.is_file():
+            return str(candidate)
+        if shutil.which(exiftool_path):
+            return shutil.which(exiftool_path)
+        if exiftool_path != "exiftool":
+            return None
+
+    candidates = ["exiftool"]
+    if sys.platform == "darwin":
+        candidates.extend(["/opt/homebrew/bin/exiftool", "/usr/local/bin/exiftool"])
+    elif os.name == "nt":
+        candidates.extend([r"C:\\Windows\\System32\\exiftool.exe", r"C:\\exiftool\\exiftool.exe"])
+
+    for candidate in candidates:
+        resolved = shutil.which(candidate) if candidate == "exiftool" else candidate
+        if resolved is None:
+            continue
+        if isinstance(resolved, str) and Path(resolved).is_file():
+            return resolved
+
+    return None
+
+
 def ensure_exiftool_available(exiftool_path: str) -> None:
+    resolved = _resolve_exiftool_path(exiftool_path)
+    if resolved is None:
+        details = [
+            "Install ExifTool from https://exiftool.org",
+            "On macOS, Homebrew users can run: brew install exiftool",
+            "On Windows, ensure exiftool.exe is on PATH or pass --exiftool-path",
+        ]
+        raise ExifToolNotFoundError(
+            f"exiftool was not found. Provide a valid path or install it first.\n"
+            + "\n".join(details)
+        )
+
     try:
-        subprocess.run([exiftool_path, "-ver"], capture_output=True, check=True)
+        subprocess.run([resolved, "-ver"], capture_output=True, check=True)
     except (OSError, subprocess.CalledProcessError) as exc:
         raise ExifToolNotFoundError(
-            f"exiftool not found or not runnable at '{exiftool_path}'. "
-            "Install it from https://exiftool.org (rename exiftool(-k).exe to "
-            "exiftool.exe and put it on PATH), or pass --exiftool-path."
+            f"exiftool is installed but could not be executed at '{resolved}'. "
+            "Check that the binary is runnable and not blocked by permissions or a broken install."
         ) from exc
 
 

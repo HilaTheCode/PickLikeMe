@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pandas as pd
 
+from ..platform import print_environment_status
 from .manifest import build_manifest, save_manifest
 from .metadata import ExifToolNotFoundError
 from .preview import generate_previews
@@ -121,6 +122,7 @@ def _arrange_species_command(args: argparse.Namespace) -> None:
 
 
 def main(argv: list[str] | None = None) -> None:
+    print_environment_status()
     parser = argparse.ArgumentParser(prog="picklikeme", description="Pick Like Me ingestion pipeline")
     sub = parser.add_subparsers(dest="command", required=True)
 

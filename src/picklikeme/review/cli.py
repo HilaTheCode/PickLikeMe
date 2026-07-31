@@ -23,6 +23,7 @@ from pathlib import Path
 
 from ..config import cli_prefix
 from ..organize import DEFAULT_SELECTION_PERCENTAGE
+from ..platform import print_environment_status
 from ..sidecar import RANKING_FILENAME, SIDECAR_DIRNAME, has_ranking, ranking_path
 
 logger = logging.getLogger("picklikeme.review")
@@ -97,6 +98,7 @@ def run_review(args: argparse.Namespace) -> int:
     from .thumbnails import DEFAULT_PREVIEW_CACHE_MAX_BYTES, close_detections
 
     _configure_logging(getattr(args, "verbose", False))
+    print_environment_status()
 
     if args.ranking and not args.input:
         raise SystemExit("--ranking requires --input (it says which ranking belongs to that folder).")
