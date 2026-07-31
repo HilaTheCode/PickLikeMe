@@ -161,6 +161,15 @@ def test_open_folder_failure_restores_previous_session(monkeypatch, tmp_path) ->
         return DummyThread()
 
     monkeypatch.setattr("picklikeme.desktop.main_window.run_in_background", fake_run_in_background)
+    # _start_open_folder now clears _open_folder_in_progress synchronously
+    # (P1 fix) instead of waiting for the loading timer to tick, so this
+    # second call actually reaches _handle_open_folder_failure's
+    # QMessageBox.warning() instead of being silently dropped by the
+    # "already loading" guard. That warning() is a real, correct modal for
+    # an interactive session, but exec()s a nested event loop that never
+    # returns under the offscreen test platform - stub it out, same as
+    # test_desktop_workflow.py already does for loupe_dialog's QMessageBox.
+    monkeypatch.setattr("picklikeme.desktop.main_window.QMessageBox.warning", staticmethod(lambda *a, **k: None))
     window._folder_load_snapshot = {"folder": str(previous_folder)}
     window._start_open_folder(str(tmp_path / "new"))
 

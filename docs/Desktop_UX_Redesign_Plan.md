@@ -346,3 +346,42 @@ Every prior milestone was validated with offscreen smoke tests that checked for 
 **Known gap, not fixed (out of scope for this redesign):** `MainWindow`'s `QSettings("PeakPic", "PeakPicDesktop")` has no test/dev isolation — every construction (real app, pytest, or an ad-hoc script) reads/writes the same real per-machine settings store. Screenshot scripts during this phase, and apparently the pre-existing pytest suite too, accumulated test-path artifacts in real user settings; cleaned up manually after each test run. Worth a dedicated test-isolation fix (e.g. `QSettings::IniFormat` pointed at a tmp path in tests) at some point, but that's test infrastructure, not desktop presentation-layer work.
 
 Every milestone was validated against the existing desktop regression suite (30 tests) plus either an offscreen-Qt smoke test or, from Phase 4 onward, actual captured screenshots read and inspected before considering a fix complete - and committed separately per the user's instruction.
+
+---
+
+## Stabilization & Performance Sprint (post-redesign)
+
+Scope: fix regressions only. No architecture changes, no ReviewSession/ReviewService/JobManager/AI-pipeline rewrites.
+
+### Priority 1 — Open Folder blocks on a modal "Loading categories…" dialog
+
+**Symptom:** opening a ~4,400-image folder shows the gallery almost immediately, but a *modal* `QProgressDialog` stays up ("Loading categories…", ~1%/min or slower), blocking all interaction even though the gallery is already usable. The web app opens the same folder fast with no equivalent block.
+
+**Method:** traced Desktop's and Web's open-folder code paths line-by-line (not guessed), then benchmarked the backend in isolation to separate "shared backend cost" from "desktop-only UI behavior."
+
+**Desktop vs Web comparison** (both call the identical `ReviewSession.open_folder()` → `.load()`):
+
+| Stage | Web | Desktop (before fix) | Blocking? | Execution time (4,400 imgs) | Purpose |
+|---|---|---|---|---|---|
+| Folder enumeration + ranked-file merge | ✅ | ✅ | Both: yes, briefly | ~0.26s | List files, merge any existing ranking CSV |
+| `ReviewSession.load()` background thread spawn | ✅ | ✅ | Neither (backgrounded) | n/a (async) | Kicks off per-image metadata fill |
+| Bounded 0.15s join on that thread | ✅ | ✅ | Both: yes, capped at 150ms | ≤0.15s | Lets a small/fast folder finish inline |
+| Initial HTTP/IPC response → gallery renders | ✅ (`setLoading` off after `await api()`) | ✅ (`_refresh_from_state`) | Both: no, once response lands | fast | Gallery becomes usable |
+| Remaining `captured_at` / `detected_category` backfill (per-image `AnnotationStore` SQLite lookups) | ✅ runs on | ✅ runs on | **Web: no** (status line only) / **Desktop (before): yes** (modal stays open) | 2.3–3.3s cold (0.53–0.75ms/img), ~0.1ms/img warm | Fills fields the gallery doesn't even display |
+| Surfacing ongoing background progress | Plain non-blocking status line (`page.py` `say(stageText)`) | Modal `QProgressDialog`, `Qt.WindowModal`, closed only on full completion | **Desktop was the outlier** | — | — |
+
+**Root cause:** Desktop-specific UI code, not the shared backend. `_start_open_folder()` kept the modal `QProgressDialog` open until `ReviewSession`'s background thread fully finished (`_finish_open_folder`, driven by a timer polling `loading_state()`), instead of closing it once the gallery already had real data — mirroring the web app's `setLoading(false)` immediately after its initial request, well before its own background categorization finishes (`page.py`'s `switchFolder()` / `render()`'s `stageText` status line).
+
+A secondary, real cost was also measured and is worth recording even though it wasn't the primary regression: `AnnotationStore._cached_per_file()` commits every row individually (`with self._conn: INSERT OR REPLACE ...`) instead of batching. Isolated benchmark: 4,400 individual commits = 6.3s (1.43ms/commit) vs. one batched commit for the same rows = 0.005s — a 1327x difference. This cost is paid identically by Web and Desktop, so it is *not* "the" desktop regression, and per the "do not rewrite the backend" constraint it was **not touched**. Flagging it here as a follow-up candidate: it likely explains a meaningful share of the real-world "~1%/minute" the user observed on actual RAW files (the synthetic-JPEG benchmark above shows the commit overhead in isolation but can't reproduce real RAW decode cost or antivirus/disk interference on the user's machine, so it should be read as a lower bound, not the full explanation).
+
+**Fix (main_window.py):** decoupled the modal dialog's lifetime from full background completion.
+- Added `_background_load_active`, tracked separately from `_open_folder_in_progress`. The former stays true only long enough to keep the status-bar progress ticking; the latter now clears the moment the gallery has data.
+- `_start_open_folder()` now closes the modal dialog and clears `_open_folder_in_progress` right after `_refresh_from_state(result)` — as soon as scores, ranks, thumbnails, and review status are populated — instead of waiting for `captured_at`/`detected_category` (fields the gallery never displays) to finish loading.
+- Remaining background progress now only updates the status bar (`_loading_progress` bar, previously created but never made visible — a second, smaller pre-existing bug fixed along the way — plus `_set_status()` text), matching the web app's non-blocking status line exactly.
+- `_poll_loading_state()`'s guard switched from `_open_folder_in_progress` to `_background_load_active` so status-bar polling keeps running for the remainder of the background pass without a modal gating it.
+
+**Bug found and fixed while implementing this:** `QProgressDialog.close()`/`.cancel()` emits its own `canceled` signal whenever the dialog hasn't reached its maximum value — true for every one of these now-earlier programmatic closes. Left connected, that signal re-entered `_cancel_open_folder()`, which would incorrectly restore the *previous* session right after a folder had just opened successfully (and, in a narrower ordering, threw `AttributeError` from re-entrant `deleteLater()` on an already-cleared dialog reference). Fixed by disconnecting `canceled` and clearing `self._folder_load_dialog` *before* calling `.close()`/`.deleteLater()` in `_hide_folder_load_dialog()`, so any re-entrant call sees `None` and no-ops, and `close()` can no longer trigger a cancel at all.
+
+**Result:** time-to-usable-gallery is unchanged (it was already fast); time-to-interactive now matches it, instead of waiting for the full background metadata pass. Desktop's behavior now matches Web's: initial render blocks briefly, background categorization never blocks again.
+
+**Test fallout:** `test_open_folder_failure_restores_previous_session` (tests/test_desktop_shell.py) started hanging under the offscreen Qt test platform once `_open_folder_in_progress` began clearing synchronously instead of only via the timer — a second, unmonkeypatched `_start_open_folder()` call in that test used to be silently no-op'd by the (accidental, timing-dependent) "already loading" guard, and now genuinely reaches `_handle_open_folder_failure()`'s `QMessageBox.warning()`, which blocks forever with no one to click it under `QT_QPA_PLATFORM=offscreen`. Fixed by stubbing `QMessageBox.warning` in that test, the same pattern `test_desktop_workflow.py` already uses for `loupe_dialog`'s message boxes. All 30 desktop tests pass.

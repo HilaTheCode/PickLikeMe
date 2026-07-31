@@ -102,6 +102,13 @@ class MainWindow(QMainWindow):
         self._last_counts: dict[str, Any] = {}
         self._active_threads: list[Any] = []  # keeps background QThreads alive while running
         self._open_folder_in_progress = False
+        # True from the moment a folder-open starts until the SESSION's own
+        # background metadata thread reports complete=True - independent of
+        # _open_folder_in_progress, which now clears as soon as the gallery
+        # has real data (see _start_open_folder). Keeps _poll_loading_state
+        # ticking (status bar text/progress) for the remainder of that
+        # background work without a modal dialog gating it.
+        self._background_load_active = False
         self._open_folder_generation = 0
         self._open_folder_thread: Any | None = None
         self._folder_load_dialog: QProgressDialog | None = None
@@ -548,10 +555,23 @@ class MainWindow(QMainWindow):
         self._folder_load_dialog.show()
 
     def _hide_folder_load_dialog(self) -> None:
-        if self._folder_load_dialog is not None:
-            self._folder_load_dialog.close()
-            self._folder_load_dialog.deleteLater()
-            self._folder_load_dialog = None
+        # QProgressDialog emits `canceled` from close()/cancel() whenever the
+        # dialog hasn't reached its maximum value yet - true for every
+        # programmatic close in this codebase now that the dialog is closed
+        # as soon as the gallery is usable, not once the background load
+        # hits 100%. Left connected, that would re-enter
+        # _cancel_open_folder() and wrongly restore the previous session
+        # right after a successful open. Clear the reference and disconnect
+        # before close() so: (a) a reentrant call here sees None and no-ops
+        # instead of hitting a deleted dialog, and (b) close() cannot fire
+        # _cancel_open_folder() at all.
+        dialog = self._folder_load_dialog
+        if dialog is None:
+            return
+        self._folder_load_dialog = None
+        dialog.canceled.disconnect(self._cancel_open_folder)
+        dialog.close()
+        dialog.deleteLater()
 
     def open_folder(self, folder: str) -> dict[str, Any]:
         return self._start_open_folder(folder)
@@ -567,9 +587,11 @@ class MainWindow(QMainWindow):
         self._open_folder_generation += 1
         generation = self._open_folder_generation
         self._open_folder_in_progress = True
+        self._background_load_active = True
         self._thumbnail_generation_count = 0
         self._metadata_loaded_count = 0
         self._last_loading_stage = None
+        self._loading_progress.setVisible(True)
         self._loading_timer.start()
         self._show_folder_load_dialog(folder_path)
         self._set_status(f"Opening {folder_path}")
@@ -595,6 +617,29 @@ class MainWindow(QMainWindow):
         self.state.image_count = result.get("counts", {}).get("total", 0)
         self._refresh_from_state(result)
 
+        # The gallery now has real data - scores, ranks, thumbnails, review
+        # status - and is fully usable. What's still running in the
+        # background (ReviewSession's own thread) only fills in captured_at
+        # and detected_category, neither of which the gallery even
+        # displays, so there is nothing left worth blocking on. Close the
+        # modal here instead of waiting for that background work to finish -
+        # matches the web review UI, whose own blocking overlay likewise
+        # only spans the initial request/response, never the background
+        # metadata pass that follows it (page.py's switchFolder(): setLoading
+        # is off before the background thread on the server side is done -
+        # only a plain status line reflects it from then on, same as
+        # _loading_progress/_status_message_label already do here).
+        self._hide_folder_load_dialog()
+        self._open_folder_in_progress = False
+        loading = result.get("loading", {})
+        if loading.get("complete", True):
+            self._background_load_active = False
+            self._loading_timer.stop()
+            self._loading_progress.setVisible(False)
+            self._set_status(f"Opened {self.state.current_folder}")
+        else:
+            self._set_status(f"Opened {self.state.current_folder} - loading capture dates and categories in the background…")
+
         if run_in_background is not _real_run_in_background:
             self._open_folder_thread = run_in_background(
                 self,
@@ -617,6 +662,8 @@ class MainWindow(QMainWindow):
             return
         self._loading_timer.stop()
         self._open_folder_in_progress = False
+        self._background_load_active = False
+        self._loading_progress.setVisible(False)
         self._open_folder_thread = None
         self._hide_folder_load_dialog()
         if result is not None:
@@ -635,14 +682,23 @@ class MainWindow(QMainWindow):
             )
             self._set_status(f"Opened {self.state.current_folder}")
         else:
+            # Reached from _poll_loading_state once the background thread's
+            # own loading.complete becomes True - the modal was already
+            # closed back in _start_open_folder as soon as the gallery had
+            # data, so this is purely "the background metadata pass just
+            # finished", not "the folder just became usable".
             self._refresh_from_state(self.service.load_session())
+            if self.state.current_folder:
+                self._set_status(f"Opened {self.state.current_folder} - capture dates and categories finished loading")
 
     def _cancel_open_folder(self) -> None:
         if not self._open_folder_in_progress:
             return
         self._folder_load_cancelled = True
         self._open_folder_in_progress = False
+        self._background_load_active = False
         self._loading_timer.stop()
+        self._loading_progress.setVisible(False)
         self.service.session._loading_generation += 1
         self._restore_previous_session()
         self._hide_folder_load_dialog()
@@ -664,7 +720,7 @@ class MainWindow(QMainWindow):
         self._refresh_from_state(self.service.load_session())
 
     def _poll_loading_state(self) -> None:
-        if not self._open_folder_in_progress:
+        if not self._background_load_active:
             return
         # loading_state() is a cheap dict read; load_session() rebuilds the
         # full images list (as_dict() over every image, O(n)) and feeds
