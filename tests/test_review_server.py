@@ -1175,22 +1175,23 @@ class GalleryFilterTests(unittest.TestCase):
         self.assertIn("if(PLM.filter === 'all') return images;", body)
         self.assertIn("i.review_status === PLM.filter", body)
 
-    def test_ai_keep_ai_reject_and_differences_filters_exist(self):
+    def test_ai_keep_ai_reject_and_split_disagreement_filters_exist(self):
         from picklikeme.review.page import build_page, build_js
 
         html = build_page()
         self.assertIn('data-filter="ai_keep"', html)
         self.assertIn('data-filter="ai_reject"', html)
-        self.assertIn('data-filter="differences"', html)
+        self.assertIn('data-filter="ai_keep_user_reject"', html)
+        self.assertIn('data-filter="ai_reject_user_keep"', html)
+        self.assertNotIn('data-filter="differences"', html)
 
         js = build_js()
         filter_images = re.search(r"function filterImages\(images\)\{(.*?)\n\}", js, re.S)
         body = filter_images.group(1)
         self.assertIn("i.ai_suggestion === 'keep'", body)
         self.assertIn("i.ai_suggestion === 'reject'", body)
-        # A difference requires the AI to have an opinion AND the photographer
-        # to have actually decided (Neutral is "no opinion", not disagreement).
-        self.assertIn("i.ai_suggestion != null && i.review_status !== 'neutral' && i.review_status !== i.ai_suggestion", body)
+        self.assertIn("i.ai_suggestion === 'keep' && i.review_status === 'reject'", body)
+        self.assertIn("i.ai_suggestion === 'reject' && i.review_status === 'keep'", body)
 
     def test_filter_buttons_are_wired_to_set_filter(self):
         from picklikeme.review.page import build_js
@@ -1577,6 +1578,15 @@ class RelocateFolderMarkupTests(unittest.TestCase):
         fn = re.search(r"async function relocateFolder\(\)\{(.*?)\n\}", js, re.S)
         self.assertIsNotNone(fn, "relocateFolder not found")
         self.assertIn("api/review/relocate-folder", fn.group(1))
+
+
+class LightboxCropOverlayTests(unittest.TestCase):
+    def test_the_lightbox_has_a_crop_overlay_toggle_and_overlay_layer(self):
+        from picklikeme.review.page import build_page
+
+        html = build_page()
+        self.assertIn('id="lb-crop-toggle"', html)
+        self.assertIn('id="lb-crop-overlay"', html)
 
 
 class AutoCropEndpointTests(ReviewServerTestCase):

@@ -511,6 +511,21 @@ class ReviewSession:
             "reject": sum(1 for s in suggestions if s == REVIEW_STATUS_REJECT),
         }
 
+    def workflow_state(self) -> dict:
+        counts = self.counts()
+        reviewed = counts["keep"] + counts["reject"] > 0
+        ranked = bool(self.ranking_file and self.ranking_file.is_file())
+        return {
+            "stage": "folder" if self.input_folder is None else "review" if not ranked else "ranked",
+            "ranked": ranked,
+            "reviewed": reviewed,
+            "selected": counts["keep"],
+            "rejected": counts["reject"],
+            "imported": False,
+            "species": "pending",
+            "crop": "pending",
+        }
+
     def as_dict(self) -> dict:
         ai_suggestions = self._ai_suggestions()
         return {
@@ -523,6 +538,7 @@ class ReviewSession:
             "agreement": self.agreement_stats(),
             "warnings": list(self.warnings),
             "run": self.run_metadata,
+            "workflow": self.workflow_state(),
             "images": [image.as_dict(ai_suggestions.get(image.image_path)) for image in self.images],
         }
 

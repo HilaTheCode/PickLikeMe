@@ -52,7 +52,7 @@ class AnalysisConfig:
     selected_root: Path | None = None
     rejected_root: Path | None = None
     output_dir: Path = DEFAULT_RESULTS_DIR
-    report_title: str = "PickLikeMe model analysis"
+    report_title: str = "PeakPic model analysis"
 
     # Decision threshold applied to the probability (or score) to turn a
     # ranking into a keep/reject prediction.

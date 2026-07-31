@@ -1,1 +1,1 @@
-"""Pick Like Me package."""
+"""PeakPic package."""

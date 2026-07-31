@@ -25,12 +25,15 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from ..auto_crop import generate_lightroom_crops
+from ..bird_crop import NormalizedCrop
 from ..platform import launch_browser
+from ..workspace import WorkspaceManager
 
 from ..analyzer.annotations import AnnotationStore, InvalidReviewDecision, InvalidReviewReason
 from ..analyzer.os_actions import choose_folder
 from ..analyzer.server import HOST, AnnotationRequestHandler
 from ..identity import IdentityUnavailable
+from ..importer import import_selected_images
 from .page import build_page
 from .session import InvalidReviewStatus, ReviewSession
 from .thumbnails import DEFAULT_PREVIEW_CACHE_MAX_BYTES
@@ -57,6 +60,7 @@ class ReviewRequestHandler(AnnotationRequestHandler):
     # configurable via `picklikeme review --preview-cache-max-gb`, set as a
     # class attribute by make_review_server() the same way session/store are.
     preview_cache_max_bytes: int = DEFAULT_PREVIEW_CACHE_MAX_BYTES
+    workspace_manager: WorkspaceManager = WorkspaceManager()
 
     # -- helpers ------------------------------------------------------------
 
@@ -125,6 +129,65 @@ class ReviewRequestHandler(AnnotationRequestHandler):
         self.send_header("Cache-Control", "max-age=300")
         self.end_headers()
         self.wfile.write(data)
+
+    def _serve_crop_data(self) -> None:
+        """Return crop metadata for an image if it has an auto-crop result on disk."""
+        target = self._within_dataset(self._query_path())
+        if target is None:
+            return
+        if not target.is_file():
+            self._send_json({"error": "file not found (has it moved?)"}, status=404)
+            return
+
+        from ..analyzer.io import load_ranking
+        from ..bird_crop import compute_composition_crop
+        from ..thumbnails import detected_category_for
+
+        try:
+            from ..ingest.metadata import ensure_exiftool_available
+        except Exception:
+            ensure_exiftool_available = None
+
+        crop = None
+        try:
+            from ..exporters import EXPORTERS
+            from ..platform import resolve_torch_device
+            from ..raw_io import RawImageLoader
+            from ..bird_crop import BirdDetector, CropParams
+
+            input_folder = self.session.input_folder
+            if input_folder is None:
+                raise RuntimeError("No folder open")
+            raw_path = str(target)
+            if target.suffix.lower() != ".dng":
+                xmp_path = target.with_suffix('.xmp')
+                if xmp_path.exists():
+                    import xml.etree.ElementTree as ET
+
+                    tree = ET.parse(xmp_path)
+                    root = tree.getroot()
+                    ns = {'crs': 'http://ns.adobe.com/camera-raw-settings/1.0/'}
+                    crop_fields = {}
+                    for key in ('CropLeft', 'CropTop', 'CropRight', 'CropBottom', 'CropAngle'):
+                        value = root.find('.//crs:' + key, ns)
+                        if value is not None and value.text:
+                            crop_fields[key] = value.text
+                    if crop_fields:
+                        crop = {
+                            'left': float(crop_fields.get('CropLeft', '0')),
+                            'top': float(crop_fields.get('CropTop', '0')),
+                            'right': float(crop_fields.get('CropRight', '1')),
+                            'bottom': float(crop_fields.get('CropBottom', '1')),
+                            'angle': float(crop_fields.get('CropAngle', '0')),
+                        }
+        except Exception:
+            crop = None
+
+        if crop is None:
+            self._send_json({"ok": True, "crop": None})
+            return
+
+        self._send_json({"ok": True, "crop": crop})
 
     def _serve_save_jpeg(self) -> None:
         """The currently-viewed image as a downloadable JPEG.
@@ -240,6 +303,9 @@ class ReviewRequestHandler(AnnotationRequestHandler):
         if route == "/thumb":
             self._serve_thumbnail()
             return
+        if route == "/crop-data":
+            self._serve_crop_data()
+            return
         if route == "/save-jpeg":
             self._serve_save_jpeg()
             return
@@ -277,6 +343,7 @@ class ReviewRequestHandler(AnnotationRequestHandler):
             "/api/review/reconcile": self._post_reconcile,
             "/api/review/auto-crop": self._post_auto_crop,
             "/api/review/open-folder": self._post_open_folder,
+            "/api/review/import-selected": self._post_import_selected,
             "/api/review/relocate-folder": self._post_relocate_folder,
         }
         handler = handlers.get(route)
@@ -449,8 +516,27 @@ class ReviewRequestHandler(AnnotationRequestHandler):
             return
         self.session.open_folder(folder)
         self._retarget_dataset_roots()
+        self.workspace_manager.open_workspace(folder)
         recovered = self.session.reconcile_by_identity()
         self._send_json({"ok": True, "recovered": recovered, "state": self.session.as_dict()})
+
+    def _post_import_selected(self, payload: dict) -> None:
+        """Copy the current folder's selected images into a destination folder."""
+        if self.session.input_folder is None:
+            self._send_json({"ok": True, "cancelled": True, "state": self.session.as_dict()})
+            return
+
+        destination = choose_folder(initial_dir=self.session.input_folder)
+        if destination is None:
+            self._send_json({"ok": True, "cancelled": True, "state": self.session.as_dict()})
+            return
+
+        result = import_selected_images(
+            source_folder=self.session.input_folder,
+            destination_root=destination,
+            store=self.store,
+        )
+        self._send_json({"ok": True, "result": result, "state": self.session.as_dict()})
 
     def _post_relocate_folder(self, payload: dict) -> None:
         """The folder this session was reviewing can no longer be found at
@@ -518,10 +604,12 @@ def serve_review(
     url = f"http://{HOST}:{server.server_address[1]}/"
     counts = session.counts()
 
-    print(f"Review: {url}")
+    workflow = session.workflow_state()
+    print(f"PeakPic review: {url}")
     print(f"  folder:   {session.input_folder or '(none yet - use Open Folder in the page)'}")
     print(f"  ranking:  {session.ranking_file or '(none)'}")
     print(f"  images:   {counts['total']:,} ({counts['neutral']:,} still Neutral)")
+    print(f"  workflow: {workflow['stage']} | ranked={'✓' if workflow['ranked'] else '—'} | reviewed={'✓' if workflow['reviewed'] else '—'} | imported={'✓' if workflow['imported'] else '—'}")
     print(f"  database: {store.db_path}")
     print(f"  preview cache: max {preview_cache_max_bytes / 1024**3:.1f} GB")
     print("  Ctrl+C to stop. No file is moved until you click Arrange.")

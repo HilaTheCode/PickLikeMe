@@ -227,6 +227,11 @@ background:#05070d;color:#fff;overflow:hidden}
 transform-origin:center center;display:block;transition:transform .08s ease-out}
 .lb-img.dragging{transition:none}
 .lb-img.grabbable{cursor:grab}.lb-img.grabbing{cursor:grabbing;transition:none}
+.lb-crop-overlay{position:absolute;inset:0;pointer-events:none;display:none;overflow:hidden}
+.lb-crop-box{position:absolute;border:2px solid #fbbf24;box-shadow:0 0 0 9999px rgba(2,6,23,.38);border-radius:4px;background:rgba(251,191,36,.12)}
+.lb-crop-box::before{content:"Auto crop";position:absolute;top:-24px;left:0;padding:2px 6px;border-radius:4px;background:#fbbf24;color:#111827;font-size:11px;font-weight:700;white-space:nowrap}
+.lb-crop-toggle{background:rgba(0,0,0,.06);border:1px solid rgba(0,0,0,.2);color:#000;border-radius:7px;padding:4px 10px;font-size:12px;cursor:pointer}
+.lb-crop-toggle.on{background:#fbbf24;color:#111827;border-color:#f59e0b}
 .lb-spinner{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
 color:#cbd5e1;font-size:13px;text-align:center;padding:20px}
 .lb-ai{font-size:11.5px;padding:2px 9px;border-radius:20px;border:1px solid #60a5fa;color:#93c5fd}
@@ -289,8 +294,9 @@ const PLM = {
   state: null,
   boxes: false,
   busy: false,
-  // 'all' | 'keep' | 'reject' | 'neutral' | 'ai_keep' | 'ai_reject' | 'differences'
-  // - client-side only, survives state refreshes.
+  // 'all' | 'keep' | 'reject' | 'neutral' | 'ai_keep' | 'ai_reject' |
+  // 'ai_keep_user_reject' | 'ai_reject_user_keep' - client-side only,
+  // survives state refreshes.
   filter: 'all',
   sort: {key: 'score', dir: 'desc'},  // key: 'score'|'name'|'date' - 'score'/'desc' matches the server's own default order
   picked: new Set(),      // image_path set, for the multi-select bulk actions bar
@@ -312,11 +318,11 @@ function filterImages(images){
   if(PLM.filter === 'all') return images;
   if(PLM.filter === 'ai_keep') return images.filter(i => i.ai_suggestion === 'keep');
   if(PLM.filter === 'ai_reject') return images.filter(i => i.ai_suggestion === 'reject');
-  // A real difference of opinion: the AI has one, the photographer has
-  // decided (Neutral is "no opinion yet", not a disagreement), and the two
-  // don't match.
-  if(PLM.filter === 'differences') {
-    return images.filter(i => i.ai_suggestion != null && i.review_status !== 'neutral' && i.review_status !== i.ai_suggestion);
+  if(PLM.filter === 'ai_keep_user_reject') {
+    return images.filter(i => i.ai_suggestion === 'keep' && i.review_status === 'reject');
+  }
+  if(PLM.filter === 'ai_reject_user_keep') {
+    return images.filter(i => i.ai_suggestion === 'reject' && i.review_status === 'keep');
   }
   // Subject category (bird/mammal/human/...) - one dynamic filter per
   // category actually present in this folder, see renderCategoryFilters().
@@ -432,6 +438,11 @@ function render(){
   q('#c-keep').textContent = s.counts.keep.toLocaleString();
   q('#c-reject').textContent = s.counts.reject.toLocaleString();
   q('#c-neutral').textContent = s.counts.neutral.toLocaleString();
+  const workflow = s.workflow || {};
+  const workflowStage = q('#workflow-stage');
+  const workflowStatus = q('#workflow-status');
+  if(workflowStage) workflowStage.textContent = workflow.stage ? ('Stage: ' + workflow.stage) : 'Stage: ready';
+  if(workflowStatus) workflowStatus.textContent = 'Ranked ' + (workflow.ranked ? '✓' : '—') + ' | Reviewed ' + (workflow.reviewed ? '✓' : '—') + ' | Imported ' + (workflow.imported ? '✓' : '—');
 
   document.querySelectorAll('.preset').forEach(b => {
     b.classList.toggle('on', Number(b.dataset.percent) === s.keep_percent);
@@ -646,6 +657,7 @@ const Lightbox = (function(){
   let index = -1;
   let scale = 1;
   let pan = {x: 0, y: 0};
+  let showCropOverlay = false;
   let drag = null;            // {startX,startY,panX,panY,moved} while dragging
   let suppressClick = false;  // true for the click a drag-release also fires
   // Steps, not EV directly: an integer avoids float drift across repeated
@@ -659,6 +671,7 @@ const Lightbox = (function(){
   // window around the current index and revoked on eviction, so a session of
   // thousands of images cannot leak memory.
   const cache = new Map();
+  const cropCache = new Map();
   // path -> in-flight Promise<url>, so two callers requesting the SAME image
   // before either has resolved (renderImage() for the now-current image,
   // preloadAround() for a neighbour that becomes current a moment later)
@@ -682,6 +695,7 @@ const Lightbox = (function(){
 
   function open(startIndex){
     index = startIndex;
+    showCropOverlay = false;
     q('#lightbox').showModal();
     resetView();
     renderAll();
@@ -717,6 +731,7 @@ const Lightbox = (function(){
   function renderAll(){
     const image = current();
     if(!image) return;
+    q('#lb-crop-toggle').classList.toggle('on', showCropOverlay);
     q('#lb-prev').disabled = index <= 0;
     q('#lb-next').disabled = index >= images().length - 1;
     q('#lb-counter').textContent = (index + 1) + ' / ' + images().length;
@@ -730,6 +745,7 @@ const Lightbox = (function(){
     updateSaveButton(image);
     updateReasonSelect(image);
     renderImage(image);
+    updateCropOverlay(image);
     renderFilmstrip();
   }
 
@@ -777,7 +793,57 @@ const Lightbox = (function(){
   }
 
   function applyTransform(){
-    q('#lb-img').style.transform = 'translate(' + pan.x + 'px,' + pan.y + 'px) scale(' + scale + ')';
+    const transform = 'translate(' + pan.x + 'px,' + pan.y + 'px) scale(' + scale + ')';
+    q('#lb-img').style.transform = transform;
+    q('#lb-crop-overlay').style.transform = transform;
+  }
+
+  async function fetchCropOverlay(image){
+    if(!image || image.missing_file || !showCropOverlay) return null;
+    const cached = cropCache.get(image.image_path);
+    if(cached !== undefined) return cached;
+    try{
+      const j = await api('api/review/crop-data?path=' + encodeURIComponent(image.image_path));
+      const crop = j && j.crop ? j.crop : null;
+      cropCache.set(image.image_path, crop);
+      return crop;
+    }catch(e){
+      cropCache.set(image.image_path, null);
+      return null;
+    }
+  }
+
+  function updateCropOverlay(image){
+    const overlay = q('#lb-crop-overlay');
+    const box = q('#lb-crop-box');
+    const img = q('#lb-img');
+    if(!image || !showCropOverlay || image.missing_file){ overlay.style.display = 'none'; return; }
+    if(!img.naturalWidth || !img.naturalHeight){ overlay.style.display = 'none'; return; }
+    const overlayW = img.clientWidth || img.offsetWidth || img.naturalWidth;
+    const overlayH = img.clientHeight || img.offsetHeight || img.naturalHeight;
+    if(!overlayW || !overlayH){ overlay.style.display = 'none'; return; }
+    overlay.style.display = 'block';
+    overlay.style.width = overlayW + 'px';
+    overlay.style.height = overlayH + 'px';
+    overlay.style.left = '0px';
+    overlay.style.top = '0px';
+    if(!img.naturalWidth || !img.naturalHeight){ box.style.display = 'none'; return; }
+    fetchCropOverlay(image).then(crop => {
+      if(current() !== image) return;
+      if(!crop){ overlay.style.display = 'none'; return; }
+      const left = Math.max(0, Math.min(1, crop.left || 0));
+      const top = Math.max(0, Math.min(1, crop.top || 0));
+      const right = Math.max(left, Math.min(1, crop.right || 1));
+      const bottom = Math.max(top, Math.min(1, crop.bottom || 1));
+      const width = Math.max(4, (right - left) * overlayW);
+      const height = Math.max(4, (bottom - top) * overlayH);
+      box.style.left = (left * overlayW) + 'px';
+      box.style.top = (top * overlayH) + 'px';
+      box.style.width = width + 'px';
+      box.style.height = height + 'px';
+      box.style.display = 'block';
+      overlay.style.display = 'block';
+    });
   }
 
   function renderImage(image){
@@ -791,7 +857,7 @@ const Lightbox = (function(){
     // fresh once it has actually decoded and laid out, not the outgoing
     // image's, which is all that is on screen the instant renderAll() calls
     // updateZoomIndicator() above.
-    img.onload = updateZoomIndicator;
+    img.onload = () => { updateZoomIndicator(); updateCropOverlay(image); };
     if(image.missing_file){
       img.removeAttribute('src');
       spinner.textContent = 'File not found (has it moved?)';
@@ -803,6 +869,7 @@ const Lightbox = (function(){
       spinner.style.display = 'none';
       img.src = cached;
       applyTransform();
+      updateCropOverlay(image);
       return;
     }
     spinner.textContent = 'Loading full size…';
@@ -814,6 +881,7 @@ const Lightbox = (function(){
       spinner.style.display = 'none';
       img.src = url;
       applyTransform();
+      updateCropOverlay(image);
     }).catch(() => {
       if(current() !== image) return;
       spinner.textContent = 'Could not load a full-size preview';
@@ -1102,9 +1170,14 @@ const Lightbox = (function(){
     q('#lb-stage').addEventListener('wheel', onWheel, {passive: false});
     q('#lb-img').addEventListener('dblclick', onDblClick);
     q('#lb-img').addEventListener('mousedown', onPointerDown);
+    q('#lb-crop-toggle').addEventListener('click', () => {
+      showCropOverlay = !showCropOverlay;
+      q('#lb-crop-toggle').classList.toggle('on', showCropOverlay);
+      updateCropOverlay(current());
+    });
     window.addEventListener('mousemove', onPointerMove);
     window.addEventListener('mouseup', onPointerUp);
-    window.addEventListener('resize', () => { clampPan(); applyTransform(); });
+    window.addEventListener('resize', () => { clampPan(); applyTransform(); updateCropOverlay(current()); });
     document.addEventListener('keydown', onKeyDown);
     q('#lightbox').addEventListener('cancel', e => { e.preventDefault(); close(); });
     q('#lightbox').addEventListener('close', () => { index = -1; });
@@ -1308,6 +1381,21 @@ async function runAutoCrop(){
 // Neutral, so Keep/Reject/Neutral is the only way to sort it. PLM.busy
 // guards against the dialog (which blocks the request on the server) being
 // opened twice from a second click.
+async function importSelected(){
+  if(PLM.busy) return;
+  PLM.busy = true;
+  q('#import-selected').disabled = true;
+  try{
+    const j = await api('api/review/import-selected', {});
+    if(j.ok){
+      say('Imported selected images into the destination folder.', false);
+    } else {
+      say(j.error || 'Import failed', true);
+    }
+  } catch(e){ say('Import failed: ' + e.message, true); }
+  finally{ PLM.busy = false; q('#import-selected').disabled = false; }
+}
+
 async function switchFolder(){
   if(PLM.busy) return;
   PLM.busy = true;
@@ -1458,6 +1546,7 @@ async function boot(){
   q('#select-all-visible').addEventListener('click', selectAllVisible);
   q('#panel-toggle').addEventListener('click', togglePanel);
   q('#auto-crop').addEventListener('click', runAutoCrop);
+  q('#import-selected').addEventListener('click', importSelected);
   let panelOpen = true;
   try{ panelOpen = localStorage.getItem('plm-panel-open') !== '0' }catch(e){}
   setPanelOpen(panelOpen);
@@ -1529,7 +1618,7 @@ def build_js() -> str:
     )
 
 
-def build_page(title: str = "PickLikeMe Review") -> str:
+def build_page(title: str = "PeakPic Review") -> str:
     """The whole document. Empty of data - it fetches its own state on load.
 
     `title` only ever reaches the browser's own tab/window chrome (the
@@ -1562,6 +1651,7 @@ def build_page(title: str = "PickLikeMe Review") -> str:
       <span class="glabel">Tools</span>
       <button id="go" class="primary" title="Move Keep to _Selected and Reject to _Rejected. Neutral is never moved.">Arrange Files</button>
       <button id="auto-crop" title="Generate Lightroom crop metadata from the current folder's RAW images">Auto Crop for Lightroom</button>
+      <button id="import-selected" title="Copy the current folder's Selected images into a destination folder">Import Selected</button>
       <button id="panel-toggle" class="on" title="Show/hide filters, sorting and view options">Filters &amp; Sorting</button>
     </div>
     <div class="stats" id="stats">
@@ -1584,7 +1674,11 @@ def build_page(title: str = "PickLikeMe Review") -> str:
     </div>
   </div>
 
-  <div class="statusbar"><span class="status" id="status"></span></div>
+  <div class="statusbar">
+    <span class="status" id="status">PeakPic workflow ready</span>
+    <span class="status" id="workflow-stage" style="margin-left:10px">Stage: ready</span>
+    <span class="status" id="workflow-status" style="margin-left:8px">Ranked — | Reviewed — | Imported —</span>
+  </div>
 </header>
 <div class="notice" id="notice" style="display:none"></div>
 
@@ -1606,7 +1700,8 @@ def build_page(title: str = "PickLikeMe Review") -> str:
         <button class="filter" data-filter="neutral">Neutral</button>
         <button class="filter" data-filter="ai_keep">AI Keep</button>
         <button class="filter" data-filter="ai_reject">AI Reject</button>
-        <button class="filter" data-filter="differences" title="Where the AI and your own review status disagree">AI &harr; User Differences</button>
+        <button class="filter" data-filter="ai_keep_user_reject" title="AI Keep / You Reject">AI Keep / You Reject</button>
+        <button class="filter" data-filter="ai_reject_user_keep" title="AI Reject / You Keep">AI Reject / You Keep</button>
       </div>
       <div class="panel-row">
         <button id="boxes" title="Show/hide the detector's bounding boxes on thumbnails">Detector Boxes</button>
@@ -1693,6 +1788,9 @@ def build_page(title: str = "PickLikeMe Review") -> str:
     <button class="lb-nav next" id="lb-next" aria-label="Next image" title="Next">&#8250;</button>
     <div class="lb-img-wrap">
       <img class="lb-img" id="lb-img" alt="" draggable="false">
+      <div class="lb-crop-overlay" id="lb-crop-overlay" style="display:none">
+        <div class="lb-crop-box" id="lb-crop-box" style="display:none"></div>
+      </div>
       <div class="lb-spinner" id="lb-spinner" style="display:none"></div>
     </div>
     <div class="lb-bottom">
@@ -1709,6 +1807,7 @@ def build_page(title: str = "PickLikeMe Review") -> str:
           <button id="lb-exp-up" type="button" aria-label="Increase exposure">+</button>
         </span>
         <button class="lb-save" id="lb-save-jpeg" type="button" title="Save the camera's own JPEG for sharing">Save JPEG</button>
+        <button class="lb-crop-toggle" id="lb-crop-toggle" type="button" title="Show the auto-crop rectangle over the photo">Crop Overlay</button>
         <select id="lb-reason" aria-label="Reason for overriding the model" title="Why you kept or rejected this, if you want to record it">
           {_reason_options_html()}
         </select>
