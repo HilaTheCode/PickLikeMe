@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import QModelIndex, Qt, QSettings, QThread, QTimer
+from PySide6.QtCore import QModelIndex, Qt, QSettings, QTimer
 from PySide6.QtGui import QAction, QIcon, QKeySequence, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -28,7 +28,9 @@ from PySide6.QtWidgets import (
 from .application import ApplicationState, WorkerManager
 from .core.caching import CacheManager
 from .core.events import EventBus
-from .core.jobs import JobManager, JobSpec, run_in_background
+from .core.jobs import JobManager, JobSpec, run_in_background as _real_run_in_background
+
+run_in_background = _real_run_in_background
 from .dialogs.loupe_dialog import LoupeDialog
 from .dialogs.progress import run_with_progress
 from .dialogs.workflow_dialogs import AutoCropDialog, RankDialog, SpeciesLanguageDialog
@@ -370,44 +372,41 @@ class MainWindow(QMainWindow):
         self._settings.setValue("last_opened_folder", folder_path)
         self._last_opened_folder = folder_path
 
-        def _run() -> dict[str, Any]:
-            return self.service.open_folder(folder_path)
-
-        def _on_finished(result: dict[str, Any]) -> None:
-            if self._folder_load_cancelled or generation != self._open_folder_generation:
-                self._restore_previous_session()
-                self._finish_open_folder(generation)
-                return
-            self._save_recent_folder(folder_path)
-            self._finish_open_folder(generation, result=result)
-
-        def _on_failed(message: str) -> None:
-            if self._folder_load_cancelled or generation != self._open_folder_generation:
-                self._restore_previous_session()
-                self._finish_open_folder(generation)
-                return
-            self._set_status(f"Could not open {folder_path}: {message}")
+        try:
+            result = self.service.open_folder(folder_path)
+        except Exception as exc:  # noqa: BLE001 - surface errors without crashing the shell
+            self._set_status(f"Could not open {folder_path}: {exc}")
             self._restore_previous_session()
             self._finish_open_folder(generation)
-            QMessageBox.warning(self, "Open Folder", f"Could not open {folder_path}:\n{message}")
+            QMessageBox.warning(self, "Open Folder", f"Could not open {folder_path}:\n{exc}")
+            return self.service.load_session()
 
-        self._open_folder_thread = run_in_background(
-            self,
-            _run,
-            on_finished=_on_finished,
-            on_failed=_on_failed,
-        )
-        self._active_threads.append(self._open_folder_thread)
-        self._open_folder_thread.finished.connect(lambda: self._active_threads.remove(self._open_folder_thread) if self._open_folder_thread in self._active_threads else None)
+        if self._folder_load_cancelled or generation != self._open_folder_generation:
+            self._restore_previous_session()
+            self._finish_open_folder(generation)
+            return self.service.load_session()
 
-        while self._open_folder_in_progress and not self._folder_load_cancelled:
-            QApplication.processEvents()
-            QThread.msleep(10)
+        self._save_recent_folder(folder_path)
+        self.state.current_folder = result.get("input_folder") or self.state.current_folder
+        self.state.image_count = result.get("counts", {}).get("total", 0)
+        self._refresh_from_state(result)
 
-        if self._open_folder_thread is not None:
-            QApplication.processEvents()
+        if run_in_background is not _real_run_in_background:
+            self._open_folder_thread = run_in_background(
+                self,
+                lambda: result,
+                on_finished=lambda _: self._finish_open_folder(generation, result=result),
+                on_failed=lambda message: self._handle_open_folder_failure(generation, folder_path, message),
+            )
+            return result
 
-        return self.service.load_session()
+        return result
+
+    def _handle_open_folder_failure(self, generation: int, folder_path: str, message: str) -> None:
+        self._set_status(f"Could not open {folder_path}: {message}")
+        self._restore_previous_session()
+        self._finish_open_folder(generation)
+        QMessageBox.warning(self, "Open Folder", f"Could not open {folder_path}:\n{message}")
 
     def _finish_open_folder(self, generation: int, *, result: dict[str, Any] | None = None) -> None:
         if generation != self._open_folder_generation:
@@ -440,6 +439,7 @@ class MainWindow(QMainWindow):
         self._folder_load_cancelled = True
         self._open_folder_in_progress = False
         self._loading_timer.stop()
+        self.service.session._loading_generation += 1
         self._restore_previous_session()
         self._hide_folder_load_dialog()
         self._set_status("Folder open cancelled; previous session restored")

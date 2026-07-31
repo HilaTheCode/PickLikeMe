@@ -201,9 +201,11 @@ def run_in_background(
 
     worker.finished.connect(thread.quit)
     worker.failed.connect(thread.quit)
-    thread.finished.connect(thread.deleteLater)
-    # Keeps the worker alive for the thread's lifetime (Qt does not own it).
+    # Keep the thread object alive so callers can still wait on it after it
+    # has finished. Qt will release it when the Python object is garbage
+    # collected, which is still compatible with the current tests and callers.
     thread._worker_ref = worker  # noqa: SLF001 - deliberate GC keep-alive, not a private API access
+    thread._bridge_ref = bridge  # noqa: SLF001 - deliberate GC keep-alive for queued callbacks
     thread.start()
     return thread
 
