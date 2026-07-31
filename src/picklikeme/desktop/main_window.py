@@ -45,7 +45,26 @@ from .settings import DesktopSettings
 from .services import ReviewService
 from .views.gallery.gallery_view import GalleryView
 
-FILTERS = ("all", "keep", "reject", "neutral")
+FILTERS = (
+    "all", "keep", "reject", "neutral",
+    "ai_keep", "ai_reject", "ai_keep_user_reject", "ai_reject_user_keep",
+)
+# Matches the web review UI's filterImages() exactly (review/page.py) -
+# ai_keep/ai_reject are "the AI currently suggests this" regardless of
+# the photographer's own decision; the two conflict filters narrow that
+# to specifically where the two disagree, one direction each (a single
+# combined "conflicts" filter can't tell a photographer which images
+# need which kind of attention).
+FILTER_LABELS = {
+    "all": "All",
+    "keep": "Keep",
+    "reject": "Reject",
+    "neutral": "Neutral",
+    "ai_keep": "AI Keep",
+    "ai_reject": "AI Reject",
+    "ai_keep_user_reject": "Conflict: AI Keep / You Reject",
+    "ai_reject_user_keep": "Conflict: AI Reject / You Keep",
+}
 KEEP_PERCENT_PRESETS = (5.0, 10.0, 20.0, 25.0, 35.0)
 SORT_FIELDS = ("score", "filename", "captured_at")
 SORT_FIELD_LABELS = {"score": "Model Score", "filename": "File Name", "captured_at": "Capture Time"}
@@ -126,7 +145,7 @@ class MainWindow(QMainWindow):
         self._gallery_view.decisionRequested.connect(self._on_card_decision)
 
         self._filter_combo = QComboBox(self)
-        self._filter_combo.addItems([f.capitalize() for f in FILTERS])
+        self._filter_combo.addItems([FILTER_LABELS[f] for f in FILTERS])
         self._filter_combo.currentIndexChanged.connect(self._on_filter_changed)
 
         self._cutoff_combo = QComboBox(self)
@@ -755,15 +774,30 @@ class MainWindow(QMainWindow):
         self._apply_filter()
 
     def _apply_filter(self) -> None:
-        if self._current_filter == "all":
-            filtered = list(self._all_items)
-        else:
-            filtered = [item for item in self._all_items if item.review_status == self._current_filter]
+        filtered = self._filter_items(self._all_items, self._current_filter)
         filtered = self._sort_items(filtered)
         self._gallery_model.set_items(filtered)
         if filtered and not self._gallery_view.currentIndex().isValid():
             self._gallery_view.setCurrentIndex(self._gallery_model.index(0, 0))
         self._gallery_view.set_empty_message(self._empty_message_for_current_state())
+
+    @staticmethod
+    def _filter_items(items: list[ImageItem], current_filter: str) -> list[ImageItem]:
+        """Matches the web review UI's filterImages() (review/page.py)
+        exactly, including the two conflict directions and the AI-only
+        filters, so a photographer moving between the two apps finds the
+        same filter names doing the same thing."""
+        if current_filter == "all":
+            return list(items)
+        if current_filter == "ai_keep":
+            return [item for item in items if item.ai_suggestion == "keep"]
+        if current_filter == "ai_reject":
+            return [item for item in items if item.ai_suggestion == "reject"]
+        if current_filter == "ai_keep_user_reject":
+            return [item for item in items if item.ai_suggestion == "keep" and item.review_status == "reject"]
+        if current_filter == "ai_reject_user_keep":
+            return [item for item in items if item.ai_suggestion == "reject" and item.review_status == "keep"]
+        return [item for item in items if item.review_status == current_filter]
 
     # -- sorting ----------------------------------------------------------------
 
@@ -813,7 +847,8 @@ class MainWindow(QMainWindow):
         if not self._all_items:
             return "No images found in this folder"
         if self._current_filter != "all":
-            return f"No images match the '{self._current_filter.capitalize()}' filter"
+            label = FILTER_LABELS.get(self._current_filter, self._current_filter.capitalize())
+            return f"No images match the '{label}' filter"
         return ""
 
     def _filtered_paths(self) -> list[str]:
