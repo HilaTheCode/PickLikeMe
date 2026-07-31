@@ -40,6 +40,7 @@ from ...analyzer.annotations import (
     REVIEW_REASON_GOOD_QUALITY,
     REVIEW_REASON_OTHER,
 )
+from .. import theme
 from ..models.image_item import ImageItem
 from ..services import ReviewService
 
@@ -61,7 +62,10 @@ EXPOSURE_MIN_STEPS = -9
 EXPOSURE_MAX_STEPS = 9
 
 STATUS_LABELS = {"keep": "Keep", "reject": "Reject", "neutral": "Neutral"}
-STATUS_COLORS = {"keep": "#4caf50", "reject": "#f44336", "neutral": "#9e9e9e"}
+# Always the dark palette's semantic colors, regardless of the app theme -
+# the Loupe's overlay bar is permanently dark-chrome (see module docstring
+# and theme.py), so it needs colors tuned for that background specifically.
+STATUS_COLORS = {"keep": theme.DARK.keep_fg, "reject": theme.DARK.reject_fg, "neutral": theme.DARK.neutral_fg}
 
 
 def _apply_brightness(pixmap: QPixmap, ev: float) -> QPixmap:
@@ -114,7 +118,7 @@ class _ZoomView(QGraphicsView):
         self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
         self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorViewCenter)
         self.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
-        self.setBackgroundBrush(QColor(24, 24, 24))
+        self.setBackgroundBrush(QColor(theme.DARK.window_bg))
         self.setFrameShape(QGraphicsView.Shape.NoFrame)
         self._fit_mode = True
         self._manual_scale = 1.0
@@ -253,8 +257,8 @@ class LoupeDialog(QDialog):
         bottom_bar = QWidget(self)
         bottom_bar.setObjectName("loupeBottomBar")
         bottom_bar.setStyleSheet(
-            "#loupeBottomBar { background-color: #1c1c1c; }"
-            "#loupeBottomBar QLabel { color: #e0e0e0; }"
+            f"#loupeBottomBar {{ background-color: {theme.DARK.panel_bg}; }}"
+            f"#loupeBottomBar QLabel {{ color: {theme.DARK.text_primary}; }}"
             "#loupeBottomBar QPushButton { padding: 4px 10px; }"
         )
         bar_layout = QHBoxLayout(bottom_bar)
@@ -356,7 +360,7 @@ class LoupeDialog(QDialog):
         ai_suggestion = info.get("ai_suggestion")
         if ai_suggestion and ai_suggestion != status:
             self._ai_badge_label.setText(f"AI suggests {STATUS_LABELS.get(ai_suggestion, ai_suggestion)}")
-            self._ai_badge_label.setStyleSheet("color: #64b5f6;")
+            self._ai_badge_label.setStyleSheet(f"color: {theme.DARK.accent};")
         else:
             self._ai_badge_label.setText("")
 

@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from PySide6.QtCore import QModelIndex, QSize, Qt, QSettings, QTimer
-from PySide6.QtGui import QAction, QIcon, QKeySequence, QPixmap
+from PySide6.QtGui import QAction, QActionGroup, QIcon, QKeySequence, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from . import theme
 from .application import ApplicationState, WorkerManager
 from .core.caching import CacheManager
 from .core.events import EventBus
@@ -127,6 +128,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("PeakPic Desktop")
         self.resize(1200, 800)
         self.setDockOptions(self.dockOptions() | self.DockOption.AnimatedDocks)
+        self._apply_theme(self._settings.value("theme", theme.DEFAULT_THEME))
         self.setCentralWidget(self._central_widget)
         self._central_widget.setLayout(self._build_central_layout())
         self._build_menu_bar()
@@ -134,6 +136,22 @@ class MainWindow(QMainWindow):
         self._build_status_bar()
         self._build_docks()
         self._restore_state()
+
+    def _apply_theme(self, name: str) -> None:
+        """Apply a theme app-wide and repaint the gallery so the color
+        change is visible immediately - no restart required."""
+        theme.set_theme(name)
+        app = QApplication.instance()
+        if app is not None:
+            app.setStyleSheet(theme.build_stylesheet(theme.current_palette()))
+        self._gallery_view.viewport().update()
+        if hasattr(self, "_dark_theme_action"):
+            self._dark_theme_action.setChecked(theme.current_theme_name() == "dark")
+            self._light_theme_action.setChecked(theme.current_theme_name() == "light")
+
+    def _set_theme(self, name: str) -> None:
+        self._apply_theme(name)
+        self._settings.setValue("theme", theme.current_theme_name())
 
     def _build_central_layout(self) -> Any:
         from PySide6.QtWidgets import QVBoxLayout
@@ -255,6 +273,20 @@ class MainWindow(QMainWindow):
         review_menu.addAction(self._neutral_action)
         review_menu.addSeparator()
         review_menu.addAction(self._loupe_action)
+
+        view_menu = menu_bar.addMenu("View")
+        theme_group = QActionGroup(self)
+        theme_group.setExclusive(True)
+        self._dark_theme_action = QAction("Dark Theme", self, checkable=True)
+        self._dark_theme_action.triggered.connect(lambda: self._set_theme("dark"))
+        self._light_theme_action = QAction("Light Theme", self, checkable=True)
+        self._light_theme_action.triggered.connect(lambda: self._set_theme("light"))
+        theme_group.addAction(self._dark_theme_action)
+        theme_group.addAction(self._light_theme_action)
+        view_menu.addAction(self._dark_theme_action)
+        view_menu.addAction(self._light_theme_action)
+        self._dark_theme_action.setChecked(theme.current_theme_name() == "dark")
+        self._light_theme_action.setChecked(theme.current_theme_name() == "light")
 
         tools_menu = menu_bar.addMenu("Tools")
         tools_menu.addAction(self._rank_action)
