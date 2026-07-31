@@ -46,6 +46,18 @@ class ReviewService:
         self.session.set_keep_percent(percent)
         return self.load_session()
 
+    def apply_ai_suggestions(self, *, include_decided: bool = False) -> dict[str, Any]:
+        """See ReviewSession.apply_ai_suggestions - the one call that lets
+        the AI ranking influence review_status at all, and only because the
+        photographer explicitly asked it to. include_decided=False (the
+        default) only ever touches Neutral images; an already-decided
+        image whose status disagrees with the AI's current suggestion is
+        only overridden when the caller passes True, after getting
+        confirmation from the photographer first (see MainWindow._apply_cutoff)."""
+        result = self.session.apply_ai_suggestions(include_decided=include_decided)
+        result["state"] = self.load_session()
+        return result
+
     def thumbnail_path(self, image_path: str, *, with_boxes: bool = False) -> Path | None:
         return review_thumbnail(image_path, with_boxes=with_boxes)
 

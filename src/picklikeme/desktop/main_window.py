@@ -830,13 +830,67 @@ class MainWindow(QMainWindow):
             self._cutoff_spin.setValue(preset)
 
     def _apply_cutoff(self) -> None:
+        """Set the AI cutoff threshold, then apply the resulting AI
+        suggestions to the gallery - mirrors the web review UI's "Apply AI
+        Suggestions" behavior (review/session.py's apply_ai_suggestions,
+        server.py's /api/review/apply-ai-suggestions), not previously wired
+        into the desktop at all. A Neutral image has nothing manual at
+        risk and is always updated. An image already marked Keep/Reject
+        that disagrees with the new threshold is only overridden after an
+        explicit confirmation showing exactly how many go each direction -
+        "3 conflicts" doesn't tell a photographer whether they're about to
+        lose 3 Keeps or 3 Rejects, which matters."""
         if not self.state.current_folder:
             self._set_status("Open a folder before setting the AI cutoff")
             return
         percent = self._cutoff_spin.value()
         state = self.service.set_keep_percent(percent)
         self._refresh_from_state(state)
-        self._set_status(f"AI cutoff set to {percent:g}%")
+
+        keep_to_reject = 0
+        reject_to_keep = 0
+        for image in state.get("images", []):
+            status = image.get("review_status")
+            suggestion = image.get("ai_suggestion")
+            if suggestion is None or status not in ("keep", "reject") or suggestion == status:
+                continue
+            if status == "keep":
+                keep_to_reject += 1
+            else:
+                reject_to_keep += 1
+        conflicts = keep_to_reject + reject_to_keep
+
+        include_decided = False
+        if conflicts:
+            message = (
+                f"At this {percent:g}% cutoff, the AI disagrees with {conflicts} image(s) "
+                "you already decided:\n\n"
+                f"    {keep_to_reject} marked Keep would become Reject\n"
+                f"    {reject_to_keep} marked Reject would become Keep\n\n"
+                "Override these manual decisions to match the AI? Neutral images are "
+                "always updated to the AI's suggestion regardless."
+            )
+            confirm = QMessageBox.question(
+                self, "PeakPic - Apply Cutoff", message,
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            include_decided = confirm == QMessageBox.StandardButton.Yes
+
+        result = self.service.apply_ai_suggestions(include_decided=include_decided)
+        self._refresh_from_state(result["state"])
+        if include_decided:
+            self._set_status(
+                f"AI cutoff set to {percent:g}% - applied to {result['applied']} neutral image(s), "
+                f"overrode {result['overridden']} manual decision(s)"
+            )
+        elif conflicts:
+            self._set_status(
+                f"AI cutoff set to {percent:g}% - applied to {result['applied']} neutral image(s); "
+                f"{conflicts} manual decision(s) left unchanged"
+            )
+        else:
+            self._set_status(f"AI cutoff set to {percent:g}% - applied to {result['applied']} neutral image(s)")
 
     # -- review actions -------------------------------------------------------
 
