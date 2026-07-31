@@ -26,6 +26,7 @@ from picklikeme.bird_crop import (
     BirdDetection,
     CropParams,
     crop_cache_path,
+    detections_cache_path,
     read_crop_params,
     save_crop_png,
     write_crop_params,
@@ -231,6 +232,52 @@ class CacheReadWriteTests(unittest.TestCase):
             self.assertEqual(stats["cached"], 3)
             self.assertEqual(stats["skipped"], 0)
             self.assertEqual(len(decoder2.decoded), 3)
+
+    def test_a_crop_with_no_detections_sidecar_is_not_skipped(self):
+        """Regression: a crop cache built before save_detections() existed
+        (or one that otherwise lost its sidecar while the crop PNG survived)
+        must not be treated as fully cached forever - the missing sidecar is
+        exactly what review reads to draw Detector Boxes, so silently
+        skipping it here permanently starves that overlay of data on every
+        future Rank by AI run, with nothing in the UI to explain why."""
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = Path(tmp) / "crops"
+            paths = _fake_paths(tmp, 3)
+            decoder = FakeDecoder()
+            _run_build(paths, cache, decoder, FakeDetector(decoder))
+            for path in paths:
+                self.assertTrue(detections_cache_path(cache, path).exists())
+
+            # Simulate a legacy cache: crops present, sidecars gone.
+            for path in paths:
+                detections_cache_path(cache, path).unlink()
+
+            decoder2 = FakeDecoder()
+            stats, _ = _run_build(paths, cache, decoder2, FakeDetector(decoder2))
+            self.assertEqual(stats["skipped"], 0, "images missing only their sidecar were skipped")
+            self.assertEqual(stats["cached"], 3)
+            self.assertEqual(len(decoder2.decoded), 3)
+            for path in paths:
+                self.assertTrue(
+                    detections_cache_path(cache, path).exists(),
+                    f"missing sidecar was not healed for {path}",
+                )
+
+    def test_a_fully_cached_image_with_its_sidecar_is_still_skipped(self):
+        """The healing above must not regress the documented idempotent
+        behaviour for the normal, healthy case - only a missing sidecar
+        should trigger reprocessing, not a normal cache hit."""
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = Path(tmp) / "crops"
+            paths = _fake_paths(tmp, 3)
+            decoder = FakeDecoder()
+            _run_build(paths, cache, decoder, FakeDetector(decoder))
+
+            decoder2 = FakeDecoder()
+            stats, _ = _run_build(paths, cache, decoder2, FakeDetector(decoder2))
+            self.assertEqual(stats["skipped"], 3)
+            self.assertEqual(stats["cached"], 0)
+            self.assertEqual(decoder2.decoded, [])
 
 
 class CacheVersionMismatchTests(unittest.TestCase):

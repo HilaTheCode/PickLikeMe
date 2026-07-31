@@ -48,6 +48,7 @@ from .bird_crop import (
     build_crop,
     coco_class_name,
     crop_cache_path,
+    detections_cache_path,
     read_crop_params,
     save_crop_png,
     save_detections,
@@ -274,6 +275,18 @@ def build_cache(
         Cached images are recognised here and enter the stream with future=None:
         they cost one stat() and no decode, but keep their position so ordering,
         counting and progress are identical to the serial pass.
+
+        A crop existing is not enough on its own: save_detections() (the
+        detector-box sidecar review reads for its overlay) was added after
+        this cache format, and get_many()/DetectionCache.get() never runs the
+        detector for an image it thinks is already recorded. Without also
+        requiring the sidecar, an image whose crop predates that sidecar - or
+        whose sidecar was lost for any other reason while the crop survived -
+        would skip detection forever, on every future run, with nothing in
+        the UI to explain why its boxes never appear. Checking for it here
+        lets the normal incremental re-run heal that gap for exactly the
+        images missing it, without forcing a full rebuild of an otherwise
+        fully cached folder.
         """
         while len(pending) < DECODE_WINDOW:
             image_path = next(source, None)
@@ -281,7 +294,8 @@ def build_cache(
                 return
             with PROFILE.stage("cache lookup"):
                 target = crop_cache_path(cache_dir, image_path)
-                already_cached = target.exists() and not force
+                has_detections = detections_cache_path(cache_dir, image_path).exists()
+                already_cached = target.exists() and has_detections and not force
             future = None if already_cached else pool.submit(_decode_one, decoder, image_path)
             pending.append(_Job(image_path=image_path, target=target, future=future))
 
