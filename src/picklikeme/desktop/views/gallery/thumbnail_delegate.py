@@ -17,15 +17,22 @@ class ThumbnailCardDelegate(QAbstractItemDelegate):
     extra notification wiring.
     """
 
-    # Geometry constants - independent of theme.
+    # Geometry constants - independent of theme. CARD_HEIGHT must be tall
+    # enough for PADDING + THUMBNAIL_SIZE + SPACING + filename line (20) +
+    # score line (14) + badge line (~18) + PADDING, or the badge line
+    # paints past the card's bottom edge into the next grid row (it did,
+    # at the original CARD_HEIGHT=200 - GalleryView's setGridSize uses
+    # these constants directly, so the overflow wasn't just cosmetic).
     CARD_WIDTH = 200
-    CARD_HEIGHT = 200
+    CARD_HEIGHT = 232
     THUMBNAIL_SIZE = 160
     PADDING = 8
     SPACING = 4
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
+        self._name_font = QFont()
+        self._name_font.setBold(True)
         self._small_font = QFont()
         self._small_font.setPointSize(8)
         self._tiny_font = QFont()
@@ -75,14 +82,14 @@ class ThumbnailCardDelegate(QAbstractItemDelegate):
         text_y = rect.y() + self.PADDING + self.THUMBNAIL_SIZE + self.SPACING
         text_rect = QRect(rect.x() + self.PADDING, text_y, rect.width() - 2 * self.PADDING, rect.height() - text_y - self.PADDING)
 
-        # Draw filename
+        # Draw filename - bold, so it reads as the card's primary label at
+        # a glance rather than competing visually with the metadata below.
         filename = item.display_name
-        name_font = QFont()
-        painter.setFont(name_font)
+        painter.setFont(self._name_font)
         painter.setPen(QColor(palette.text_primary))
         name_rect = QRect(text_rect)
         name_rect.setHeight(20)
-        elided_name = QFontMetrics(name_font).elidedText(filename, Qt.TextElideMode.ElideRight, name_rect.width())
+        elided_name = QFontMetrics(self._name_font).elidedText(filename, Qt.TextElideMode.ElideRight, name_rect.width())
         painter.drawText(name_rect, Qt.AlignmentFlag.AlignTop, elided_name)
 
         # Draw score and rank
@@ -136,13 +143,17 @@ class ThumbnailCardDelegate(QAbstractItemDelegate):
             status_text = "? Neutral"
             status_color = QColor(palette.neutral_fg)
 
-        # Draw status badge with background
+        # Draw status badge, then the AI suggestion right after it (not at
+        # a fixed offset - "Neutral"/"AI: Neutral" are both longer than
+        # "Keep"/"AI: Keep", and a fixed gap either clipped the longer
+        # combinations or left an oddly wide gap for the shorter ones).
+        next_x = x
         if status_text and status_color is not None:
             painter.setPen(status_color)
             painter.drawText(x, y, status_text)
+            next_x = x + QFontMetrics(painter.font()).horizontalAdvance(status_text) + 8
 
-        # Draw AI suggestion if it differs from review status
         if item.ai_suggestion and item.ai_suggestion != item.review_status:
             ai_text = f"AI: {item.ai_suggestion.capitalize()}"
             painter.setPen(QColor(palette.accent))
-            painter.drawText(x + 100, y, ai_text)
+            painter.drawText(next_x, y, ai_text)
