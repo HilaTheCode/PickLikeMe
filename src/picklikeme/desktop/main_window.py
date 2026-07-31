@@ -273,6 +273,10 @@ class MainWindow(QMainWindow):
             "Loupe", icon=SP.SP_FileDialogContentsView, shortcut="Return",
             tooltip="Open the selected image in the Loupe", triggered=self._open_loupe_for_selection,
         )
+        self._select_all_action = self._make_action(
+            "Select All", icon=SP.SP_FileDialogListView, shortcut=QKeySequence.StandardKey.SelectAll,
+            tooltip="Select every currently visible (filtered) image", triggered=self._select_all_visible,
+        )
 
         self._rank_action = self._make_action(
             "Rank by AI…", icon=SP.SP_BrowserReload,
@@ -315,6 +319,8 @@ class MainWindow(QMainWindow):
         file_menu.addAction(exit_action)
 
         review_menu = menu_bar.addMenu("Review")
+        review_menu.addAction(self._select_all_action)
+        review_menu.addSeparator()
         review_menu.addAction(self._keep_action)
         review_menu.addAction(self._reject_action)
         review_menu.addAction(self._neutral_action)
@@ -358,6 +364,7 @@ class MainWindow(QMainWindow):
         toolbar.addAction(self._open_action)
         toolbar.addSeparator()
 
+        toolbar.addAction(self._select_all_action)
         toolbar.addAction(self._keep_action)
         toolbar.addAction(self._reject_action)
         toolbar.addAction(self._neutral_action)
@@ -832,6 +839,15 @@ class MainWindow(QMainWindow):
         self._set_status(f"AI cutoff set to {percent:g}%")
 
     # -- review actions -------------------------------------------------------
+
+    def _select_all_visible(self) -> None:
+        """Select every image in the current filter/sort view - the first
+        step of "filter by status, select all, apply one decision to all
+        of them": _apply_filter() already put only the filtered set into
+        the model, so selectAll() naturally only selects that set."""
+        self._gallery_view.selectAll()
+        count = len(self._gallery_model.items())
+        self._set_status(f"Selected {count} image(s)" if count else "No images to select")
 
     def _selected_image_paths(self) -> list[str]:
         """Every multi-selected image, or the single current one when
