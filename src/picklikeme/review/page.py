@@ -80,8 +80,21 @@ padding:10px 20px;box-shadow:0 1px 3px var(--shadow)}
    line on it (see the toolbar-redesign notes in this module's docstring: no
    app/page name is shown here at all - the window/tab title already carries
    that). */
-.toolbar{display:flex;align-items:center;gap:14px;flex-wrap:wrap}
-.group{display:flex;gap:6px;align-items:center}
+.toolbar{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+.toolbar-shell{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.toolbar-menu{position:relative}
+.toolbar-menu>summary{list-style:none;cursor:pointer;padding:7px 12px;border-radius:999px;
+border:1px solid var(--border);background:linear-gradient(180deg,var(--panel),var(--panel-2));color:var(--text);font-size:12.5px;
+font-weight:700;display:inline-flex;align-items:center;gap:6px;letter-spacing:.01em}
+.toolbar-menu>summary::after{content:"▾";font-size:10px;opacity:.7}
+.toolbar-menu[open]>summary{background:var(--accent);color:#fff;border-color:var(--accent)}
+.toolbar-menu[open]>summary::after{content:"▴";opacity:1}
+.menu-panel{position:absolute;top:calc(100% + 8px);left:0;display:flex;flex-direction:column;gap:8px;
+padding:10px;border:1px solid var(--border);border-radius:12px;background:var(--panel);
+box-shadow:0 12px 32px var(--shadow);min-width:280px;z-index:30}
+.menu-panel .group{padding:6px 4px;border-radius:8px;background:rgba(148,163,184,.06)}
+.menu-panel .glabel{display:block;margin-bottom:2px}
+.group{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
 .glabel{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.04em;margin-right:2px}
 .divider{width:1px;align-self:stretch;min-height:22px;background:var(--border)}
 .folder-name{font-size:12.5px;color:var(--muted);font-family:ui-monospace,Consolas,monospace;
@@ -429,6 +442,9 @@ function setLoading(active, message){
 function render(){
   const s = PLM.state;
   if(!s) return;
+  const loading = s.loading || null;
+  const stageText = loading && !loading.complete ? (loading.message || 'Loading…') : '';
+  if(stageText){ say(stageText); } else if(!q('#status').textContent) { say('PeakPic workflow ready'); }
   const hasFolder = !!s.input_folder;
   const folderEl = q('#folder');
   folderEl.textContent = s.input_folder || 'No folder open';
@@ -452,6 +468,12 @@ function render(){
   // on without a ranking at all - hidden rather than shown inert, per the
   // same "disappear until needed" rule the bulk bar follows.
   q('#ai-group').style.display = s.has_ranking ? '' : 'none';
+  if(loading && !loading.complete){
+    q('#apply-ai').disabled = true;
+    q('#percent').disabled = true;
+  } else {
+    q('#percent').disabled = false;
+  }
   q('#apply-ai').disabled = !s.has_ranking || s.counts.neutral === 0;
 
   const notice = q('#notice');
@@ -485,7 +507,7 @@ function render(){
   // (see openFolder) or fail outright on one that cannot be found, and
   // Arrange has nothing to file.
   q('#open').disabled = !hasFolder || s.folder_missing;
-  q('#go').disabled = !hasFolder || s.folder_missing;
+  q('#go').disabled = !hasFolder || s.folder_missing || !!(loading && !loading.complete);
 
   // A pick can outlive the image it names - arranging or switching folders
   // both replace s.images wholesale (arrange repoints paths, a new folder is
@@ -1618,7 +1640,7 @@ def build_js() -> str:
     )
 
 
-def build_page(title: str = "PeakPic Review") -> str:
+def build_page(title: str = "PeakPic") -> str:
     """The whole document. Empty of data - it fetches its own state on load.
 
     `title` only ever reaches the browser's own tab/window chrome (the
@@ -1632,27 +1654,45 @@ def build_page(title: str = "PeakPic Review") -> str:
 <style>{CSS}</style></head><body>
 <header>
   <div class="toolbar">
-    <div class="group" data-group="folder">
-      <span class="glabel">Folder</span>
-      <span class="folder-name" id="folder">No folder open</span>
-      <button id="switch-folder">Open&hellip;</button>
-      <button id="open" title="Reveal the current folder in the OS file manager">Reveal</button>
-    </div>
-    <span class="divider"></span>
-    <div class="group" id="ai-group" data-group="ai">
-      <span class="glabel">AI Suggests</span>
-      {_presets_html()}
-      <input type="number" id="percent" min="0" max="100" step="1" aria-label="AI suggestion threshold, percent">
-      <span class="gunit">%</span>
-      <button id="apply-ai" title="Set every Neutral, ranked image to the AI's current suggestion">Apply Suggestions</button>
-    </div>
-    <span class="divider"></span>
-    <div class="group" data-group="tools">
-      <span class="glabel">Tools</span>
-      <button id="go" class="primary" title="Move Keep to _Selected and Reject to _Rejected. Neutral is never moved.">Arrange Files</button>
-      <button id="auto-crop" title="Generate Lightroom crop metadata from the current folder's RAW images">Auto Crop for Lightroom</button>
-      <button id="import-selected" title="Copy the current folder's Selected images into a destination folder">Import Selected</button>
-      <button id="panel-toggle" class="on" title="Show/hide filters, sorting and view options">Filters &amp; Sorting</button>
+    <div class="toolbar-shell">
+      <details class="toolbar-menu">
+        <summary>▣ Folder</summary>
+        <div class="menu-panel">
+          <div class="group" data-group="folder">
+            <span class="glabel">Folder</span>
+            <span class="folder-name" id="folder">No folder open</span>
+            <button id="switch-folder">Open&hellip;</button>
+            <button id="open" title="Reveal the current folder in the OS file manager">Reveal</button>
+          </div>
+        </div>
+      </details>
+      <details class="toolbar-menu">
+        <summary>◎ Review</summary>
+        <div class="menu-panel">
+          <div class="group" id="ai-group" data-group="ai">
+            <span class="glabel">AI Suggests</span>
+            {_presets_html()}
+            <input type="number" id="percent" min="0" max="100" step="1" aria-label="AI suggestion threshold, percent">
+            <span class="gunit">%</span>
+            <button id="apply-ai" title="Set every Neutral, ranked image to the AI's current suggestion">Apply Suggestions</button>
+          </div>
+          <div class="group" data-group="review-actions">
+            <span class="glabel">Review</span>
+            <button id="go" class="primary" title="Move Keep to _Selected and Reject to _Rejected. Neutral is never moved.">Arrange Files</button>
+            <button id="import-selected" title="Copy the current folder's Selected images into a destination folder">Import Selected</button>
+          </div>
+        </div>
+      </details>
+      <details class="toolbar-menu">
+        <summary>⚙ Tools</summary>
+        <div class="menu-panel">
+          <div class="group" data-group="tools">
+            <span class="glabel">Tools</span>
+            <button id="auto-crop" title="Generate Lightroom crop metadata from the current folder's RAW images">Auto Crop for Lightroom</button>
+            <button id="panel-toggle" class="on" title="Show/hide filters, sorting and view options">Filters &amp; Sorting</button>
+          </div>
+        </div>
+      </details>
     </div>
     <div class="stats" id="stats">
       <span class="stat"><b id="c-total">0</b><span class="glabel">Total</span></span>

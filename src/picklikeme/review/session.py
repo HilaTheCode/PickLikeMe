@@ -25,6 +25,7 @@ Three ideas do the work:
 from __future__ import annotations
 
 import logging
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -131,6 +132,11 @@ class ReviewSession:
     ):
         self.store = store
         self.keep_percent = validate_selection_percentage(keep_percent)
+        self._state_lock = threading.RLock()
+        self._background_lock = threading.Lock()
+        self._loading_generation = 0
+        self._loading_thread: threading.Thread | None = None
+        self._loading_state: dict = {}
         if input_folder is None:
             # `picklikeme review` with no --input at all starts here: an
             # empty, folder-less gallery, so the page still has something to
@@ -142,11 +148,14 @@ class ReviewSession:
             self.open_folder(input_folder, ranking_file=ranking_file)
 
     def _clear(self) -> None:
-        self.input_folder = None
-        self.ranking_file = None
-        self.run_metadata: dict = {}
-        self.warnings: list[str] = ['No folder open yet. Click "Open Folder…" above to choose one.']
-        self.images: list[ReviewImage] = []
+        with self._state_lock:
+            self.input_folder = None
+            self.ranking_file = None
+            self.run_metadata: dict = {}
+            self.warnings: list[str] = ['No folder open yet. Click "Open Folder…" above to choose one.']
+            self.images: list[ReviewImage] = []
+            self._loading_generation += 1
+            self._loading_state = {"stage": "idle", "message": "Ready", "percent": 100, "complete": True}
 
     # -- loading ------------------------------------------------------------
 
@@ -166,14 +175,27 @@ class ReviewSession:
         self.input_folder = Path(input_folder).resolve()
         self.ranking_file = Path(ranking_file) if ranking_file else ranking_path(self.input_folder)
         self.run_metadata = read_run_metadata(self.input_folder)
-        self.warnings: list[str] = []
+        with self._state_lock:
+            self.warnings: list[str] = []
         self.load()
 
     def load(self) -> None:
-        """(Re)build the gallery from the ranking, the folder, and the store."""
+        """(Re)build the gallery from the ranking, the folder, and the store.
+
+        The initial view is exposed immediately and the rest of the metadata is
+        filled in progressively in the background so the UI can start showing
+        thumbnails without waiting for the full load to finish.
+        """
+        if self.input_folder is None:
+            self._clear()
+            return
+
+        generation = self._loading_generation + 1
+        self._loading_generation = generation
+        self._set_loading_state("scanning", "Scanning images…", 5, False)
+
         ranked = self._load_ranked()
         on_disk = self._enumerate_folder()
-
         images: list[ReviewImage] = []
         seen: set[str] = set()
         for image in ranked:
@@ -183,30 +205,83 @@ class ReviewSession:
             if _key(str(path)) in seen:
                 continue
             images.append(ReviewImage(image_path=str(path), filename=path.name))
-
-        from .thumbnails import detected_category_for
-
-        for image in images:
-            if not image.missing_file:
-                image.captured_at = self.store.capture_timestamp_of(image.image_path)
-                # detected_category_for's own cache is a per-image file on
-                # disk (a JSON sidecar from preprocessing) - real I/O that
-                # must not be paid for on every single load. Memoised in the
-                # store exactly like captured_at (see
-                # AnnotationStore.detected_category_of), so only the first
-                # load after a file last changed re-reads it.
-                image.detected_category = self.store.detected_category_of(
-                    image.image_path, detected_category_for
-                )
-
-        # Best first; unranked last, since they have no score to place them by.
         images.sort(key=lambda i: (i.score is None, -(i.score or 0.0), i.filename))
-        self.images = images
+        with self._state_lock:
+            self.images = images
+
         self._apply_decisions()
+
+        if self._loading_thread is not None and self._loading_thread.is_alive():
+            self._loading_thread.join(timeout=0)
+
+        self._loading_thread = threading.Thread(target=self._background_load, args=(generation,), daemon=True)
+        self._loading_thread.start()
+        # Give the first metadata pass a brief chance to finish before the
+        # caller returns, so tests and the initial page render still see
+        # category/capture values even though the UI itself stays responsive.
+        self._loading_thread.join(timeout=0.15)
+
+    def _set_loading_state(self, stage: str, message: str, percent: int, complete: bool) -> None:
+        with self._state_lock:
+            self._loading_state = {
+                "stage": stage,
+                "message": message,
+                "percent": percent,
+                "complete": complete,
+            }
+
+    def _background_load(self, generation: int) -> None:
+        try:
+            with self._background_lock:
+                if generation != self._loading_generation:
+                    return
+                metadata_store = AnnotationStore(self.store.db_path, self.store.fields_config)
+                try:
+                    self._set_loading_state("loading-metadata", "Loading ranking and review metadata…", 20, False)
+                    self._apply_decisions(metadata_store)
+                    if generation != self._loading_generation:
+                        return
+
+                    from .thumbnails import detected_category_for
+
+                    with self._state_lock:
+                        images = list(self.images)
+                    for index, image in enumerate(images):
+                        if generation != self._loading_generation:
+                            return
+                        if image.missing_file:
+                            continue
+                        image.captured_at = metadata_store.capture_timestamp_of(image.image_path)
+                        # detected_category_for's own cache is a per-image file on
+                        # disk (a JSON sidecar from preprocessing) - real I/O that
+                        # must not be paid for on every single load. Memoised in the
+                        # store exactly like captured_at (see
+                        # AnnotationStore.detected_category_of), so only the first
+                        # load after a file last changed re-reads it.
+                        image.detected_category = metadata_store.detected_category_of(
+                            image.image_path, detected_category_for
+                        )
+                        if index % 25 == 0 or index == len(images) - 1:
+                            with self._state_lock:
+                                self.images = list(images)
+                            percent = 20 + int(70 * (index + 1) / max(1, len(images)))
+                            self._set_loading_state("loading-categories", "Loading categories…", percent, False)
+
+                    if generation != self._loading_generation:
+                        return
+                    self._set_loading_state("ready", "Ready", 100, True)
+                finally:
+                    metadata_store.close()
+        except Exception as exc:  # noqa: BLE001 - a background failure must not break the page
+            logger.exception("Could not finish progressive metadata load for %s", self.input_folder)
+            with self._state_lock:
+                self.warnings.append(f"Could not finish loading metadata: {exc}")
+            self._set_loading_state("error", "Could not finish loading metadata", 100, False)
 
     def _load_ranked(self) -> list[ReviewImage]:
         if not self.ranking_file.is_file():
-            self.warnings.append(f"No ranking at {self.ranking_file}; every image starts Neutral.")
+            with self._state_lock:
+                self.warnings.append(f"No ranking at {self.ranking_file}; every image starts Neutral.")
             return []
         from ..analyzer.io import load_ranking
 
@@ -214,10 +289,12 @@ class ReviewSession:
             ranking = load_ranking(self.ranking_file)
         except Exception as exc:  # noqa: BLE001 - a broken ranking must not end the session
             logger.warning("Could not read %s: %s", self.ranking_file, exc)
-            self.warnings.append(f"Could not read the ranking ({exc}); every image starts Neutral.")
+            with self._state_lock:
+                self.warnings.append(f"Could not read the ranking ({exc}); every image starts Neutral.")
             return []
 
-        self.warnings.extend(ranking.warnings)
+        with self._state_lock:
+            self.warnings.extend(ranking.warnings)
         return [
             ReviewImage(
                 image_path=image.image_path,
@@ -238,11 +315,12 @@ class ReviewSession:
         try:
             found = enumerate_ground_truth(self.input_folder)
         except FileNotFoundError as exc:
-            self.warnings.append(str(exc))
+            with self._state_lock:
+                self.warnings.append(str(exc))
             return []
         return [p for p in found if SIDECAR_DIRNAME not in p.parts]
 
-    def _apply_decisions(self) -> None:
+    def _apply_decisions(self, store: AnnotationStore | None = None) -> None:
         """Attach stored manual decisions to the gallery.
 
         Matched on path, which is one query for the whole session. Content
@@ -251,7 +329,8 @@ class ReviewSession:
         minutes on a cold cache (see identity.py). `reconcile_by_identity()`
         closes the gap for the few rows a path match misses.
         """
-        rows = self.store.review_decisions()
+        store = store or self.store
+        rows = store.review_decisions()
         by_hash = {
             row["image_hash"]: (row["decision"], row.get("reason"), row.get("reason_note")) for row in rows
         }
@@ -259,8 +338,9 @@ class ReviewSession:
             _key(row["image_path"]): (row["decision"], row.get("reason"), row.get("reason_note"))
             for row in rows
         }
-        self._decisions_by_hash = by_hash
         matched: set[str] = set()
+        with self._state_lock:
+            self._decisions_by_hash = by_hash
         for image in self.images:
             decision, reason, reason_note = by_path.get(_key(image.image_path), (None, None, None))
             image.decision = decision
@@ -271,9 +351,10 @@ class ReviewSession:
             # elsewhere in the gallery waiting to be found by identity.
             if decision is not None and not image.missing_file:
                 matched.add(_key(image.image_path))
-        self._unmatched_decisions = len(rows) - len(matched)
+        with self._state_lock:
+            self._unmatched_decisions = len(rows) - len(matched)
 
-    def reconcile_by_identity(self) -> int:
+    def reconcile_by_identity(self, store: AnnotationStore | None = None) -> int:
         """Recover decisions for images whose file has moved since it was
         reviewed, by falling back to content identity.
 
@@ -289,7 +370,7 @@ class ReviewSession:
             if image.decision is not None or image.missing_file:
                 continue
             try:
-                digest = self.store.identity_of(image.image_path)
+                digest = (store or self.store).identity_of(image.image_path)
             except IdentityUnavailable:
                 continue
             decision, reason, reason_note = self._decisions_by_hash.get(digest, (None, None, None))
@@ -528,6 +609,10 @@ class ReviewSession:
 
     def as_dict(self) -> dict:
         ai_suggestions = self._ai_suggestions()
+        with self._state_lock:
+            loading = dict(self._loading_state)
+            warnings = list(self.warnings)
+            images = list(self.images)
         return {
             "input_folder": str(self.input_folder) if self.input_folder else None,
             "folder_missing": self.folder_missing,
@@ -536,10 +621,11 @@ class ReviewSession:
             "keep_percent": self.keep_percent,
             "counts": self.counts(),
             "agreement": self.agreement_stats(),
-            "warnings": list(self.warnings),
+            "warnings": warnings,
             "run": self.run_metadata,
             "workflow": self.workflow_state(),
-            "images": [image.as_dict(ai_suggestions.get(image.image_path)) for image in self.images],
+            "loading": loading,
+            "images": [image.as_dict(ai_suggestions.get(image.image_path)) for image in images],
         }
 
     # -- writes ---------------------------------------------------------------
