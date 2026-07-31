@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import QModelIndex, QSize, Qt, QSettings, QThreadPool, QTimer
+from PySide6.QtCore import QModelIndex, QSize, Qt, QSettings, QThreadPool
 from PySide6.QtGui import QAction, QActionGroup, QIcon, QKeySequence, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -17,7 +17,6 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMenuBar,
     QMessageBox,
-    QProgressBar,
     QProgressDialog,
     QPushButton,
     QStatusBar,
@@ -102,13 +101,6 @@ class MainWindow(QMainWindow):
         self._last_counts: dict[str, Any] = {}
         self._active_threads: list[Any] = []  # keeps background QThreads alive while running
         self._open_folder_in_progress = False
-        # True from the moment a folder-open starts until the SESSION's own
-        # background metadata thread reports complete=True - independent of
-        # _open_folder_in_progress, which now clears as soon as the gallery
-        # has real data (see _start_open_folder). Keeps _poll_loading_state
-        # ticking (status bar text/progress) for the remainder of that
-        # background work without a modal dialog gating it.
-        self._background_load_active = False
         self._open_folder_generation = 0
         self._open_folder_thread: Any | None = None
         self._folder_load_dialog: QProgressDialog | None = None
@@ -116,12 +108,6 @@ class MainWindow(QMainWindow):
         self._folder_load_snapshot: dict[str, Any] | None = None
         self._recent_folders: list[str] = []
         self._recent_folder_actions: list[QAction] = []
-        self._thumbnail_generation_count = 0
-        self._metadata_loaded_count = 0
-        self._last_loading_stage: str | None = None
-        self._loading_timer = QTimer(self)
-        self._loading_timer.setInterval(200)
-        self._loading_timer.timeout.connect(self._poll_loading_state)
 
         # Thumbnails decode off the UI thread (see core/thumbnail_loader.py);
         # this signal is how a finished background decode gets back to the
@@ -139,9 +125,6 @@ class MainWindow(QMainWindow):
         self._status_label = QLabel("Ready")
         self._status_message_label = QLabel("")
         self._gpu_status_label = QLabel("")
-        self._loading_progress = QProgressBar(self)
-        self._loading_progress.setMaximumWidth(160)
-        self._loading_progress.setVisible(False)
 
         self._central_widget = QWidget(self)
         self._gallery_model = ImageModel()
@@ -436,7 +419,6 @@ class MainWindow(QMainWindow):
         status_bar.addWidget(self._image_count_label)
         status_bar.addWidget(self._counts_label)
         status_bar.addWidget(self._status_label)
-        status_bar.addWidget(self._loading_progress)
         status_bar.addPermanentWidget(self._gpu_status_label)
         status_bar.addPermanentWidget(self._status_message_label)
         self.setStatusBar(status_bar)
@@ -547,10 +529,17 @@ class MainWindow(QMainWindow):
         self._folder_load_dialog.canceled.connect(self._cancel_open_folder)
 
     def _show_folder_load_dialog(self, folder: str) -> None:
+        # Spans only the brief synchronous portion of open_folder() (file
+        # enumeration, ranked-file merge, thumbnail model population) -
+        # closed again in _start_open_folder the moment the gallery has
+        # real data, the same span the web review UI's own blocking overlay
+        # covers (setLoading(true) before its fetch, off right after).
+        # Nothing here tracks the background metadata pass that follows;
+        # see _start_open_folder's comment for why that is no longer this
+        # dialog's job.
         if self._folder_load_dialog is None:
             self._setup_folder_load_dialog()
-        detail = "Current operation: Scanning folder…\nFiles discovered: 0\nThumbnails generated: 0\nMetadata loaded: 0\nEstimated completion: 0%"
-        self._folder_load_dialog.setLabelText(f"Opening {Path(folder).name}\n{detail}")
+        self._folder_load_dialog.setLabelText(f"Opening {Path(folder).name}\nScanning folder…")
         self._folder_load_dialog.setValue(0)
         self._folder_load_dialog.show()
 
@@ -587,12 +576,6 @@ class MainWindow(QMainWindow):
         self._open_folder_generation += 1
         generation = self._open_folder_generation
         self._open_folder_in_progress = True
-        self._background_load_active = True
-        self._thumbnail_generation_count = 0
-        self._metadata_loaded_count = 0
-        self._last_loading_stage = None
-        self._loading_progress.setVisible(True)
-        self._loading_timer.start()
         self._show_folder_load_dialog(folder_path)
         self._set_status(f"Opening {folder_path}")
         self._settings.setValue("last_opened_folder", folder_path)
@@ -620,22 +603,21 @@ class MainWindow(QMainWindow):
         # The gallery now has real data - scores, ranks, thumbnails, review
         # status - and is fully usable. What's still running in the
         # background (ReviewSession's own thread) only fills in captured_at
-        # and detected_category, neither of which the gallery even
-        # displays, so there is nothing left worth blocking on. Close the
-        # modal here instead of waiting for that background work to finish -
-        # matches the web review UI, whose own blocking overlay likewise
-        # only spans the initial request/response, never the background
-        # metadata pass that follows it (page.py's switchFolder(): setLoading
-        # is off before the background thread on the server side is done -
-        # only a plain status line reflects it from then on, same as
-        # _loading_progress/_status_message_label already do here).
+        # and detected_category. detected_category has no Desktop consumer
+        # at all today (only the web review UI's category chip/filter reads
+        # it); captured_at feeds one optional sort mode ("Capture Time",
+        # see _on_sort_field_changed) that pulls a fresh refresh on demand
+        # the moment it's actually selected, same principle as the web page
+        # never polling for this either (page.py's switchFolder(): setLoading
+        # is off before the background thread on the server side is done,
+        # and nothing there ever re-fetches state on a timer - the next
+        # ordinary interaction's own state refresh is what reveals it).
+        # So there is nothing here worth tracking to completion: close the
+        # modal now and leave the rest to finish silently.
         self._hide_folder_load_dialog()
         self._open_folder_in_progress = False
         loading = result.get("loading", {})
         if loading.get("complete", True):
-            self._background_load_active = False
-            self._loading_timer.stop()
-            self._loading_progress.setVisible(False)
             self._set_status(f"Opened {self.state.current_folder}")
         else:
             self._set_status(f"Opened {self.state.current_folder} - loading capture dates and categories in the background…")
@@ -658,12 +640,16 @@ class MainWindow(QMainWindow):
         QMessageBox.warning(self, "PeakPic - Open Folder", f"Could not open {folder_path}:\n{message}")
 
     def _finish_open_folder(self, generation: int, *, result: dict[str, Any] | None = None) -> None:
+        """Reset open-folder bookkeeping after a run that didn't end in the
+        ordinary success path in _start_open_folder - a failure, a cancel,
+        or (only under the test-seam that monkeypatches run_in_background)
+        an async completion. There is no longer a "the background metadata
+        pass just finished" case here: nothing polls for that anymore (see
+        _start_open_folder's comment), so this is purely open/cancel/fail
+        cleanup."""
         if generation != self._open_folder_generation:
             return
-        self._loading_timer.stop()
         self._open_folder_in_progress = False
-        self._background_load_active = False
-        self._loading_progress.setVisible(False)
         self._open_folder_thread = None
         self._hide_folder_load_dialog()
         if result is not None:
@@ -681,24 +667,12 @@ class MainWindow(QMainWindow):
                 )
             )
             self._set_status(f"Opened {self.state.current_folder}")
-        else:
-            # Reached from _poll_loading_state once the background thread's
-            # own loading.complete becomes True - the modal was already
-            # closed back in _start_open_folder as soon as the gallery had
-            # data, so this is purely "the background metadata pass just
-            # finished", not "the folder just became usable".
-            self._refresh_from_state(self.service.load_session())
-            if self.state.current_folder:
-                self._set_status(f"Opened {self.state.current_folder} - capture dates and categories finished loading")
 
     def _cancel_open_folder(self) -> None:
         if not self._open_folder_in_progress:
             return
         self._folder_load_cancelled = True
         self._open_folder_in_progress = False
-        self._background_load_active = False
-        self._loading_timer.stop()
-        self._loading_progress.setVisible(False)
         self.service.session._loading_generation += 1
         self._restore_previous_session()
         self._hide_folder_load_dialog()
@@ -718,70 +692,6 @@ class MainWindow(QMainWindow):
             return
         self.service.session._clear()
         self._refresh_from_state(self.service.load_session())
-
-    def _poll_loading_state(self) -> None:
-        if not self._background_load_active:
-            return
-        # loading_state() is a cheap dict read; load_session() rebuilds the
-        # full images list (as_dict() over every image, O(n)) and feeds
-        # _refresh_from_state's model reset. A large folder's background
-        # metadata pass fires this timer every 200ms for the whole duration
-        # of loading-categories/-metadata (which can be many seconds for
-        # thousands of real RAW files), and neither of the fields that
-        # phase fills in (captured_at, detected_category) is even shown on
-        # a gallery card - so doing the expensive rebuild+reset on every
-        # tick was pure waste, and on a large folder was slow enough on its
-        # own to make the whole app look hung. Only do it when the stage
-        # actually changes (or loading finishes); the progress bar/dialog
-        # still update smoothly every tick from the cheap read.
-        loading = self.service.loading_state()
-        percent = int(loading.get("percent", 0))
-        self._loading_progress.setValue(percent)
-        self._status_message_label.setText(loading.get("message", ""))
-
-        stage = loading.get("stage")
-        complete = loading.get("complete", True)
-        if stage != self._last_loading_stage or complete:
-            self._last_loading_stage = stage
-            state = self.service.load_session()
-            self._refresh_from_state(state)
-            self._update_folder_load_dialog(state)
-        else:
-            self._update_folder_load_dialog_progress(loading)
-
-        if complete:
-            self._finish_open_folder(self._open_folder_generation)
-
-    def _update_folder_load_dialog_progress(self, loading: dict[str, Any]) -> None:
-        """Cheap per-tick refresh of just the progress dialog's percent and
-        operation text - see the comment in _poll_loading_state for why the
-        fuller per-file detail counts (_update_folder_load_dialog) only
-        refresh on a stage change instead of every 200ms tick."""
-        if self._folder_load_dialog is None:
-            return
-        percent = int(loading.get("percent", 0))
-        operation = loading.get("message", "Preparing folder")
-        self._folder_load_dialog.setLabelText(f"Opening folder\nCurrent operation: {operation}\nEstimated completion: {percent}%")
-        self._folder_load_dialog.setValue(percent)
-
-    def _update_folder_load_dialog(self, state: dict[str, Any]) -> None:
-        if self._folder_load_dialog is None:
-            return
-        loading = state.get("loading", {})
-        images = state.get("images", [])
-        percent = int(loading.get("percent", 0))
-        operation = loading.get("message", "Preparing folder")
-        discovered = state.get("counts", {}).get("total", len(images))
-        metadata = sum(1 for image in images if image.get("captured_at") or image.get("detected_category"))
-        detail = (
-            f"Current operation: {operation}\n"
-            f"Files discovered: {discovered}\n"
-            f"Thumbnails generated: {self._thumbnail_generation_count}\n"
-            f"Metadata loaded: {metadata}\n"
-            f"Estimated completion: {percent}%"
-        )
-        self._folder_load_dialog.setLabelText(f"Opening folder\n{detail}")
-        self._folder_load_dialog.setValue(percent)
 
     def _refresh_from_state(self, state: dict[str, Any]) -> None:
         input_folder = state.get("input_folder")
@@ -888,9 +798,19 @@ class MainWindow(QMainWindow):
 
     def _on_sort_field_changed(self, index: int) -> None:
         field = self._sort_combo.itemData(index)
-        if field:
-            self._sort_field = field
-            self._apply_filter()
+        if not field:
+            return
+        self._sort_field = field
+        if field == "captured_at" and not self.service.loading_state().get("complete", True):
+            # captured_at is filled in lazily, in the background, after
+            # Open Folder already returned (see _start_open_folder) - this
+            # sort is the first moment a Desktop session actually needs it,
+            # so pull whatever the background pass has finished so far right
+            # now instead of showing a stale/partial view. loading_state()
+            # is a cheap dict read; load_session() is the real refresh, and
+            # it only runs here, once, on demand - not on any timer.
+            self._refresh_from_state(self.service.load_session())
+        self._apply_filter()
 
     def _on_sort_direction_toggled(self) -> None:
         self._sort_ascending = not self._sort_ascending
@@ -1243,5 +1163,14 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event: Any) -> None:
         self._save_state()
+        # ReviewSession._background_load (the daemon thread filling in
+        # captured_at/detected_category after Open Folder already returned)
+        # checks this generation counter every 25 images and bails out the
+        # moment it no longer matches - the same mechanism that already
+        # stops it when a different folder is opened. Bumping it here means
+        # a slow pass on a large folder does not keep running, and does not
+        # keep writing to the annotations database, after the window it was
+        # started for is already gone.
+        self.service.session._loading_generation += 1
         super().closeEvent(event)
 
