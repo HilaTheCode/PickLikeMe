@@ -176,4 +176,15 @@ def build_stylesheet(palette: Palette) -> str:
         background-color: {palette.window_bg};
         border: none;
     }}
+    QProgressBar {{
+        background-color: {palette.panel_bg};
+        color: {palette.text_primary};
+        border: 1px solid {palette.border};
+        border-radius: 3px;
+        text-align: center;
+    }}
+    QProgressBar::chunk {{
+        background-color: {palette.accent};
+        border-radius: 2px;
+    }}
     """

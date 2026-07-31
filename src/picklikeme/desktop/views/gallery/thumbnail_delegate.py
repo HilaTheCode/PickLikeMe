@@ -60,9 +60,21 @@ class ThumbnailCardDelegate(QAbstractItemDelegate):
         bg_color = self._get_background_color(palette, item, is_hovered)
         painter.fillRect(rect, bg_color)
 
+        # Selection needs to read at a glance even for a card that's also
+        # Keep/Reject-tinted, and a pixel-sampling check during development
+        # showed a 2px border alone (vs. 1px for unselected) is too weak a
+        # signal to reliably tell apart in a dense grid of small thumbnails.
+        # A translucent wash across the whole card, on top of any status
+        # tint, plus a heavier border, gives a much stronger combined cue -
+        # the same idea Lightroom/Capture One use for selected thumbnails.
+        if is_selected:
+            wash = QColor(palette.selection_border)
+            wash.setAlpha(45)
+            painter.fillRect(rect, wash)
+
         # Draw border
         border_color = QColor(palette.selection_border) if is_selected else QColor(palette.border)
-        border_pen = QPen(border_color, 2 if is_selected else 1)
+        border_pen = QPen(border_color, 3 if is_selected else 1)
         painter.setPen(border_pen)
         painter.drawRect(rect.adjusted(0, 0, -1, -1))
 
