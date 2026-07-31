@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from PySide6.QtCore import QItemSelectionModel, QSize, Qt, Signal
-from PySide6.QtGui import QColor, QKeyEvent, QPainter
+from PySide6.QtGui import QColor, QKeyEvent, QMouseEvent, QPainter
 from PySide6.QtWidgets import QListView
 
 from ... import theme
@@ -12,6 +12,11 @@ from .thumbnail_delegate import ThumbnailCardDelegate
 
 class GalleryView(QListView):
     keyPressSignal = Signal(int)
+    # Emitted when a card's own Keep/Reject/Neutral button is clicked -
+    # (image_path, status). Deliberately separate from the view's own
+    # selection: clicking a card's button acts on that card only and must
+    # not disturb whatever multi-selection the user already has.
+    decisionRequested = Signal(str, str)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -19,7 +24,7 @@ class GalleryView(QListView):
         self.setViewMode(QListView.IconMode)
         self.setUniformItemSizes(True)
         self.setResizeMode(QListView.Adjust)
-        self.setSpacing(4)
+        self.setSpacing(10)
         self.setMouseTracking(True)  # enable hover state in delegate
         self._delegate = ThumbnailCardDelegate(self)
         self.setItemDelegate(self._delegate)
@@ -41,6 +46,20 @@ class GalleryView(QListView):
             painter.setPen(QColor(theme.current_palette().text_muted))
             painter.drawText(self.viewport().rect(), Qt.AlignmentFlag.AlignCenter, self._empty_message)
             painter.end()
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:  # noqa: N802 - Qt override signature
+        if event.button() == Qt.MouseButton.LeftButton:
+            index = self.indexAt(event.pos())
+            if index.isValid():
+                card_rect = self.visualRect(index)
+                for status, btn_rect in self._delegate.button_rects(card_rect).items():
+                    if btn_rect.contains(event.pos()):
+                        item = self.model().item_at(index.row())
+                        if item is not None:
+                            self.decisionRequested.emit(item.path, status)
+                        event.accept()
+                        return
+        super().mousePressEvent(event)
 
     def keyPressEvent(self, event: QKeyEvent) -> None:
         # K/R/N are deliberately NOT handled here: MainWindow's Review menu

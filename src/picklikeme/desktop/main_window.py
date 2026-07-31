@@ -118,6 +118,7 @@ class MainWindow(QMainWindow):
         self._gallery_view.setModel(self._gallery_model)
         self._gallery_view.doubleClicked.connect(self._open_loupe_for_index)
         self._gallery_view.keyPressSignal.connect(self._on_gallery_key_press)
+        self._gallery_view.decisionRequested.connect(self._on_card_decision)
 
         self._filter_combo = QComboBox(self)
         self._filter_combo.addItems([f.capitalize() for f in FILTERS])
@@ -782,12 +783,17 @@ class MainWindow(QMainWindow):
                 paths.append(item.path)
         return paths
 
-    def apply_review_status(self, status: str) -> None:
+    def apply_review_status(self, status: str, *, paths: list[str] | None = None) -> None:
+        """paths=None (the keyboard/toolbar path) acts on the current
+        multi-selection. An explicit paths list (a single-card button
+        click, see _on_card_decision) acts on just that image and leaves
+        the view's own multi-selection untouched."""
         if not self.state.current_folder:
             self._set_status("Open a folder before applying review decisions")
             return
 
-        paths = self._selected_image_paths()
+        if paths is None:
+            paths = self._selected_image_paths()
         if not paths:
             self._set_status("Select an image in the gallery first")
             return
@@ -801,6 +807,10 @@ class MainWindow(QMainWindow):
         else:
             self._set_status(f"Marked {len(paths)} images as {status}")
         self._refresh_from_state(self.service.load_session())
+
+    def _on_card_decision(self, path: str, status: str) -> None:
+        """A card's own Keep/Reject/Neutral button was clicked directly."""
+        self.apply_review_status(status, paths=[path])
 
     # -- loupe / zoom review ---------------------------------------------------
 

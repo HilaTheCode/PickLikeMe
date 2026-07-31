@@ -1,33 +1,40 @@
-"""Delegate for rendering rich thumbnail cards in the gallery."""
+"""Delegate for rendering rich, clickable thumbnail cards in the gallery."""
 
 from __future__ import annotations
 
 from PySide6.QtCore import QRect, QSize, Qt
-from PySide6.QtGui import QColor, QFont, QFontMetrics, QPainter, QPen
+from PySide6.QtGui import QColor, QFont, QFontMetrics, QPainter, QPainterPath, QPen
 from PySide6.QtWidgets import QAbstractItemDelegate, QStyle
 
 from ... import theme
 
+STATUS_ORDER = ("keep", "reject", "neutral")
+STATUS_SYMBOLS = {"keep": "✓", "reject": "✗", "neutral": "○"}
+
 
 class ThumbnailCardDelegate(QAbstractItemDelegate):
-    """Renders thumbnail cards with image, filename, score, rank, and review status.
+    """Renders thumbnail cards with image, filename, score, rank, AI
+    suggestion, and clickable Keep/Reject/Neutral buttons.
 
     Colors are pulled from `theme.current_palette()` on every paint rather
     than cached, so a theme switch takes effect on the next repaint with no
-    extra notification wiring.
+    extra notification wiring. Button geometry lives in one method
+    (button_rects) used by both paint() and GalleryView's mouse handling,
+    so the drawn buttons and their click targets can never drift apart.
     """
 
-    # Geometry constants - independent of theme. CARD_HEIGHT must be tall
-    # enough for PADDING + THUMBNAIL_SIZE + SPACING + filename line (20) +
-    # score line (14) + badge line (~18) + PADDING, or the badge line
-    # paints past the card's bottom edge into the next grid row (it did,
-    # at the original CARD_HEIGHT=200 - GalleryView's setGridSize uses
-    # these constants directly, so the overflow wasn't just cosmetic).
-    CARD_WIDTH = 200
-    CARD_HEIGHT = 232
+    # Geometry constants - independent of theme. CARD_WIDTH is wide enough
+    # for "Score -0.1234 · Rank 999" plus an "AI Reject" pill on the same
+    # line without eliding - narrower cards truncated the score text
+    # noticeably often.
+    CARD_WIDTH = 220
+    CARD_HEIGHT = 252
     THUMBNAIL_SIZE = 160
     PADDING = 8
     SPACING = 4
+    CORNER_RADIUS = 8
+    BUTTON_HEIGHT = 24
+    BUTTON_GAP = 4
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -37,15 +44,33 @@ class ThumbnailCardDelegate(QAbstractItemDelegate):
         self._small_font.setPointSize(8)
         self._tiny_font = QFont()
         self._tiny_font.setPointSize(7)
+        self._button_font = QFont()
+        self._button_font.setPointSize(9)
+        self._button_font.setBold(True)
 
     def sizeHint(self, option, index) -> QSize:  # noqa: ARG002
         return QSize(self.CARD_WIDTH, self.CARD_HEIGHT)
 
+    def button_rects(self, card_rect: QRect) -> dict[str, QRect]:
+        """Keep/Reject/Neutral button rects within a card, in the same
+        coordinate space paint() receives - GalleryView's mouse handling
+        uses this exact method to hit-test clicks against what was drawn."""
+        x0 = card_rect.x() + self.PADDING
+        width = card_rect.width() - 2 * self.PADDING
+        y0 = card_rect.bottom() - self.PADDING - self.BUTTON_HEIGHT
+        btn_width = (width - 2 * self.BUTTON_GAP) // 3
+        last_width = width - 2 * (btn_width + self.BUTTON_GAP)
+        return {
+            "keep": QRect(x0, y0, btn_width, self.BUTTON_HEIGHT),
+            "reject": QRect(x0 + btn_width + self.BUTTON_GAP, y0, btn_width, self.BUTTON_HEIGHT),
+            "neutral": QRect(x0 + 2 * (btn_width + self.BUTTON_GAP), y0, last_width, self.BUTTON_HEIGHT),
+        }
+
     def paint(self, painter: QPainter, option, index) -> None:
         """Paint a single thumbnail card."""
         painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
 
-        # Get item data
         item = index.data(Qt.UserRole)
         if item is None:
             painter.restore()
@@ -56,83 +81,140 @@ class ThumbnailCardDelegate(QAbstractItemDelegate):
         is_selected = bool(option.state & QStyle.StateFlag.State_Selected)
         is_hovered = bool(option.state & QStyle.StateFlag.State_MouseOver)
 
-        # Draw background
-        bg_color = self._get_background_color(palette, item, is_hovered)
-        painter.fillRect(rect, bg_color)
+        card_rect = rect.adjusted(2, 2, -2, -2)
+        path = QPainterPath()
+        path.addRoundedRect(float(card_rect.x()), float(card_rect.y()), float(card_rect.width()), float(card_rect.height()), self.CORNER_RADIUS, self.CORNER_RADIUS)
 
-        # Selection needs to read at a glance even for a card that's also
-        # Keep/Reject-tinted, and a pixel-sampling check during development
-        # showed a 2px border alone (vs. 1px for unselected) is too weak a
-        # signal to reliably tell apart in a dense grid of small thumbnails.
-        # A translucent wash across the whole card, on top of any status
-        # tint, plus a heavier border, gives a much stronger combined cue -
-        # the same idea Lightroom/Capture One use for selected thumbnails.
+        bg_color = self._get_background_color(palette, item, is_hovered)
+        painter.fillPath(path, bg_color)
+
         if is_selected:
+            # Selection needs to read at a glance even for a card that's
+            # also Keep/Reject-tinted - a translucent wash across the
+            # whole card, on top of any status tint, plus a heavier
+            # border, gives a much stronger combined cue (a pixel-sampling
+            # check during development showed a border difference alone
+            # was too weak to reliably tell apart in a dense grid).
             wash = QColor(palette.selection_border)
             wash.setAlpha(45)
-            painter.fillRect(rect, wash)
+            painter.fillPath(path, wash)
 
-        # Draw border
-        border_color = QColor(palette.selection_border) if is_selected else QColor(palette.border)
-        border_pen = QPen(border_color, 3 if is_selected else 1)
-        painter.setPen(border_pen)
-        painter.drawRect(rect.adjusted(0, 0, -1, -1))
+        # Frame color communicates review status at a glance - the single
+        # biggest ask behind this redesign (green/red/neutral, matching the
+        # web review UI's card borders), overridden by the selection color
+        # when the card is selected.
+        border_color = QColor(palette.selection_border) if is_selected else self._status_color(palette, item.review_status)
+        border_width = 3 if is_selected else 2
+        painter.setPen(QPen(border_color, border_width))
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        inset = border_width / 2.0
+        painter.drawRoundedRect(
+            card_rect.adjusted(int(inset), int(inset), -int(inset), -int(inset)),
+            self.CORNER_RADIUS, self.CORNER_RADIUS,
+        )
 
-        # Draw thumbnail image
+        # Thumbnail image. review_thumbnail()'s cached files are letterboxed
+        # onto a square canvas (contactsheets.build_thumbnail pastes each
+        # photo, centered, onto a fixed-color square) - fine at full size,
+        # but at this card's much smaller display area the letterbox bars
+        # became a visually prominent dark band. "Cover" scaling (like CSS
+        # object-fit: cover) fills the target box and center-crops the
+        # overflow, cropping the letterboxing out - the same effect the
+        # web review UI gets from displaying these same cached files in an
+        # <img> with object-fit: cover.
         thumbnail = index.data(Qt.DecorationRole)
-        if thumbnail is not None:
-            thumb_rect = rect.adjusted(self.PADDING, self.PADDING, -self.PADDING, -self.PADDING)
+        if thumbnail is not None and not thumbnail.isNull():
+            thumb_rect = card_rect.adjusted(self.PADDING, self.PADDING, -self.PADDING, -self.PADDING)
             thumb_rect.setHeight(self.THUMBNAIL_SIZE)
-            pixmap = thumbnail
-            if not pixmap.isNull():
-                scaled = pixmap.scaledToWidth(thumb_rect.width(), Qt.TransformationMode.SmoothTransformation)
-                y_offset = (self.THUMBNAIL_SIZE - scaled.height()) // 2
-                thumb_rect.setY(thumb_rect.y() + y_offset)
-                painter.drawPixmap(thumb_rect.topLeft(), scaled)
+            scaled = thumbnail.scaled(
+                thumb_rect.width(), thumb_rect.height(),
+                Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+            crop_x = max(0, (scaled.width() - thumb_rect.width()) // 2)
+            crop_y = max(0, (scaled.height() - thumb_rect.height()) // 2)
+            cropped = scaled.copy(crop_x, crop_y, thumb_rect.width(), thumb_rect.height())
+            painter.drawPixmap(thumb_rect.topLeft(), cropped)
 
-        # Draw text section (below thumbnail)
-        text_y = rect.y() + self.PADDING + self.THUMBNAIL_SIZE + self.SPACING
-        text_rect = QRect(rect.x() + self.PADDING, text_y, rect.width() - 2 * self.PADDING, rect.height() - text_y - self.PADDING)
+        text_y = card_rect.y() + self.PADDING + self.THUMBNAIL_SIZE + self.SPACING
+        text_rect = QRect(card_rect.x() + self.PADDING, text_y, card_rect.width() - 2 * self.PADDING, 18)
 
-        # Draw filename - bold, so it reads as the card's primary label at
-        # a glance rather than competing visually with the metadata below.
-        filename = item.display_name
+        # Filename - bold, so it reads as the card's primary label at a
+        # glance rather than competing visually with the metadata below.
         painter.setFont(self._name_font)
         painter.setPen(QColor(palette.text_primary))
-        name_rect = QRect(text_rect)
-        name_rect.setHeight(20)
-        elided_name = QFontMetrics(self._name_font).elidedText(filename, Qt.TextElideMode.ElideRight, name_rect.width())
-        painter.drawText(name_rect, Qt.AlignmentFlag.AlignTop, elided_name)
+        elided_name = QFontMetrics(self._name_font).elidedText(item.display_name, Qt.TextElideMode.ElideRight, text_rect.width())
+        painter.drawText(text_rect, Qt.AlignmentFlag.AlignVCenter, elided_name)
 
-        # Draw score and rank
-        score_text = ""
-        if item.score is not None:
-            score_text = f"Score: {item.score:.3f}"
-        if item.rank is not None:
-            rank_text = f"Rank: {item.rank}"
-            score_text = f"{score_text} | {rank_text}" if score_text else rank_text
+        # Score/rank (left) and AI-suggestion pill (right) on one line.
+        # moveTop(), not setY(): QRect.setY() moves the top edge while
+        # holding the *bottom* edge fixed (it's meant for resizing a rect
+        # from its top, not translating one) - it collapsed this row's
+        # 18px height down to ~-1px, silently clamped, so nothing drew.
+        # moveTop() translates the whole rect and preserves its size.
+        score_rect = QRect(text_rect)
+        score_rect.moveTop(score_rect.y() + 19)
+        self._draw_score_and_ai_badge(painter, palette, score_rect, item)
 
-        if score_text:
-            painter.setFont(self._small_font)
-            painter.setPen(QColor(palette.text_muted))
-            score_rect = QRect(text_rect)
-            score_rect.setY(score_rect.y() + 20)
-            score_rect.setHeight(14)
-            elided_score = QFontMetrics(self._small_font).elidedText(score_text, Qt.TextElideMode.ElideRight, score_rect.width())
-            painter.drawText(score_rect, Qt.AlignmentFlag.AlignTop, elided_score)
-
-        # Draw review status and AI suggestion badges
-        painter.setFont(self._tiny_font)
-        badge_rect = QRect(text_rect)
-        badge_rect.setY(badge_rect.y() + 36)
-        badge_rect.setHeight(16)
-        self._draw_status_badge(painter, palette, badge_rect, item)
+        # Keep/Reject/Neutral buttons
+        self._draw_buttons(painter, palette, card_rect, item)
 
         painter.restore()
 
+    def _draw_score_and_ai_badge(self, painter: QPainter, palette: theme.Palette, rect: QRect, item) -> None:
+        parts = []
+        if item.score is not None:
+            parts.append(f"Score {item.score:.4f}")
+        if item.rank is not None:
+            parts.append(f"Rank {item.rank}")
+        score_text = " · ".join(parts) if parts else "Unranked"
+
+        painter.setFont(self._small_font)
+        painter.setPen(QColor(palette.text_muted))
+        metrics = QFontMetrics(self._small_font)
+
+        ai_text = ""
+        if item.ai_suggestion and item.ai_suggestion != item.review_status:
+            ai_text = f"AI {item.ai_suggestion.capitalize()}"
+        ai_width = metrics.horizontalAdvance(ai_text) + 14 if ai_text else 0
+
+        score_box = QRect(rect)
+        score_box.setWidth(max(0, rect.width() - ai_width - (6 if ai_text else 0)))
+        elided_score = metrics.elidedText(score_text, Qt.TextElideMode.ElideRight, score_box.width())
+        painter.drawText(score_box, Qt.AlignmentFlag.AlignVCenter, elided_score)
+
+        if ai_text:
+            pill_rect = QRect(rect.right() - ai_width, rect.y(), ai_width, rect.height())
+            pill_path = QPainterPath()
+            pill_path.addRoundedRect(float(pill_rect.x()), float(pill_rect.y()), float(pill_rect.width()), float(pill_rect.height()), rect.height() / 2.0, rect.height() / 2.0)
+            fill = QColor(palette.accent)
+            fill.setAlpha(40)
+            painter.fillPath(pill_path, fill)
+            painter.setPen(QColor(palette.accent))
+            painter.drawText(pill_rect, Qt.AlignmentFlag.AlignCenter, ai_text)
+
+    def _draw_buttons(self, painter: QPainter, palette: theme.Palette, card_rect: QRect, item) -> None:
+        rects = self.button_rects(card_rect)
+        active_colors = {"keep": palette.keep_fg, "reject": palette.reject_fg, "neutral": palette.neutral_fg}
+        painter.setFont(self._button_font)
+        for status in STATUS_ORDER:
+            btn_rect = rects[status]
+            is_active = item.review_status == status
+            btn_path = QPainterPath()
+            radius = self.BUTTON_HEIGHT / 2.0
+            btn_path.addRoundedRect(float(btn_rect.x()), float(btn_rect.y()), float(btn_rect.width()), float(btn_rect.height()), radius, radius)
+            if is_active:
+                painter.fillPath(btn_path, QColor(active_colors[status]))
+                painter.setPen(QColor("#ffffff") if status != "neutral" else QColor(palette.window_bg))
+            else:
+                painter.setPen(QPen(QColor(palette.border), 1))
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.drawPath(btn_path)
+                painter.setPen(QColor(palette.text_muted))
+            painter.drawText(btn_rect, Qt.AlignmentFlag.AlignCenter, STATUS_SYMBOLS[status])
+
     @staticmethod
     def _get_background_color(palette: theme.Palette, item, is_hovered: bool) -> QColor:
-        """Determine background color based on review status."""
         if item.review_status == "keep":
             return QColor(palette.keep_bg)
         if item.review_status == "reject":
@@ -142,40 +224,9 @@ class ThumbnailCardDelegate(QAbstractItemDelegate):
         return QColor(palette.neutral_bg)
 
     @staticmethod
-    def _draw_status_badge(painter: QPainter, palette: theme.Palette, rect: QRect, item) -> None:
-        """Draw review status and AI suggestion badges.
-
-        Uses the rect+alignment drawText overload throughout (matching the
-        filename/score rows above), not the point+baseline overload - mixing
-        the two previously put the badge's text *baseline* where the score
-        row's text *top* was, so the two visibly overlapped.
-        """
-        status_text = ""
-        status_color: QColor | None = None
-
-        if item.review_status == "keep":
-            status_text = "✓ Keep"
-            status_color = QColor(palette.keep_fg)
-        elif item.review_status == "reject":
-            status_text = "✗ Reject"
-            status_color = QColor(palette.reject_fg)
-        elif item.review_status == "neutral":
-            status_text = "? Neutral"
-            status_color = QColor(palette.neutral_fg)
-
-        # Draw status badge, then the AI suggestion right after it (not at
-        # a fixed offset - "Neutral"/"AI: Neutral" are both longer than
-        # "Keep"/"AI: Keep", and a fixed gap either clipped the longer
-        # combinations or left an oddly wide gap for the shorter ones).
-        next_x = rect.x()
-        if status_text and status_color is not None:
-            painter.setPen(status_color)
-            painter.drawText(rect, Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft, status_text)
-            next_x = rect.x() + QFontMetrics(painter.font()).horizontalAdvance(status_text) + 8
-
-        if item.ai_suggestion and item.ai_suggestion != item.review_status:
-            ai_text = f"AI: {item.ai_suggestion.capitalize()}"
-            ai_rect = QRect(rect)
-            ai_rect.setX(next_x)
-            painter.setPen(QColor(palette.accent))
-            painter.drawText(ai_rect, Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft, ai_text)
+    def _status_color(palette: theme.Palette, status: str) -> QColor:
+        if status == "keep":
+            return QColor(palette.keep_fg)
+        if status == "reject":
+            return QColor(palette.reject_fg)
+        return QColor(palette.border)
