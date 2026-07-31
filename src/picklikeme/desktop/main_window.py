@@ -117,6 +117,7 @@ class MainWindow(QMainWindow):
         # queue duplicate decode jobs for it.
         self._thumbnail_signal = ThumbnailReadySignal()
         self._thumbnail_signal.ready.connect(self._on_thumbnail_ready)
+        self._thumbnail_signal.failed.connect(self._on_thumbnail_failed)
         self._thumbnails_loading: set[tuple[str, bool]] = set()
 
         self._folder_label = QLabel("No folder open")
@@ -607,20 +608,17 @@ class MainWindow(QMainWindow):
         # at all today (only the web review UI's category chip/filter reads
         # it); captured_at feeds one optional sort mode ("Capture Time",
         # see _on_sort_field_changed) that pulls a fresh refresh on demand
-        # the moment it's actually selected, same principle as the web page
-        # never polling for this either (page.py's switchFolder(): setLoading
-        # is off before the background thread on the server side is done,
-        # and nothing there ever re-fetches state on a timer - the next
-        # ordinary interaction's own state refresh is what reveals it).
-        # So there is nothing here worth tracking to completion: close the
-        # modal now and leave the rest to finish silently.
+        # the moment it's actually selected. Nothing currently visible or
+        # interactive is waiting on this pass, so - deliberately, not an
+        # oversight - the status message says only "Opened", never "...
+        # loading in the background": that clause would be accurate for a
+        # moment and then silently stale for however long the photographer
+        # doesn't happen to trigger an unrelated refresh, which is a worse
+        # message than none at all. Matches the web page exactly as far as
+        # it matters: nothing here tracks this pass to completion.
         self._hide_folder_load_dialog()
         self._open_folder_in_progress = False
-        loading = result.get("loading", {})
-        if loading.get("complete", True):
-            self._set_status(f"Opened {self.state.current_folder}")
-        else:
-            self._set_status(f"Opened {self.state.current_folder} - loading capture dates and categories in the background…")
+        self._set_status(f"Opened {self.state.current_folder}")
 
         if run_in_background is not _real_run_in_background:
             self._open_folder_thread = run_in_background(
@@ -753,6 +751,18 @@ class MainWindow(QMainWindow):
         self.cache_manager.put_thumbnail((path, with_boxes), pixmap)
         if with_boxes == self._show_detector_boxes:
             self._gallery_model.notify_thumbnail_ready(path)
+
+    def _on_thumbnail_failed(self, path: str, with_boxes: bool) -> None:
+        """A decode that raised, returned nothing, or produced a null pixmap
+        (a locked file, a transient RAW-reader error) - not cached, since
+        there is nothing to cache, but the in-flight marker must still be
+        cleared. Without this, _load_thumbnail's `if cache_key not in
+        self._thumbnails_loading` guard would never let this image be
+        requested again for the rest of the session; that card would stay
+        blank forever regardless of scrolling, resorting, or reopening the
+        filter - the one path a bad frame could look identical to "still
+        loading" with no way to tell the two apart."""
+        self._thumbnails_loading.discard((path, with_boxes))
 
     def _on_toggle_detector_boxes(self, checked: bool) -> None:
         """Every visible cell's decoration is re-requested on the next

@@ -9,6 +9,7 @@ from PySide6.QtCore import Qt
 from picklikeme.desktop.core.caching import CacheManager
 from picklikeme.desktop.core.commands import OpenFolderCommand
 from picklikeme.desktop.core.events import EventBus
+from picklikeme.desktop.core.thumbnail_loader import ThumbnailLoadTask, ThumbnailReadySignal
 from picklikeme.desktop.models.image_item import ImageItem
 from picklikeme.desktop.models.image_model import ImageModel
 from picklikeme.desktop.views.gallery.gallery_view import GalleryView
@@ -39,6 +40,41 @@ def test_event_bus_delivers_payload() -> None:
     bus.publish("folder-opened", {"folder": "/tmp/shoot"})
 
     assert events == [{"folder": "/tmp/shoot"}]
+
+
+@pytest.mark.skipif(QApplication is None, reason="PySide6 not installed")
+def test_thumbnail_load_task_emits_failed_not_silence_on_exception() -> None:
+    """Regression: run() used to just `return` on a bad frame, emitting
+    nothing at all - indistinguishable from "still loading" to the caller,
+    which left that image's (path, with_boxes) key stuck in
+    MainWindow._thumbnails_loading forever (see _on_thumbnail_failed), with
+    no way to ever retry it for the rest of the session."""
+    QApplication.instance() or QApplication([])
+    signal = ThumbnailReadySignal()
+    failed: list[tuple[str, bool]] = []
+    ready: list[tuple[str, bool]] = []
+    signal.failed.connect(lambda path, with_boxes: failed.append((path, with_boxes)))
+    signal.ready.connect(lambda path, with_boxes, pixmap: ready.append((path, with_boxes)))
+
+    def raising_load_fn():
+        raise RuntimeError("simulated decode failure")
+
+    ThumbnailLoadTask("bad/frame.NEF", False, raising_load_fn, signal).run()
+
+    assert failed == [("bad/frame.NEF", False)]
+    assert ready == []
+
+
+@pytest.mark.skipif(QApplication is None, reason="PySide6 not installed")
+def test_thumbnail_load_task_emits_failed_on_none_result() -> None:
+    QApplication.instance() or QApplication([])
+    signal = ThumbnailReadySignal()
+    failed: list[tuple[str, bool]] = []
+    signal.failed.connect(lambda path, with_boxes: failed.append((path, with_boxes)))
+
+    ThumbnailLoadTask("no/thumbnail.NEF", True, lambda: None, signal).run()
+
+    assert failed == [("no/thumbnail.NEF", True)]
 
 
 def test_cache_manager_tracks_hits_and_misses() -> None:

@@ -1,4 +1,5 @@
 import os
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -87,6 +88,46 @@ def test_main_window_can_apply_review_status(tmp_path) -> None:
     assert service.session.images[0].review_status == "keep"
 
     window.close()
+
+
+@pytest.mark.skipif(QApplication is None, reason="PySide6 not installed")
+def test_thumbnail_decode_failure_can_be_retried(tmp_path) -> None:
+    """Regression: a thumbnail that fails to decode (here, a file that is
+    not a real image, so review_thumbnail/QPixmap load fails) used to get
+    permanently stuck in _thumbnails_loading, since ThumbnailLoadTask.run()
+    emitted nothing at all on failure - not even the fact that it had
+    failed - so _load_thumbnail's own dedup guard could never let it be
+    requested again for the rest of the session."""
+    app = QApplication.instance() or QApplication([])
+    state = ApplicationState()
+    settings = DesktopSettings()
+    service = ReviewService(db_path=tmp_path / "annotations.sqlite")
+    window = MainWindow(state=state, settings=settings, service=service, worker_manager=WorkerManager())
+
+    folder = tmp_path / "review"
+    folder.mkdir()
+    bad_path = folder / "not_really_an_image.jpg"
+    bad_path.write_bytes(b"fake")
+
+    window.open_folder(str(folder))
+    resolved = str(bad_path.resolve())
+    key = (resolved, False)
+
+    assert window._load_thumbnail(resolved) is None  # cache miss - queues the decode
+    assert key in window._thumbnails_loading
+
+    deadline = time.monotonic() + 5.0
+    while key in window._thumbnails_loading and time.monotonic() < deadline:
+        app.processEvents()
+        time.sleep(0.01)
+
+    assert key not in window._thumbnails_loading, "a failed decode is stuck and can never be retried"
+    assert window._load_thumbnail(resolved) is None
+    assert key in window._thumbnails_loading, "a retry after failure was not queued"
+
+    window.close()
+    service.close()
+    app.quit()
     service.close()
     app.quit()
 

@@ -30,6 +30,13 @@ class ThumbnailReadySignal(QObject):
     Qt auto-queues the connected slot onto this object's (the GUI) thread."""
 
     ready = Signal(str, bool, QPixmap)  # image path, with_boxes, pixmap
+    # A load that raised, returned None, or produced a null pixmap - travels
+    # the same (path, with_boxes) identity as `ready` so the caller can clear
+    # its "in flight" bookkeeping either way. Without this, a single failed
+    # decode (a locked file, a transient RAW-reader error) left that image
+    # permanently stuck in _thumbnails_loading with no way to ever retry it
+    # for the rest of the session - see MainWindow._on_thumbnail_failed.
+    failed = Signal(str, bool)  # image path, with_boxes
 
 
 class ThumbnailLoadTask(QRunnable):
@@ -56,10 +63,13 @@ class ThumbnailLoadTask(QRunnable):
         try:
             thumbnail_path = self._load_fn()
         except Exception:  # noqa: BLE001 - a bad frame must not break the gallery
+            self._signal.failed.emit(self._path, self._with_boxes)
             return
         if thumbnail_path is None:
+            self._signal.failed.emit(self._path, self._with_boxes)
             return
         pixmap = QPixmap(str(thumbnail_path))
         if pixmap.isNull():
+            self._signal.failed.emit(self._path, self._with_boxes)
             return
         self._signal.ready.emit(self._path, self._with_boxes, pixmap)
