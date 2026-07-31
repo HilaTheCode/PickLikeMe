@@ -98,6 +98,7 @@ class MainWindow(QMainWindow):
         self._current_filter = "all"
         self._sort_field = "score"  # matches ReviewSession.load()'s own default ordering
         self._sort_ascending = False
+        self._show_detector_boxes = False
         self._last_counts: dict[str, Any] = {}
         self._active_threads: list[Any] = []  # keeps background QThreads alive while running
         self._open_folder_in_progress = False
@@ -123,7 +124,7 @@ class MainWindow(QMainWindow):
         # queue duplicate decode jobs for it.
         self._thumbnail_signal = ThumbnailReadySignal()
         self._thumbnail_signal.ready.connect(self._on_thumbnail_ready)
-        self._thumbnails_loading: set[str] = set()
+        self._thumbnails_loading: set[tuple[str, bool]] = set()
 
         self._folder_label = QLabel("No folder open")
         self._image_count_label = QLabel("Images: 0")
@@ -359,6 +360,11 @@ class MainWindow(QMainWindow):
         view_menu.addAction(self._light_theme_action)
         self._dark_theme_action.setChecked(theme.current_theme_name() == "dark")
         self._light_theme_action.setChecked(theme.current_theme_name() == "light")
+        view_menu.addSeparator()
+        self._detector_boxes_action = QAction("Detector Boxes", self, checkable=True)
+        self._detector_boxes_action.setToolTip("Show the AI's detected-subject bounding boxes on gallery thumbnails and in the Loupe")
+        self._detector_boxes_action.toggled.connect(self._on_toggle_detector_boxes)
+        view_menu.addAction(self._detector_boxes_action)
 
         tools_menu = menu_bar.addMenu("Tools")
         tools_menu.addAction(self._rank_action)
@@ -397,6 +403,7 @@ class MainWindow(QMainWindow):
         toolbar.addWidget(QLabel(" Sort: "))
         toolbar.addWidget(self._sort_combo)
         toolbar.addWidget(self._sort_direction_btn)
+        toolbar.addAction(self._detector_boxes_action)
         toolbar.addSeparator()
 
         toolbar.addAction(self._rank_action)
@@ -750,22 +757,44 @@ class MainWindow(QMainWindow):
         paint path, on the UI thread. Must never decode here: a cache miss
         starts a background decode (see core/thumbnail_loader.py) and
         returns None immediately; the delegate paints a blank card until
-        _on_thumbnail_ready repaints this one row."""
+        _on_thumbnail_ready repaints this one row.
+
+        Cached and requested under a (path, with_boxes) key - the same
+        path needs two independent cache slots since review_thumbnail()
+        returns a different file for each (a separate overlaid copy, not
+        the plain thumbnail modified in place), and toggling the Detector
+        Boxes view must not show a stale plain/overlaid thumbnail from
+        before the toggle."""
         if not path:
             return None
-        cached = self.cache_manager.get_thumbnail(path)
+        with_boxes = self._show_detector_boxes
+        cache_key = (path, with_boxes)
+        cached = self.cache_manager.get_thumbnail(cache_key)
         if cached is not None:
             return cached
-        if path not in self._thumbnails_loading:
-            self._thumbnails_loading.add(path)
-            task = ThumbnailLoadTask(path, self.service.thumbnail_path, self._thumbnail_signal)
+        if cache_key not in self._thumbnails_loading:
+            self._thumbnails_loading.add(cache_key)
+            task = ThumbnailLoadTask(
+                path, with_boxes,
+                lambda p=path, wb=with_boxes: self.service.thumbnail_path(p, with_boxes=wb),
+                self._thumbnail_signal,
+            )
             QThreadPool.globalInstance().start(task)
         return None
 
-    def _on_thumbnail_ready(self, path: str, pixmap: QPixmap) -> None:
-        self._thumbnails_loading.discard(path)
-        self.cache_manager.put_thumbnail(path, pixmap)
-        self._gallery_model.notify_thumbnail_ready(path)
+    def _on_thumbnail_ready(self, path: str, with_boxes: bool, pixmap: QPixmap) -> None:
+        self._thumbnails_loading.discard((path, with_boxes))
+        self.cache_manager.put_thumbnail((path, with_boxes), pixmap)
+        if with_boxes == self._show_detector_boxes:
+            self._gallery_model.notify_thumbnail_ready(path)
+
+    def _on_toggle_detector_boxes(self, checked: bool) -> None:
+        """Every visible cell's decoration is re-requested on the next
+        repaint; _load_thumbnail keys its cache by (path, with_boxes), so
+        this naturally fetches (or reuses an already-cached) overlaid or
+        plain thumbnail per the new state rather than showing a stale one."""
+        self._show_detector_boxes = checked
+        self._gallery_view.viewport().update()
 
     # -- filtering ------------------------------------------------------------
 

@@ -19,7 +19,6 @@ just that one row.
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Callable
 
 from PySide6.QtCore import QObject, QRunnable, Signal
@@ -30,22 +29,32 @@ class ThumbnailReadySignal(QObject):
     """Owned by the GUI thread; emitting from a worker thread is safe -
     Qt auto-queues the connected slot onto this object's (the GUI) thread."""
 
-    ready = Signal(str, QPixmap)
+    ready = Signal(str, bool, QPixmap)  # image path, with_boxes, pixmap
 
 
 class ThumbnailLoadTask(QRunnable):
-    """Decodes one thumbnail off the UI thread and reports back via signal."""
+    """Decodes one thumbnail off the UI thread and reports back via signal.
 
-    def __init__(self, path: str, thumbnail_path_fn: Callable[[str], Path | None], signal: ThumbnailReadySignal) -> None:
+    `path` and `with_boxes` are purely identity for the caller to know
+    which cache slot to fill when `ready` fires (with_boxes travels with
+    the result rather than being read from live toggle state at
+    completion time, so a toggle flipped while this request is still
+    in-flight can't mislabel the result under the wrong cache key).
+    `load_fn` is a zero-argument closure that does the actual work (e.g.
+    `lambda: service.thumbnail_path(path, with_boxes=with_boxes)`).
+    """
+
+    def __init__(self, path: str, with_boxes: bool, load_fn: Callable[[], object], signal: ThumbnailReadySignal) -> None:
         super().__init__()
         self._path = path
-        self._thumbnail_path_fn = thumbnail_path_fn
+        self._with_boxes = with_boxes
+        self._load_fn = load_fn
         self._signal = signal
         self.setAutoDelete(True)
 
     def run(self) -> None:
         try:
-            thumbnail_path = self._thumbnail_path_fn(self._path)
+            thumbnail_path = self._load_fn()
         except Exception:  # noqa: BLE001 - a bad frame must not break the gallery
             return
         if thumbnail_path is None:
@@ -53,4 +62,4 @@ class ThumbnailLoadTask(QRunnable):
         pixmap = QPixmap(str(thumbnail_path))
         if pixmap.isNull():
             return
-        self._signal.ready.emit(self._path, pixmap)
+        self._signal.ready.emit(self._path, self._with_boxes, pixmap)
