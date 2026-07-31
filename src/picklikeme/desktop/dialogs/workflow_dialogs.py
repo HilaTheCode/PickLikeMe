@@ -28,6 +28,12 @@ class RankDialog(QDialog):
     def __init__(self, *, parent=None) -> None:
         super().__init__(parent)
         self.setWindowTitle("Rank by AI")
+        # The default checkpoint path is a full project-relative path
+        # (~60 chars); without a minimum width the dialog shrinks to fit
+        # its labels/buttons and the path field scrolls to the cursor,
+        # showing only its tail ("...odel_checkpoint.pt") instead of the
+        # full path.
+        self.setMinimumWidth(480)
 
         self._checkpoint_edit = QLineEdit(str(DEFAULT_CHECKPOINT_PATH), self)
         browse_btn = QPushButton("Browse…", self)
