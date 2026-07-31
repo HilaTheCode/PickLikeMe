@@ -25,6 +25,15 @@ class DesktopApplication:
 
     def __init__(self, *, db_path: str | Path | None = None) -> None:
         self._app = QApplication.instance() or QApplication([])
+        # Belt-and-suspenders app identification: every dialog that shows a
+        # title bar sets its own explicit setWindowTitle() (the actual fix
+        # for windows that were showing "python" - QProgressDialog's first
+        # constructor argument is its label text, not a window title, and
+        # was never given one), but naming the application itself is still
+        # the correct Qt practice for OS-level identification (taskbar
+        # grouping, Alt-Tab, crash dialogs) independent of that.
+        self._app.setApplicationName("PeakPic")
+        self._app.setApplicationDisplayName("PeakPic Desktop")
         self.state = ApplicationState()
         self.service = ReviewService(db_path=db_path)
         self.settings = SettingsStore()

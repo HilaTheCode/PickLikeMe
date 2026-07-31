@@ -335,7 +335,7 @@ class LoupeDialog(QDialog):
         try:
             preview = self.service.preview_path(path)
         except Exception as exc:  # noqa: BLE001 - a bad frame must not crash the loupe
-            QMessageBox.warning(self, "Loupe", f"Could not load preview:\n{exc}")
+            QMessageBox.warning(self, "PeakPic - Loupe", f"Could not load preview:\n{exc}")
             return
         pixmap = QPixmap(str(preview))
         self._current_raw_pixmap = pixmap
@@ -392,7 +392,7 @@ class LoupeDialog(QDialog):
         try:
             self.service.set_review_status(self._current_path(), status, reason=reason, reason_note=note)
         except Exception as exc:  # noqa: BLE001 - surfaced to the photographer, not fatal
-            QMessageBox.warning(self, "Loupe", f"Could not save decision:\n{exc}")
+            QMessageBox.warning(self, "PeakPic - Loupe", f"Could not save decision:\n{exc}")
             return
         if self.items is not None:
             self.items[self.index].review_status = status
@@ -429,9 +429,9 @@ class LoupeDialog(QDialog):
         try:
             self.service.save_jpeg(path, destination)
         except Exception as exc:  # noqa: BLE001 - surfaced to the photographer, not fatal
-            QMessageBox.warning(self, "Save as JPEG", f"Could not save JPEG:\n{exc}")
+            QMessageBox.warning(self, "PeakPic - Save as JPEG", f"Could not save JPEG:\n{exc}")
             return
-        QMessageBox.information(self, "Save as JPEG", f"Saved to {destination}")
+        QMessageBox.information(self, "PeakPic - Save as JPEG", f"Saved to {destination}")
 
     def keyPressEvent(self, event: QKeyEvent) -> None:  # noqa: N802 - Qt override signature
         key = event.key()

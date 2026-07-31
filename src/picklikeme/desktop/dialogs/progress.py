@@ -26,6 +26,11 @@ def run_with_progress(
     the duration of the run (e.g. store it on `self`).
     """
     dialog = QProgressDialog(title, "", 0, 0, parent)
+    # QProgressDialog's first constructor argument is the label text shown
+    # inside the dialog, not its window title - without an explicit
+    # setWindowTitle() the title bar falls back to the executable name
+    # ("python"), not the app name.
+    dialog.setWindowTitle(f"PeakPic - {title}")
     dialog.setWindowModality(Qt.WindowModal)
     dialog.setCancelButton(None)
     dialog.setMinimumDuration(0)
@@ -53,7 +58,7 @@ def run_with_progress(
         if on_error is not None:
             on_error(message)
         else:
-            QMessageBox.warning(parent, title, f"{title} failed:\n{message}")
+            QMessageBox.warning(parent, f"PeakPic - {title}", f"{title} failed:\n{message}")
 
     return run_in_background(
         parent,

@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import QModelIndex, QSize, Qt, QSettings, QTimer
+from PySide6.QtCore import QModelIndex, QSize, Qt, QSettings, QThreadPool, QTimer
 from PySide6.QtGui import QAction, QActionGroup, QIcon, QKeySequence, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -32,6 +32,7 @@ from .application import ApplicationState, WorkerManager
 from .core.caching import CacheManager
 from .core.events import EventBus
 from .core.jobs import JobManager, JobSpec, run_in_background as _real_run_in_background
+from .core.thumbnail_loader import ThumbnailLoadTask, ThumbnailReadySignal
 
 run_in_background = _real_run_in_background
 from .dialogs.loupe_dialog import LoupeDialog
@@ -85,9 +86,20 @@ class MainWindow(QMainWindow):
         self._recent_folder_actions: list[QAction] = []
         self._thumbnail_generation_count = 0
         self._metadata_loaded_count = 0
+        self._last_loading_stage: str | None = None
         self._loading_timer = QTimer(self)
         self._loading_timer.setInterval(200)
         self._loading_timer.timeout.connect(self._poll_loading_state)
+
+        # Thumbnails decode off the UI thread (see core/thumbnail_loader.py);
+        # this signal is how a finished background decode gets back to the
+        # GUI thread to repaint just its one row. _thumbnails_loading tracks
+        # in-flight paths so Qt re-asking for the same not-yet-ready cell
+        # (which it does, repeatedly, while scrolling/repainting) doesn't
+        # queue duplicate decode jobs for it.
+        self._thumbnail_signal = ThumbnailReadySignal()
+        self._thumbnail_signal.ready.connect(self._on_thumbnail_ready)
+        self._thumbnails_loading: set[str] = set()
 
         self._folder_label = QLabel("No folder open")
         self._image_count_label = QLabel("Images: 0")
@@ -459,6 +471,11 @@ class MainWindow(QMainWindow):
 
     def _setup_folder_load_dialog(self) -> None:
         self._folder_load_dialog = QProgressDialog("Opening folder…", "Cancel", 0, 100, self)
+        # QProgressDialog's first constructor argument is the label text
+        # shown inside the dialog, not its window title - without an
+        # explicit setWindowTitle() the title bar falls back to the
+        # executable name ("python"), not the app name.
+        self._folder_load_dialog.setWindowTitle("PeakPic - Opening Folder")
         self._folder_load_dialog.setWindowModality(Qt.WindowModal)
         self._folder_load_dialog.setMinimumDuration(0)
         self._folder_load_dialog.setAutoClose(False)
@@ -496,6 +513,7 @@ class MainWindow(QMainWindow):
         self._open_folder_in_progress = True
         self._thumbnail_generation_count = 0
         self._metadata_loaded_count = 0
+        self._last_loading_stage = None
         self._loading_timer.start()
         self._show_folder_load_dialog(folder_path)
         self._set_status(f"Opening {folder_path}")
@@ -508,7 +526,7 @@ class MainWindow(QMainWindow):
             self._set_status(f"Could not open {folder_path}: {exc}")
             self._restore_previous_session()
             self._finish_open_folder(generation)
-            QMessageBox.warning(self, "Open Folder", f"Could not open {folder_path}:\n{exc}")
+            QMessageBox.warning(self, "PeakPic - Open Folder", f"Could not open {folder_path}:\n{exc}")
             return self.service.load_session()
 
         if self._folder_load_cancelled or generation != self._open_folder_generation:
@@ -536,7 +554,7 @@ class MainWindow(QMainWindow):
         self._set_status(f"Could not open {folder_path}: {message}")
         self._restore_previous_session()
         self._finish_open_folder(generation)
-        QMessageBox.warning(self, "Open Folder", f"Could not open {folder_path}:\n{message}")
+        QMessageBox.warning(self, "PeakPic - Open Folder", f"Could not open {folder_path}:\n{message}")
 
     def _finish_open_folder(self, generation: int, *, result: dict[str, Any] | None = None) -> None:
         if generation != self._open_folder_generation:
@@ -592,14 +610,47 @@ class MainWindow(QMainWindow):
     def _poll_loading_state(self) -> None:
         if not self._open_folder_in_progress:
             return
-        state = self.service.load_session()
-        loading = state.get("loading", {})
-        self._loading_progress.setValue(int(loading.get("percent", 0)))
+        # loading_state() is a cheap dict read; load_session() rebuilds the
+        # full images list (as_dict() over every image, O(n)) and feeds
+        # _refresh_from_state's model reset. A large folder's background
+        # metadata pass fires this timer every 200ms for the whole duration
+        # of loading-categories/-metadata (which can be many seconds for
+        # thousands of real RAW files), and neither of the fields that
+        # phase fills in (captured_at, detected_category) is even shown on
+        # a gallery card - so doing the expensive rebuild+reset on every
+        # tick was pure waste, and on a large folder was slow enough on its
+        # own to make the whole app look hung. Only do it when the stage
+        # actually changes (or loading finishes); the progress bar/dialog
+        # still update smoothly every tick from the cheap read.
+        loading = self.service.loading_state()
+        percent = int(loading.get("percent", 0))
+        self._loading_progress.setValue(percent)
         self._status_message_label.setText(loading.get("message", ""))
-        self._refresh_from_state(state)
-        self._update_folder_load_dialog(state)
-        if loading.get("complete", True):
+
+        stage = loading.get("stage")
+        complete = loading.get("complete", True)
+        if stage != self._last_loading_stage or complete:
+            self._last_loading_stage = stage
+            state = self.service.load_session()
+            self._refresh_from_state(state)
+            self._update_folder_load_dialog(state)
+        else:
+            self._update_folder_load_dialog_progress(loading)
+
+        if complete:
             self._finish_open_folder(self._open_folder_generation)
+
+    def _update_folder_load_dialog_progress(self, loading: dict[str, Any]) -> None:
+        """Cheap per-tick refresh of just the progress dialog's percent and
+        operation text - see the comment in _poll_loading_state for why the
+        fuller per-file detail counts (_update_folder_load_dialog) only
+        refresh on a stage change instead of every 200ms tick."""
+        if self._folder_load_dialog is None:
+            return
+        percent = int(loading.get("percent", 0))
+        operation = loading.get("message", "Preparing folder")
+        self._folder_load_dialog.setLabelText(f"Opening folder\nCurrent operation: {operation}\nEstimated completion: {percent}%")
+        self._folder_load_dialog.setValue(percent)
 
     def _update_folder_load_dialog(self, state: dict[str, Any]) -> None:
         if self._folder_load_dialog is None:
@@ -645,22 +696,26 @@ class MainWindow(QMainWindow):
             self.open_folder(folder)
 
     def _load_thumbnail(self, path: str) -> QPixmap | None:
+        """Called from ImageModel.data(Qt.DecorationRole) - i.e. from Qt's
+        paint path, on the UI thread. Must never decode here: a cache miss
+        starts a background decode (see core/thumbnail_loader.py) and
+        returns None immediately; the delegate paints a blank card until
+        _on_thumbnail_ready repaints this one row."""
         if not path:
             return None
         cached = self.cache_manager.get_thumbnail(path)
         if cached is not None:
             return cached
-        try:
-            thumbnail_path = self.service.thumbnail_path(path)
-        except Exception:  # noqa: BLE001 - a bad frame must not break the gallery
-            return None
-        if thumbnail_path is None:
-            return None
-        pixmap = QPixmap(str(thumbnail_path))
-        if pixmap.isNull():
-            return None
+        if path not in self._thumbnails_loading:
+            self._thumbnails_loading.add(path)
+            task = ThumbnailLoadTask(path, self.service.thumbnail_path, self._thumbnail_signal)
+            QThreadPool.globalInstance().start(task)
+        return None
+
+    def _on_thumbnail_ready(self, path: str, pixmap: QPixmap) -> None:
+        self._thumbnails_loading.discard(path)
         self.cache_manager.put_thumbnail(path, pixmap)
-        return pixmap
+        self._gallery_model.notify_thumbnail_ready(path)
 
     # -- filtering ------------------------------------------------------------
 
@@ -809,7 +864,7 @@ class MainWindow(QMainWindow):
             f"  {preview['rejected']} image(s) -> {preview['rejected_dir']}\n\n"
             "Neutral images are left where they are. Continue?"
         )
-        confirm = QMessageBox.question(self, "Organize", message)
+        confirm = QMessageBox.question(self, "PeakPic - Organize", message)
         if confirm != QMessageBox.StandardButton.Yes:
             return
         result = self.service.arrange(dry_run=False)
@@ -831,7 +886,7 @@ class MainWindow(QMainWindow):
 
         def _on_success(result: dict[str, Any]) -> None:
             self._set_status(f"Imported {result.get('copied', 0)} image(s) into {destination}")
-            QMessageBox.information(self, "Import Selected", f"Copied {result.get('copied', 0)} image(s) to:\n{destination}")
+            QMessageBox.information(self, "PeakPic - Import Selected", f"Copied {result.get('copied', 0)} image(s) to:\n{destination}")
 
         thread = run_with_progress(self, "Importing Selected Images", _run, on_success=_on_success)
         self._active_threads.append(thread)
@@ -860,7 +915,7 @@ class MainWindow(QMainWindow):
         def _on_error(message: str) -> None:
             QMessageBox.warning(
                 self,
-                "Organize by Species",
+                "PeakPic - Organize by Species",
                 "Could not organize by species. The species classifier may not be installed:\n" + message,
             )
 
