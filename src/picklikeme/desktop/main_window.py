@@ -588,12 +588,13 @@ class MainWindow(QMainWindow):
         self._open_loupe(start_row=index.row() if index.isValid() else 0)
 
     def _open_loupe(self, *, start_row: int) -> None:
-        paths = self._filtered_paths()
-        if not paths:
+        items = self._gallery_model.items()
+        if not items:
             self._set_status("No images to review in the current filter")
             return
+        paths = [item.path for item in items]
         start_row = max(0, min(start_row, len(paths) - 1))
-        dialog = LoupeDialog(service=self.service, image_paths=paths, start_index=start_row, parent=self)
+        dialog = LoupeDialog(service=self.service, image_paths=paths, items=items, start_index=start_row, parent=self)
         dialog.exec()
         self._refresh_from_state(self.service.load_session())
 
