@@ -94,16 +94,12 @@ class MainWindow(QMainWindow):
         self._loading_progress.setVisible(False)
 
         self._central_widget = QWidget(self)
-        self._central_text = QTextEdit(self._central_widget)
-        self._central_text.setReadOnly(True)
-        self._central_text.setPlainText("PeakPic Desktop\n\nOpen a folder to begin reviewing images.")
         self._gallery_model = ImageModel()
         self._gallery_model.set_thumbnail_provider(self._load_thumbnail)
         self._gallery_view = GalleryView(self._central_widget)
         self._gallery_view.setModel(self._gallery_model)
         self._gallery_view.doubleClicked.connect(self._open_loupe_for_index)
-        self._inspector = QTextEdit(self._central_widget)
-        self._inspector.setReadOnly(True)
+        self._gallery_view.keyPressSignal.connect(self._on_gallery_key_press)
 
         self._filter_combo = QComboBox(self)
         self._filter_combo.addItems([f.capitalize() for f in FILTERS])
@@ -138,11 +134,12 @@ class MainWindow(QMainWindow):
         self._restore_state()
 
     def _build_central_layout(self) -> Any:
-        from PySide6.QtWidgets import QHBoxLayout
+        from PySide6.QtWidgets import QVBoxLayout
 
-        layout = QHBoxLayout(self._central_widget)
-        layout.addWidget(self._gallery_view, 2)
-        layout.addWidget(self._inspector, 1)
+        layout = QVBoxLayout(self._central_widget)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        layout.addWidget(self._gallery_view)
         return layout
 
     def _build_menu_bar(self) -> None:
@@ -243,15 +240,7 @@ class MainWindow(QMainWindow):
         self.setStatusBar(status_bar)
 
     def _build_docks(self) -> None:
-        folder_dock = QDockWidget("Folder", self)
-        folder_dock.setObjectName("folder_dock")
-        folder_dock.setWidget(QTextEdit("Folder tree placeholder"))
-        self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, folder_dock)
-
-        inspector_dock = QDockWidget("Inspector", self)
-        inspector_dock.setObjectName("inspector_dock")
-        inspector_dock.setWidget(QTextEdit("Inspector placeholder"))
-        self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, inspector_dock)
+        pass
 
     def _restore_state(self) -> None:
         geometry = self._settings.value("window/geometry")
@@ -504,9 +493,6 @@ class MainWindow(QMainWindow):
             for image in state.get("images", [])
         ]
         self._apply_filter()
-        self._central_text.setPlainText(
-            f"Loaded folder: {self.state.current_folder}\n\nImages found: {self.state.image_count}"
-        )
 
     def _open_folder_dialog(self) -> None:
         folder = QFileDialog.getExistingDirectory(self, "Open Folder", str(Path.home()))
@@ -590,7 +576,6 @@ class MainWindow(QMainWindow):
         self.state.current_selection = [image_path]
         self.service.set_review_status(image_path, status)
         self._set_status(f"Marked {Path(image_path).name} as {status}")
-        self._inspector.setPlainText(f"Marked {Path(image_path).name} as {status}")
         self._refresh_from_state(self.service.load_session())
 
     # -- loupe / zoom review ---------------------------------------------------
@@ -741,6 +726,17 @@ class MainWindow(QMainWindow):
     def _set_status(self, message: str) -> None:
         self.state.status_message = message
         self._status_message_label.setText(message)
+
+    def _on_gallery_key_press(self, key: int) -> None:
+        """Handle keyboard shortcuts in gallery view."""
+        if key == Qt.Key.Key_K:
+            self.apply_review_status("keep")
+        elif key == Qt.Key.Key_R:
+            self.apply_review_status("reject")
+        elif key == Qt.Key.Key_N:
+            self.apply_review_status("neutral")
+        elif key == Qt.Key.Key_Return or key == Qt.Key.Key_Enter:
+            self._open_loupe_for_selection()
 
     def closeEvent(self, event: Any) -> None:
         self._save_state()
