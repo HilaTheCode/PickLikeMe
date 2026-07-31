@@ -128,6 +128,67 @@ def test_thumbnail_decode_failure_can_be_retried(tmp_path) -> None:
     window.close()
     service.close()
     app.quit()
+
+
+@pytest.mark.skipif(QApplication is None, reason="PySide6 not installed")
+def test_closing_the_window_drains_in_flight_thumbnail_decodes(tmp_path) -> None:
+    """Regression: closing the main window used to hang the whole process
+    indefinitely (python -m picklikeme.desktop never returned to the shell)
+    whenever a QThreadPool.globalInstance() thumbnail decode was still
+    running at the time. Confirmed by direct instrumentation against the
+    real DesktopApplication - threading.enumerate(), QThreadPool
+    .activeThreadCount(), and QApplication.aboutToQuit - that no
+    Python-visible thread was ever the cause (QThreadPool's workers are
+    native Qt threads, invisible to Python's own threading module); a
+    worker finishing after the window - and _thumbnail_signal, one of its
+    children - was torn down raised "RuntimeError: Signal source has been
+    deleted" from inside QRunnable::run(), and the process never recovered.
+    closeEvent() must leave the pool fully drained before returning."""
+    from PIL import Image
+    from PySide6.QtCore import QThreadPool
+
+    app = QApplication.instance() or QApplication([])
+    state = ApplicationState()
+    settings = DesktopSettings()
+    service = ReviewService(db_path=tmp_path / "annotations.sqlite")
+    window = MainWindow(state=state, settings=settings, service=service, worker_manager=WorkerManager())
+
+    folder = tmp_path / "review"
+    folder.mkdir()
+    paths = []
+    for i in range(8):
+        p = folder / f"IMG_{i:02d}.jpg"
+        Image.new("RGB", (32, 24), color=(i * 20 % 255, 50, 100)).save(p)
+        paths.append(p)
+
+    # Slow enough that several decodes are still genuinely in flight - not
+    # just queued - at the moment the window closes, matching the real
+    # regression (a large folder of real RAW files, not instant JPEGs).
+    real_thumbnail_path = ReviewService.thumbnail_path
+
+    def slow_thumbnail_path(self, image_path, *, with_boxes=False):
+        time.sleep(0.3)
+        return real_thumbnail_path(self, image_path, with_boxes=with_boxes)
+
+    ReviewService.thumbnail_path = slow_thumbnail_path
+    try:
+        window.open_folder(str(folder))
+        for path in paths:
+            window._load_thumbnail(str(path.resolve()))
+        time.sleep(0.05)
+        app.processEvents()
+
+        assert QThreadPool.globalInstance().activeThreadCount() > 0, "test setup did not get any decode running"
+
+        window.close()
+
+        # closeEvent()'s clear()+waitForDone() is synchronous: by the time
+        # close() returns, nothing may still be running against a signal
+        # object this now-closed window owns.
+        assert QThreadPool.globalInstance().activeThreadCount() == 0
+    finally:
+        ReviewService.thumbnail_path = real_thumbnail_path
+
     service.close()
     app.quit()
 

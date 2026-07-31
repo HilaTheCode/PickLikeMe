@@ -1182,5 +1182,32 @@ class MainWindow(QMainWindow):
         # keep writing to the annotations database, after the window it was
         # started for is already gone.
         self.service.session._loading_generation += 1
+
+        # Every gallery thumbnail decode runs on QThreadPool.globalInstance()
+        # - a process-wide singleton this window does not own and cannot
+        # just walk away from. Confirmed by direct instrumentation (logging
+        # threading.enumerate(), QThreadPool.activeThreadCount(), and every
+        # QTimer/QThread/job this window tracks, at QApplication.aboutToQuit)
+        # that closing this window while decodes are still in flight left
+        # activeThreadCount() non-zero and the process hanging indefinitely
+        # after app.exec() returned - never a Python-visible thread (daemon
+        # or otherwise; threading.enumerate() only ever showed MainThread and
+        # ReviewSession's own daemon thread), because QThreadPool's workers
+        # are native Qt threads outside Python's threading module entirely.
+        # A worker still running when this window - and _thumbnail_signal,
+        # one of its children - gets torn down finishes later and tries to
+        # emit onto an already-deleted QObject, confirmed to raise
+        # "RuntimeError: Signal source has been deleted" from inside
+        # QRunnable::run() on its own thread with nothing positioned to ever
+        # recover from that. clear() drops every not-yet-started decode (the
+        # bulk of a large folder's backlog - nothing left to wait for or
+        # crash on); waitForDone() then blocks only for whatever handful of
+        # decodes were already mid-flight, bounded by a timeout so a single
+        # unusually slow RAW read cannot hang the close indefinitely by
+        # itself (ThumbnailLoadTask's own isValid() check is the actual
+        # safety net for that remaining sliver either way).
+        QThreadPool.globalInstance().clear()
+        QThreadPool.globalInstance().waitForDone(5000)
+
         super().closeEvent(event)
 

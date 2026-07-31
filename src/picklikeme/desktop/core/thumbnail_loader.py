@@ -23,6 +23,7 @@ from typing import Callable
 
 from PySide6.QtCore import QObject, QRunnable, Signal
 from PySide6.QtGui import QPixmap
+from shiboken6 import isValid
 
 
 class ThumbnailReadySignal(QObject):
@@ -63,13 +64,32 @@ class ThumbnailLoadTask(QRunnable):
         try:
             thumbnail_path = self._load_fn()
         except Exception:  # noqa: BLE001 - a bad frame must not break the gallery
-            self._signal.failed.emit(self._path, self._with_boxes)
+            self._emit_failed()
             return
         if thumbnail_path is None:
-            self._signal.failed.emit(self._path, self._with_boxes)
+            self._emit_failed()
             return
         pixmap = QPixmap(str(thumbnail_path))
         if pixmap.isNull():
-            self._signal.failed.emit(self._path, self._with_boxes)
+            self._emit_failed()
             return
-        self._signal.ready.emit(self._path, self._with_boxes, pixmap)
+        # This task runs on a QThreadPool worker thread, independent of
+        # MainWindow's own lifetime: closing the window and quitting the
+        # app happen on the GUI thread while a decode already in progress
+        # here keeps running. Without this check, a task that finishes
+        # after the window (and therefore this signal object, one of its
+        # children) has been torn down raises "RuntimeError: Signal source
+        # has been deleted" from inside QRunnable::run() - confirmed by
+        # direct instrumentation to leave the whole process hanging
+        # indefinitely rather than exiting, since nothing was ever queued
+        # to clean up after a background thread crashing mid-signal-emit.
+        # closeEvent() drains the pool before the window actually goes away
+        # so this is normally never reached after a close, but is kept as
+        # the actual safety net: it is the one check that is correct
+        # regardless of how or when the target went away.
+        if isValid(self._signal):
+            self._signal.ready.emit(self._path, self._with_boxes, pixmap)
+
+    def _emit_failed(self) -> None:
+        if isValid(self._signal):
+            self._signal.failed.emit(self._path, self._with_boxes)
