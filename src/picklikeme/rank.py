@@ -33,6 +33,7 @@ from .organize import (
     validate_selection_percentage,
 )
 from .preprocess import build_cache
+from .profiling import PipelineProfiler
 from .raw_io import RawImageLoader
 from .sidecar import RANKING_FILENAME, SIDECAR_DIRNAME, ranking_path, write_run_metadata
 from .train import load_checkpoint, rank_dataset, timestamped_output_path, write_results_csv
@@ -142,6 +143,8 @@ def main() -> None:
     if len(dataset) == 0:
         raise SystemExit(f"No RAW images (.arw/.nef/.cr3) found under {input_folder.resolve()}")
     print(f"Found {len(dataset)} images to rank under {input_folder.resolve()}")
+    profiler = PipelineProfiler(images=len(dataset), decode_workers=1, device=resolve_device(args.device))
+    profiler.capture_environment(torch_module=None)
 
     # Resolved before the crop-cache build so the destination is known up front,
     # not only after a long preprocessing + scoring pass.
@@ -156,6 +159,7 @@ def main() -> None:
     print(f"Ranked CSV for this run will be written to {output_csv.resolve()}")
 
     device = resolve_device(args.device)
+    profiler.device = device
 
     crop_cache_dir = None
     if args.crop_birds:
@@ -168,7 +172,8 @@ def main() -> None:
             max_side=args.max_side,
         )
         image_paths = [item.image_path for item in dataset.items]
-        build_cache(image_paths, args.crop_cache_dir, params, device=device, force=args.force_preprocess)
+        with profiler.stage("Preprocessing"):
+            build_cache(image_paths, args.crop_cache_dir, params, device=device, force=args.force_preprocess)
         crop_cache_dir = args.crop_cache_dir
     else:
         print("Scoring full frames (--no-crop-birds).")
@@ -185,16 +190,21 @@ def main() -> None:
     model.load_state_dict(checkpoint["model_state_dict"])
 
     loader = RawImageLoader(str(input_folder), resize_mode=args.resize_mode, crop_cache_dir=crop_cache_dir)
-    ranked = rank_dataset(model, dataset, loader, device=device)
+    with profiler.stage("Ranking inference"):
+        ranked = rank_dataset(model, dataset, loader, device=device)
 
-    output_paths = write_results_csv(
-        output_csv,
-        dataset,
-        ranked,
-        select_root=str(input_folder),
-        reject_root="(inference - no labels)",
-        max_rows=args.max_rows,
-    )
+    with profiler.stage("CSV generation"):
+        output_paths = write_results_csv(
+            output_csv,
+            dataset,
+            ranked,
+            select_root=str(input_folder),
+            reject_root="(inference - no labels)",
+            max_rows=args.max_rows,
+        )
+
+    total_runtime = (datetime.now() - run_started).total_seconds()
+    print(profiler.build_report(total_runtime=total_runtime))
     print("\nTop-ranked images:")
     for rank, entry in enumerate(ranked[:10], start=1):
         print(f"{rank}. {entry[0]}: {entry[1]:.4f}")
