@@ -584,7 +584,8 @@ def rank_dataset(
             score = float(tensor.mean().cpu().item()) if tensor.ndim > 0 else float(tensor.cpu().item())
             scored.append((Path(item.image_path).name, score, int(item.label), str(item.image_path)))
             processed_images += 1
-            print(f"  ranked image {processed_images}/{len(dataset)}: {Path(item.image_path).name}")
+            if processed_images % 100 == 0 or processed_images == len(dataset):
+                print(f"  ranked image {processed_images}/{len(dataset)}: {Path(item.image_path).name}")
             if on_progress is not None:
                 on_progress(processed_images, len(dataset))
 
