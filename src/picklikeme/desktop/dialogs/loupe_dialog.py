@@ -207,8 +207,19 @@ class LoupeDialog(QDialog):
         self.index = max(0, min(start_index, len(image_paths) - 1))
         self._exposure_steps = 0
         self._current_raw_pixmap: QPixmap | None = None
-        self.setWindowTitle("Loupe")
+        self.setWindowTitle("PeakPic - Loupe")
+        # QDialog hides the maximize/minimize buttons by default on some
+        # platforms (Windows in particular), and the default 1280x860 size
+        # read as "too small" on a large monitor - both fixed by explicitly
+        # requesting resize/maximize window hints and opening maximized.
+        # The user can still resize/restore-down normally from there.
+        self.setWindowFlags(
+            self.windowFlags()
+            | Qt.WindowType.WindowMaximizeButtonHint
+            | Qt.WindowType.WindowMinimizeButtonHint
+        )
         self.resize(1280, 860)
+        self.setWindowState(Qt.WindowState.WindowMaximized)
 
         # Only queried when the caller doesn't already have ImageItems on
         # hand (see MainWindow._open_loupe) - built once, then patched
