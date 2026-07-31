@@ -385,3 +385,44 @@ A secondary, real cost was also measured and is worth recording even though it w
 **Result:** time-to-usable-gallery is unchanged (it was already fast); time-to-interactive now matches it, instead of waiting for the full background metadata pass. Desktop's behavior now matches Web's: initial render blocks briefly, background categorization never blocks again.
 
 **Test fallout:** `test_open_folder_failure_restores_previous_session` (tests/test_desktop_shell.py) started hanging under the offscreen Qt test platform once `_open_folder_in_progress` began clearing synchronously instead of only via the timer — a second, unmonkeypatched `_start_open_folder()` call in that test used to be silently no-op'd by the (accidental, timing-dependent) "already loading" guard, and now genuinely reaches `_handle_open_folder_failure()`'s `QMessageBox.warning()`, which blocks forever with no one to click it under `QT_QPA_PLATFORM=offscreen`. Fixed by stubbing `QMessageBox.warning` in that test, the same pattern `test_desktop_workflow.py` already uses for `loupe_dialog`'s message boxes. All 30 desktop tests pass.
+
+### Priority 2 — Gallery grid left-aligned with wasted space on the right
+
+**Symptom:** the thumbnail grid packed against the viewport's left edge, leaving a large unused strip on the right in a wide window.
+
+**Root cause:** `QListView` in icon mode always starts each row at the viewport's left edge; a viewport wider than an exact multiple of the 220px card cell leaves the remainder as dead space on the right only. There is no built-in "center the grid" option.
+
+**Fix (gallery_view.py):** `GalleryView._center_grid()`, driven from `resizeEvent`, computes how many whole card columns fit the viewport and adds equal left/right `setViewportMargins()` to absorb the remainder symmetrically — the row/column wrapping and scrolling logic itself is untouched.
+
+**Two real bugs found and fixed while implementing this** (both confirmed by direct measurement — offscreen screenshots plus `visualRect()`, not guessed):
+- `getViewportMargins()` doesn't exist on this PySide6 build; the resulting unhandled `AttributeError`, raised inside a Qt virtual-function override (`resizeEvent`), crashed the process (`Segmentation fault`) instead of raising a normal Python exception. Switched to `viewportMargins()`.
+- Driving the recentering off `viewportEvent` instead of `resizeEvent` set up an unbounded resize↔margin feedback loop (`setViewportMargins` resizes the viewport, which re-fires `viewportEvent`) and stack-overflowed. `resizeEvent` — this widget's own geometry, never touched by `setViewportMargins` — has no such loop.
+- Shrinking the viewport to *exactly* `columns * item_width` made `QListView`'s own grid layout drop a column right at that exact-multiple boundary (measured: a 1384px-wide viewport that should fit 6 220px columns only rendered 5 once margins made it exactly 1320px). Leaving 1px of slack unclaimed avoids the boundary.
+
+**Result:** verified across five widths (900–1600px) via `visualRect()` measurement — margins symmetric to within 1px at every width, column pitch a constant 220px. Screenshots confirm the grid centers correctly with no visual regression to wrapping or scrolling.
+
+### Priority 3 — Rank by AI: "No RAW images found" on an already-organized folder
+
+**Symptom:** running Rank by AI again on a folder that had already been arranged (via Organize) reported "No RAW images found," even though the folder's images were still there, just moved into `_Selected`/`_Rejected`.
+
+**Root cause:** recursive search was never the problem — `UnlabeledImageDataset.from_folder()` already walks with `rglob()`. `from_folder()` deliberately excludes `_Selected`/`_Rejected` (so a second run never re-ranks images a previous Organize already filed) and `.picklikeme` (the ranking sidecar). Once every RAW in a folder has been moved into `_Selected`/`_Rejected`, a later Rank by AI run on that same folder legitimately finds zero *un-arranged* images — the generic "no RAW images found" message was technically true but misleading, since the images are right there, just already handled.
+
+**Fix (rank.py):** `_folder_already_organized()` reruns the same `from_folder()` scan without the exclusions, only on that error path (rare, so the extra walk is cheap), to tell "genuinely empty" apart from "already organized," and raises a message that says which one it is. Applied to both `rank_folder()` (the desktop entry point) and the CLI's `main()`.
+
+**Verified directly** (not just by reading the code) with three scenarios: a genuinely empty folder still gets the original message; a folder with everything moved into `_Selected`/`_Rejected` gets the new, accurate message; and a folder with RAWs nested in a subfolder passes the raw-image check and proceeds into real ranking work — confirming recursive search was never actually broken.
+
+### Priority 4 — Detector Boxes don't appear anywhere
+
+**Symptom:** reported as boxes never appearing in the Gallery at all (Loupe's overlay was to be added to match).
+
+**Investigation, not assumption:** rather than starting from "the overlay must be broken," this was verified end-to-end first. A direct reproduction — a real `MainWindow` and a real `LoupeDialog`, a synthetic image with a manually-recorded detection written the same way `rank_folder`'s preprocessing would, offscreen screenshots — showed the Gallery delegate, the toggle wiring (`MainWindow._show_detector_boxes`, cache keyed by `(path, with_boxes)`), and the Loupe's `QGraphicsScene` overlay with its coordinate transform **all draw correctly** once given real detection data. Both already shared `_show_detector_boxes` as one global toggle, exactly as requested — no UI defect existed to fix.
+
+**Actual root cause, found by tracing the data the UI was reading:** `preprocess.build_cache()`'s incremental-skip check (the crop-building step `rank_folder` calls before scoring) only tested whether an image's crop PNG already existed before deciding to skip re-detecting it entirely. `save_detections()` — which writes the sidecar `review`'s `DetectionCache` reads for the overlay — was added to the codebase after this crop-cache format existed. Any crop built before then (or any sidecar lost for any other reason while its crop survived) is treated as fully cached forever: no re-run of Rank by AI could ever fix it, because the crop existing was the *only* thing checked. That silently explains a folder where boxes never appear on any image, with no error surfaced anywhere.
+
+**Fix (preprocess.py):** `_refill()` now also requires the detections sidecar to exist before treating an image as already cached, so a normal incremental Rank by AI re-run heals exactly the images missing it — without forcing an expensive full rebuild of an otherwise fully-cached folder via `--force-preprocess`.
+
+**Verified two ways:** two new tests in `test_preprocess_pipeline.py` pin both directions — a crop with no sidecar is reprocessed and gets one; a normal cache hit (both crop and sidecar present) still skips exactly as before, so the documented idempotent behavior for the healthy case is unchanged. And the original visual repro (screenshots of both Gallery and Loupe drawing the green/amber boxes correctly) stands as evidence the painting side was already correct.
+
+### Final validation
+
+All four priorities fixed and committed separately. Full desktop regression suite plus the directly-affected suites (`test_preprocess_pipeline.py`, `test_fn_overlay.py`, `test_rank.py`) pass — 100+ tests, zero failures. Time-to-usable-gallery on Desktop now matches Web's responsiveness (Priority 1); the remaining fixes (2–4) were UI/data correctness issues independent of load performance.
