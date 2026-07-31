@@ -17,6 +17,7 @@ from __future__ import annotations
 import argparse
 from datetime import datetime
 from pathlib import Path
+from typing import Callable
 
 from .auto_crop import resolve_device
 from .bird_crop import CropParams
@@ -37,6 +38,97 @@ from .profiling import PipelineProfiler
 from .raw_io import RawImageLoader
 from .sidecar import RANKING_FILENAME, SIDECAR_DIRNAME, ranking_path, write_run_metadata
 from .train import load_checkpoint, rank_dataset, timestamped_output_path, write_results_csv
+
+
+def rank_folder(
+    input_folder: str | Path,
+    *,
+    checkpoint: str | Path = DEFAULT_CHECKPOINT_PATH,
+    device: str | None = None,
+    backbone: str = DINOV3_BACKBONE,
+    crop_birds: bool = True,
+    crop_cache_dir: str | Path = DEFAULT_CROP_CACHE_DIR,
+    margin_frac: float = CropParams.margin_frac,
+    conf_threshold: float = CropParams.conf_threshold,
+    max_side: int = CropParams.max_side,
+    force_preprocess: bool = False,
+    resize_mode: str = "letterbox",
+    max_rows: int = DEFAULT_MAX_CSV_ROWS,
+    on_stage: Callable[[str], None] | None = None,
+    on_progress: Callable[[int, int], None] | None = None,
+) -> dict:
+    """Programmatic ranking entry point, reused by `main()` and by the
+    desktop app's "Rank by AI" action.
+
+    Unlike the CLI, this never organizes the output into Selected/Rejected -
+    the review workflow expects every image to stay where it is until the
+    photographer reviews it and explicitly arranges the folder. Raises
+    FileNotFoundError/ValueError instead of calling sys.exit, so a caller
+    (a UI) can catch and display the error itself.
+    """
+    input_folder = Path(input_folder)
+    if not input_folder.exists():
+        raise FileNotFoundError(f"Input folder does not exist: {input_folder}")
+
+    checkpoint_path = Path(checkpoint)
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path.resolve()}")
+
+    dataset = UnlabeledImageDataset.from_folder(input_folder, exclude_dirs=set(ORGANIZE_DIRNAMES) | {SIDECAR_DIRNAME})
+    if len(dataset) == 0:
+        raise ValueError(f"No RAW images found under {input_folder.resolve()}")
+
+    resolved_device = resolve_device(device)
+    output_csv = ranking_path(input_folder)
+
+    crop_cache = None
+    if crop_birds:
+        if on_stage is not None:
+            on_stage("Building bird-crop cache")
+        params = CropParams(margin_frac=margin_frac, conf_threshold=conf_threshold, max_side=max_side)
+        image_paths = [item.image_path for item in dataset.items]
+        build_cache(image_paths, crop_cache_dir, params, device=resolved_device, force=force_preprocess)
+        crop_cache = crop_cache_dir
+
+    if on_stage is not None:
+        on_stage("Loading model")
+    model_config = ModelConfig(backbone=backbone, pretrained=False, freeze_backbone=True)
+    model = PreferenceHead(model_config).to(resolved_device)
+    checkpoint_data = load_checkpoint(checkpoint_path, map_location=resolved_device)
+    model.load_state_dict(checkpoint_data["model_state_dict"])
+
+    loader = RawImageLoader(str(input_folder), resize_mode=resize_mode, crop_cache_dir=crop_cache)
+    if on_stage is not None:
+        on_stage("Scoring images")
+    ranked = rank_dataset(model, dataset, loader, device=resolved_device, on_progress=on_progress)
+
+    if on_stage is not None:
+        on_stage("Writing ranking CSV")
+    output_paths = write_results_csv(
+        output_csv,
+        dataset,
+        ranked,
+        select_root=str(input_folder),
+        reject_root="(inference - no labels)",
+        max_rows=max_rows,
+    )
+
+    write_run_metadata(
+        input_folder,
+        backbone=backbone,
+        checkpoint=str(checkpoint_path.resolve()),
+        image_count=len(dataset),
+        crop_birds=bool(crop_birds),
+    )
+
+    return {
+        "output_csv": output_paths[0],
+        "extra_csv_files": output_paths[1:],
+        "image_count": len(dataset),
+        "device": resolved_device,
+        "top": [(name, score) for name, score, _label, _path in ranked[:10]],
+    }
+
 
 
 def _boolean(value: str) -> bool:

@@ -9,6 +9,7 @@ import traceback
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Callable
 
 import numpy as np
 import torch
@@ -563,7 +564,14 @@ def train(
     return model
 
 
-def rank_dataset(model: nn.Module, dataset, loader, device: str = "cpu") -> list[tuple[str, float, int, str]]:
+def rank_dataset(
+    model: nn.Module,
+    dataset,
+    loader,
+    device: str = "cpu",
+    *,
+    on_progress: Callable[[int, int], None] | None = None,
+) -> list[tuple[str, float, int, str]]:
     model.eval()
     scored: list[tuple[str, float, int, str]] = []
     with torch.no_grad():
@@ -577,6 +585,8 @@ def rank_dataset(model: nn.Module, dataset, loader, device: str = "cpu") -> list
             scored.append((Path(item.image_path).name, score, int(item.label), str(item.image_path)))
             processed_images += 1
             print(f"  ranked image {processed_images}/{len(dataset)}: {Path(item.image_path).name}")
+            if on_progress is not None:
+                on_progress(processed_images, len(dataset))
 
     scored.sort(key=lambda entry: entry[1], reverse=True)
     return scored

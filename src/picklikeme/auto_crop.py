@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+from typing import Callable
 
 from .bird_crop import BirdDetector, CropParams, compute_composition_crop
 from .exporters import EXPORTERS
@@ -43,6 +44,7 @@ def generate_lightroom_crops(
     conf_threshold: float | None = None,
     device: str | None = None,
     exiftool_path: str = "exiftool",
+    on_progress: Callable[[int, int], None] | None = None,
 ) -> dict:
     """Generate Lightroom-ready crop metadata for every supported RAW under a folder."""
     input_path = Path(input_folder)
@@ -71,7 +73,7 @@ def generate_lightroom_crops(
 
     stats = {"written": 0, "embedded": 0, "skipped": 0, "no_bird": 0, "errors": 0}
     details: list[dict] = []
-    for path in images:
+    for index, path in enumerate(images, start=1):
         name = Path(path).name
         try:
             full = decoder._decode_full_frame(path)
@@ -89,6 +91,9 @@ def generate_lightroom_crops(
         except Exception as exc:  # noqa: BLE001 - one bad file shouldn't stop the batch
             stats["errors"] += 1
             details.append({"path": path, "status": "error", "message": f"{name}: ERROR {type(exc).__name__}: {exc}"})
+        finally:
+            if on_progress is not None:
+                on_progress(index, len(images))
 
     return {
         "processed": len(images),

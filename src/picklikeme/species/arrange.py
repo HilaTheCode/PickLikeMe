@@ -93,6 +93,7 @@ def arrange_by_species(
     *,
     dry_run: bool = False,
     on_progress: Callable[[int, int], None] | None = None,
+    folder_name_fn: Callable[[str], str] | None = None,
 ) -> SpeciesArrangeResult:
     """Classify and file every image in `input_folder`.
 
@@ -106,9 +107,15 @@ def arrange_by_species(
     `on_progress(done, total)`, if given, is called after every image -
     the CLI's own progress line (see cli.py); this function has no opinion
     on how progress is reported.
+
+    `folder_name_fn`, if given, maps the classifier's own species string to
+    the folder name actually used (e.g. translating an English common name
+    to Hebrew) - defaults to `sanitize_species_folder_name`, applied
+    directly to the classifier's answer.
     """
     from ..analyzer.io import enumerate_ground_truth
 
+    name_fn = folder_name_fn or sanitize_species_folder_name
     input_folder = Path(input_folder)
     images = enumerate_ground_truth(input_folder)
     result = SpeciesArrangeResult(total=len(images))
@@ -117,7 +124,7 @@ def arrange_by_species(
         try:
             prediction = cache.get_or_classify(str(source), classifier)
             result.classified += 1
-            folder_name = sanitize_species_folder_name(prediction.species)
+            folder_name = name_fn(prediction.species)
             result.species_counts[folder_name] = result.species_counts.get(folder_name, 0) + 1
 
             destination_dir = input_folder / folder_name
