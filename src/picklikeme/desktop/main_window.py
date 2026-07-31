@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QProgressDialog,
+    QPushButton,
     QStatusBar,
     QStyle,
     QStyleFactory,
@@ -46,6 +47,8 @@ from .views.gallery.gallery_view import GalleryView
 
 FILTERS = ("all", "keep", "reject", "neutral")
 KEEP_PERCENT_PRESETS = (5.0, 10.0, 20.0, 25.0, 35.0)
+SORT_FIELDS = ("score", "filename", "captured_at")
+SORT_FIELD_LABELS = {"score": "Model Score", "filename": "File Name", "captured_at": "Capture Time"}
 
 
 class MainWindow(QMainWindow):
@@ -74,6 +77,8 @@ class MainWindow(QMainWindow):
         self._settings = QSettings("PeakPic", "PeakPicDesktop")
         self._all_items: list[ImageItem] = []
         self._current_filter = "all"
+        self._sort_field = "score"  # matches ReviewSession.load()'s own default ordering
+        self._sort_ascending = False
         self._last_counts: dict[str, Any] = {}
         self._active_threads: list[Any] = []  # keeps background QThreads alive while running
         self._open_folder_in_progress = False
@@ -135,6 +140,18 @@ class MainWindow(QMainWindow):
         self._cutoff_spin.setSuffix("%")
         self._cutoff_spin.setValue(KEEP_PERCENT_PRESETS[0])
         self._cutoff_spin.setEnabled(False)
+
+        self._sort_combo = QComboBox(self)
+        for field in SORT_FIELDS:
+            self._sort_combo.addItem(SORT_FIELD_LABELS[field], field)
+        self._sort_combo.setCurrentIndex(SORT_FIELDS.index(self._sort_field))
+        self._sort_combo.currentIndexChanged.connect(self._on_sort_field_changed)
+
+        self._sort_direction_btn = QPushButton(self)
+        self._sort_direction_btn.setCheckable(True)
+        self._sort_direction_btn.setMaximumWidth(28)
+        self._sort_direction_btn.clicked.connect(self._on_sort_direction_toggled)
+        self._update_sort_direction_button()
 
         self._build_ui()
         self._load_recent_folders()
@@ -349,6 +366,11 @@ class MainWindow(QMainWindow):
 
         toolbar.addWidget(QLabel(" Filter: "))
         toolbar.addWidget(self._filter_combo)
+        toolbar.addSeparator()
+
+        toolbar.addWidget(QLabel(" Sort: "))
+        toolbar.addWidget(self._sort_combo)
+        toolbar.addWidget(self._sort_direction_btn)
         toolbar.addSeparator()
 
         toolbar.addAction(self._rank_action)
@@ -685,6 +707,7 @@ class MainWindow(QMainWindow):
                 rank=image.get("rank"),
                 review_status=image.get("review_status", "neutral"),
                 ai_suggestion=image.get("ai_suggestion"),
+                captured_at=image.get("captured_at"),
             )
             for image in state.get("images", [])
         ]
@@ -729,10 +752,53 @@ class MainWindow(QMainWindow):
             filtered = list(self._all_items)
         else:
             filtered = [item for item in self._all_items if item.review_status == self._current_filter]
+        filtered = self._sort_items(filtered)
         self._gallery_model.set_items(filtered)
         if filtered and not self._gallery_view.currentIndex().isValid():
             self._gallery_view.setCurrentIndex(self._gallery_model.index(0, 0))
         self._gallery_view.set_empty_message(self._empty_message_for_current_state())
+
+    # -- sorting ----------------------------------------------------------------
+
+    def _on_sort_field_changed(self, index: int) -> None:
+        field = self._sort_combo.itemData(index)
+        if field:
+            self._sort_field = field
+            self._apply_filter()
+
+    def _on_sort_direction_toggled(self) -> None:
+        self._sort_ascending = not self._sort_ascending
+        self._update_sort_direction_button()
+        self._apply_filter()
+
+    def _update_sort_direction_button(self) -> None:
+        if self._sort_ascending:
+            self._sort_direction_btn.setText("↑")
+            self._sort_direction_btn.setToolTip("Ascending - click for descending")
+        else:
+            self._sort_direction_btn.setText("↓")
+            self._sort_direction_btn.setToolTip("Descending - click for ascending")
+
+    def _sort_items(self, items: list[ImageItem]) -> list[ImageItem]:
+        """Sort by the selected field, ascending or descending. Items
+        missing a value for the field (no score, no capture-time metadata)
+        always sort to the end regardless of direction - reversing which
+        end unranked/undated images land on depending on ascending vs.
+        descending would be more confusing than useful."""
+        field = self._sort_field
+
+        def value_of(item: ImageItem):
+            if field == "filename":
+                return item.display_name.lower()
+            if field == "captured_at":
+                return item.captured_at
+            return item.score
+
+        with_value = [item for item in items if value_of(item) is not None]
+        without_value = [item for item in items if value_of(item) is None]
+        with_value.sort(key=value_of, reverse=not self._sort_ascending)
+        without_value.sort(key=lambda item: item.display_name.lower())
+        return with_value + without_value
 
     def _empty_message_for_current_state(self) -> str:
         if not self.state.current_folder:

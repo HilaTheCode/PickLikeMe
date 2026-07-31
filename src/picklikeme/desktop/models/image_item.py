@@ -15,6 +15,11 @@ class ImageItem:
     review_status: str = "neutral"
     ai_suggestion: str | None = None
     selected: bool = False
+    # The file's own EXIF capture date/time (ISO-8601), or None if it has
+    # none - see ReviewImage.captured_at. ISO-8601 sorts lexicographically
+    # in chronological order, so gallery sort-by-capture-time needs no
+    # date parsing.
+    captured_at: str | None = None
 
     @property
     def display_name(self) -> str:
