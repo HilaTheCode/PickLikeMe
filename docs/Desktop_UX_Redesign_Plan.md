@@ -319,8 +319,20 @@ After Phase 1, the desktop app should:
 
 ---
 
-## Next Steps
+## Progress Log
 
-1. ✅ Analysis approved
-2. ✅ Priority order confirmed (Gallery → Thumbnails → Loupe → Toolbar → Theme)
-3. ⏭️ Begin Milestone 1: Gallery Layout Redesign
+### Phase 1 — complete
+1. ✅ Milestone 1: Gallery Layout Redesign — gallery fills the window, placeholder panels removed.
+2. ✅ Milestone 2: Thumbnail Card Redesign — custom-painted cards (filename, score, rank, status, AI suggestion).
+3. ✅ Milestone 3: Loupe Redesign — single dark overlay bar, Ctrl+wheel zoom / wheel navigate, persisted zoom mode, EV preview.
+4. ✅ Milestone 4: Toolbar Redesign — shared QActions (menu+toolbar), icons, workflow-ordered groups, GPU status.
+5. ✅ Milestone 5: Theme System — dark/light semantic palette, switchable from the View menu, persisted, no restart required.
+
+### Phase 2 — complete
+6. ✅ Milestone 6: Keyboard-First Workflow — multi-select bulk Keep/Reject/Neutral, Space-to-toggle-selection, rank-display bug fix, status bar Keep/Reject/Neutral breakdown, contextual empty-state messaging.
+
+### Phase 3 — complete (scoped)
+7. ✅ Milestone 7: Typography & Spacing Polish — fixed a real thumbnail-card overflow bug (badge line was painting past the card's bottom edge), bold filename, dynamic AI-badge positioning.
+   - Deliberately deferred: bespoke icon set (asset-design decision for the user), further large-folder perf work (no evidence of a problem after review), cancel buttons on backend operations that don't support cooperative cancellation (would be misleading UI).
+
+Every milestone was validated against the existing desktop regression suite (30 tests) plus an offscreen-Qt smoke test exercising the actual paint/interaction code paths unit tests don't reach, and committed separately per the user's instruction.
