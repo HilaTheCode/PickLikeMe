@@ -627,7 +627,7 @@ class DetectedCategoryTests(SessionTestCase):
         shoot, images, _ = build_shoot(self.root, ranked=4)
         images[1].unlink()
 
-        with mock.patch("picklikeme.review.thumbnails.detected_category_for") as detected:
+        with mock.patch("picklikeme.review.thumbnails.detected_category_for", return_value=None) as detected:
             session = self.session(shoot)
 
         queried_paths = [call.args[0] for call in detected.call_args_list]

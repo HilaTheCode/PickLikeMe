@@ -928,6 +928,145 @@ class LightboxMarkupTests(unittest.TestCase):
         self.assertIn("addEventListener('click', saveJpeg)", build_js())
 
 
+class ZoomWindowCleanupTests(unittest.TestCase):
+    """The Lightbox's floating top-left status pill is gone - the Keep/
+    Reject/Neutral buttons' own `.on` highlight and the reason/status text
+    already say the same thing, so showing it a second time was pure
+    clutter. The Light/Dark toggle moved out of the toolbar into the side
+    panel, reclaiming the toolbar row it used to occupy alone."""
+
+    def test_the_floating_status_badge_is_gone(self):
+        from picklikeme.review.page import CSS, build_js, build_page
+
+        self.assertNotIn('id="lb-badge"', build_page())
+        self.assertNotIn(".lb-badge", CSS)
+        self.assertNotIn("updateBadge", build_js())
+
+    def test_the_theme_toggle_lives_in_the_side_panel_not_the_toolbar(self):
+        from picklikeme.review.page import build_page
+
+        html = build_page()
+        toolbar = re.search(r'<div class="toolbar">(.*?)\n  </div>', html, re.S)
+        panel = re.search(r'<aside class="panel" id="side-panel">(.*?)</aside>', html, re.S)
+        self.assertIsNotNone(toolbar)
+        self.assertIsNotNone(panel)
+        self.assertNotIn('id="theme"', toolbar.group(1))
+        self.assertIn('id="theme"', panel.group(1))
+
+
+class MainWindowCleanupTests(unittest.TestCase):
+    """The opened folder is shown exactly once (the toolbar's #folder chip),
+    and a gallery card no longer repeats its own Keep/Reject/Neutral status
+    as text - the card's colored border (.card.keep/.reject/.neutral)
+    already carries it, freeing room for a slightly larger thumbnail."""
+
+    def test_switching_folders_does_not_repeat_the_path_in_the_status_line(self):
+        from picklikeme.review.page import build_js
+
+        js = build_js()
+        switch_block = re.search(r"async function switchFolder\(\)\{(.*?)\n\}", js, re.S)
+        self.assertIsNotNone(switch_block, "switchFolder not found")
+        body = switch_block.group(1)
+        self.assertNotIn("j.state.input_folder", body, "the folder path must not be repeated in say()")
+        self.assertIn("say('Folder opened.'", body)
+
+    def test_the_card_has_no_text_status_badge(self):
+        from picklikeme.review.page import build_js
+
+        card_fn = re.search(r"function card\(image, index\)\{(.*?)\n\}", build_js(), re.S)
+        self.assertIsNotNone(card_fn)
+        body = card_fn.group(1)
+        self.assertNotIn('class="badge ', body)
+        self.assertIn("title=", body, "the status should still be reachable on hover")
+
+    def test_the_badge_css_class_is_gone_entirely(self):
+        from picklikeme.review.page import CSS
+
+        self.assertNotIn(".badge{", CSS)
+        self.assertNotIn(".badge.keep", CSS)
+
+    def test_the_colored_border_is_still_how_status_is_shown(self):
+        from picklikeme.review.page import CSS
+
+        self.assertIn(".card.keep{", CSS)
+        self.assertIn(".card.reject{", CSS)
+        self.assertIn(".card.neutral{", CSS)
+
+    def test_thumbnails_get_slightly_larger_once_the_badge_text_is_gone(self):
+        from picklikeme.review.page import CSS
+
+        self.assertIn("minmax(240px,1fr)", CSS)
+
+
+class LoadingFeedbackMarkupTests(unittest.TestCase):
+    """Folder loading feedback - a spinner overlay for the initial load,
+    switching folders, and relocating one, all sharing one setLoading()
+    helper rather than a bespoke indicator per action."""
+
+    def test_the_overlay_exists_and_starts_hidden(self):
+        from picklikeme.review.page import build_page
+
+        html = build_page()
+        overlay = re.search(r'<div class="loading-overlay" id="loading-overlay"([^>]*)>', html)
+        self.assertIsNotNone(overlay, "loading-overlay not found")
+        self.assertIn("display:none", overlay.group(1))
+
+    def test_set_loading_toggles_the_overlay(self):
+        from picklikeme.review.page import build_js
+
+        js = build_js()
+        fn = re.search(r"function setLoading\(active, message\)\{(.*?)\n\}", js, re.S)
+        self.assertIsNotNone(fn, "setLoading not found")
+        body = fn.group(1)
+        self.assertIn("'flex' : 'none'", body)
+
+    def test_every_folder_replacing_call_shows_the_overlay(self):
+        from picklikeme.review.page import build_js
+
+        js = build_js()
+        for fn_name in ("switchFolder", "relocateFolder", "boot"):
+            block = re.search(r"async function " + fn_name + r"\(\)\{(.*?)\n\}", js, re.S)
+            self.assertIsNotNone(block, f"{fn_name} not found")
+            self.assertIn("setLoading(true", block.group(1), f"{fn_name} never shows the loading overlay")
+            self.assertIn("setLoading(false)", block.group(1), f"{fn_name} never hides the loading overlay")
+
+
+class ArrangeProgressFeedbackTests(unittest.TestCase):
+    """Arrange is a real file-moving operation for potentially thousands of
+    files - the dialog must show it is working and refuse a second click
+    (Arrange or Cancel) while one move is already in flight."""
+
+    def test_the_dialog_has_a_progress_indicator_that_starts_hidden(self):
+        from picklikeme.review.page import build_page
+
+        html = build_page()
+        progress = re.search(r'<div class="dlg-progress" id="dlg-progress"([^>]*)>', html)
+        self.assertIsNotNone(progress, "dlg-progress not found")
+        self.assertIn("display:none", progress.group(1))
+
+    def test_do_arrange_disables_both_dialog_buttons_and_shows_the_spinner(self):
+        from picklikeme.review.page import build_js
+
+        js = build_js()
+        fn = re.search(r"async function doArrange\(\)\{(.*?)\n\}", js, re.S)
+        self.assertIsNotNone(fn, "doArrange not found")
+        body = fn.group(1)
+        self.assertIn("q('#dlg-cancel').disabled = true", body)
+        self.assertIn("q('#dlg-go').disabled = true", body)
+        self.assertIn("q('#dlg-progress').style.display = 'flex'", body)
+        # And both must be restored afterwards, success or failure.
+        self.assertIn("q('#dlg-cancel').disabled = false", body)
+        self.assertIn("q('#dlg-go').disabled = false", body)
+
+    def test_do_arrange_sets_a_wait_cursor_while_busy(self):
+        from picklikeme.review.page import build_js
+
+        fn = re.search(r"async function doArrange\(\)\{(.*?)\n\}", build_js(), re.S)
+        body = fn.group(1)
+        self.assertIn("document.body.style.cursor = 'wait'", body)
+        self.assertIn("document.body.style.cursor = ''", body)
+
+
 class ReasonFieldTests(unittest.TestCase):
     """The override-reason dropdown next to Keep/Reject/Neutral - structural
     checks only, same rationale as LightboxMarkupTests."""

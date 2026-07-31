@@ -114,6 +114,12 @@ def _review_command(args: argparse.Namespace) -> None:
     raise SystemExit(run_review(args))
 
 
+def _arrange_species_command(args: argparse.Namespace) -> None:
+    from ..species.cli import run_arrange_species
+
+    raise SystemExit(run_arrange_species(args))
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(prog="picklikeme", description="Pick Like Me ingestion pipeline")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -176,6 +182,16 @@ def main(argv: list[str] | None = None) -> None:
         description="Review a ranked folder and file it into _Selected / _Rejected",
     )
     review_parser.set_defaults(func=_review_command)
+
+    from ..species.cli import build_arrange_species_parser
+
+    arrange_species_parser = sub.add_parser(
+        "arrange-species",
+        parents=[build_arrange_species_parser(add_help=False)],
+        help="Classify a folder's images by species and file each into a same-named subfolder",
+        description="Classify a folder's images by species and file each into a same-named subfolder",
+    )
+    arrange_species_parser.set_defaults(func=_arrange_species_command)
 
     args = parser.parse_args(argv)
     args.func(args)

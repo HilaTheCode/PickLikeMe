@@ -189,7 +189,15 @@ class ReviewSession:
         for image in images:
             if not image.missing_file:
                 image.captured_at = self.store.capture_timestamp_of(image.image_path)
-                image.detected_category = detected_category_for(image.image_path)
+                # detected_category_for's own cache is a per-image file on
+                # disk (a JSON sidecar from preprocessing) - real I/O that
+                # must not be paid for on every single load. Memoised in the
+                # store exactly like captured_at (see
+                # AnnotationStore.detected_category_of), so only the first
+                # load after a file last changed re-reads it.
+                image.detected_category = self.store.detected_category_of(
+                    image.image_path, detected_category_for
+                )
 
         # Best first; unranked last, since they have no score to place them by.
         images.sort(key=lambda i: (i.score is None, -(i.score or 0.0), i.filename))

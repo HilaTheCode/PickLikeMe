@@ -60,7 +60,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable, Sequence
+from typing import Any, Iterable, Sequence
 
 from ..config import PROJECT_ROOT, cli_prefix
 from ..identity import IdentityUnavailable, cache_key, capture_datetime, image_identity
@@ -478,6 +478,20 @@ class AnnotationStore:
                     captured_at TEXT
                 );
 
+                -- Same reasoning as capture_time_cache, for detected_category:
+                -- review.thumbnails.detected_category_for's own cache is a
+                -- per-image file on disk (a JSON sidecar written by
+                -- preprocessing), which every review session was re-reading
+                -- for every image on every single folder load before this
+                -- table existed. Memoised here exactly like capture time, so
+                -- only the first load after a file last changed pays for it.
+                CREATE TABLE IF NOT EXISTS detected_category_cache (
+                    path      TEXT PRIMARY KEY,
+                    size      INTEGER NOT NULL,
+                    mtime_ns  INTEGER NOT NULL,
+                    category  TEXT
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_v2_filename ON annotations_v2(filename);
                 CREATE INDEX IF NOT EXISTS idx_v2_updated  ON annotations_v2(updated_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_v2_category ON annotation_categories_v2(category);
@@ -778,15 +792,19 @@ class AnnotationStore:
         """Public identity lookup. Raises IdentityUnavailable."""
         return self._identity_of(image_path)
 
-    def capture_timestamp_of(self, image_path: str | Path) -> str | None:
-        """The image's own EXIF capture date/time, memoised against
-        (path, size, mtime) exactly like identity_of - see
-        contactsheets.read_capture_timestamp for what is actually read.
+    def _cached_per_file(self, table: str, column: str, image_path: str | Path, compute) -> Any:
+        """A value computed from one file's current bytes, memoised against
+        (path, size, mtime) so it is computed at most once per version of
+        that file, not once per lookup - the shape identity_cache and
+        capture_time_cache both already use. `table` must exist with columns
+        (path TEXT PRIMARY KEY, size INTEGER, mtime_ns INTEGER, <column>);
+        `table`/`column` are always this module's own literal constants,
+        never caller input.
 
-        Unlike identity_of, never raises: a missing file, or one with no
-        readable capture time, simply has nothing to report - the absence is
-        cached too (see the schema comment on capture_time_cache), so it is
-        computed at most once per file, not once per lookup.
+        A file that cannot be stat'd (missing, permissions) has nothing to
+        memoise against and returns None without calling `compute` at all -
+        the same "absence is not itself cached" rule identity_of's raising
+        cousin follows, since there is no (size, mtime) to key it by.
         """
         path = Path(image_path)
         try:
@@ -796,21 +814,45 @@ class AnnotationStore:
 
         key = str(path.resolve())
         row = self._conn.execute(
-            "SELECT captured_at FROM capture_time_cache WHERE path = ? AND size = ? AND mtime_ns = ?",
+            f"SELECT {column} FROM {table} WHERE path = ? AND size = ? AND mtime_ns = ?",  # noqa: S608
             (key, stat.st_size, stat.st_mtime_ns),
         ).fetchone()
         if row is not None:
-            return row["captured_at"]
+            return row[column]
 
-        from .contactsheets import read_capture_timestamp
-
-        captured_at = read_capture_timestamp(str(path))
+        value = compute(str(path))
         with self._conn:
             self._conn.execute(
-                "INSERT OR REPLACE INTO capture_time_cache(path, size, mtime_ns, captured_at) VALUES (?, ?, ?, ?)",
-                (key, stat.st_size, stat.st_mtime_ns, captured_at),
+                f"INSERT OR REPLACE INTO {table}(path, size, mtime_ns, {column}) VALUES (?, ?, ?, ?)",  # noqa: S608
+                (key, stat.st_size, stat.st_mtime_ns, value),
             )
-        return captured_at
+        return value
+
+    def capture_timestamp_of(self, image_path: str | Path) -> str | None:
+        """The image's own EXIF capture date/time, memoised against
+        (path, size, mtime) - see contactsheets.read_capture_timestamp for
+        what is actually read. Absence (no EXIF, or none readable) is cached
+        too, so a file with no capture time is also only ever read once.
+        """
+        from .contactsheets import read_capture_timestamp
+
+        return self._cached_per_file("capture_time_cache", "captured_at", image_path, read_capture_timestamp)
+
+    def detected_category_of(self, image_path: str | Path, compute) -> str | None:
+        """The subject category already recorded for this image (see
+        bird_crop.DETECTION_CATEGORIES), memoised the same way
+        capture_timestamp_of is.
+
+        `compute` is injected rather than imported directly: the actual
+        lookup (review.thumbnails.detected_category_for) reads the
+        detector's own cache, most often a per-image JSON sidecar file on
+        disk - real I/O this module must not pay for on every single lookup,
+        the same reasoning that justified capture_time_cache. Injecting it
+        also means this module - shared by the whole app - never needs to
+        depend on the review package's detection-cache wiring; see
+        review/session.py's call site for the actual function passed in.
+        """
+        return self._cached_per_file("detected_category_cache", "category", image_path, compute)
 
     def close(self) -> None:
         self._conn.close()

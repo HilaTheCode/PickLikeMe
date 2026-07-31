@@ -12,6 +12,7 @@ import unittest
 import urllib.error
 import urllib.request
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
@@ -328,6 +329,75 @@ class CaptureTimestampTests(unittest.TestCase):
                 ).fetchone()
                 self.assertIsNotNone(row, "a None result must still be written to the cache")
                 self.assertIsNone(row["captured_at"])
+
+
+class DetectedCategoryOfTests(unittest.TestCase):
+    """detected_category_of: the same (path, size, mtime) memoisation as
+    capture_timestamp_of (both now share _cached_per_file), but for the
+    subject category. `compute` is injected - a plain fake here, exactly
+    like review/session.py passes in detected_category_for - since this
+    module must never depend on the detector's own cache wiring to test its
+    own memoisation.
+
+    This exists to close a real regression: before this cache, every review
+    session load re-ran `compute` (a per-image disk read in production) for
+    every image, every single time - see review/session.py's load().
+    """
+
+    def test_reads_through_to_compute_on_a_miss(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = make_jpeg_with_capture_time(Path(tmp) / "a.jpg")
+            with store_in(tmp) as store:
+                self.assertEqual(store.detected_category_of(path, lambda p: "bird"), "bird")
+
+    def test_compute_is_called_at_most_once_per_file_version(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = make_jpeg_with_capture_time(Path(tmp) / "a.jpg")
+            with store_in(tmp) as store:
+                calls = []
+
+                def compute(p):
+                    calls.append(p)
+                    return "mammal"
+
+                first = store.detected_category_of(path, compute)
+                second = store.detected_category_of(path, compute)
+
+                self.assertEqual(first, "mammal")
+                self.assertEqual(second, "mammal")
+                self.assertEqual(len(calls), 1, "a cache hit must not call compute again")
+
+    def test_a_changed_file_is_recomputed_not_served_stale(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = make_jpeg_with_capture_time(Path(tmp) / "a.jpg")
+            with store_in(tmp) as store:
+                self.assertEqual(store.detected_category_of(path, lambda p: "bird"), "bird")
+
+                # A new file at the same path, forced to a different byte
+                # size - the same trick CaptureTimestampTests uses.
+                make_jpeg_with_capture_time(path, size=32)
+                self.assertEqual(store.detected_category_of(path, lambda p: "mammal"), "mammal")
+
+    def test_a_missing_file_has_no_category_and_does_not_call_compute(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = Path(tmp) / "gone.jpg"
+            with store_in(tmp) as store:
+                compute = mock.Mock()
+                self.assertIsNone(store.detected_category_of(missing, compute))
+                compute.assert_not_called()
+
+    def test_no_recorded_category_is_cached_too(self):
+        """Consistent with capture_timestamp_of: "nothing detected" is a
+        cacheable answer, not a miss to keep retrying."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = make_jpeg_with_capture_time(Path(tmp) / "a.jpg")
+            with store_in(tmp) as store:
+                store.detected_category_of(path, lambda p: None)
+                row = store._conn.execute(
+                    "SELECT category FROM detected_category_cache WHERE path = ?", (str(path.resolve()),)
+                ).fetchone()
+                self.assertIsNotNone(row, "a None result must still be written to the cache")
+                self.assertIsNone(row["category"])
 
 
 class MigrationTests(unittest.TestCase):

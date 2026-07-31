@@ -62,9 +62,11 @@ REASON_LABELS = {
 CSS = """
 *{box-sizing:border-box}
 :root{--bg:#f8fafc;--panel:#fff;--panel-2:#f1f5f9;--text:#0f172a;--muted:#64748b;
---border:#e2e8f0;--accent:#2563eb;--good:#10b981;--bad:#ef4444;--warn:#f59e0b;--shadow:rgba(15,23,42,.08)}
+--border:#e2e8f0;--accent:#2563eb;--good:#10b981;--bad:#ef4444;--warn:#f59e0b;--shadow:rgba(15,23,42,.08);
+--overlay-bg:rgba(241,245,249,.7)}
 :root[data-theme="dark"]{--bg:#0a0f28;--panel:#131a3a;--panel-2:#19214a;--text:#e2e8f0;
---muted:#94a3b8;--border:#293567;--accent:#60a5fa;--good:#34d399;--bad:#f87171;--warn:#fbbf24;--shadow:rgba(0,0,0,.4)}
+--muted:#94a3b8;--border:#293567;--accent:#60a5fa;--good:#34d399;--bad:#f87171;--warn:#fbbf24;--shadow:rgba(0,0,0,.4);
+--overlay-bg:rgba(10,15,40,.55)}
 body{margin:0;background:var(--bg);color:var(--text);
 font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
 header{position:sticky;top:0;z-index:20;background:var(--panel);border-bottom:1px solid var(--border);
@@ -121,12 +123,30 @@ background:var(--panel-2);font-size:13px}
 .status{font-size:12.5px;color:var(--muted)}
 .status.error{color:var(--bad)}
 
+/* One small rotating ring, reused everywhere something is working: the
+   folder-load overlay below, and the Arrange dialog's own in-progress state
+   - a single spinner style rather than a bespoke one per feature. */
+@keyframes plmSpin{to{transform:rotate(360deg)}}
+.spinner{display:inline-block;width:16px;height:16px;border-radius:50%;
+border:2px solid var(--border);border-top-color:var(--accent);
+animation:plmSpin .7s linear infinite;flex-shrink:0}
+.spinner.big{width:34px;height:34px;border-width:3px}
+
+/* Covers the gallery while a folder is (re)loading - opening a different
+   folder, relocating one, or the very first fetch on page load. The
+   previous gallery content stays in the DOM underneath (dimmed, not wiped),
+   so switching back to a fast, already-loaded folder never produces a
+   flash of empty content. */
+.loading-overlay{position:fixed;inset:0;z-index:4;display:none;
+align-items:center;justify-content:center;gap:12px;flex-direction:column;
+background:var(--overlay-bg);color:var(--text);font-size:13.5px}
+
 /* Filters, sorting and view options live here rather than in the toolbar
    (Phase 7 of the redesign) - contextual to the gallery it controls, and
    collapsible so a photographer who wants every last pixel for the grid can
    tuck it away; the toggle's own state persists like the theme does. */
 .layout{display:flex;align-items:flex-start;gap:0}
-.grid{flex:1;min-width:0;display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));
+.grid{flex:1;min-width:0;display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));
 gap:12px;padding:16px 20px 60px}
 .panel{width:250px;flex-shrink:0;padding:16px 20px 20px 4px;position:sticky;top:0;
 max-height:100vh;overflow-y:auto}
@@ -168,14 +188,10 @@ display:flex;align-items:center;flex-wrap:wrap;gap:6px}
 color:var(--accent);white-space:nowrap}
 /* Structured subject metadata (bird/mammal/human/...), not a judgement of
    any kind - its own neutral, muted style so it is never mistaken for
-   either the AI-suggestion chip or the review-status badge. */
+   either the AI-suggestion chip or the card's own colored border
+   (.card.keep/.reject/.neutral) that shows review_status. */
 .category-chip{font-size:10.5px;padding:1px 7px;border-radius:20px;border:1px solid var(--muted);
 color:var(--muted);white-space:nowrap}
-.badge{display:inline-block;font-size:11.5px;padding:2px 8px;border-radius:20px;
-border:1px solid var(--border);background:var(--panel-2);width:fit-content}
-.badge.keep{background:var(--good);color:#fff;border-color:var(--good)}
-.badge.reject{background:var(--bad);color:#fff;border-color:var(--bad)}
-.badge.neutral{color:var(--muted)}
 .acts{display:flex;gap:6px;padding:0 10px 10px}
 .acts button{flex:1;padding:6px 4px;font-size:15px;line-height:1}
 .acts .a-keep.on{background:var(--good);border-color:var(--good);color:#fff}
@@ -191,6 +207,7 @@ dialog::backdrop{background:rgba(2,6,23,.55)}
 .plan b{font-variant-numeric:tabular-nums;text-align:right}
 .plan .dest{font-family:ui-monospace,Consolas,monospace;font-size:12.5px;color:var(--muted)}
 .dlg-acts{display:flex;gap:8px;justify-content:flex-end}
+.dlg-progress{display:flex;align-items:center;gap:8px;font-size:13px;color:var(--muted);margin-bottom:14px}
 .empty{padding:60px 20px;text-align:center;color:var(--muted)}
 
 /* Lightbox: full-screen in-app viewer opened by clicking a card's thumbnail.
@@ -212,11 +229,6 @@ transform-origin:center center;display:block;transition:transform .08s ease-out}
 .lb-img.grabbable{cursor:grab}.lb-img.grabbing{cursor:grabbing;transition:none}
 .lb-spinner{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
 color:#cbd5e1;font-size:13px;text-align:center;padding:20px}
-.lb-badge{position:absolute;top:10px;left:10px;font-size:12px;padding:4px 10px;border-radius:20px;
-font-weight:650;pointer-events:none}
-.lb-badge.keep{background:var(--good);color:#06281f}
-.lb-badge.reject{background:var(--bad);color:#2a0a0a}
-.lb-badge.neutral{background:rgba(148,163,184,.18);color:#e2e8f0;border:1px solid #475569}
 .lb-ai{font-size:11.5px;padding:2px 9px;border-radius:20px;border:1px solid #60a5fa;color:#93c5fd}
 /* z-index:5 on every piece of overlay chrome (close/nav/bottom bar):
    a CSS transform doesn't resize .lb-img-wrap's own layout box, so once the
@@ -392,6 +404,18 @@ function say(message, isError){
   });
 }
 
+// One shared "this could take a while" overlay for every gallery-replacing
+// server round trip (initial load, switching folders, relocating one) -
+// large folders are real disk I/O, not instant, and the previous gallery
+// content otherwise just sits there unchanged with no sign anything is
+// happening beyond the easy-to-miss status line. The overlay dims the
+// existing gallery rather than clearing it, so a fast reload never flashes
+// empty content first.
+function setLoading(active, message){
+  q('#loading-overlay').style.display = active ? 'flex' : 'none';
+  if(active) q('#loading-overlay-message').textContent = message || 'Loading…';
+}
+
 // The gallery is rebuilt from state on every change. At a few thousand cards
 // this is comfortably fast, and every card's markup then comes from exactly
 // one place; `loading="lazy"` keeps the browser from fetching a thumbnail
@@ -550,11 +574,16 @@ function card(image, index){
   const pick = '<label class="pick" title="Select for a bulk action">' +
       '<input type="checkbox" data-pick="' + esc(image.image_path) + '"' + (picked ? ' checked' : '') + '>' +
     '</label>';
-  return '<div class="card ' + status + (picked ? ' picked' : '') + '">' + pick + visual +
+  // No text label for review_status any more - the card's own colored
+  // border (.card.keep/.reject/.neutral) already communicates it, and
+  // repeating it in text only added clutter without room for slightly
+  // larger thumbnails. The status is still on the card's own title
+  // attribute, so it is a hover away, not gone entirely.
+  return '<div class="card ' + status + (picked ? ' picked' : '') + '" title="' +
+      esc(PLM.labels[status] || status) + '">' + pick + visual +
     '<div class="meta">' +
       '<div class="name" title="' + esc(image.image_path) + '">' + esc(image.filename) + '</div>' +
       '<div class="nums">' + score + aiChip + categoryChip + '</div>' +
-      '<span class="badge ' + status + '">' + esc(PLM.labels[status] || status) + '</span>' +
     '</div>' +
     '<div class="acts">' +
       '<button class="a-keep' + (status === 'keep' ? ' on' : '') + '"' +
@@ -698,7 +727,6 @@ const Lightbox = (function(){
     q('#lb-ai').style.display = image.ai_suggestion ? '' : 'none';
     updateZoomIndicator();
     updateStatusButtons(image);
-    updateBadge(image);
     updateSaveButton(image);
     updateReasonSelect(image);
     renderImage(image);
@@ -722,12 +750,6 @@ const Lightbox = (function(){
     note.value = (image && image.reason_note) || '';
     note.style.display = reason === 'other' ? '' : 'none';
     note.disabled = disabled;
-  }
-
-  function updateBadge(image){
-    const badge = q('#lb-badge');
-    badge.className = 'lb-badge ' + image.review_status;
-    badge.textContent = PLM.labels[image.review_status] || image.review_status;
   }
 
   function updateStatusButtons(image){
@@ -876,7 +898,6 @@ const Lightbox = (function(){
     const reasonNote = reason === 'other' ? (q('#lb-reason-note').value || null) : null;
     await setStatus(image.image_path, status, reason, reasonNote);
     updateStatusButtons(current());
-    updateBadge(current());
     updateReasonSelect(current());
     if(!wasLast) next();
   }
@@ -1276,6 +1297,12 @@ async function switchFolder(){
   PLM.busy = true;
   q('#switch-folder').disabled = true;
   say('Choose a folder…');
+  // Covers both the native folder-picker dialog and, once one is chosen, the
+  // actual load - a single awaited request from here, with no way to tell
+  // the two phases apart from outside it. The OS dialog sits above this
+  // overlay regardless (a separate top-level window), so showing it early
+  // is harmless.
+  setLoading(true, 'Opening folder…');
   try{
     const j = await api('api/review/open-folder', {
       method: 'POST',
@@ -1285,9 +1312,11 @@ async function switchFolder(){
     if(j.cancelled){ say(''); return; }
     PLM.state = j.state;
     render();
-    say('Opened ' + j.state.input_folder + (j.recovered ? ' — ' + j.recovered + ' decision(s) recovered.' : '.'));
+    // The folder path itself is not repeated here - the toolbar's own
+    // #folder chip already shows it persistently, right above this message.
+    say('Folder opened.' + (j.recovered ? ' ' + j.recovered + ' decision(s) recovered.' : ''));
   }catch(e){ say('Could not open a folder: ' + e.message, true); }
-  finally{ PLM.busy = false; q('#switch-folder').disabled = false; }
+  finally{ PLM.busy = false; q('#switch-folder').disabled = false; setLoading(false); }
 }
 
 // The folder this session was reviewing can no longer be found - moved,
@@ -1300,6 +1329,7 @@ async function relocateFolder(){
   if(PLM.busy) return;
   PLM.busy = true;
   say("Choose the folder's new location…");
+  setLoading(true, 'Relocating folder…');
   try{
     const j = await api('api/review/relocate-folder', {
       method: 'POST',
@@ -1312,7 +1342,7 @@ async function relocateFolder(){
     say('Folder relocated: ' + j.relocated.toLocaleString() + ' path(s) updated'
       + (j.recovered ? ', ' + j.recovered.toLocaleString() + ' decision(s) recovered' : '') + '.');
   }catch(e){ say('Could not relocate the folder: ' + e.message, true); }
-  finally{ PLM.busy = false; }
+  finally{ PLM.busy = false; setLoading(false); }
 }
 
 // Nothing moves until the photographer has seen the exact plan, so the dialog
@@ -1337,6 +1367,14 @@ async function doArrange(){
   if(PLM.busy) return;
   PLM.busy = true;
   q('#go').disabled = true;
+  // Moving thousands of files is real, visible work - a busy cursor, the
+  // dialog's own spinner in place of its buttons, and neither button
+  // clickable meanwhile (unlike before: a second click, or Cancel, while a
+  // move was already in flight was never actually guarded against here).
+  document.body.style.cursor = 'wait';
+  q('#dlg-cancel').disabled = true;
+  q('#dlg-go').disabled = true;
+  q('#dlg-progress').style.display = 'flex';
   say('Moving files...');
   try{
     const j = await api('api/review/arrange', {
@@ -1353,7 +1391,15 @@ async function doArrange(){
     if(r.errors) message += ', ' + r.errors.toLocaleString() + ' failed';
     say(message, r.errors > 0);
   }catch(e){ say('Arrange failed: ' + e.message, true); }
-  finally{ PLM.busy = false; q('#go').disabled = false; q('#dlg').close(); }
+  finally{
+    PLM.busy = false;
+    q('#go').disabled = false;
+    document.body.style.cursor = '';
+    q('#dlg-cancel').disabled = false;
+    q('#dlg-go').disabled = false;
+    q('#dlg-progress').style.display = 'none';
+    q('#dlg').close();
+  }
 }
 
 // A real navigation, exactly like Lightbox's saveJpeg: the server answers
@@ -1416,6 +1462,7 @@ async function boot(){
   q('#confirm-go').addEventListener('click', runPendingConfirm);
   Lightbox.bind();
 
+  setLoading(true, 'Loading folder…');
   try{
     // Every endpoint answers {ok, ..., state}, not the gallery state itself -
     // arrange and reconcile carry a sibling (result, recovered) alongside it,
@@ -1426,7 +1473,7 @@ async function boot(){
     render();
   }catch(e){
     q('#grid').innerHTML = '<div class="empty">Could not load this review: ' + esc(e.message) + '</div>';
-  }
+  } finally{ setLoading(false); }
 
   // Decisions for images that moved since they were reviewed are recovered by
   // content identity in the background, so the gallery is never held up by it.
@@ -1505,7 +1552,6 @@ def build_page(title: str = "PickLikeMe Review") -> str:
       <span class="stat reject"><b id="c-reject">0</b><span class="glabel">Reject</span></span>
       <span class="stat neutral"><b id="c-neutral">0</b><span class="glabel">Neutral</span></span>
     </div>
-    <button id="theme">Dark Mode</button>
   </div>
 
   <div class="bulkbar" id="bulk-bar" style="display:none">
@@ -1524,6 +1570,11 @@ def build_page(title: str = "PickLikeMe Review") -> str:
 </header>
 <div class="notice" id="notice" style="display:none"></div>
 
+<div class="loading-overlay" id="loading-overlay" style="display:none">
+  <span class="spinner big"></span>
+  <span id="loading-overlay-message">Loading&hellip;</span>
+</div>
+
 <div class="layout">
   <div class="grid" id="grid"><div class="empty">Loading...</div></div>
 
@@ -1541,6 +1592,7 @@ def build_page(title: str = "PickLikeMe Review") -> str:
       </div>
       <div class="panel-row">
         <button id="boxes" title="Show/hide the detector's bounding boxes on thumbnails">Detector Boxes</button>
+        <button id="theme">Dark Mode</button>
       </div>
     </div>
 
@@ -1598,6 +1650,9 @@ def build_page(title: str = "PickLikeMe Review") -> str:
     <b id="p-reject">0</b><span>Reject &rarr; <span class="dest" id="p-reject-dir"></span></span>
     <b id="p-neutral">0</b><span>Neutral &rarr; <span class="dest">left where they are</span></span>
   </div>
+  <div class="dlg-progress" id="dlg-progress" style="display:none">
+    <span class="spinner"></span> Moving files&hellip;
+  </div>
   <div class="dlg-acts">
     <button id="dlg-cancel">Cancel</button>
     <button id="dlg-go" class="primary">Arrange</button>
@@ -1620,7 +1675,6 @@ def build_page(title: str = "PickLikeMe Review") -> str:
     <button class="lb-nav next" id="lb-next" aria-label="Next image" title="Next">&#8250;</button>
     <div class="lb-img-wrap">
       <img class="lb-img" id="lb-img" alt="" draggable="false">
-      <span class="lb-badge" id="lb-badge"></span>
       <div class="lb-spinner" id="lb-spinner" style="display:none"></div>
     </div>
     <div class="lb-bottom">
