@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import QModelIndex, Qt, QSettings, QTimer
+from PySide6.QtCore import QModelIndex, QSize, Qt, QSettings, QTimer
 from PySide6.QtGui import QAction, QIcon, QKeySequence, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QProgressDialog,
     QStatusBar,
+    QStyle,
     QTextEdit,
     QToolBar,
     QWidget,
@@ -89,6 +90,7 @@ class MainWindow(QMainWindow):
         self._image_count_label = QLabel("Images: 0")
         self._status_label = QLabel("Ready")
         self._status_message_label = QLabel("")
+        self._gpu_status_label = QLabel("")
         self._loading_progress = QProgressBar(self)
         self._loading_progress.setMaximumWidth(160)
         self._loading_progress.setVisible(False)
@@ -142,92 +144,166 @@ class MainWindow(QMainWindow):
         layout.addWidget(self._gallery_view)
         return layout
 
+    def _std_icon(self, pixmap: QStyle.StandardPixmap) -> QIcon:
+        """A platform-native stand-in icon. Cheap and always available;
+        a bespoke icon set is future polish, not a blocker for a clear,
+        professional toolbar."""
+        return self.style().standardIcon(pixmap)
+
+    def _make_action(
+        self,
+        text: str,
+        *,
+        icon: QStyle.StandardPixmap | None = None,
+        shortcut: str | QKeySequence | None = None,
+        tooltip: str | None = None,
+        triggered=None,
+    ) -> QAction:
+        action = QAction(self._std_icon(icon), text, self) if icon is not None else QAction(text, self)
+        if shortcut is not None:
+            action.setShortcut(shortcut)
+        hint = tooltip or text
+        if shortcut is not None:
+            sequence = QKeySequence(shortcut) if not isinstance(shortcut, QKeySequence) else shortcut
+            hint = f"{hint} ({sequence.toString()})"
+        action.setToolTip(hint)
+        action.setStatusTip(hint)
+        if triggered is not None:
+            action.triggered.connect(triggered)
+        return action
+
     def _build_menu_bar(self) -> None:
+        # Actions are built once here and reused verbatim on the toolbar
+        # (see _build_tool_bar) so every shortcut has exactly one QAction
+        # behind it - two QActions bound to the same shortcut string would
+        # make Qt refuse to fire either ("ambiguous shortcut overload").
+        SP = QStyle.StandardPixmap
+
+        self._open_action = self._make_action(
+            "Open Folder…", icon=SP.SP_DirOpenIcon, shortcut=QKeySequence.Open,
+            tooltip="Open a folder of images to review", triggered=self._open_folder_dialog,
+        )
+        self._import_action = self._make_action(
+            "Import Selected…", icon=SP.SP_ArrowDown,
+            tooltip="Copy Keep-marked images to another folder", triggered=self._import_selected,
+        )
+        self._settings_action = self._make_action(
+            "Preferences…", icon=SP.SP_FileDialogInfoView,
+            tooltip="Application settings", triggered=self._show_settings,
+        )
+
+        self._keep_action = self._make_action(
+            "Keep", icon=SP.SP_DialogApplyButton, shortcut="K",
+            tooltip="Mark the selected image Keep", triggered=lambda: self.apply_review_status("keep"),
+        )
+        self._reject_action = self._make_action(
+            "Reject", icon=SP.SP_DialogCancelButton, shortcut="R",
+            tooltip="Mark the selected image Reject", triggered=lambda: self.apply_review_status("reject"),
+        )
+        self._neutral_action = self._make_action(
+            "Neutral", icon=SP.SP_DialogResetButton, shortcut="N",
+            tooltip="Clear the review decision", triggered=lambda: self.apply_review_status("neutral"),
+        )
+        self._loupe_action = self._make_action(
+            "Loupe", icon=SP.SP_FileDialogContentsView, shortcut="Return",
+            tooltip="Open the selected image in the Loupe", triggered=self._open_loupe_for_selection,
+        )
+
+        self._rank_action = self._make_action(
+            "Rank by AI…", icon=SP.SP_BrowserReload,
+            tooltip="Score every image in the folder with the AI model", triggered=self._rank_by_ai,
+        )
+        self._apply_cutoff_action = self._make_action(
+            "Apply Cutoff", icon=SP.SP_DialogOkButton,
+            tooltip="Apply the AI keep-percent cutoff to the current folder", triggered=self._apply_cutoff,
+        )
+        self._organize_action = self._make_action(
+            "Organize…", icon=SP.SP_DirIcon,
+            tooltip="Move Keep/Reject images into Selected/Rejected folders", triggered=self._organize,
+        )
+        self._species_action = self._make_action(
+            "Organize by Species…", icon=SP.SP_FileDialogListView,
+            tooltip="Group images into per-species folders", triggered=self._organize_by_species,
+        )
+        self._crop_action = self._make_action(
+            "Auto Crop…", icon=SP.SP_FileDialogDetailedView,
+            tooltip="Generate Lightroom crop metadata around detected birds", triggered=self._auto_crop,
+        )
+
+        exit_action = self._make_action(
+            "Exit", icon=SP.SP_DialogCloseButton, triggered=QApplication.instance().quit,
+        )
+        about_action = self._make_action("About", triggered=self._show_about)
+
         menu_bar = self.menuBar()
+
         file_menu = menu_bar.addMenu("File")
-        open_action = QAction("Open Folder…", self)
-        open_action.setShortcut(QKeySequence.Open)
-        open_action.triggered.connect(self._open_folder_dialog)
-        file_menu.addAction(open_action)
+        file_menu.addAction(self._open_action)
         self._recent_menu = file_menu.addMenu("Recent Folders")
         self._recent_menu.setEnabled(False)
         self._refresh_recent_folders_menu()
         file_menu.addSeparator()
-        import_action = QAction("Import Selected…", self)
-        import_action.triggered.connect(self._import_selected)
-        file_menu.addAction(import_action)
+        file_menu.addAction(self._import_action)
         file_menu.addSeparator()
-        settings_action = QAction("Settings", self)
-        settings_action.triggered.connect(self._show_settings)
-        file_menu.addAction(settings_action)
+        file_menu.addAction(self._settings_action)
         file_menu.addSeparator()
-        exit_action = QAction("Exit", self)
-        exit_action.triggered.connect(QApplication.instance().quit)
         file_menu.addAction(exit_action)
 
         review_menu = menu_bar.addMenu("Review")
-        keep_action = QAction("Keep", self)
-        keep_action.setShortcut("K")
-        keep_action.triggered.connect(lambda: self.apply_review_status("keep"))
-        review_menu.addAction(keep_action)
-        reject_action = QAction("Reject", self)
-        reject_action.setShortcut("R")
-        reject_action.triggered.connect(lambda: self.apply_review_status("reject"))
-        review_menu.addAction(reject_action)
-        neutral_action = QAction("Neutral", self)
-        neutral_action.setShortcut("N")
-        neutral_action.triggered.connect(lambda: self.apply_review_status("neutral"))
-        review_menu.addAction(neutral_action)
+        review_menu.addAction(self._keep_action)
+        review_menu.addAction(self._reject_action)
+        review_menu.addAction(self._neutral_action)
         review_menu.addSeparator()
-        loupe_action = QAction("Open in Loupe…", self)
-        loupe_action.triggered.connect(self._open_loupe_for_selection)
-        review_menu.addAction(loupe_action)
-
-        view_menu = menu_bar.addMenu("View")
-        zoom_in = QAction("Zoom In", self)
-        zoom_in.triggered.connect(lambda: self._set_status("Zoom In placeholder"))
-        view_menu.addAction(zoom_in)
-        zoom_out = QAction("Zoom Out", self)
-        zoom_out.triggered.connect(lambda: self._set_status("Zoom Out placeholder"))
-        view_menu.addAction(zoom_out)
+        review_menu.addAction(self._loupe_action)
 
         tools_menu = menu_bar.addMenu("Tools")
-        rank_action = QAction("Rank by AI…", self)
-        rank_action.triggered.connect(self._rank_by_ai)
-        tools_menu.addAction(rank_action)
-        organize_action = QAction("Organize (Selected/Rejected)…", self)
-        organize_action.triggered.connect(self._organize)
-        tools_menu.addAction(organize_action)
-        species_action = QAction("Organize by Species…", self)
-        species_action.triggered.connect(self._organize_by_species)
-        tools_menu.addAction(species_action)
-        crop_action = QAction("Auto Crop…", self)
-        crop_action.triggered.connect(self._auto_crop)
-        tools_menu.addAction(crop_action)
+        tools_menu.addAction(self._rank_action)
+        tools_menu.addAction(self._apply_cutoff_action)
+        tools_menu.addSeparator()
+        tools_menu.addAction(self._organize_action)
+        tools_menu.addAction(self._species_action)
+        tools_menu.addAction(self._crop_action)
 
         help_menu = menu_bar.addMenu("Help")
-        about_action = QAction("About", self)
-        about_action.triggered.connect(self._show_about)
         help_menu.addAction(about_action)
 
     def _build_tool_bar(self) -> None:
+        """Groups mirror the workflow: Open -> Review decisions/Loupe ->
+        AI ranking/cutoff -> Organize/Import/Species/Crop -> Preferences."""
         toolbar = QToolBar("Main", self)
         toolbar.setObjectName("main_toolbar")
         toolbar.setMovable(False)
-        toolbar.addAction("Open Folder", self._open_folder_dialog)
+        toolbar.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        toolbar.setIconSize(QSize(20, 20))
+
+        toolbar.addAction(self._open_action)
         toolbar.addSeparator()
-        toolbar.addAction("Keep", lambda: self.apply_review_status("keep"))
-        toolbar.addAction("Reject", lambda: self.apply_review_status("reject"))
-        toolbar.addAction("Neutral", lambda: self.apply_review_status("neutral"))
-        toolbar.addAction("Loupe", self._open_loupe_for_selection)
+
+        toolbar.addAction(self._keep_action)
+        toolbar.addAction(self._reject_action)
+        toolbar.addAction(self._neutral_action)
+        toolbar.addAction(self._loupe_action)
         toolbar.addSeparator()
+
         toolbar.addWidget(QLabel(" Filter: "))
         toolbar.addWidget(self._filter_combo)
         toolbar.addSeparator()
+
+        toolbar.addAction(self._rank_action)
         toolbar.addWidget(QLabel(" AI cutoff: "))
         toolbar.addWidget(self._cutoff_combo)
         toolbar.addWidget(self._cutoff_spin)
-        toolbar.addAction("Apply Cutoff", self._apply_cutoff)
+        toolbar.addAction(self._apply_cutoff_action)
+        toolbar.addSeparator()
+
+        toolbar.addAction(self._organize_action)
+        toolbar.addAction(self._import_action)
+        toolbar.addAction(self._species_action)
+        toolbar.addAction(self._crop_action)
+        toolbar.addSeparator()
+
+        toolbar.addAction(self._settings_action)
+
         self.addToolBar(Qt.ToolBarArea.TopToolBarArea, toolbar)
 
     def _build_status_bar(self) -> None:
@@ -236,6 +312,7 @@ class MainWindow(QMainWindow):
         status_bar.addWidget(self._image_count_label)
         status_bar.addWidget(self._status_label)
         status_bar.addWidget(self._loading_progress)
+        status_bar.addPermanentWidget(self._gpu_status_label)
         status_bar.addPermanentWidget(self._status_message_label)
         self.setStatusBar(status_bar)
 
@@ -618,6 +695,10 @@ class MainWindow(QMainWindow):
         def _on_success(result: dict[str, Any]) -> None:
             self._refresh_from_state(result["state"])
             self._set_status(f"Ranked {result.get('image_count', 0)} images")
+            device = result.get("device")
+            if device:
+                self.state.gpu_status = device
+                self._gpu_status_label.setText(f"Device: {device}")
 
         thread = run_with_progress(self, "Rank by AI", _run, on_success=_on_success)
         self._active_threads.append(thread)
@@ -729,14 +810,10 @@ class MainWindow(QMainWindow):
         self._status_message_label.setText(message)
 
     def _on_gallery_key_press(self, key: int) -> None:
-        """Handle keyboard shortcuts in gallery view."""
-        if key == Qt.Key.Key_K:
-            self.apply_review_status("keep")
-        elif key == Qt.Key.Key_R:
-            self.apply_review_status("reject")
-        elif key == Qt.Key.Key_N:
-            self.apply_review_status("neutral")
-        elif key == Qt.Key.Key_Return or key == Qt.Key.Key_Enter:
+        """Open the Loupe for the current gallery selection. K/R/N are
+        handled by the Review menu's QActions (shared with the toolbar),
+        not here - see GalleryView.keyPressEvent."""
+        if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
             self._open_loupe_for_selection()
 
     def closeEvent(self, event: Any) -> None:

@@ -25,8 +25,14 @@ class GalleryView(QListView):
         self.setGridSize(QSize(self._delegate.CARD_WIDTH, self._delegate.CARD_HEIGHT))
 
     def keyPressEvent(self, event: QKeyEvent) -> None:
+        # K/R/N are deliberately NOT handled here: MainWindow's Review menu
+        # QActions already own those shortcuts window-wide (and are shared
+        # with the toolbar) - intercepting them a second time here would
+        # register an ambiguous duplicate shortcut. Return/Enter has no
+        # QAction shortcut of its own, so it's safe and useful to open the
+        # Loupe for the current selection directly from the gallery.
         key = event.key()
-        if key in (Qt.Key.Key_K, Qt.Key.Key_R, Qt.Key.Key_N, Qt.Key.Key_Return, Qt.Key.Key_Enter):
+        if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
             self.keyPressSignal.emit(key)
             event.accept()
         else:
