@@ -7,16 +7,40 @@ __pycache__/
 *.swp
 *.swo
 *.DS_Store
+Thumbs.db
+
+# Virtual environments
 .venv/
 venv/
+
+# Environment
 .env
+
+# Jupyter
 .ipynb_checkpoints/
+
+# Python caches
 .mypy_cache/
 .pytest_cache/
+.ruff_cache/
+.pyre/
 .coverage
 htmlcov/
+
+# VS Code / IDE
+.vscode/
+.idea/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# Data formats
 *.parquet
 *.csv
+
+# Images
 *.jpg
 *.jpeg
 *.png
@@ -29,17 +53,30 @@ htmlcov/
 *.raw
 *.rw2
 *.dng
+
+# AI models
 *.pt
 *.pth
 *.onnx
+
+# Temporary / backup
 *.bak
-data/
-models/
-outputs/
-checkpoints/
-cache/
-inspection/
-analysis_results/
+
+# Project folders (root-anchored: unanchored patterns like "models/" also
+# matched src/picklikeme/desktop/models/, the Qt Model/View source package,
+# silently excluding it - and everything in it - from every commit)
+/data/
+/models/
+/outputs/
+/checkpoints/
+/cache/
+/inspection/
+/analysis_results/
+/logs/
+/tmp/
+/temp/
+/exports/
+/thumbnails/
 
 # Analyzer false-negative knowledge base. The .db is your accumulated notes -
 # irreplaceable, but binary, so it is kept out of git; back it up separately.
@@ -47,3 +84,23 @@ analysis_results/
 annotations/*.db
 annotations/*.db-wal
 annotations/*.db-shm
+
+# Qt Desktop
+*.qmlc
+*.jsc
+*.qrc.dep
+
+# Qt Creator
+*.pro.user
+*.pro.user.*
+
+# Local SQLite databases
+*.sqlite
+*.sqlite3
+
+# macOS
+.AppleDouble
+.LSOverride
+
+# Windows
+Desktop.ini
