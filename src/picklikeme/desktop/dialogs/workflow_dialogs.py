@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from PySide6.QtWidgets import (
+    QButtonGroup,
     QCheckBox,
     QDialog,
     QDialogButtonBox,
@@ -86,6 +87,69 @@ class SpeciesLanguageDialog(QDialog):
         layout.addWidget(buttons)
 
     def language(self) -> str:
+        return "he" if self._hebrew_radio.isChecked() else "en"
+
+
+class PreferencesDialog(QDialog):
+    """Application preferences: theme and the default species-organization
+    language. Both are settings that already exist and persist (theme.py /
+    QSettings "review/species_language") - this just gives them one
+    conventional home instead of a "not implemented yet" stub, and instead
+    of only being reachable via the View menu or by running Organize by
+    Species once."""
+
+    def __init__(self, *, default_theme: str = "dark", default_language: str = "en", parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Preferences")
+
+        # Qt auto-groups sibling QRadioButtons that share the same parent
+        # widget into one mutually-exclusive set, regardless of which
+        # layout visually contains them - without these two explicit
+        # QButtonGroups, checking "English" would silently uncheck "Dark"
+        # (all four buttons are children of `self`, so they'd otherwise
+        # all compete as a single group of four).
+        self._dark_radio = QRadioButton("Dark", self)
+        self._light_radio = QRadioButton("Light", self)
+        theme_group = QButtonGroup(self)
+        theme_group.addButton(self._dark_radio)
+        theme_group.addButton(self._light_radio)
+        if default_theme == "light":
+            self._light_radio.setChecked(True)
+        else:
+            self._dark_radio.setChecked(True)
+        theme_row = QHBoxLayout()
+        theme_row.addWidget(self._dark_radio)
+        theme_row.addWidget(self._light_radio)
+
+        self._english_radio = QRadioButton("English", self)
+        self._hebrew_radio = QRadioButton("Hebrew", self)
+        language_group = QButtonGroup(self)
+        language_group.addButton(self._english_radio)
+        language_group.addButton(self._hebrew_radio)
+        if default_language == "he":
+            self._hebrew_radio.setChecked(True)
+        else:
+            self._english_radio.setChecked(True)
+        language_row = QHBoxLayout()
+        language_row.addWidget(self._english_radio)
+        language_row.addWidget(self._hebrew_radio)
+
+        form = QFormLayout()
+        form.addRow("Theme:", theme_row)
+        form.addRow("Default species language:", language_row)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel, self)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+
+        layout = QVBoxLayout(self)
+        layout.addLayout(form)
+        layout.addWidget(buttons)
+
+    def theme_name(self) -> str:
+        return "light" if self._light_radio.isChecked() else "dark"
+
+    def species_language(self) -> str:
         return "he" if self._hebrew_radio.isChecked() else "en"
 
 

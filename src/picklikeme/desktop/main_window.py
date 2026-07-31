@@ -36,7 +36,7 @@ from .core.jobs import JobManager, JobSpec, run_in_background as _real_run_in_ba
 run_in_background = _real_run_in_background
 from .dialogs.loupe_dialog import LoupeDialog
 from .dialogs.progress import run_with_progress
-from .dialogs.workflow_dialogs import AutoCropDialog, RankDialog, SpeciesLanguageDialog
+from .dialogs.workflow_dialogs import AutoCropDialog, PreferencesDialog, RankDialog, SpeciesLanguageDialog
 from .models.image_item import ImageItem
 from .models.image_model import ImageModel
 from .settings import DesktopSettings
@@ -892,7 +892,12 @@ class MainWindow(QMainWindow):
     # -- misc -----------------------------------------------------------------
 
     def _show_settings(self) -> None:
-        QMessageBox.information(self, "Settings", "Settings dialog will be implemented in a later phase.")
+        current_language = self._settings.value("review/species_language", "en")
+        dialog = PreferencesDialog(default_theme=theme.current_theme_name(), default_language=current_language, parent=self)
+        if dialog.exec() != PreferencesDialog.DialogCode.Accepted:
+            return
+        self._set_theme(dialog.theme_name())
+        self._settings.setValue("review/species_language", dialog.species_language())
 
     def _show_about(self) -> None:
         QMessageBox.about(self, "About PeakPic", "PeakPic Desktop\nNative desktop shell powered by the existing backend.")
