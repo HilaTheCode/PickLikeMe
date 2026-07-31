@@ -45,13 +45,21 @@ def generate_lightroom_crops(
     device: str | None = None,
     exiftool_path: str = "exiftool",
     on_progress: Callable[[int, int], None] | None = None,
+    image_paths: list[str] | None = None,
 ) -> dict:
-    """Generate Lightroom-ready crop metadata for every supported RAW under a folder."""
+    """Generate Lightroom-ready crop metadata for RAWs under a folder.
+
+    By default (image_paths=None) processes every supported RAW under
+    input_folder, exactly as before. Pass image_paths (e.g. the
+    photographer's current gallery selection) to restrict the batch to
+    just those files instead - useful when auto-crop is expensive enough
+    that running it over a whole shoot isn't what was wanted.
+    """
     input_path = Path(input_folder)
     if not input_path.exists():
         raise FileNotFoundError(f"Input folder does not exist: {input_path}")
 
-    images = discover_raw_images(input_path)
+    images = list(image_paths) if image_paths is not None else discover_raw_images(input_path)
     if not images:
         return {"processed": 0, "message": "No compatible images were found.", "stats": {}, "details": []}
 

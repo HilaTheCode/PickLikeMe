@@ -1021,18 +1021,22 @@ class MainWindow(QMainWindow):
         if not self.state.current_folder:
             self._set_status("Open a folder before running auto crop")
             return
+        paths = self._selected_image_paths()
+        if not paths:
+            self._set_status("Select one or more images before running Auto Crop")
+            return
         dialog = AutoCropDialog(parent=self)
         if dialog.exec() != AutoCropDialog.DialogCode.Accepted:
             return
         margin_percent = dialog.margin_percent()
 
         def _run(on_progress=None, on_stage=None):
-            return self.service.auto_crop(margin_percent=margin_percent, on_progress=on_progress)
+            return self.service.auto_crop(margin_percent=margin_percent, on_progress=on_progress, image_paths=paths)
 
         def _on_success(result: dict[str, Any]) -> None:
             self._set_status(result.get("message", "Auto crop finished"))
 
-        thread = run_with_progress(self, "Auto Crop", _run, on_success=_on_success)
+        thread = run_with_progress(self, f"Auto Crop ({len(paths)} selected)", _run, on_success=_on_success)
         self._active_threads.append(thread)
         thread.finished.connect(lambda: self._active_threads.remove(thread) if thread in self._active_threads else None)
 

@@ -123,6 +123,7 @@ class ReviewService:
         *,
         margin_percent: float = 0.0,
         on_progress: Callable[[int, int], None] | None = None,
+        image_paths: list[str] | None = None,
     ) -> dict[str, Any]:
         if self.session.input_folder is None:
             raise ValueError("Open a folder before running auto crop.")
@@ -130,6 +131,7 @@ class ReviewService:
             self.session.input_folder,
             margin_percent=margin_percent,
             on_progress=on_progress,
+            image_paths=image_paths,
         )
 
     def organize_by_species(
