@@ -31,6 +31,49 @@ class GalleryView(QListView):
         self.setGridSize(QSize(self._delegate.CARD_WIDTH, self._delegate.CARD_HEIGHT))
         self._empty_message = "Open a folder to begin reviewing images"
 
+    def resizeEvent(self, event) -> None:  # noqa: N802 - Qt override signature
+        super().resizeEvent(event)
+        self._center_grid()
+
+    def _center_grid(self) -> None:
+        # QListView's icon-mode flow always starts a row at the viewport's
+        # left edge, so a viewport wider than an exact multiple of the grid
+        # cell leaves the remainder as dead space on the right only. Adding
+        # equal left/right viewport margins re-centers the grid as a whole
+        # without touching how it wraps or scrolls - the row/column layout
+        # itself is untouched, only where it starts.
+        #
+        # Deliberately hung off resizeEvent (this widget's own geometry
+        # change), not viewportEvent: setViewportMargins() below resizes the
+        # *viewport* child widget, which would re-trigger a viewportEvent
+        # hook and, since a wider/narrower viewport can flip whether the
+        # content needs a vertical scrollbar, that scrollbar appearing or
+        # disappearing changes the viewport width again - an unbounded
+        # resize<->margin feedback loop that stack-overflowed in practice.
+        # resizeEvent isn't part of that loop: setViewportMargins never
+        # resizes this widget itself, only its viewport.
+        item_width = self.gridSize().width()
+        if item_width <= 0:
+            return
+        margins = self.viewportMargins()
+        left, right = margins.left(), margins.right()
+        available = self.viewport().width() + left + right
+        columns = max(1, available // item_width)
+        extra = max(0, available - columns * item_width)
+        # Shrinking the viewport to *exactly* columns * item_width (extra
+        # margin split with none left over) puts the post-margin viewport
+        # right at an exact multiple of the cell width - and QListView's own
+        # grid layout drops a column right at that boundary (confirmed by
+        # measuring visualRect: an exact-fit viewport rendered one fewer
+        # column than the arithmetic said should fit). Keeping 1px of
+        # leftover slack unclaimed keeps the post-margin viewport strictly
+        # wider than columns * item_width, so Qt reliably keeps all of them.
+        usable_extra = max(0, extra - 1)
+        new_left = usable_extra // 2
+        new_right = usable_extra - new_left
+        if (new_left, new_right) != (left, right):
+            self.setViewportMargins(new_left, 0, new_right, 0)
+
     def set_empty_message(self, message: str) -> None:
         """Text shown centered in the viewport when the model has zero
         rows - a folder with no images, or a filter that matches none,
