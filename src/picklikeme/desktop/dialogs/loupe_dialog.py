@@ -15,8 +15,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QColor, QKeyEvent, QMouseEvent, QPainter, QPixmap, QWheelEvent
+from PySide6.QtCore import QRectF, Qt, Signal
+from PySide6.QtGui import QColor, QKeyEvent, QMouseEvent, QPainter, QPen, QPixmap, QWheelEvent
 from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
@@ -40,6 +40,7 @@ from ...analyzer.annotations import (
     REVIEW_REASON_GOOD_QUALITY,
     REVIEW_REASON_OTHER,
 )
+from ...analyzer.contactsheets import OTHER_BOX, SELECTED_BOX
 from .. import theme
 from ..models.image_item import ImageItem
 from ..services import ReviewService
@@ -122,10 +123,12 @@ class _ZoomView(QGraphicsView):
         self.setFrameShape(QGraphicsView.Shape.NoFrame)
         self._fit_mode = True
         self._manual_scale = 1.0
+        self._overlay_items: list = []
 
     def set_pixmap(self, pixmap: QPixmap) -> None:
         """Load a new image, applying the current zoom mode (fit or manual)."""
         self._scene.clear()
+        self._overlay_items = []  # scene.clear() already deleted these Qt objects
         self._pixmap_item = self._scene.addPixmap(pixmap)
         self._scene.setSceneRect(pixmap.rect())
         if not pixmap.isNull():
@@ -141,6 +144,48 @@ class _ZoomView(QGraphicsView):
         """Replace the current pixmap in place, preserving zoom/pan (for exposure changes)."""
         if self._pixmap_item is not None:
             self._pixmap_item.setPixmap(pixmap)
+
+    def clear_detection_overlay(self) -> None:
+        for item in self._overlay_items:
+            self._scene.removeItem(item)
+        self._overlay_items = []
+
+    def set_detection_overlay(self, boxes_data: dict | None) -> None:
+        """Draw the detector's boxes (review/thumbnails.detection_boxes_for)
+        over the current image - solid green for the box that became the
+        crop the model scored, dashed amber for runners-up it passed over.
+        Same colors as the gallery's own with_boxes thumbnail overlay
+        (contactsheets.SELECTED_BOX/OTHER_BOX) so both views agree.
+
+        Coordinates in boxes_data are full-frame source pixels; scaled here
+        against the currently-displayed pixmap's own size rather than
+        assumed to match 1:1, since nothing guarantees the preview was
+        never resized relative to the source frame.
+        """
+        self.clear_detection_overlay()
+        if boxes_data is None or self._pixmap_item is None:
+            return
+        source_size = boxes_data.get("source_size")
+        if not source_size or source_size[0] <= 0 or source_size[1] <= 0:
+            return
+        pixmap_size = self._pixmap_item.pixmap().size()
+        scale_x = pixmap_size.width() / source_size[0]
+        scale_y = pixmap_size.height() / source_size[1]
+
+        def to_scene_rect(box: dict) -> QRectF:
+            x1, y1, x2, y2 = box["box"]
+            return QRectF(x1 * scale_x, y1 * scale_y, (x2 - x1) * scale_x, (y2 - y1) * scale_y)
+
+        for box in boxes_data.get("others", []):
+            item = self._scene.addRect(to_scene_rect(box), QPen(QColor(*OTHER_BOX), 2, Qt.PenStyle.DashLine))
+            item.setZValue(10)
+            self._overlay_items.append(item)
+
+        selected = boxes_data.get("selected")
+        if selected is not None:
+            item = self._scene.addRect(to_scene_rect(selected), QPen(QColor(*SELECTED_BOX), 3))
+            item.setZValue(11)
+            self._overlay_items.append(item)
 
     def _emit_zoom(self) -> None:
         self.zoomChanged.emit(self.transform().m11())
@@ -196,6 +241,7 @@ class LoupeDialog(QDialog):
         image_paths: list[str],
         start_index: int = 0,
         items: list[ImageItem] | None = None,
+        show_boxes: bool = False,
         parent=None,
     ) -> None:
         super().__init__(parent)
@@ -207,6 +253,11 @@ class LoupeDialog(QDialog):
         self.index = max(0, min(start_index, len(image_paths) - 1))
         self._exposure_steps = 0
         self._current_raw_pixmap: QPixmap | None = None
+        # Starts synced with the gallery's own Detector Boxes toggle (see
+        # MainWindow._open_loupe); toggling it here only affects this Loupe
+        # session; matches the web review UI where boxes is one shared
+        # client-side flag covering both the grid and the Lightbox.
+        self._show_boxes = show_boxes
         self.setWindowTitle("PeakPic - Loupe")
         # QDialog hides the maximize/minimize buttons by default on some
         # platforms (Windows in particular), and the default 1280x860 size
@@ -263,6 +314,10 @@ class LoupeDialog(QDialog):
         neutral_btn = QPushButton("Neutral (N)", self)
         exp_down_btn = QPushButton("−", self)
         exp_up_btn = QPushButton("+", self)
+        self._boxes_btn = QPushButton("Boxes", self)
+        self._boxes_btn.setCheckable(True)
+        self._boxes_btn.setChecked(self._show_boxes)
+        self._boxes_btn.setToolTip("Show the AI's detected-subject bounding boxes on this image")
         save_jpeg_btn = QPushButton("Save JPEG", self)
         close_btn = QPushButton("Close", self)
         for button in (exp_down_btn, exp_up_btn):
@@ -275,6 +330,7 @@ class LoupeDialog(QDialog):
         neutral_btn.clicked.connect(lambda: self._apply_status("neutral"))
         exp_down_btn.clicked.connect(lambda: self._adjust_exposure(-1))
         exp_up_btn.clicked.connect(lambda: self._adjust_exposure(1))
+        self._boxes_btn.toggled.connect(self._on_boxes_toggled)
         save_jpeg_btn.clicked.connect(self._save_jpeg)
         close_btn.clicked.connect(self.accept)
 
@@ -298,6 +354,7 @@ class LoupeDialog(QDialog):
         bar_layout.addWidget(exp_down_btn)
         bar_layout.addWidget(self._exposure_label)
         bar_layout.addWidget(exp_up_btn)
+        bar_layout.addWidget(self._boxes_btn)
         bar_layout.addWidget(save_jpeg_btn)
         bar_layout.addWidget(QLabel("Reason:"))
         bar_layout.addWidget(self._reason_combo)
@@ -351,7 +408,22 @@ class LoupeDialog(QDialog):
         pixmap = QPixmap(str(preview))
         self._current_raw_pixmap = pixmap
         self._view.set_pixmap(self._exposed_pixmap())
+        self._refresh_detection_overlay()
         self._update_info_labels()
+
+    def _refresh_detection_overlay(self) -> None:
+        if not self._show_boxes:
+            self._view.clear_detection_overlay()
+            return
+        try:
+            boxes = self.service.detection_boxes(self._current_path())
+        except Exception:  # noqa: BLE001 - a missing/unreadable detection record must not break the loupe
+            boxes = None
+        self._view.set_detection_overlay(boxes)
+
+    def _on_boxes_toggled(self, checked: bool) -> None:
+        self._show_boxes = checked
+        self._refresh_detection_overlay()
 
     def _exposed_pixmap(self) -> QPixmap:
         if self._current_raw_pixmap is None:

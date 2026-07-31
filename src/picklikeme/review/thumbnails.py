@@ -250,6 +250,30 @@ def detected_category_for(image_path: str) -> str | None:
     return selected.category if selected is not None else None
 
 
+def detection_boxes_for(image_path: str) -> dict | None:
+    """Detector boxes for one image, in full-frame pixel coordinates - the
+    same read-only data review_thumbnail's with_boxes overlay draws onto a
+    thumbnail file, for a caller (the desktop Loupe) that wants to draw its
+    own overlay on a full-size preview instead. None when there is no
+    recorded source frame size, i.e. nothing to scale boxes against -
+    review must never run the detector itself (allow_detect=False), only
+    ever read what preprocessing already computed, same as
+    detected_category_for above.
+    """
+    try:
+        record = _detections().get(image_path, allow_detect=False)
+    except Exception as exc:  # noqa: BLE001 - an unreadable cache is not fatal
+        logger.debug("No detections for %s: %s", image_path, exc)
+        return None
+    if record.source_size is None:
+        return None
+    return {
+        "source_size": record.source_size,
+        "selected": record.selected.as_dict() if record.selected is not None else None,
+        "others": [box.as_dict() for box in record.others],
+    }
+
+
 def close_detections() -> None:
     """Release the detector-box cache connection, for a clean shutdown."""
     global _detection_cache

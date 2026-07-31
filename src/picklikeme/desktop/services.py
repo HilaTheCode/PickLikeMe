@@ -13,7 +13,7 @@ from ..importer import import_selected_images
 from ..organize import SELECTED_DIRNAME
 from ..rank import rank_folder as run_rank_folder
 from ..review.session import ReviewSession
-from ..review.thumbnails import review_preview, review_thumbnail
+from ..review.thumbnails import detection_boxes_for, review_preview, review_thumbnail
 
 
 class ReviewService:
@@ -63,6 +63,9 @@ class ReviewService:
 
     def preview_path(self, image_path: str) -> Path:
         return review_preview(image_path)
+
+    def detection_boxes(self, image_path: str) -> dict[str, Any] | None:
+        return detection_boxes_for(image_path)
 
     def save_jpeg(self, image_path: str, destination_path: str | Path) -> Path:
         from ..analyzer.contactsheets import export_jpeg_bytes

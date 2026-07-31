@@ -1028,7 +1028,10 @@ class MainWindow(QMainWindow):
             return
         paths = [item.path for item in items]
         start_row = max(0, min(start_row, len(paths) - 1))
-        dialog = LoupeDialog(service=self.service, image_paths=paths, items=items, start_index=start_row, parent=self)
+        dialog = LoupeDialog(
+            service=self.service, image_paths=paths, items=items, start_index=start_row,
+            show_boxes=self._show_detector_boxes, parent=self,
+        )
         dialog.exec()
         self._refresh_from_state(self.service.load_session())
 
