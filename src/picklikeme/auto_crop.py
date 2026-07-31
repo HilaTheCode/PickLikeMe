@@ -18,25 +18,13 @@ from pathlib import Path
 
 from .bird_crop import BirdDetector, CropParams, compute_composition_crop
 from .exporters import EXPORTERS
+from .platform import resolve_torch_device
 from .raw_io import RawImageLoader
 
 
 def resolve_device(requested: str | None) -> str:
-    """Auto-select GPU when available, else CPU. `requested` may be None (auto)
-    or an explicit override; an explicit 'cuda' still falls back if unavailable."""
-    want_cuda = requested is None or requested.startswith("cuda")
-    if want_cuda:
-        try:
-            import torch
-
-            if torch.cuda.is_available():
-                return requested if (requested and requested != "cuda") else "cuda"
-        except ImportError:
-            pass
-        if requested is not None:
-            print(f"Requested device '{requested}' but CUDA is not available; using CPU")
-        return "cpu"
-    return requested
+    """Auto-select the best available torch device for this workflow."""
+    return resolve_torch_device(requested)
 
 
 def discover_raw_images(input_folder: Path) -> list[str]:
@@ -45,6 +33,70 @@ def discover_raw_images(input_folder: Path) -> list[str]:
         str(p) for p in input_folder.rglob("*")
         if p.is_file() and p.suffix.lower() in RawImageLoader.RAW_EXTENSIONS
     )
+
+
+def generate_lightroom_crops(
+    input_folder: str | Path,
+    *,
+    margin_percent: float = 0.0,
+    overwrite_xmp: bool = False,
+    conf_threshold: float | None = None,
+    device: str | None = None,
+    exiftool_path: str = "exiftool",
+) -> dict:
+    """Generate Lightroom-ready crop metadata for every supported RAW under a folder."""
+    input_path = Path(input_folder)
+    if not input_path.exists():
+        raise FileNotFoundError(f"Input folder does not exist: {input_path}")
+
+    images = discover_raw_images(input_path)
+    if not images:
+        return {"processed": 0, "message": "No compatible images were found.", "stats": {}, "details": []}
+
+    exporter_cls = EXPORTERS["lightroom"]
+    exporter = exporter_cls(exiftool_path=exiftool_path)
+
+    if any(Path(p).suffix.lower() == ".dng" for p in images):
+        from .ingest.metadata import ensure_exiftool_available
+
+        ensure_exiftool_available(exiftool_path)
+
+    selected_device = resolve_device(device)
+    detector = BirdDetector(
+        device=selected_device,
+        conf_threshold=conf_threshold if conf_threshold is not None else CropParams.conf_threshold,
+    )
+    decoder = RawImageLoader(raw_root=str(input_path))
+    margin_frac = margin_percent / 100.0
+
+    stats = {"written": 0, "embedded": 0, "skipped": 0, "no_bird": 0, "errors": 0}
+    details: list[dict] = []
+    for path in images:
+        name = Path(path).name
+        try:
+            full = decoder._decode_full_frame(path)
+            height, width = full.shape[:2]
+            detection = detector.detect_best_bird(full)
+            if detection is None:
+                stats["no_bird"] += 1
+                details.append({"path": path, "status": "skipped", "message": f"{name}: no bird detected -> skipped"})
+                continue
+            crop = compute_composition_crop(detection, width, height, margin_frac)
+            result = exporter.export(Path(path), crop, overwrite=overwrite_xmp)
+            key = {"written": "written", "embedded": "embedded", "skipped_exists": "skipped"}[result.action]
+            stats[key] += 1
+            details.append({"path": path, "status": result.action, "message": f"{name}: {result.action}"})
+        except Exception as exc:  # noqa: BLE001 - one bad file shouldn't stop the batch
+            stats["errors"] += 1
+            details.append({"path": path, "status": "error", "message": f"{name}: ERROR {type(exc).__name__}: {exc}"})
+
+    return {
+        "processed": len(images),
+        "message": f"Processed {len(images)} RAW image(s) with auto crop.",
+        "stats": stats,
+        "details": details,
+        "device": selected_device,
+    }
 
 
 def main() -> None:
@@ -69,47 +121,24 @@ def main() -> None:
         )
     print(f"Found {len(images)} RAW images under {input_folder.resolve()}")
 
-    exporter_cls = EXPORTERS[args.exporter]
-    exporter = exporter_cls(exiftool_path=args.exiftool_path) if args.exporter == "lightroom" else exporter_cls()
-
-    # Fail early with a clear message if DNGs are present but exiftool is missing.
-    if any(Path(p).suffix.lower() == ".dng" for p in images):
-        from .ingest.metadata import ensure_exiftool_available
-
-        ensure_exiftool_available(args.exiftool_path)
-
-    device = resolve_device(args.device)
-    print(f"Loading detector on {device} (read-only)...")
-    detector = BirdDetector(device=device, conf_threshold=args.conf_threshold)
-    decoder = RawImageLoader(raw_root=str(input_folder))
-    margin_frac = args.margin / 100.0
-
-    stats = {"written": 0, "embedded": 0, "skipped": 0, "no_bird": 0, "errors": 0}
-    for path in images:
-        name = Path(path).name
-        try:
-            full = decoder._decode_full_frame(path)
-            height, width = full.shape[:2]
-            detection = detector.detect_best_bird(full)
-            if detection is None:
-                stats["no_bird"] += 1
-                print(f"  {name}: no bird detected -> skipped (no crop written)")
-                continue
-            crop = compute_composition_crop(detection, width, height, margin_frac)
-            result = exporter.export(Path(path), crop, overwrite=args.overwrite_xmp)
-            key = {"written": "written", "embedded": "embedded", "skipped_exists": "skipped"}[result.action]
-            stats[key] += 1
-            print(f"  {name}: {result.action} -> {result.output_path.name} (conf={detection.score:.2f})")
-        except Exception as exc:  # noqa: BLE001 - one bad file shouldn't stop the batch
-            stats["errors"] += 1
-            print(f"  {name}: ERROR {type(exc).__name__}: {exc}")
+    result = generate_lightroom_crops(
+        input_folder,
+        margin_percent=args.margin,
+        overwrite_xmp=args.overwrite_xmp,
+        conf_threshold=args.conf_threshold,
+        device=args.device,
+        exiftool_path=args.exiftool_path,
+    )
+    print(f"Loading detector on {result['device']} (read-only)...")
+    for detail in result["details"]:
+        print(f"  {detail['message']}")
 
     print("\nAuto-crop complete:")
-    print(f"  sidecars written:   {stats['written']}")
-    print(f"  DNG crops embedded: {stats['embedded']}")
-    print(f"  skipped (existing): {stats['skipped']}")
-    print(f"  no bird detected:   {stats['no_bird']}")
-    print(f"  errors:             {stats['errors']}")
+    print(f"  sidecars written:   {result['stats']['written']}")
+    print(f"  DNG crops embedded: {result['stats']['embedded']}")
+    print(f"  skipped (existing): {result['stats']['skipped']}")
+    print(f"  no bird detected:   {result['stats']['no_bird']}")
+    print(f"  errors:             {result['stats']['errors']}")
 
 
 if __name__ == "__main__":

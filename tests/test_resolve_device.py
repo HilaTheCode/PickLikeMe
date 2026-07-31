@@ -12,6 +12,12 @@ class ResolveDeviceTests(unittest.TestCase):
     def test_cpu_request_passes_through(self):
         self.assertEqual(resolve_device("cpu"), "cpu")
 
+    def test_auto_request_prefers_mps_when_cuda_is_unavailable(self):
+        with mock.patch("torch.cuda.is_available", return_value=False), mock.patch(
+            "torch.backends.mps.is_available", return_value=True, create=True
+        ):
+            self.assertEqual(resolve_device(None), "mps")
+
     def test_cuda_request_passes_through_when_available(self):
         with mock.patch("torch.cuda.is_available", return_value=True):
             self.assertEqual(resolve_device("cuda"), "cuda")

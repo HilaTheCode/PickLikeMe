@@ -163,17 +163,11 @@ def _writer_loop(write_queue: "queue.Queue", failures: list[tuple[_WriteJob, Bas
             failures.append((job, exc))
 
 
-def _resolve_device(requested: str) -> str:
-    if requested.startswith("cuda"):
-        try:
-            import torch
+from .platform import resolve_torch_device
 
-            if not torch.cuda.is_available():
-                print(f"Requested device '{requested}' but CUDA is not available; using CPU")
-                return "cpu"
-        except ImportError:
-            return "cpu"
-    return requested
+
+def _resolve_device(requested: str) -> str:
+    return resolve_torch_device(requested)
 
 
 def build_cache(

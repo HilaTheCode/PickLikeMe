@@ -6,7 +6,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from picklikeme.auto_crop import discover_raw_images, resolve_device
+from picklikeme.auto_crop import discover_raw_images, generate_lightroom_crops, resolve_device
 
 
 class DiscoverRawTests(unittest.TestCase):
@@ -36,6 +36,15 @@ class ResolveDeviceTests(unittest.TestCase):
 
     def test_explicit_cpu(self):
         self.assertEqual(resolve_device("cpu"), "cpu")
+
+
+class GenerateLightroomCropsTests(unittest.TestCase):
+    def test_empty_folder_reports_no_compatible_images(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result = generate_lightroom_crops(Path(tmp))
+
+        self.assertEqual(result["processed"], 0)
+        self.assertEqual(result["message"], "No compatible images were found.")
 
 
 if __name__ == "__main__":

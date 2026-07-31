@@ -29,6 +29,7 @@ from .config import (
 from .dataset import FolderLabelDataset, LabelDataset, PathSuffixIndex
 from .evaluate import compute_metrics, format_metrics, score_items, write_metrics_json
 from .model import DINOV3_BACKBONE, ModelConfig, PreferenceHead
+from .platform import resolve_torch_device
 
 
 class ExistingCheckpointError(RuntimeError):
@@ -78,10 +79,7 @@ class ImageTensorDataset(Dataset):
 
 
 def resolve_device(requested: str) -> str:
-    if requested.startswith("cuda") and not torch.cuda.is_available():
-        print(f"Requested device '{requested}' but CUDA is not available; falling back to CPU")
-        return "cpu"
-    return requested
+    return resolve_torch_device(requested)
 
 
 def _gigabytes(num_bytes: int) -> str:

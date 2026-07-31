@@ -117,6 +117,13 @@ class PageTests(ReviewServerTestCase):
         self.assertNotIn("PickLikeMe", body_without_title)
         self.assertNotIn("<h1>", body_without_title)
 
+    def test_the_page_exposes_an_auto_crop_action(self):
+        with urllib.request.urlopen(self.base + "/") as response:
+            body = response.read().decode("utf-8")
+
+        self.assertIn('id="auto-crop"', body)
+        self.assertIn("Auto Crop for Lightroom", body)
+
 
 class PageMarkupTests(unittest.TestCase):
     """Structural checks on the generated document, with no server involved.
@@ -1570,6 +1577,16 @@ class RelocateFolderMarkupTests(unittest.TestCase):
         fn = re.search(r"async function relocateFolder\(\)\{(.*?)\n\}", js, re.S)
         self.assertIsNotNone(fn, "relocateFolder not found")
         self.assertIn("api/review/relocate-folder", fn.group(1))
+
+
+class AutoCropEndpointTests(ReviewServerTestCase):
+    def test_the_auto_crop_endpoint_starts_a_background_job(self):
+        with mock.patch("picklikeme.review.server.generate_lightroom_crops", return_value={"processed": 0, "message": "No compatible images were found."}) as generate:
+            payload = self.post("/api/review/auto-crop", {})
+
+        self.assertTrue(payload["ok"])
+        self.assertTrue(payload["started"])
+        generate.assert_called_once()
 
 
 class ArrangeEndpointTests(ReviewServerTestCase):

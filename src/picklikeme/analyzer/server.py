@@ -27,9 +27,12 @@ import json
 import logging
 import mimetypes
 import threading
+import webbrowser
 from http.server import HTTPServer, SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
+
+from ..platform import launch_browser
 
 from ..config import cli_prefix
 from ..identity import IdentityUnavailable
@@ -411,9 +414,7 @@ def serve(
 
     if open_browser:
         # Opened from a thread so a slow browser launch cannot delay serving.
-        threading.Thread(
-            target=lambda: __import__("webbrowser").open(url), daemon=True
-        ).start()
+        threading.Thread(target=lambda: launch_browser(url), daemon=True).start()
 
     try:
         server.serve_forever()

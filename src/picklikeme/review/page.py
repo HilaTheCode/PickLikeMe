@@ -1285,6 +1285,22 @@ async function openFolder(){
   }catch(e){ say('Could not open the folder: ' + e.message, true); }
 }
 
+async function runAutoCrop(){
+  if(PLM.busy) return;
+  PLM.busy = true;
+  q('#auto-crop').disabled = true;
+  say('Starting auto crop for Lightroom…');
+  try{
+    const j = await api('api/review/auto-crop', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({}),
+    });
+    say(j.message || 'Auto crop started.');
+  }catch(e){ say('Could not start auto crop: ' + e.message, true); }
+  finally{ PLM.busy = false; q('#auto-crop').disabled = false; }
+}
+
 // Shows the OS's own folder-browser dialog (the server bridges it - a
 // browser cannot show one itself, see os_actions.py's choose_folder) and, if
 // the photographer picked something, switches the whole review to it. Meant
@@ -1441,6 +1457,7 @@ async function boot(){
   q('#sort-dir').addEventListener('click', toggleSortDir);
   q('#select-all-visible').addEventListener('click', selectAllVisible);
   q('#panel-toggle').addEventListener('click', togglePanel);
+  q('#auto-crop').addEventListener('click', runAutoCrop);
   let panelOpen = true;
   try{ panelOpen = localStorage.getItem('plm-panel-open') !== '0' }catch(e){}
   setPanelOpen(panelOpen);
@@ -1544,6 +1561,7 @@ def build_page(title: str = "PickLikeMe Review") -> str:
     <div class="group" data-group="tools">
       <span class="glabel">Tools</span>
       <button id="go" class="primary" title="Move Keep to _Selected and Reject to _Rejected. Neutral is never moved.">Arrange Files</button>
+      <button id="auto-crop" title="Generate Lightroom crop metadata from the current folder's RAW images">Auto Crop for Lightroom</button>
       <button id="panel-toggle" class="on" title="Show/hide filters, sorting and view options">Filters &amp; Sorting</button>
     </div>
     <div class="stats" id="stats">

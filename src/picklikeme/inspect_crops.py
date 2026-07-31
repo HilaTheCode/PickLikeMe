@@ -36,6 +36,7 @@ from .bird_crop import (
 )
 from .config import DEFAULT_CROP_CACHE_DIR, DEFAULT_INSPECTION_DIR
 from .dataset import FolderLabelDataset
+from .platform import resolve_torch_device
 from .raw_io import RawImageLoader
 
 # Supported inputs for folder mode: the exact RAW formats the pipeline decodes
@@ -47,21 +48,8 @@ SUPPORTED_INPUT_EXTS = RawImageLoader.RAW_EXTENSIONS | {
 
 
 def resolve_device(requested: str | None) -> str:
-    """Auto-select the device: GPU when available, else CPU. `requested` may be
-    None (auto) or an explicit override like 'cpu'."""
-    want_cuda = requested is None or requested.startswith("cuda")
-    if want_cuda:
-        try:
-            import torch
-
-            if torch.cuda.is_available():
-                return requested if (requested and requested != "cuda") else "cuda"
-        except ImportError:
-            pass
-        if requested is not None:
-            print(f"Requested device '{requested}' but CUDA is not available; using CPU")
-        return "cpu"
-    return requested
+    """Auto-select the best available torch device for this workflow."""
+    return resolve_torch_device(requested)
 
 
 def discover_images(input_folder: Path) -> list[str]:

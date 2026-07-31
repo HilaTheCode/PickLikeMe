@@ -24,6 +24,9 @@ from http.server import HTTPServer, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+from ..auto_crop import generate_lightroom_crops
+from ..platform import launch_browser
+
 from ..analyzer.annotations import AnnotationStore, InvalidReviewDecision, InvalidReviewReason
 from ..analyzer.os_actions import choose_folder
 from ..analyzer.server import HOST, AnnotationRequestHandler
@@ -272,6 +275,7 @@ class ReviewRequestHandler(AnnotationRequestHandler):
             "/api/review/keep-percent": self._post_keep_percent,
             "/api/review/arrange": self._post_arrange,
             "/api/review/reconcile": self._post_reconcile,
+            "/api/review/auto-crop": self._post_auto_crop,
             "/api/review/open-folder": self._post_open_folder,
             "/api/review/relocate-folder": self._post_relocate_folder,
         }
@@ -380,6 +384,23 @@ class ReviewRequestHandler(AnnotationRequestHandler):
     def _post_reconcile(self, payload: dict) -> None:
         recovered = self.session.reconcile_by_identity()
         self._send_json({"ok": True, "recovered": recovered, "state": self.session.as_dict()})
+
+    def _post_auto_crop(self, payload: dict) -> None:
+        if self.session.input_folder is None:
+            self._send_json({"ok": True, "started": False, "message": "No folder is open yet."})
+            return
+
+        folder = self.session.input_folder
+
+        def worker() -> None:
+            try:
+                generate_lightroom_crops(folder)
+            except Exception as exc:  # noqa: BLE001 - background work must not break the page
+                logger.exception("Auto crop failed for %s", folder)
+                logger.warning("Auto crop error: %s", exc)
+
+        threading.Thread(target=worker, daemon=True).start()
+        self._send_json({"ok": True, "started": True, "message": f"Auto crop started for {folder}."})
 
     def _pick_folder(self, payload: dict) -> Path | None:
         """Resolve which folder a caller means - shared by `/open-folder` and
@@ -518,7 +539,7 @@ def serve_review(
 
     if open_browser:
         # From a thread so a slow browser launch cannot delay serving.
-        threading.Thread(target=lambda: __import__("webbrowser").open(url), daemon=True).start()
+        threading.Thread(target=lambda: launch_browser(url), daemon=True).start()
 
     try:
         server.serve_forever()
