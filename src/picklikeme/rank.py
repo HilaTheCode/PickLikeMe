@@ -40,6 +40,14 @@ from .sidecar import RANKING_FILENAME, SIDECAR_DIRNAME, ranking_path, write_run_
 from .train import load_checkpoint, rank_dataset, timestamped_output_path, write_results_csv
 
 
+def _folder_already_organized(input_folder: Path) -> bool:
+    """True when every RAW under `input_folder` was excluded only because it
+    already lives under _Selected/_Rejected - i.e. this folder was ranked
+    and arranged before, not never touched. Distinguishes that case from a
+    genuinely empty folder so the two can get different error messages."""
+    return len(UnlabeledImageDataset.from_folder(input_folder)) > 0
+
+
 def rank_folder(
     input_folder: str | Path,
     *,
@@ -76,6 +84,11 @@ def rank_folder(
 
     dataset = UnlabeledImageDataset.from_folder(input_folder, exclude_dirs=set(ORGANIZE_DIRNAMES) | {SIDECAR_DIRNAME})
     if len(dataset) == 0:
+        if _folder_already_organized(input_folder):
+            raise ValueError(
+                f"{input_folder.resolve()} has already been organized into "
+                f"{SELECTED_DIRNAME}/{REJECTED_DIRNAME} - there are no un-arranged RAW images left to rank."
+            )
         raise ValueError(f"No RAW images found under {input_folder.resolve()}")
 
     resolved_device = resolve_device(device)
@@ -233,6 +246,11 @@ def main() -> None:
         input_folder, exclude_dirs=set(ORGANIZE_DIRNAMES) | {SIDECAR_DIRNAME}
     )
     if len(dataset) == 0:
+        if _folder_already_organized(input_folder):
+            raise SystemExit(
+                f"{input_folder.resolve()} has already been organized into "
+                f"{SELECTED_DIRNAME}/{REJECTED_DIRNAME} - there are no un-arranged RAW images left to rank."
+            )
         raise SystemExit(f"No RAW images (.arw/.nef/.cr3) found under {input_folder.resolve()}")
     print(f"Found {len(dataset)} images to rank under {input_folder.resolve()}")
     profiler = PipelineProfiler(images=len(dataset), decode_workers=1, device=resolve_device(args.device))
