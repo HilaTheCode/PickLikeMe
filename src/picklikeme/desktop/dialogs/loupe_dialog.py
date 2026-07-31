@@ -172,6 +172,19 @@ class _ZoomView(QGraphicsView):
         self._emit_zoom()
         event.accept()
 
+    def resizeEvent(self, event) -> None:  # noqa: N802 - Qt override signature
+        # set_pixmap() calls fitInView() using whatever viewport size exists
+        # at that moment - but the constructor loads the first image before
+        # the dialog has been shown/laid out to its final size, so that
+        # first fitInView() computes its scale against a near-empty
+        # viewport and bakes in a tiny transform. Re-fitting on every
+        # resize (cheap; only runs while actually resizing) is the standard
+        # fix for QGraphicsView-based "fit to window" viewers.
+        super().resizeEvent(event)
+        if self._fit_mode and self._pixmap_item is not None:
+            self.fitInView(self._pixmap_item, Qt.AspectRatioMode.KeepAspectRatio)
+            self._emit_zoom()
+
 
 class LoupeDialog(QDialog):
     """Full-screen-style zoom review for a filtered set of images."""

@@ -48,11 +48,16 @@ DARK = Palette(
     hover_bg="#2d2d30",
     selection_border="#4fc3f7",
     accent="#4fc3f7",
-    keep_bg="#1b3a1f",
+    # Kept perceptibly separated from neutral_bg and from each other by hue
+    # AND saturation, not just luminance - a screenshot of the first pass
+    # (keep_bg #1b3a1f / reject_bg #3a1c1c / neutral_bg #2a2a2a) showed all
+    # three clustering into the same dark-gray band at a glance, defeating
+    # "immediately recognizable" review status on the gallery cards.
+    keep_bg="#1d4a27",
     keep_fg="#66bb6a",
-    reject_bg="#3a1c1c",
+    reject_bg="#4a1f1f",
     reject_fg="#ef5350",
-    neutral_bg="#2a2a2a",
+    neutral_bg="#242424",
     neutral_fg="#9e9e9e",
 )
 

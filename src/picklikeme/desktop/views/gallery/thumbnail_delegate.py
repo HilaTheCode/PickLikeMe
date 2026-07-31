@@ -111,8 +111,10 @@ class ThumbnailCardDelegate(QAbstractItemDelegate):
 
         # Draw review status and AI suggestion badges
         painter.setFont(self._tiny_font)
-        badge_y = text_rect.y() + 36
-        self._draw_status_badge(painter, palette, text_rect.x(), badge_y, item)
+        badge_rect = QRect(text_rect)
+        badge_rect.setY(badge_rect.y() + 36)
+        badge_rect.setHeight(16)
+        self._draw_status_badge(painter, palette, badge_rect, item)
 
         painter.restore()
 
@@ -128,8 +130,14 @@ class ThumbnailCardDelegate(QAbstractItemDelegate):
         return QColor(palette.neutral_bg)
 
     @staticmethod
-    def _draw_status_badge(painter: QPainter, palette: theme.Palette, x: int, y: int, item) -> None:
-        """Draw review status and AI suggestion badges."""
+    def _draw_status_badge(painter: QPainter, palette: theme.Palette, rect: QRect, item) -> None:
+        """Draw review status and AI suggestion badges.
+
+        Uses the rect+alignment drawText overload throughout (matching the
+        filename/score rows above), not the point+baseline overload - mixing
+        the two previously put the badge's text *baseline* where the score
+        row's text *top* was, so the two visibly overlapped.
+        """
         status_text = ""
         status_color: QColor | None = None
 
@@ -147,13 +155,15 @@ class ThumbnailCardDelegate(QAbstractItemDelegate):
         # a fixed offset - "Neutral"/"AI: Neutral" are both longer than
         # "Keep"/"AI: Keep", and a fixed gap either clipped the longer
         # combinations or left an oddly wide gap for the shorter ones).
-        next_x = x
+        next_x = rect.x()
         if status_text and status_color is not None:
             painter.setPen(status_color)
-            painter.drawText(x, y, status_text)
-            next_x = x + QFontMetrics(painter.font()).horizontalAdvance(status_text) + 8
+            painter.drawText(rect, Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft, status_text)
+            next_x = rect.x() + QFontMetrics(painter.font()).horizontalAdvance(status_text) + 8
 
         if item.ai_suggestion and item.ai_suggestion != item.review_status:
             ai_text = f"AI: {item.ai_suggestion.capitalize()}"
+            ai_rect = QRect(rect)
+            ai_rect.setX(next_x)
             painter.setPen(QColor(palette.accent))
-            painter.drawText(next_x, y, ai_text)
+            painter.drawText(ai_rect, Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft, ai_text)

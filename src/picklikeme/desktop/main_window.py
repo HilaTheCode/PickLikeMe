@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
     QProgressDialog,
     QStatusBar,
     QStyle,
+    QStyleFactory,
     QTextEdit,
     QToolBar,
     QWidget,
@@ -145,6 +146,18 @@ class MainWindow(QMainWindow):
         theme.set_theme(name)
         app = QApplication.instance()
         if app is not None:
+            # Windows' native "windows11"/"windowsvista" style renders its
+            # own chrome for QMenuBar/QToolBar/QStatusBar and ignores most
+            # QSS background-color rules on them - confirmed by screenshot,
+            # not just style-string inspection: switching themes visibly
+            # reskinned the gallery cards but left the toolbar/menu/status
+            # bar dark in both themes. Fusion is the standard fix: it's a
+            # QStyle Qt fully implements against stylesheets, and it also
+            # renders identically across Windows/macOS/Linux.
+            if app.style().objectName().lower() != "fusion":
+                fusion = QStyleFactory.create("Fusion")
+                if fusion is not None:
+                    app.setStyle(fusion)
             app.setStyleSheet(theme.build_stylesheet(theme.current_palette()))
         self._gallery_view.viewport().update()
         if hasattr(self, "_dark_theme_action"):
@@ -608,6 +621,8 @@ class MainWindow(QMainWindow):
         self._folder_load_dialog.setValue(percent)
 
     def _refresh_from_state(self, state: dict[str, Any]) -> None:
+        input_folder = state.get("input_folder")
+        self._folder_label.setText(f"Folder: {Path(input_folder).name}" if input_folder else "No folder open")
         self.state.image_count = state.get("counts", {}).get("total", 0)
         self._image_count_label.setText(f"Images: {self.state.image_count}")
         self._all_items = [
