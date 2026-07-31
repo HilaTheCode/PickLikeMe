@@ -262,7 +262,7 @@ class MainWindow(QMainWindow):
         )
         self._crop_action = self._make_action(
             "Auto Crop…", icon=SP.SP_FileDialogDetailedView,
-            tooltip="Generate Lightroom crop metadata around detected birds", triggered=self._auto_crop,
+            tooltip="Generate Lightroom crop metadata around detected subjects", triggered=self._auto_crop,
         )
 
         exit_action = self._make_action(

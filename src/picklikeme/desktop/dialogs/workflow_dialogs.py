@@ -42,7 +42,7 @@ class RankDialog(QDialog):
         checkpoint_row.addWidget(self._checkpoint_edit, 1)
         checkpoint_row.addWidget(browse_btn)
 
-        self._crop_birds_check = QCheckBox("Score bird crops (recommended)", self)
+        self._crop_birds_check = QCheckBox("Score subject crops (recommended)", self)
         self._crop_birds_check.setChecked(True)
 
         form = QFormLayout()
