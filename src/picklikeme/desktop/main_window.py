@@ -72,6 +72,7 @@ class MainWindow(QMainWindow):
         self._settings = QSettings("PeakPic", "PeakPicDesktop")
         self._all_items: list[ImageItem] = []
         self._current_filter = "all"
+        self._last_counts: dict[str, Any] = {}
         self._active_threads: list[Any] = []  # keeps background QThreads alive while running
         self._open_folder_in_progress = False
         self._open_folder_generation = 0
@@ -89,6 +90,7 @@ class MainWindow(QMainWindow):
 
         self._folder_label = QLabel("No folder open")
         self._image_count_label = QLabel("Images: 0")
+        self._counts_label = QLabel("")
         self._status_label = QLabel("Ready")
         self._status_message_label = QLabel("")
         self._gpu_status_label = QLabel("")
@@ -148,6 +150,8 @@ class MainWindow(QMainWindow):
         if hasattr(self, "_dark_theme_action"):
             self._dark_theme_action.setChecked(theme.current_theme_name() == "dark")
             self._light_theme_action.setChecked(theme.current_theme_name() == "light")
+        if hasattr(self, "_counts_label"):
+            self._update_status_counts(self._last_counts)
 
     def _set_theme(self, name: str) -> None:
         self._apply_theme(name)
@@ -342,11 +346,26 @@ class MainWindow(QMainWindow):
         status_bar = QStatusBar(self)
         status_bar.addWidget(self._folder_label)
         status_bar.addWidget(self._image_count_label)
+        status_bar.addWidget(self._counts_label)
         status_bar.addWidget(self._status_label)
         status_bar.addWidget(self._loading_progress)
         status_bar.addPermanentWidget(self._gpu_status_label)
         status_bar.addPermanentWidget(self._status_message_label)
         self.setStatusBar(status_bar)
+
+    def _update_status_counts(self, counts: dict[str, Any]) -> None:
+        """Keep/Reject/Neutral breakdown, color-coded to match the gallery
+        cards - the same at-a-glance density the web review header gives."""
+        self._last_counts = counts
+        palette = theme.current_palette()
+        keep = counts.get("keep", 0)
+        reject = counts.get("reject", 0)
+        neutral = counts.get("neutral", 0)
+        self._counts_label.setText(
+            f'<span style="color:{palette.keep_fg}">Keep {keep}</span>&nbsp;&nbsp;'
+            f'<span style="color:{palette.reject_fg}">Reject {reject}</span>&nbsp;&nbsp;'
+            f'<span style="color:{palette.neutral_fg}">Neutral {neutral}</span>'
+        )
 
     def _build_docks(self) -> None:
         pass
@@ -596,12 +615,14 @@ class MainWindow(QMainWindow):
                 path=image.get("image_path") or "",
                 file_name=Path(image.get("image_path") or "").name,
                 score=image.get("score"),
+                rank=image.get("rank"),
                 review_status=image.get("review_status", "neutral"),
                 ai_suggestion=image.get("ai_suggestion"),
             )
             for image in state.get("images", [])
         ]
         self._apply_filter()
+        self._update_status_counts(state.get("counts", {}))
 
     def _open_folder_dialog(self) -> None:
         folder = QFileDialog.getExistingDirectory(self, "Open Folder", str(Path.home()))
@@ -640,6 +661,16 @@ class MainWindow(QMainWindow):
         self._gallery_model.set_items(filtered)
         if filtered and not self._gallery_view.currentIndex().isValid():
             self._gallery_view.setCurrentIndex(self._gallery_model.index(0, 0))
+        self._gallery_view.set_empty_message(self._empty_message_for_current_state())
+
+    def _empty_message_for_current_state(self) -> str:
+        if not self.state.current_folder:
+            return "Open a folder to begin reviewing images"
+        if not self._all_items:
+            return "No images found in this folder"
+        if self._current_filter != "all":
+            return f"No images match the '{self._current_filter.capitalize()}' filter"
+        return ""
 
     def _filtered_paths(self) -> list[str]:
         return [item.path for item in self._gallery_model.items()]
@@ -665,26 +696,40 @@ class MainWindow(QMainWindow):
 
     # -- review actions -------------------------------------------------------
 
-    def _selected_image_path(self) -> str | None:
-        index = self._gallery_view.currentIndex()
-        if not index.isValid():
-            return None
-        item = self._gallery_model.item_at(index.row())
-        return item.path if item else None
+    def _selected_image_paths(self) -> list[str]:
+        """Every multi-selected image, or the single current one when
+        nothing was explicitly multi-selected (mouse click, arrow-key
+        navigation, or the fallback selection _apply_filter sets on the
+        first row of a freshly filtered gallery)."""
+        indexes = self._gallery_view.selectionModel().selectedIndexes()
+        if not indexes:
+            current = self._gallery_view.currentIndex()
+            indexes = [current] if current.isValid() else []
+        paths: list[str] = []
+        for index in indexes:
+            item = self._gallery_model.item_at(index.row())
+            if item is not None and item.path:
+                paths.append(item.path)
+        return paths
 
     def apply_review_status(self, status: str) -> None:
         if not self.state.current_folder:
             self._set_status("Open a folder before applying review decisions")
             return
 
-        image_path = self._selected_image_path()
-        if image_path is None:
+        paths = self._selected_image_paths()
+        if not paths:
             self._set_status("Select an image in the gallery first")
             return
 
-        self.state.current_selection = [image_path]
-        self.service.set_review_status(image_path, status)
-        self._set_status(f"Marked {Path(image_path).name} as {status}")
+        self.state.current_selection = paths
+        for image_path in paths:
+            self.service.set_review_status(image_path, status)
+
+        if len(paths) == 1:
+            self._set_status(f"Marked {Path(paths[0]).name} as {status}")
+        else:
+            self._set_status(f"Marked {len(paths)} images as {status}")
         self._refresh_from_state(self.service.load_session())
 
     # -- loupe / zoom review ---------------------------------------------------
