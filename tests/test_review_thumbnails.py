@@ -257,5 +257,31 @@ class ReviewPreviewCacheTests(unittest.TestCase):
         self.assertLessEqual(total, 2000)
 
 
+class PreviewCacheIsIndependentOfTheVisionCacheTests(unittest.TestCase):
+    """The Preview Cache (this module) and the Vision Cache (bird_crop.py's
+    crop cache) are deliberately separate concerns - a UI optimization vs
+    the source of truth for Computer Vision - and the Vision Cache's
+    resolution/format/quality becoming configurable must not have touched
+    this one at all. See bird_crop.py's module docstring and
+    docs/vision_cache.md."""
+
+    def test_review_preview_builds_from_the_original_image_never_the_crop_cache(self):
+        """review_preview must never import or depend on bird_crop's crop
+        cache - it reads the ORIGINAL image directly (see
+        contactsheets.load_source_image), which is exactly why a change to
+        how bird crops are cached cannot affect it."""
+        import inspect
+
+        source = inspect.getsource(thumbnails_module.review_preview)
+        self.assertNotIn("crop_cache", source)
+        self.assertNotIn("bird_crop", source)
+
+    def test_preview_cache_constants_are_unchanged_by_the_vision_cache_work(self):
+        """Pinned so an accidental edit made while touching the Vision Cache
+        elsewhere is caught immediately."""
+        self.assertEqual(thumbnails_module.REVIEW_PREVIEW_CACHE_VERSION, 1)
+        self.assertEqual(thumbnails_module.DEFAULT_PREVIEW_CACHE_MAX_BYTES, 20 * 1024**3)
+
+
 if __name__ == "__main__":
     unittest.main()

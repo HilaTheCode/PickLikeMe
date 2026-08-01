@@ -37,6 +37,22 @@ class CacheManager:
         self.stats.misses += 1
         return None
 
+    def clear_thumbnails(self) -> None:
+        """Drop every cached thumbnail pixmap - both plain and detector-box
+        overlaid.
+
+        Needed after a ranking run: `review_thumbnail(with_boxes=True)`
+        picks a different on-disk file depending on what is currently
+        recorded for an image (see `annotated_thumbnail_path`'s `has_eye`),
+        so an overlaid pixmap already sitting in this in-memory cache from
+        before a run - e.g. the Gallery's Detector Boxes toggle was on
+        while only the AI model had ranked the folder - would otherwise be
+        served back forever even after Classic Vision adds eye data for
+        the same (path, with_boxes) key. See MainWindow._rank_with_strategy's
+        `_on_success`, the only call site.
+        """
+        self._thumbs.clear()
+
     def put_preview(self, key: str, value: Any) -> None:
         self._previews[key] = value
 

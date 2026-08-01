@@ -61,6 +61,10 @@ from ..auto_crop import resolve_device
 from ..bird_crop import CropParams, crop_cache_path, read_detections
 from ..config import DEFAULT_CROP_CACHE_DIR, DEFAULT_MAX_CSV_ROWS
 from ..dataset import UnlabeledImageDataset
+from ..eyes.eyepose_v0 import (
+    DEFAULT_MAX_EYE_HEAD_DISTANCE_RATIO as EYEPOSE_DEFAULT_MAX_HEAD_DISTANCE_RATIO,
+)
+from ..eyes.eyepose_v0 import DEFAULT_MIN_CONFIDENCE as EYEPOSE_DEFAULT_MIN_CONFIDENCE
 from ..eyes.superanimal_bird import DEFAULT_MAX_EYE_DISAGREEMENT, DEFAULT_MIN_CONFIDENCE
 from ..preprocess import build_cache
 from ..sidecar import (
@@ -85,6 +89,16 @@ STRATEGY_ID = "classic-vision"
 # Where the per-image filter verdicts land, beside the ranking CSV the same
 # run produced. Not merged into run.json (which is provenance about the run as
 # a whole) because this is per-image data that grows with the folder.
+#
+# These two are the ORIGINAL, un-suffixed names - kept exactly as they were
+# before Classic Vision supported more than one eye-detection backend, so a
+# folder already analysed by the legacy (SuperAnimal-Bird) strategy keeps
+# reading and writing the exact same files. A folder analysed by ANY other
+# backend gets its own, backend-specific filenames instead - see
+# `_filter_report_filename`/`_metrics_report_filename` - so two backends run
+# on the same folder coexist rather than overwriting each other, the same
+# requirement `sidecar.strategy_ranking_path` already satisfies for the
+# ranking CSV itself.
 FILTER_REPORT_FILENAME = "classic_vision_filters.json"
 
 # Where each surviving image's raw, per-metric measurements land - the
@@ -96,6 +110,18 @@ FILTER_REPORT_FILENAME = "classic_vision_filters.json"
 # diagnostics line - needs no per-strategy code; see
 # sidecar.discover_metric_reports.
 METRICS_REPORT_FILENAME = "classic_vision_metrics.json"
+
+
+def _filter_report_filename(strategy_id: str) -> str:
+    """Where one backend's filter report lives - the legacy name for the
+    original (SuperAnimal-Bird) strategy id, `<strategy_id>_filters.json`
+    for any other, so a second Classic Vision backend never overwrites the
+    first's results on a folder analysed by both."""
+    return FILTER_REPORT_FILENAME if strategy_id == STRATEGY_ID else f"{strategy_id}_filters.json"
+
+
+def _metrics_report_filename(strategy_id: str) -> str:
+    return METRICS_REPORT_FILENAME if strategy_id == STRATEGY_ID else f"{strategy_id}_metrics.json"
 
 # Display labels for the raw metrics above, for the same generic reader.
 METRIC_LABELS: dict[str, str] = {
@@ -138,14 +164,58 @@ def analysis_targets(input_folder: str | Path) -> list[str]:
     return [str(path) for path in found if SIDECAR_DIRNAME not in path.parts]
 
 
+# The three scoring weights are identical in name and meaning across every
+# Classic Vision backend - scoring (ranking.metrics) never knows which
+# backend produced the eye it measures inside, so there is nothing
+# backend-specific about them. Shared here so both params dataclasses below
+# declare the exact same three specs rather than two copies that could drift.
+def _scoring_weight_specs() -> tuple[ParamSpec, ...]:
+    return (
+        ParamSpec(
+            name="eye_sharpness_weight",
+            label="Eye sharpness",
+            default=50.0,
+            minimum=0.0,
+            maximum=1000.0,
+            group=GROUP_WEIGHTS,
+            help="How sharp the eye itself is, measured inside the eye box only.",
+        ),
+        ParamSpec(
+            name="subject_sharpness_weight",
+            label="Subject sharpness",
+            default=30.0,
+            minimum=0.0,
+            maximum=1000.0,
+            group=GROUP_WEIGHTS,
+            help="How sharp the whole detected subject is.",
+        ),
+        ParamSpec(
+            name="subject_size_weight",
+            label="Subject size",
+            default=20.0,
+            minimum=0.0,
+            maximum=1000.0,
+            group=GROUP_WEIGHTS,
+            help="How much of the frame the subject fills.",
+        ),
+    )
+
+
 @dataclass(frozen=True)
 class ClassicVisionParams(WeightedParams):
-    """Everything the photographer can tune before a Classic Vision run.
+    """Everything the photographer can tune before a Classic Vision
+    (SuperAnimal-Bird) run.
 
     Adding a parameter later is: one field here, one `ParamSpec` in `specs()`.
     The dialog builds itself from `specs()` (see the desktop
     `AlgorithmParametersDialog`), the weights normalise themselves, and no
-    other code changes.
+    other code changes. See `ClassicVisionEyePoseParams` for the EyePose-v0
+    backend's own params - the two gates below (confidence, eye-channel
+    disagreement) are specific to how SuperAnimal-Bird predicts an eye and do
+    not carry over to a different backend's landmark schema unchanged, so
+    each backend declares its own tunables rather than sharing one shape that
+    would fit neither well - see `ranking.classic`'s module docstring and
+    `eyes.eyepose_v0`'s "Accept/reject gate" for why.
     """
 
     eye_sharpness_weight: float = 50.0
@@ -157,33 +227,7 @@ class ClassicVisionParams(WeightedParams):
     @classmethod
     def specs(cls) -> tuple[ParamSpec, ...]:
         return (
-            ParamSpec(
-                name="eye_sharpness_weight",
-                label="Eye sharpness",
-                default=50.0,
-                minimum=0.0,
-                maximum=1000.0,
-                group=GROUP_WEIGHTS,
-                help="How sharp the eye itself is, measured inside the eye box only.",
-            ),
-            ParamSpec(
-                name="subject_sharpness_weight",
-                label="Subject sharpness",
-                default=30.0,
-                minimum=0.0,
-                maximum=1000.0,
-                group=GROUP_WEIGHTS,
-                help="How sharp the whole detected subject is.",
-            ),
-            ParamSpec(
-                name="subject_size_weight",
-                label="Subject size",
-                default=20.0,
-                minimum=0.0,
-                maximum=1000.0,
-                group=GROUP_WEIGHTS,
-                help="How much of the frame the subject fills.",
-            ),
+            *_scoring_weight_specs(),
             ParamSpec(
                 name="min_eye_confidence",
                 label="Minimum eye confidence",
@@ -206,6 +250,53 @@ class ClassicVisionParams(WeightedParams):
                     "How much the two independently-predicted eye positions may disagree "
                     "(relative to head size) before the eye is distrusted, even at high "
                     "confidence - catches a confidently-guessed eye on an occluded head."
+                ),
+            ),
+        )
+
+
+@dataclass(frozen=True)
+class ClassicVisionEyePoseParams(WeightedParams):
+    """Everything the photographer can tune before a Classic Vision
+    (EyePose-v0) run - see `ClassicVisionParams` for why this is a separate
+    dataclass rather than a shared one: the two backends' accept/reject
+    gates are genuinely different (see `eyes.eyepose_v0`'s "Accept/reject
+    gate"), so their tunable thresholds are too. The three scoring weights
+    are identical - see `_scoring_weight_specs`.
+    """
+
+    eye_sharpness_weight: float = 50.0
+    subject_sharpness_weight: float = 30.0
+    subject_size_weight: float = 20.0
+    min_eye_confidence: float = EYEPOSE_DEFAULT_MIN_CONFIDENCE
+    max_head_distance_ratio: float = EYEPOSE_DEFAULT_MAX_HEAD_DISTANCE_RATIO
+
+    @classmethod
+    def specs(cls) -> tuple[ParamSpec, ...]:
+        return (
+            *_scoring_weight_specs(),
+            ParamSpec(
+                name="min_eye_confidence",
+                label="Minimum eye confidence",
+                default=EYEPOSE_DEFAULT_MIN_CONFIDENCE,
+                minimum=0.0,
+                maximum=1.0,
+                group=GROUP_THRESHOLDS,
+                decimals=2,
+                help="Below this, the eye counts as not visible and the image is filtered out.",
+            ),
+            ParamSpec(
+                name="max_head_distance_ratio",
+                label="Max eye/head distance",
+                default=EYEPOSE_DEFAULT_MAX_HEAD_DISTANCE_RATIO,
+                minimum=0.0,
+                maximum=10.0,
+                group=GROUP_THRESHOLDS,
+                decimals=2,
+                help=(
+                    "How far the eye may sit from the beak<->head-top line, relative to "
+                    "head size, before it is distrusted - catches a keypoint that landed "
+                    "on a shoulder or the background rather than the head."
                 ),
             ),
         )
@@ -272,18 +363,22 @@ def combine(metrics: list[ImageMetrics], weights: dict[str, float]) -> list[floa
     ]
 
 
-def write_filter_report(input_folder: Path, rejected: dict[str, str], counts: dict[str, int]) -> Path:
+def write_filter_report(
+    input_folder: Path, rejected: dict[str, str], counts: dict[str, int], strategy_id: str = STRATEGY_ID
+) -> Path:
     """Record which images were filtered out and why, beside the ranking.
 
     The ranking CSV cannot carry this: a filtered image has no score, so it
     has no row. Written as its own sidecar file so "why is this frame
-    unranked?" has an answer that survives the run.
+    unranked?" has an answer that survives the run. `strategy_id` defaults
+    to the legacy (SuperAnimal-Bird) id for backward compatibility - see
+    `_filter_report_filename`.
     """
     ensure_sidecar_dir(input_folder)
-    target = input_folder / SIDECAR_DIRNAME / FILTER_REPORT_FILENAME
+    target = input_folder / SIDECAR_DIRNAME / _filter_report_filename(strategy_id)
     payload = {
         "version": 1,
-        "strategy": STRATEGY_ID,
+        "strategy": strategy_id,
         "counts": counts,
         "images": rejected,
     }
@@ -291,9 +386,9 @@ def write_filter_report(input_folder: Path, rejected: dict[str, str], counts: di
     return target
 
 
-def read_filter_report(input_folder: str | Path) -> dict:
-    """The last Classic Vision run's filter verdicts for this folder, or `{}`."""
-    target = Path(input_folder) / SIDECAR_DIRNAME / FILTER_REPORT_FILENAME
+def read_filter_report(input_folder: str | Path, strategy_id: str = STRATEGY_ID) -> dict:
+    """The last run's filter verdicts for this folder and backend, or `{}`."""
+    target = Path(input_folder) / SIDECAR_DIRNAME / _filter_report_filename(strategy_id)
     if not target.is_file():
         return {}
     try:
@@ -304,7 +399,9 @@ def read_filter_report(input_folder: str | Path) -> dict:
     return payload if isinstance(payload, dict) else {}
 
 
-def write_metrics_report(input_folder: str | Path, metrics: list[ImageMetrics]) -> Path:
+def write_metrics_report(
+    input_folder: str | Path, metrics: list[ImageMetrics], strategy_id: str = STRATEGY_ID
+) -> Path:
     """Record every surviving image's raw, per-metric measurements, beside
     the filter report and the ranking itself.
 
@@ -312,12 +409,14 @@ def write_metrics_report(input_folder: str | Path, metrics: list[ImageMetrics]) 
     combined score - a photographer investigating why a weak-eyed image
     still ranked respectably (or a strong-eyed one ranked low) needs to see
     the three numbers `combine()` weighted together, not just their sum.
+    `strategy_id` defaults to the legacy (SuperAnimal-Bird) id for backward
+    compatibility - see `_metrics_report_filename`.
     """
     ensure_sidecar_dir(input_folder)
-    target = Path(input_folder) / SIDECAR_DIRNAME / METRICS_REPORT_FILENAME
+    target = Path(input_folder) / SIDECAR_DIRNAME / _metrics_report_filename(strategy_id)
     payload = {
         "version": 1,
-        "strategy": STRATEGY_ID,
+        "strategy": strategy_id,
         "metrics": {
             m.image_path: {
                 "eye_sharpness": m.eye_sharpness,
@@ -332,10 +431,10 @@ def write_metrics_report(input_folder: str | Path, metrics: list[ImageMetrics]) 
     return target
 
 
-def read_metrics_report(input_folder: str | Path) -> dict:
-    """The last Classic Vision run's raw per-image metrics for this folder,
-    or `{}`."""
-    target = Path(input_folder) / SIDECAR_DIRNAME / METRICS_REPORT_FILENAME
+def read_metrics_report(input_folder: str | Path, strategy_id: str = STRATEGY_ID) -> dict:
+    """The last run's raw per-image metrics for this folder and backend, or
+    `{}`."""
+    target = Path(input_folder) / SIDECAR_DIRNAME / _metrics_report_filename(strategy_id)
     if not target.is_file():
         return {}
     try:
@@ -347,16 +446,29 @@ def read_metrics_report(input_folder: str | Path) -> dict:
 
 
 class ClassicVisionStrategy:
-    """Implements `ranking.base.RankingStrategy` deterministically."""
+    """Implements `ranking.base.RankingStrategy` deterministically, against
+    the SuperAnimal-Bird eye-detection backend.
+
+    This is one of potentially several Classic Vision *backends* - see
+    `ClassicVisionEyePoseStrategy` for the second (EyePose-v0) - which is
+    why `info`/`params_class`/`param_specs` are declared here rather than
+    assumed fixed: a subclass overrides exactly these three class
+    attributes and `_eye_detector_kwargs` below, and inherits everything
+    else (filtering, scoring, CSV/report writing) completely unchanged.
+    Registering a third backend later is the same shape again - see
+    `eyes.build_eye_detector`'s own module docstring for the matching
+    detector-side half of this.
+    """
 
     info = StrategyInfo(
         strategy_id=STRATEGY_ID,
-        display_name="Classic Vision Ranking",
+        display_name="Classic Vision Ranking (SuperAnimal)",
         description=(
             "Deterministic scoring from eye sharpness, subject sharpness and subject "
-            "size. Filters out frames with no subject or no visible eye."
+            "size. Filters out frames with no subject or no visible eye. Eye "
+            "localisation: SuperAnimal-Bird (DeepLabCut Model Zoo)."
         ),
-        score_label="Classic",
+        score_label="Classic (SuperAnimal)",
     )
     params_class = ClassicVisionParams
     param_specs = ClassicVisionParams.specs()
@@ -364,9 +476,21 @@ class ClassicVisionStrategy:
     # diagnostics UI (see `ranking.metric_labels`) reads this class attribute
     # generically, by name, rather than importing classic.py directly.
     metric_labels = METRIC_LABELS
+    # Which eyes.build_eye_detector name this backend runs - the ONE thing
+    # that actually differs at the detector level; overridden per subclass.
+    _eye_detector_name = "superanimal-bird"
 
-    def __init__(self, *, eye_detector_name: str = "superanimal-bird") -> None:
-        self._eye_detector_name = eye_detector_name
+    def _eye_detector_kwargs(self, params: ClassicVisionParams) -> dict:
+        """This backend's own params -> `eyes.build_eye_detector` kwargs.
+
+        The only place `rank_folder` below is not 100% shared across
+        backends: SuperAnimal-Bird's and EyePose-v0's accept/reject gates
+        are genuinely different concepts with different parameter names
+        (see `ClassicVisionParams`'s own docstring), so each backend maps
+        its own `params` dataclass to its own detector constructor here
+        rather than `rank_folder` assuming one shared shape.
+        """
+        return {"min_confidence": params.min_eye_confidence, "max_eye_disagreement": params.max_eye_disagreement}
 
     def rank_folder(
         self,
@@ -378,12 +502,32 @@ class ClassicVisionStrategy:
         crop_cache_dir: str | Path = DEFAULT_CROP_CACHE_DIR,
         device: str | None = None,
         max_rows: int = DEFAULT_MAX_CSV_ROWS,
+        debug_dir: str | Path | None = None,
+        force_preprocess: bool = False,
     ) -> dict:
+        """See the class docstring. `debug_dir` is a development/
+        troubleshooting aid, off by default and never exposed in the
+        desktop UI's generated parameter dialog (see `ranking.debug`'s
+        module docstring): when set, one combined debug image per processed
+        candidate is written there, showing the crop, the eye box, both eye
+        keypoints, confidence values, and the eye box projected onto the
+        full frame - drawn from the same `FilterCandidate`/`EyeDetection`
+        shape regardless of which backend produced it.
+
+        `force_preprocess` is passed straight through to `build_cache` -
+        needed because a Vision Cache built under different cache-affecting
+        parameters (resolution, format, quality - see `bird_crop.CropParams`)
+        is refused rather than silently reused (see `build_cache`'s own
+        `crop_params.json` mismatch check). Same name and meaning as
+        `rank.rank_folder`'s own parameter, so the same "rebuild the cache"
+        action means the same thing from either ranking strategy.
+        """
         from ..eyes import build_eye_detector
         from ..eyes.cache import save_eye_detection
         from ..train import write_results_csv
+        from .debug import save_debug_image
 
-        params = params or ClassicVisionParams()
+        params = params or self.params_class()
         input_folder = Path(input_folder)
         if not input_folder.exists():
             raise FileNotFoundError(f"Input folder does not exist: {input_folder}")
@@ -403,15 +547,18 @@ class ClassicVisionStrategy:
         # has already ranked this is a fast pass that decodes nothing.
         if on_stage is not None:
             on_stage("Building subject-crop cache")
-        build_cache(image_paths, crop_cache_dir, CropParams(), device=resolved_device)
+        # A bare CropParams() picks up the Vision Cache's own current
+        # defaults (see bird_crop.CropParams) - original crop resolution,
+        # JPEG q98 - automatically, with nothing Classic-Vision-specific to
+        # configure; see bird_crop.py's module docstring.
+        build_cache(image_paths, crop_cache_dir, CropParams(), device=resolved_device, force=force_preprocess)
 
         if on_stage is not None:
             on_stage("Loading the eye detector")
         eye_detector = build_eye_detector(
             self._eye_detector_name,
             device=resolved_device,
-            min_confidence=params.min_eye_confidence,
-            max_eye_disagreement=params.max_eye_disagreement,
+            **self._eye_detector_kwargs(params),
         )
         chain = FilterChain([SubjectFilter(), EyeFilter(eye_detector)])
 
@@ -431,6 +578,8 @@ class ClassicVisionStrategy:
             if candidate.eye is not None and candidate.subject_crop is not None:
                 crop_height, crop_width = candidate.subject_crop.shape[:2]
                 save_eye_detection(crop_cache_dir, image_path, (crop_width, crop_height), candidate.eye)
+            if debug_dir is not None:
+                save_debug_image(candidate, self.info.strategy_id, debug_dir)
             if reason is not None:
                 rejected[image_path] = reason
                 counts[reason] = counts.get(reason, 0) + 1
@@ -452,33 +601,34 @@ class ClassicVisionStrategy:
         ]
         ranked.sort(key=lambda entry: entry[1], reverse=True)
 
+        strategy_id = self.info.strategy_id
         output_paths = write_results_csv(
-            # This module's OWN scores file, never the AI model's - see
-            # sidecar.py. An image can carry both scores at once, and running
-            # one analysis must not destroy the other's results.
-            strategy_ranking_path(input_folder, STRATEGY_ID),
+            # This backend's OWN scores file, never the AI model's nor
+            # another Classic Vision backend's - see sidecar.py. An image
+            # can carry every strategy's score at once, and running one must
+            # never destroy another's results.
+            strategy_ranking_path(input_folder, strategy_id),
             dataset,
             ranked,
             select_root=str(input_folder),
             reject_root="(classic vision - no labels)",
             max_rows=max_rows,
         )
-        write_filter_report(input_folder, rejected, counts)
-        write_metrics_report(input_folder, measurements)
+        write_filter_report(input_folder, rejected, counts, strategy_id=strategy_id)
+        write_metrics_report(input_folder, measurements, strategy_id=strategy_id)
         write_run_metadata(
             input_folder,
-            strategy=STRATEGY_ID,
+            strategy=strategy_id,
             image_count=len(ranked),
             considered=len(image_paths),
             filtered=counts,
             weights=params.normalized_weights(),
-            min_eye_confidence=params.min_eye_confidence,
-            max_eye_disagreement=params.max_eye_disagreement,
             eye_detector=self._eye_detector_name,
+            **self._eye_detector_kwargs(params),
         )
 
         return {
-            "strategy": STRATEGY_ID,
+            "strategy": strategy_id,
             "output_csv": output_paths[0],
             "extra_csv_files": output_paths[1:],
             "image_count": len(ranked),
@@ -522,3 +672,45 @@ class ClassicVisionStrategy:
         candidate.source_size = (int(source_size[0]), int(source_size[1]))
         candidate.subject_label = int(selected.get("label", -1))
         return candidate
+
+
+EYEPOSE_STRATEGY_ID = "classic-vision-eyepose-v0"
+
+
+class ClassicVisionEyePoseStrategy(ClassicVisionStrategy):
+    """Classic Vision against the EyePose-v0 backend instead of
+    SuperAnimal-Bird - filtering, scoring, CSV/report writing are all
+    inherited from `ClassicVisionStrategy` completely unchanged (see its own
+    docstring); only `info`, `params_class`/`param_specs`,
+    `_eye_detector_name` and `_eye_detector_kwargs` differ, which is the
+    entire adapter surface a new Classic Vision backend needs to override.
+
+    A distinct `strategy_id` means a distinct ranking CSV
+    (`sidecar.strategy_ranking_path`) and distinct filter/metrics reports
+    (`_filter_report_filename`/`_metrics_report_filename`) - the two
+    backends' results coexist on the same folder rather than one
+    overwriting the other, so they can be compared directly (the Sort/Color
+    Source/score-row UI already does this generically for any two
+    strategies - see `ranking.score_labels`/`metric_labels`).
+    """
+
+    info = StrategyInfo(
+        strategy_id=EYEPOSE_STRATEGY_ID,
+        display_name="Classic Vision Ranking (EyePose-v0, recommended)",
+        description=(
+            "Deterministic scoring from eye sharpness, subject sharpness and subject "
+            "size. Filters out frames with no subject or no visible eye. Eye "
+            "localisation: EyePose-v0 (YOLO11-pose, six bird head/body landmarks)."
+        ),
+        score_label="Classic (EyePose)",
+    )
+    params_class = ClassicVisionEyePoseParams
+    param_specs = ClassicVisionEyePoseParams.specs()
+    metric_labels = METRIC_LABELS
+    _eye_detector_name = "eyepose-v0"
+
+    def _eye_detector_kwargs(self, params: ClassicVisionEyePoseParams) -> dict:
+        return {
+            "min_confidence": params.min_eye_confidence,
+            "max_head_distance_ratio": params.max_head_distance_ratio,
+        }

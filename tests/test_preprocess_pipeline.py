@@ -134,7 +134,7 @@ class ShardedLayoutTests(unittest.TestCase):
     def test_path_is_sharded_by_first_two_digest_chars(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = crop_cache_path(tmp, r"C:\photos\a.arw")
-            self.assertEqual(path.suffix, ".png")
+            self.assertEqual(path.suffix, ".jpg")  # DEFAULT_IMAGE_FORMAT="jpeg" - see bird_crop.CropParams
             self.assertEqual(len(path.parent.name), CACHE_SHARD_CHARS)
             # The shard is a prefix of the filename, so the path is derivable
             # from the digest alone - never by searching.
@@ -300,15 +300,17 @@ class CacheVersionMismatchTests(unittest.TestCase):
         """Pins the version string itself, so a future accidental revert of
         the bump is caught immediately rather than silently reopening this
         exact hole."""
-        self.assertEqual(CROP_CACHE_VERSION, "v4")
-        self.assertEqual(CropParams().version, "v4")
+        self.assertEqual(CROP_CACHE_VERSION, "v5")
+        self.assertEqual(CropParams().version, "v5")
 
     def test_a_cache_from_a_previous_selection_algorithm_is_refused(self):
         """The literal scenario this protects against: an existing cache built
-        by an earlier algorithm (area-dominant v3, or highest-confidence v2)
-        must stop the current run cold, rather than letting training silently
-        proceed on stale crops."""
-        for stale_version in ("v2", "v3"):
+        by an earlier algorithm (area-dominant v3, or highest-confidence v2),
+        or under the pre-Vision-Cache fixed 1024px PNG policy (v4), must stop
+        the current run cold, rather than letting training or Classic Vision
+        silently proceed on stale (wrong-selection-policy, or lower-quality/
+        wrong-format) crops."""
+        for stale_version in ("v2", "v3", "v4"):
             with self.subTest(stale_version=stale_version):
                 with tempfile.TemporaryDirectory() as tmp:
                     cache = Path(tmp) / "crops"
@@ -335,7 +337,7 @@ class CacheVersionMismatchTests(unittest.TestCase):
 
             self.assertEqual(stats["cached"], 3, "a stale cache must be rebuilt in full, not skipped")
             self.assertEqual(len(decoder.decoded), 3)
-            self.assertEqual(read_crop_params(cache).version, "v4")
+            self.assertEqual(read_crop_params(cache).version, "v5")
 
     def test_a_cache_already_at_the_current_version_is_reused_normally(self):
         """The mismatch guard must not become a reason to always rebuild -
@@ -350,6 +352,75 @@ class CacheVersionMismatchTests(unittest.TestCase):
             stats, _ = _run_build(paths, cache, decoder2, FakeDetector(decoder2), force=False)
             self.assertEqual(stats["skipped"], 3)
             self.assertEqual(decoder2.decoded, [])
+
+    def test_a_jpeg_quality_only_change_is_refused_just_like_a_version_bump(self):
+        """The mismatch check is plain CropParams equality (see
+        CropParams's own docstring) - any field, not only `version`, must be
+        caught. Nothing about jpeg_quality changing the crop-SELECTION
+        algorithm; it still must never be silently reused once the cache
+        was built at a different quality."""
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = Path(tmp) / "crops"
+            paths = _fake_paths(tmp, 2)
+            decoder = FakeDecoder()
+            _run_build(paths, cache, decoder, FakeDetector(decoder), params=CropParams(jpeg_quality=98))
+
+            decoder2 = FakeDecoder()
+            with self.assertRaises(SystemExit) as ctx:
+                build_cache(
+                    paths, cache, CropParams(jpeg_quality=50), device="cpu",
+                    force=False, decode_workers=4,
+                )
+            self.assertIn("different parameters", str(ctx.exception))
+
+    def test_an_image_format_only_change_is_refused_and_force_migrates_cleanly(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = Path(tmp) / "crops"
+            paths = _fake_paths(tmp, 2)
+            decoder = FakeDecoder()
+            _run_build(paths, cache, decoder, FakeDetector(decoder), params=CropParams(image_format="png"))
+            for path in paths:
+                self.assertTrue(crop_cache_path(cache, path, image_format="png").exists())
+
+            decoder2 = FakeDecoder()
+            stats, _ = _run_build(
+                paths, cache, decoder2, FakeDetector(decoder2), force=True, params=CropParams(image_format="jpeg"),
+            )
+            self.assertEqual(stats["cached"], 2, "switching format must rebuild, not skip")
+            for path in paths:
+                self.assertTrue(crop_cache_path(cache, path, image_format="jpeg").exists())
+                # The old-format file is left alone, not deleted - analysis
+                # data is never silently removed (see the Vision Cache's
+                # own design principle).
+                self.assertTrue(crop_cache_path(cache, path, image_format="png").exists())
+
+
+class ConfigurableWriteFormatTests(unittest.TestCase):
+    """The writer thread (_writer_loop) actually applies CropParams'
+    image_format/jpeg_quality, not just the path computation - the seam
+    ShardedLayoutTests/CacheVersionMismatchTests don't cover."""
+
+    def test_the_written_files_are_real_jpegs_at_the_requested_quality(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = Path(tmp) / "crops"
+            paths = _fake_paths(tmp, 1)
+            decoder = FakeDecoder()
+            _run_build(paths, cache, decoder, FakeDetector(decoder), params=CropParams(jpeg_quality=90))
+
+            written = crop_cache_path(cache, paths[0])
+            self.assertEqual(written.suffix, ".jpg")
+            self.assertEqual(written.read_bytes()[:3], b"\xff\xd8\xff")
+
+    def test_png_format_writes_real_lossless_pngs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = Path(tmp) / "crops"
+            paths = _fake_paths(tmp, 1)
+            decoder = FakeDecoder()
+            _run_build(paths, cache, decoder, FakeDetector(decoder), params=CropParams(image_format="png"))
+
+            written = crop_cache_path(cache, paths[0], image_format="png")
+            self.assertEqual(written.suffix, ".png")
+            self.assertEqual(written.read_bytes()[:8], b"\x89PNG\r\n\x1a\n")
 
 
 class ResumeTests(unittest.TestCase):
@@ -473,10 +544,10 @@ class PipelineContractTests(unittest.TestCase):
             doomed = crop_cache_path(cache, paths[1])
             real_save = preprocess_module.save_crop_png
 
-            def flaky_save(target, crop):
+            def flaky_save(target, crop, **kwargs):
                 if Path(target) == doomed:
                     raise OSError("simulated disk full")
-                return real_save(target, crop)
+                return real_save(target, crop, **kwargs)
 
             preprocess_module.save_crop_png = flaky_save
             try:

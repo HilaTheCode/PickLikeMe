@@ -46,6 +46,12 @@ class ReviewService:
         self.session.set_keep_percent(percent)
         return self.load_session()
 
+    def set_burst_strategy(self, strategy_id: str) -> dict[str, Any]:
+        """See ReviewSession.set_burst_strategy - which strategy's score
+        Burst Analysis ranks each burst's own members by."""
+        self.session.set_burst_strategy(strategy_id)
+        return self.load_session()
+
     def apply_ai_suggestions(self, *, include_decided: bool = False) -> dict[str, Any]:
         """See ReviewSession.apply_ai_suggestions - the one call that lets
         the AI ranking influence review_status at all, and only because the

@@ -178,7 +178,7 @@ import numpy as np
 
 from ..bird_crop import COCO_BIRD_CLASS
 from ..config import PROJECT_ROOT
-from .detector import EyeDetection, EyeKeypoint
+from .detector import EyeDetection, EyeKeypoint, derive_eye_box
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     import torch.nn as nn
@@ -431,19 +431,16 @@ class SuperAnimalBirdEyeDetector:
             disagreement = float(np.hypot(primary.x - other.x, primary.y - other.y)) / head_scale
             accepted = disagreement <= self.max_eye_disagreement
 
-        side = max(MIN_EYE_BOX_PX, self.eye_box_frac * min(width, height))
-        half = side / 2.0
         # Clamped to the crop, and only after clamping is the box guaranteed
         # non-degenerate - an eye detected hard against an edge would otherwise
         # yield a zero-width region the caller cannot crop. Computed
         # regardless of `accepted`, so a rejected image still has a real box
-        # to show in a debugging overlay.
-        x1 = max(0.0, min(primary.x - half, width - 1.0))
-        y1 = max(0.0, min(primary.y - half, height - 1.0))
-        x2 = min(float(width), max(x1 + 1.0, primary.x + half))
-        y2 = min(float(height), max(y1 + 1.0, primary.y + half))
+        # to show in a debugging overlay. See eyes.detector.derive_eye_box,
+        # shared with eyepose_v0.py so every keypoint-based detector's box
+        # means the same thing.
+        box = derive_eye_box(primary.x, primary.y, width, height, self.eye_box_frac, MIN_EYE_BOX_PX)
         return EyeDetection(
-            box=(x1, y1, x2, y2),
+            box=box,
             confidence=primary.confidence,
             center=(primary.x, primary.y),
             detector_id=self.detector_id,

@@ -21,6 +21,7 @@ from PIL import Image
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from picklikeme.analyzer.contactsheets import (
+    SELECTED_BOX,
     annotate_thumbnail,
     annotated_thumbnail_path,
     build_thumbnail_overlays,
@@ -710,6 +711,41 @@ class ThicknessTests(unittest.TestCase):
         # And still capped against a small box's own dimensions, so a
         # distant bird's box is never swallowed by its own outline.
         self.assertEqual(_stroke(new_line, 8, 8), 2)
+
+    def test_a_large_box_s_outline_is_now_about_five_times_as_thick(self):
+        """The later "make the overlay our primary debugging tool" pass
+        multiplied the whole `line` formula by ~5x (see annotate_thumbnail's
+        own comment) - measured here on an actual rendered box big enough
+        that _stroke's small-box cap never kicks in, so the real drawn
+        pixel thickness is what is pinned, not just the formula."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            plain = make_thumb(root / "t.jpg", 400)
+            out = annotate_thumbnail(
+                plain,
+                record_of([Box(20, 20, 380, 380, 0.9, 16, selected=True)], size=(400, 400)),
+                root / "t_boxes.jpg",
+                400,
+            )
+            pixels = np.asarray(Image.open(out).convert("RGB")).astype(int)
+            # A vertical slice through the box's horizontal centre, counting
+            # how many consecutive rows near the top edge (y=20) are the
+            # selected-box colour - PIL draws a rectangle outline growing
+            # INWARD from the given coordinate, so this band's length IS the
+            # stroke width.
+            column = pixels[:, 200, :]
+            close = (
+                (np.abs(column[:, 0] - SELECTED_BOX[0]) < 30)
+                & (np.abs(column[:, 1] - SELECTED_BOX[1]) < 30)
+                & (np.abs(column[:, 2] - SELECTED_BOX[2]) < 30)
+            )
+            band = int(close[15:45].sum())
+            # Old default (line=3, selected width=line+1=4) drew a 4px band;
+            # ~5x that is ~20px. A loose lower bound (>= 12px, 3x the old
+            # width) keeps this robust to _stroke's own rounding/capping
+            # while still failing hard if the 5x change ever regresses back
+            # toward the old thin default.
+            self.assertGreaterEqual(band, 12, f"outline only {band}px thick - the 5x change appears to have regressed")
 
 
 class ScopeTests(unittest.TestCase):

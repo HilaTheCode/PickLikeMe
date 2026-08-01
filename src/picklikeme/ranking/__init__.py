@@ -26,12 +26,28 @@ from .base import (
     StrategyInfo,
     WeightedParams,
 )
-from .classic import ClassicVisionParams, ClassicVisionStrategy
+from .classic import (
+    ClassicVisionEyePoseParams,
+    ClassicVisionEyePoseStrategy,
+    ClassicVisionParams,
+    ClassicVisionStrategy,
+)
 
 DEFAULT_STRATEGY_ID = AIModelStrategy.info.strategy_id
 
 # Ordered: this is the order the Rank menu offers them in, default first.
-_STRATEGIES: tuple[type, ...] = (AIModelStrategy, ClassicVisionStrategy)
+# The two Classic Vision entries are separate, independently selectable
+# strategies (see ranking.classic's module docstring) - not one strategy
+# with a hidden backend switch - so the photographer always knows exactly
+# which algorithm a run used, and both backends' results coexist on a
+# folder for direct comparison. EyePose-v0 is listed first among the two as
+# the recommended one for new analyses; SuperAnimal-Bird stays fully
+# available.
+_STRATEGIES: tuple[type, ...] = (
+    AIModelStrategy,
+    ClassicVisionEyePoseStrategy,
+    ClassicVisionStrategy,
+)
 
 
 def available_strategies() -> list[StrategyInfo]:
@@ -86,6 +102,8 @@ __all__ = [
     "GROUP_WEIGHTS",
     "AIModelParams",
     "AIModelStrategy",
+    "ClassicVisionEyePoseParams",
+    "ClassicVisionEyePoseStrategy",
     "ClassicVisionParams",
     "ClassicVisionStrategy",
     "ParamSpec",

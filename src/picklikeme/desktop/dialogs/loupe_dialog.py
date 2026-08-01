@@ -117,6 +117,19 @@ def _apply_brightness(pixmap: QPixmap, ev: float) -> QPixmap:
     return result
 
 
+# Detector-box overlay pen widths - ~5x the Loupe's original (4/3px), the
+# same "the overlay is our primary debugging tool" motivation that
+# multiplied contactsheets.annotate_thumbnail's own `line` by ~5x, applied
+# here to the Loupe's separate vector overlay (a QGraphicsScene, drawn from
+# the same detection data but never sharing code with the Gallery's raster
+# one - so it needed its own, matching change). Eye keypoint markers
+# (_add_eye_overlay's ellipses) are deliberately NOT scaled with these: they
+# are points, not boxes, and were already clearly visible.
+BOX_PEN_WIDTH_OTHER = 15
+BOX_PEN_WIDTH_SELECTED = 20
+BOX_PEN_WIDTH_EYE = 20
+
+
 class _ZoomView(QGraphicsView):
     """A QGraphicsView with Lightroom-style navigation:
 
@@ -206,14 +219,16 @@ class _ZoomView(QGraphicsView):
         if boxes_data is not None:
             for box in boxes_data.get("others", []):
                 item = self._scene.addRect(
-                    to_scene_rect(box["box"]), QPen(QColor(*OTHER_BOX), 3, Qt.PenStyle.DashLine)
+                    to_scene_rect(box["box"]), QPen(QColor(*OTHER_BOX), BOX_PEN_WIDTH_OTHER, Qt.PenStyle.DashLine)
                 )
                 item.setZValue(10)
                 self._overlay_items.append(item)
 
             selected = boxes_data.get("selected")
             if selected is not None:
-                item = self._scene.addRect(to_scene_rect(selected["box"]), QPen(QColor(*SELECTED_BOX), 4))
+                item = self._scene.addRect(
+                    to_scene_rect(selected["box"]), QPen(QColor(*SELECTED_BOX), BOX_PEN_WIDTH_SELECTED)
+                )
                 item.setZValue(11)
                 self._overlay_items.append(item)
 
@@ -227,7 +242,11 @@ class _ZoomView(QGraphicsView):
         found something the acceptance gate should have caught (or did, and
         a different metric carried the ranking anyway)."""
         colour = QColor(*(EYE_BOX_ACCEPTED if eye_data.get("accepted") else EYE_BOX_REJECTED))
-        pen = QPen(colour, 4) if eye_data.get("accepted") else QPen(colour, 4, Qt.PenStyle.DashLine)
+        pen = (
+            QPen(colour, BOX_PEN_WIDTH_EYE)
+            if eye_data.get("accepted")
+            else QPen(colour, BOX_PEN_WIDTH_EYE, Qt.PenStyle.DashLine)
+        )
         item = self._scene.addRect(to_scene_rect(eye_data["box"]), pen)
         item.setZValue(12)
         self._overlay_items.append(item)

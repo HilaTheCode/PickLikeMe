@@ -13,13 +13,17 @@ from picklikeme.bird_crop import (
     CATALOGUED_CLASSES,
     COCO_BIRD_CLASS,
     COCO_PERSON_CLASS,
+    CROP_CACHE_VERSION,
     DEFAULT_AREA_TIE_FRAC,
     DEFAULT_GROUP_SCENE_THRESHOLD,
+    DEFAULT_IMAGE_FORMAT,
+    DEFAULT_JPEG_QUALITY,
     DETECTION_CATEGORIES,
     DETECTION_CATEGORY_BIRD,
     DETECTION_CATEGORY_HUMAN,
     DETECTION_CATEGORY_MAMMAL,
     DOMESTIC_ANIMAL_CLASSES,
+    IMAGE_FORMAT_EXTENSIONS,
     SUPPORTED_ANIMAL_CLASSES,
     WILDLIFE_CLASSES,
     BirdDetection,
@@ -534,7 +538,7 @@ class CachePathTests(unittest.TestCase):
             b = crop_cache_path(tmp, r"C:\photos\b.arw")
             self.assertEqual(a, a2)
             self.assertNotEqual(a, b)
-            self.assertEqual(a.suffix, ".png")
+            self.assertEqual(a.suffix, ".jpg")  # DEFAULT_IMAGE_FORMAT="jpeg" - see bird_crop.CropParams
 
     def test_params_round_trip(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -546,6 +550,179 @@ class CachePathTests(unittest.TestCase):
             reloaded = read_crop_params(tmp)
             self.assertEqual(reloaded, params)
             self.assertEqual(reloaded.group_scene_threshold, 6)
+
+    def test_cache_path_extension_follows_image_format(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            jpeg_path = crop_cache_path(tmp, r"C:\photos\a.arw", image_format="jpeg")
+            png_path = crop_cache_path(tmp, r"C:\photos\a.arw", image_format="png")
+            self.assertEqual(jpeg_path.suffix, ".jpg")
+            self.assertEqual(png_path.suffix, ".png")
+            # Same digest (same stem) regardless of format - only the
+            # extension differs, so the two never collide on disk.
+            self.assertEqual(jpeg_path.stem, png_path.stem)
+            self.assertNotEqual(jpeg_path, png_path)
+
+    def test_an_unknown_format_falls_back_to_the_default_rather_than_crashing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = crop_cache_path(tmp, r"C:\photos\a.arw", image_format="tiff")
+            self.assertEqual(path.suffix, IMAGE_FORMAT_EXTENSIONS[DEFAULT_IMAGE_FORMAT])
+
+
+# ---------------------------------------------------------------------------
+# Vision Cache - configurable resolution, format and quality (see bird_crop.
+# py's module docstring "Vision Cache infrastructure" section, and the
+# audit that motivated it: a fixed max_side=1024 PNG cap was silently
+# discarding real detail before it ever reached a Computer Vision model or
+# the sharpness metrics that read the cache directly).
+# ---------------------------------------------------------------------------
+
+
+class ConfigurableResolutionTests(unittest.TestCase):
+    def test_the_default_is_unlimited_not_1024(self):
+        """Pins the actual default, so a future accidental revert back to a
+        hardcoded cap is caught immediately."""
+        self.assertIsNone(CropParams().max_side)
+
+    def test_max_side_none_never_downscales_however_large(self):
+        big = np.zeros((6000, 8000, 3), dtype=np.uint8)
+        out = downscale_long_side(big, None)
+        self.assertEqual(out.shape[:2], (6000, 8000))
+        self.assertIs(out, big, "no copy should be made when nothing changes")
+
+    def test_an_explicit_max_side_still_caps_as_before(self):
+        """The capping behaviour itself is unchanged and still available -
+        only the DEFAULT changed, for a machine/use case that genuinely
+        wants to trade detail for disk space."""
+        image = np.zeros((500, 1000, 3), dtype=np.uint8)
+        out = downscale_long_side(image, 400)
+        self.assertEqual(out.shape[:2], (200, 400))
+
+    def test_build_crop_respects_an_unlimited_max_side_end_to_end(self):
+        frame = np.zeros((3000, 4000, 3), dtype=np.uint8)
+        detector = _detector_with_fake_model(
+            boxes=[[100.0, 100.0, 3900.0, 2900.0]], scores=[0.95], labels=[COCO_BIRD_CLASS],
+        )
+        result = build_crop(frame, detector, CropParams(margin_frac=0.0, max_side=None))
+        # The crop is large (a big chunk of a 4000x3000 frame) and must come
+        # back completely uncapped - this is exactly the case that used to
+        # lose real detail to the old hardcoded 1024px cap.
+        self.assertGreater(max(result.crop.shape[:2]), 1024)
+
+
+class ConfigurableFormatAndQualityTests(unittest.TestCase):
+    def _rich_crop(self, size: int = 64) -> np.ndarray:
+        """Photo-like structured detail (smooth gradients plus a few sharp
+        edges), not a flat color and not pure noise. A flat color makes
+        quality differences invisible (compresses to nearly nothing at any
+        setting); pure random noise is the opposite failure - real photos
+        have local spatial correlation JPEG's DCT exploits well, so testing
+        against noise (which has none) would make even a high quality look
+        artificially lossy. This lands in between, like real image content.
+        """
+        rng = np.random.default_rng(0)
+        yy, xx = np.mgrid[0:size, 0:size]
+        gradient = (xx * (255 / size)).astype(np.int16)
+        image = np.stack([gradient, gradient[::-1, :], np.full_like(gradient, 128)], axis=-1)
+        image[size // 4 : size // 2, size // 4 : size // 2] = (220, 40, 40)  # a sharp-edged block
+        image = image + rng.integers(-3, 4, image.shape, dtype=np.int16)
+        return np.clip(image, 0, 255).astype(np.uint8)
+
+    def test_default_format_and_quality(self):
+        self.assertEqual(CropParams().image_format, DEFAULT_IMAGE_FORMAT)
+        self.assertEqual(CropParams().jpeg_quality, DEFAULT_JPEG_QUALITY)
+
+    def test_a_dot_jpg_path_is_written_as_jpeg(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "a.jpg"
+            save_crop_png(path, self._rich_crop())
+            # A real JPEG file, not a PNG saved under a misleading extension.
+            self.assertEqual(cv2.imread(str(path)).shape[:2], (64, 64))
+            header = path.read_bytes()[:3]
+            self.assertEqual(header, b"\xff\xd8\xff", "not a JPEG file signature")
+
+    def test_a_dot_png_path_is_written_as_lossless_png(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "a.png"
+            crop = self._rich_crop()
+            save_crop_png(path, crop)
+            header = path.read_bytes()[:8]
+            self.assertEqual(header, b"\x89PNG\r\n\x1a\n", "not a PNG file signature")
+            # Lossless: reading it back must reproduce the source exactly.
+            roundtrip = cv2.cvtColor(cv2.imread(str(path)), cv2.COLOR_BGR2RGB)
+            self.assertTrue(np.array_equal(roundtrip, crop))
+
+    def test_jpeg_quality_is_configurable_and_affects_file_size(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            crop = self._rich_crop()
+            low = Path(tmp) / "low.jpg"
+            high = Path(tmp) / "high.jpg"
+            save_crop_png(low, crop, jpeg_quality=10)
+            save_crop_png(high, crop, jpeg_quality=100)
+            self.assertLess(
+                low.stat().st_size, high.stat().st_size,
+                "a lower JPEG quality must produce a smaller file - the parameter is not being applied",
+            )
+
+    def test_the_default_quality_98_is_close_to_lossless(self):
+        """Not a hard numeric accuracy budget (JPEG's exact error depends on
+        content), just the sanity check behind choosing 98 as the default -
+        see docs/vision_cache.md: near-lossless in practice, not merely
+        'better than a very low quality'."""
+        with tempfile.TemporaryDirectory() as tmp:
+            crop = self._rich_crop()
+            path = Path(tmp) / "a.jpg"
+            save_crop_png(path, crop, jpeg_quality=DEFAULT_JPEG_QUALITY)
+            roundtrip = cv2.cvtColor(cv2.imread(str(path)), cv2.COLOR_BGR2RGB)
+            mean_abs_error = np.abs(roundtrip.astype(int) - crop.astype(int)).mean()
+            # A tiny (64px) test crop concentrates a sharp synthetic edge
+            # into a large fraction of its own 8x8 DCT blocks - a real,
+            # much larger photo has proportionally far less edge area, so
+            # this loose bound (out of a possible 255) is deliberately
+            # generous, not a tight accuracy budget.
+            self.assertLess(mean_abs_error, 4.0, "q98 should be visually near-lossless on real content")
+
+
+class CacheVersioningParticipationTests(unittest.TestCase):
+    """The mechanism `build_cache` already uses to refuse a mismatched cache
+    (see test_preprocess_pipeline.py's CacheVersionMismatchTests) is just
+    CropParams equality - so image_format/jpeg_quality/max_side automatically
+    participate in it the moment they exist as fields, with no separate
+    version-tracking code. These tests pin exactly that participation."""
+
+    def test_a_different_jpeg_quality_is_not_equal_to_the_default(self):
+        self.assertNotEqual(CropParams(), CropParams(jpeg_quality=50))
+
+    def test_a_different_image_format_is_not_equal_to_the_default(self):
+        self.assertNotEqual(CropParams(), CropParams(image_format="png"))
+
+    def test_a_different_max_side_is_not_equal_to_the_default(self):
+        self.assertNotEqual(CropParams(), CropParams(max_side=1024))
+
+    def test_current_version_constant_matches_the_dataclass_default(self):
+        self.assertEqual(CROP_CACHE_VERSION, CropParams().version)
+
+
+class OldFormatCacheIsOrphanedNotMisreadTests(unittest.TestCase):
+    """Backward compatibility: an old (pre-Vision-Cache) cache entry must
+    never be silently treated as a valid new one - see bird_crop.py's module
+    docstring. Rather than an explicit staleness check, the file EXTENSION
+    itself already guarantees this: the new default format's path simply
+    does not exist yet for anything only ever built under the old one."""
+
+    def test_a_legacy_png_entry_is_invisible_to_the_new_default_lookup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = r"C:\photos\legacy.arw"
+            legacy_path = crop_cache_path(tmp, source, image_format="png")
+            legacy_path.parent.mkdir(parents=True, exist_ok=True)
+            save_crop_png(legacy_path, np.zeros((10, 10, 3), dtype=np.uint8))
+            self.assertTrue(legacy_path.exists())
+
+            # A caller using today's defaults (no image_format override)
+            # looks for a *different* path and finds nothing - it will
+            # rebuild fresh rather than reading the old, lower-quality file.
+            current_path = crop_cache_path(tmp, source)
+            self.assertNotEqual(current_path, legacy_path)
+            self.assertFalse(current_path.exists())
 
 
 class LoaderCropCacheTests(unittest.TestCase):

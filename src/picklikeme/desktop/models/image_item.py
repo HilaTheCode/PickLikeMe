@@ -39,6 +39,18 @@ class ImageItem:
     # {metric_name: value}, for a diagnostics display of what its combined
     # score was actually made of.
     metrics: dict[str, dict[str, float]] = field(default_factory=dict)
+    # Burst Analysis's own output (see picklikeme.burst_analysis /
+    # ReviewSession.burst_info) - which burst this image belongs to, how
+    # many members that burst has, this image's 1-based rank within it (by
+    # whichever strategy ReviewSession.burst_strategy currently names), and
+    # whether it is that burst's top-ranked member. Always populated - a
+    # burst of one is still a burst - so burst_size/rank default to 1 and
+    # burst_best to True, matching what an image with no burstmates gets
+    # from ReviewImage.as_dict.
+    burst_id: str | None = None
+    burst_size: int = 1
+    burst_rank: int = 1
+    burst_best: bool = True
 
     @property
     def display_name(self) -> str:

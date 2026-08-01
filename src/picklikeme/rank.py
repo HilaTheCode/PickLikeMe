@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Callable
 
 from .auto_crop import resolve_device
-from .bird_crop import CropParams
+from .bird_crop import IMAGE_FORMAT_EXTENSIONS, CropParams
 from .config import DEFAULT_CHECKPOINT_PATH, DEFAULT_CROP_CACHE_DIR, DEFAULT_MAX_CSV_ROWS, cli_prefix
 from .dataset import UnlabeledImageDataset
 from .model import DINOV3_BACKBONE, ModelConfig, PreferenceHead
@@ -58,7 +58,9 @@ def rank_folder(
     crop_cache_dir: str | Path = DEFAULT_CROP_CACHE_DIR,
     margin_frac: float = CropParams.margin_frac,
     conf_threshold: float = CropParams.conf_threshold,
-    max_side: int = CropParams.max_side,
+    max_side: int | None = CropParams.max_side,
+    image_format: str = CropParams.image_format,
+    jpeg_quality: int = CropParams.jpeg_quality,
     force_preprocess: bool = False,
     resize_mode: str = "letterbox",
     max_rows: int = DEFAULT_MAX_CSV_ROWS,
@@ -98,7 +100,10 @@ def rank_folder(
     if crop_birds:
         if on_stage is not None:
             on_stage("Building bird-crop cache")
-        params = CropParams(margin_frac=margin_frac, conf_threshold=conf_threshold, max_side=max_side)
+        params = CropParams(
+            margin_frac=margin_frac, conf_threshold=conf_threshold, max_side=max_side,
+            image_format=image_format, jpeg_quality=jpeg_quality,
+        )
         image_paths = [item.image_path for item in dataset.items]
         build_cache(image_paths, crop_cache_dir, params, device=resolved_device, force=force_preprocess)
         crop_cache = crop_cache_dir
@@ -188,7 +193,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--crop-cache-dir", default=str(DEFAULT_CROP_CACHE_DIR), help="Where to build/read the bird-crop cache")
     parser.add_argument("--margin-frac", type=float, default=CropParams.margin_frac)
     parser.add_argument("--conf-threshold", type=float, default=CropParams.conf_threshold)
-    parser.add_argument("--max-side", type=int, default=CropParams.max_side)
+    parser.add_argument(
+        "--max-side", type=int, default=CropParams.max_side,
+        help="Max cached crop long side in pixels (default: unlimited - the crop's own original resolution)",
+    )
+    parser.add_argument(
+        "--image-format", choices=sorted(IMAGE_FORMAT_EXTENSIONS), default=CropParams.image_format,
+        help=f"Vision Cache file format (default: {CropParams.image_format})",
+    )
+    parser.add_argument(
+        "--jpeg-quality", type=int, default=CropParams.jpeg_quality,
+        help=f"JPEG quality when --image-format=jpeg (default: {CropParams.jpeg_quality})",
+    )
     parser.add_argument("--force-preprocess", action="store_true", help="Rebuild crops even if already cached")
     parser.add_argument(
         "--organize-output",
@@ -280,6 +296,8 @@ def main() -> None:
             margin_frac=args.margin_frac,
             conf_threshold=args.conf_threshold,
             max_side=args.max_side,
+            image_format=args.image_format,
+            jpeg_quality=args.jpeg_quality,
         )
         image_paths = [item.image_path for item in dataset.items]
         with profiler.stage("Preprocessing"):

@@ -119,13 +119,31 @@ def _candidate(**overrides) -> FilterCandidate:
 # ---------------------------------------------------------------------------
 
 
-def test_both_strategies_are_registered_with_the_ai_model_first() -> None:
+def test_every_strategy_is_registered_with_the_ai_model_first() -> None:
     infos = available_strategies()
-    assert [i.strategy_id for i in infos] == ["ai-model", "classic-vision"]
+    assert [i.strategy_id for i in infos] == ["ai-model", "classic-vision-eyepose-v0", "classic-vision"]
     # The AI model stays the default: strategies were added to give it company,
     # never to demote it.
     assert DEFAULT_STRATEGY_ID == "ai-model"
     assert all(i.display_name and i.description for i in infos)
+
+
+def test_the_two_classic_vision_backends_are_independently_selectable() -> None:
+    """The reported requirement: Classic Vision is a framework of
+    interchangeable eye-localisation backends, not one strategy with a
+    hidden switch - each is its own strategy_id, its own ranking CSV, its
+    own filter/metrics report files, so results from both coexist on a
+    folder for direct comparison."""
+    from picklikeme.ranking.classic import EYEPOSE_STRATEGY_ID, STRATEGY_ID
+
+    superanimal = get_strategy(STRATEGY_ID)
+    eyepose = get_strategy(EYEPOSE_STRATEGY_ID)
+    assert superanimal.info.strategy_id != eyepose.info.strategy_id
+    assert superanimal._eye_detector_name == "superanimal-bird"
+    assert eyepose._eye_detector_name == "eyepose-v0"
+    # Distinct score labels too, so the Gallery/Loupe never shows one
+    # backend's number under a name that could be mistaken for the other's.
+    assert superanimal.info.score_label != eyepose.info.score_label
 
 
 def test_get_strategy_resolves_each_id_and_rejects_unknown_ones() -> None:
@@ -143,7 +161,7 @@ def test_listing_strategies_does_not_import_torch() -> None:
         assert module in sys.modules or True  # imported at module load, above
     # Constructing every strategy must still be cheap - no weights, no CUDA.
     strategies = [get_strategy(i.strategy_id) for i in available_strategies()]
-    assert len(strategies) == 2
+    assert len(strategies) == 3
 
 
 # ---------------------------------------------------------------------------
@@ -575,6 +593,38 @@ def test_classic_vision_ranks_a_folder_and_writes_the_usual_sidecar(tmp_path, mo
     metrics_report = read_metrics_report(folder)["metrics"]
     assert set(metrics_report) == set(scoring) | {mammal}
     assert set(metrics_report[mammal]) == {"eye_sharpness", "subject_sharpness", "subject_size", "eye_confidence"}
+
+
+def test_classic_vision_writes_debug_images_only_when_debug_dir_is_given(tmp_path, monkeypatch) -> None:
+    """Off by default (see ranking.debug's module docstring) - a run with no
+    `debug_dir` must write nothing extra; a run with one gets one debug
+    image per candidate that reached the eye detector."""
+    from picklikeme.ranking import classic as classic_module
+    from picklikeme.ranking.debug import debug_image_path
+
+    folder = tmp_path / "shoot"
+    folder.mkdir()
+    cache_dir = tmp_path / "crops"
+    scoring = [str(folder / f"bird_{i}.nef") for i in range(2)]
+    for path in scoring:
+        Path(path).write_bytes(b"not really a raw file")
+        _write_cache_entry(cache_dir, path)
+
+    monkeypatch.setattr(classic_module, "build_cache", lambda *a, **k: {})
+    monkeypatch.setattr(
+        "picklikeme.eyes.build_eye_detector",
+        lambda name, **kwargs: _FakeEyeDetector(detection=_eye(), supported=True),
+    )
+
+    ClassicVisionStrategy().rank_folder(folder, params=ClassicVisionParams(), crop_cache_dir=cache_dir, device="cpu")
+    debug_dir = tmp_path / "debug"
+    assert not debug_dir.exists(), "no debug_dir was requested - nothing extra should be written"
+
+    ClassicVisionStrategy().rank_folder(
+        folder, params=ClassicVisionParams(), crop_cache_dir=cache_dir, device="cpu", debug_dir=debug_dir,
+    )
+    for path in scoring:
+        assert debug_image_path(debug_dir, path).is_file()
 
 
 def test_classic_vision_refuses_a_folder_with_no_images(tmp_path) -> None:

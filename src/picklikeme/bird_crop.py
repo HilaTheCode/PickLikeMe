@@ -23,11 +23,34 @@ Design notes:
 - If no supported animal is detected, the full frame is cached as the fallback,
   so every image still yields an input and is never re-detected.
 
+**This cache is Vision Cache infrastructure, not a training-only
+optimization.** It is the shared image source for every Computer Vision
+consumer - AI-model training, Classic Vision (both eye-detection backends),
+and any future vision module (species classification, sharpness analysis,
+composition, ...) - never re-decoding the same RAW twice for repeated work
+on the same image. Its one job is to hand every consumer the best crop it
+can, at the resolution and quality *they* need; it must never become a
+resolution ceiling on its own. Concretely: `CropParams.max_side` defaults to
+`None` (the crop's own resolution, uncapped) rather than a fixed number, and
+any consumer that genuinely needs a smaller input (training's own
+`RawImageLoader` in particular) does its own resize at load time - see
+`raw_io.RawImageLoader._letterbox`, which already worked this way before
+`max_side` became configurable, so no consumer changed. `image_format`/
+`jpeg_quality` are similarly consumer-agnostic knobs on the cache itself, not
+per-model settings.
+
 Bump CROP_CACHE_VERSION whenever the crop algorithm, its defaults, or the set
 of accepted detection classes changes, so a stale cache is detected instead of
 silently reused. v1 = bird only; v2 = SUPPORTED_ANIMAL_CLASSES; v3 = area-
 dominant selection among survivors; v4 = group-scene handling (see "Crop
-selection policy" below).
+selection policy" below); v5 = Vision Cache - `max_side`/`image_format`/
+`jpeg_quality` became configurable cache parameters instead of a hardcoded
+1024px PNG, so a v4-or-earlier cache (fixed 1024px cap, PNG) is a different,
+lower-quality artifact that must never be silently mistaken for a v5 one -
+see `build_cache`'s own `crop_params.json` mismatch check, and
+`crop_cache_path`'s format-dependent file extension, which is the other half
+of that same guarantee (a reader configured for the new default format
+simply never finds an old-format file to misread in the first place).
 
 Crop selection policy
 ----------------------
@@ -195,13 +218,24 @@ def detection_category(label: int) -> str | None:
     return COCO_CLASS_CATEGORY.get(int(label))
 
 
-CROP_CACHE_VERSION = "v4"
+CROP_CACHE_VERSION = "v5"
 CROP_PARAMS_FILENAME = "crop_params.json"
 
-# Cache entries live in cache_dir/<first 2 hex chars of digest>/<digest>.png.
-# Two characters gives 256 shards: ~215 files per shard at 55k images, which
-# keeps NTFS directory operations fast without creating a deep tree.
+# Cache entries live in cache_dir/<first 2 hex chars of digest>/<digest><ext>,
+# <ext> depending on image_format (see crop_cache_path). Two shard characters
+# gives 256 shards: ~215 files per shard at 55k images, which keeps NTFS
+# directory operations fast without creating a deep tree.
 CACHE_SHARD_CHARS = 2
+
+# Vision Cache format - see CropParams.image_format/jpeg_quality and the
+# module docstring's "Vision Cache infrastructure" note. JPEG at a high
+# quality rather than lossless PNG: measured on this project's own real
+# cache, JPEG q98 runs ~3x smaller than PNG for the same pixels (see
+# docs/vision_cache.md), which matters once the cache stores crops at their
+# original resolution instead of a capped 1024px.
+DEFAULT_IMAGE_FORMAT = "jpeg"
+DEFAULT_JPEG_QUALITY = 98
+IMAGE_FORMAT_EXTENSIONS: dict[str, str] = {"jpeg": ".jpg", "png": ".png"}
 
 # How close two surviving detections' areas must be, as a fraction of the
 # larger one, before confidence is allowed to decide between them. 0.10 means
@@ -220,14 +254,40 @@ DEFAULT_GROUP_SCENE_THRESHOLD = 10
 @dataclass(frozen=True)
 class CropParams:
     """Parameters that define how a crop cache was built. Recorded alongside
-    the cache so a mismatched configuration can be detected."""
+    the cache (write_crop_params/read_crop_params) so a mismatched
+    configuration is detected rather than silently reused - build_cache
+    compares the stored value against the requested one on every run and
+    refuses (SystemExit, "pass --force to rebuild") when they differ. Adding
+    a field here automatically joins that comparison, which is how
+    `image_format`/`jpeg_quality`/max_side's new default are protected
+    without any extra version-tracking code - see the module docstring's
+    "Vision Cache infrastructure" and CROP_CACHE_VERSION notes.
+    """
 
     margin_frac: float = 0.05          # small safety margin around the tight box
     conf_threshold: float = 0.30       # min detection confidence to accept a detection
-    max_side: int = 1024               # cap the cached crop's long side (px)
+    # Cap the cached crop's long side, in pixels - None (the default) means
+    # NO cap: the crop is cached at its own, original resolution. Vision
+    # Cache quality must never be reduced for a consumer that never asked
+    # for that; a consumer that genuinely wants a smaller input (training's
+    # RawImageLoader) resizes at load time instead - see the module
+    # docstring. Set an explicit int to cap disk usage at the cost of detail,
+    # e.g. for a quick experiment or a disk-constrained machine.
+    max_side: int | None = None
     area_tie_frac: float = DEFAULT_AREA_TIE_FRAC  # size-tie tolerance for select_best_detection
     group_scene_threshold: int = DEFAULT_GROUP_SCENE_THRESHOLD  # >= this many detections -> group scene
     detector: str = "fasterrcnn_resnet50_fpn_v2"
+    # "jpeg" (default) or "png". See DEFAULT_IMAGE_FORMAT/crop_cache_path -
+    # the cache file's own extension depends on this, so a format change
+    # cannot silently collide with an old-format entry on disk.
+    image_format: str = DEFAULT_IMAGE_FORMAT
+    # Only meaningful when image_format == "jpeg"; ignored for "png" (always
+    # lossless). 98 was chosen by measuring real cached crops: visually and
+    # numerically close to lossless, at roughly a third of PNG's size - see
+    # docs/vision_cache.md. Exposed here, not hardcoded, so a future need
+    # (e.g. 100 for a specific analysis, or a lower value to shrink an
+    # existing archive) is a parameter, not a code change.
+    jpeg_quality: int = DEFAULT_JPEG_QUALITY
     version: str = CROP_CACHE_VERSION
 
 
@@ -290,9 +350,14 @@ def crop_to_box(image: np.ndarray, box: tuple[int, int, int, int]) -> np.ndarray
     return image[y1:y2, x1:x2]
 
 
-def downscale_long_side(image: np.ndarray, max_side: int) -> np.ndarray:
+def downscale_long_side(image: np.ndarray, max_side: int | None) -> np.ndarray:
     """Downscale (never upscale) so the longer side is at most max_side,
-    preserving aspect ratio. Keeps cached crops small without distortion."""
+    preserving aspect ratio. `max_side=None` means no cap at all - the image
+    is returned unchanged, at its own full resolution (see
+    CropParams.max_side and the module docstring's "Vision Cache
+    infrastructure" note for why that is the default)."""
+    if max_side is None:
+        return image
     height, width = image.shape[:2]
     longest = max(height, width)
     if longest <= max_side:
@@ -307,7 +372,9 @@ def downscale_long_side(image: np.ndarray, max_side: int) -> np.ndarray:
 # Cache path scheme (shared by the preprocessor and the loader)
 # ---------------------------------------------------------------------------
 
-def crop_cache_path(cache_dir: str | Path, source_path: str | Path) -> Path:
+def crop_cache_path(
+    cache_dir: str | Path, source_path: str | Path, *, image_format: str = DEFAULT_IMAGE_FORMAT
+) -> Path:
     """Deterministic cache file for a source image, keyed by its absolute path.
 
     THE single place in the codebase that constructs a cache path: every read
@@ -319,12 +386,20 @@ def crop_cache_path(cache_dir: str | Path, source_path: str | Path) -> Path:
     operations on NTFS. The path is always *computed* from the digest — the
     cache is never scanned, globbed, or walked to find an entry.
 
-    Independent of crop parameters (those are recorded in crop_params.json);
-    rebuilding the cache overwrites in place.
+    The digest itself is independent of crop parameters (those are recorded
+    in crop_params.json; rebuilding the cache overwrites in place) - but the
+    file EXTENSION depends on `image_format`, so a cache rebuilt under a
+    different format (see CropParams.image_format) writes to a different
+    path rather than silently overwriting - or being silently mistaken for -
+    an entry in the old format. A caller reading the cache with the current
+    default format therefore naturally gets a cache miss (not a wrong- format
+    read) for anything still on disk from before the Vision Cache's format
+    became configurable - see the module docstring's CROP_CACHE_VERSION note.
     """
     resolved = str(Path(source_path).resolve())
     digest = hashlib.sha1(resolved.encode("utf-8")).hexdigest()[:20]
-    return Path(cache_dir) / digest[:CACHE_SHARD_CHARS] / f"{digest}.png"
+    extension = IMAGE_FORMAT_EXTENSIONS.get(image_format, IMAGE_FORMAT_EXTENSIONS[DEFAULT_IMAGE_FORMAT])
+    return Path(cache_dir) / digest[:CACHE_SHARD_CHARS] / f"{digest}{extension}"
 
 
 def write_crop_params(cache_dir: str | Path, params: CropParams) -> Path:
@@ -403,13 +478,26 @@ def read_detections(cache_dir: str | Path, source_path: str | Path) -> dict | No
         return None
 
 
-def save_crop_png(cache_path: Path, crop_rgb: np.ndarray) -> None:
-    """Write an RGB crop to the cache as PNG (stored BGR so cv2.imread +
-    the loader's BGR->RGB conversion round-trips correctly)."""
-    with PROFILE.stage("png encode + write"):
+def save_crop_png(cache_path: Path, crop_rgb: np.ndarray, *, jpeg_quality: int = DEFAULT_JPEG_QUALITY) -> None:
+    """Write an RGB crop to the cache (stored BGR so cv2.imread + the
+    loader's BGR->RGB conversion round-trips correctly).
+
+    Format is read from `cache_path`'s own extension - `.jpg`/`.jpeg` writes
+    a JPEG at `jpeg_quality`, anything else (`.png`) writes lossless PNG -
+    matching whatever `crop_cache_path(..., image_format=...)` decided the
+    path should be, so this function never has to be told the format twice.
+    Name kept for backward compatibility (many existing call sites and tests
+    reference it) even though the default format is no longer literally PNG
+    - see CropParams.image_format.
+    """
+    with PROFILE.stage("image encode + write"):
         cache_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = cache_path.with_name(cache_path.name + ".tmp.png")
-        cv2.imwrite(str(tmp), cv2.cvtColor(crop_rgb, cv2.COLOR_RGB2BGR))
+        tmp = cache_path.with_name(cache_path.name + ".tmp" + cache_path.suffix)
+        bgr = cv2.cvtColor(crop_rgb, cv2.COLOR_RGB2BGR)
+        if cache_path.suffix.lower() in (".jpg", ".jpeg"):
+            cv2.imwrite(str(tmp), bgr, [cv2.IMWRITE_JPEG_QUALITY, int(jpeg_quality)])
+        else:
+            cv2.imwrite(str(tmp), bgr)
         tmp.replace(cache_path)
 
 

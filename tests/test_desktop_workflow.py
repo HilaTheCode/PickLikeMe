@@ -12,10 +12,12 @@ from picklikeme.species.translations import localized_species_name
 
 try:
     from PySide6.QtCore import QCoreApplication
+    from PySide6.QtGui import QPixmap
     from PySide6.QtWidgets import QApplication
 except ModuleNotFoundError:  # pragma: no cover - depends on local environment
     QApplication = None  # type: ignore[assignment]
     QCoreApplication = None  # type: ignore[assignment]
+    QPixmap = None  # type: ignore[assignment]
 
 
 def _make_jpeg(path) -> None:
@@ -284,6 +286,57 @@ def test_loupe_dialog_keep_reject_and_navigation(tmp_path) -> None:
 
     dialog._go_prev()
     assert dialog.index == 0
+
+    dialog.close()
+    service.close()
+    app.quit()
+
+
+@pytest.mark.skipif(QApplication is None, reason="PySide6 not installed")
+def test_loupe_overlay_boxes_are_drawn_at_the_thickened_pen_widths(tmp_path) -> None:
+    """The Loupe's own vector overlay (a QGraphicsScene, separate code from
+    the Gallery's raster one - see contactsheets.annotate_thumbnail's own
+    thickness test) needed its pen widths multiplied by the same ~5x the
+    overlay-as-primary-debugging-tool pass applied there. Untested until
+    now - the first test to actually inspect what set_detection_overlay
+    draws rather than just that it doesn't crash."""
+    from PySide6.QtWidgets import QGraphicsRectItem
+
+    from picklikeme.desktop.dialogs.loupe_dialog import (
+        BOX_PEN_WIDTH_EYE,
+        BOX_PEN_WIDTH_OTHER,
+        BOX_PEN_WIDTH_SELECTED,
+        LoupeDialog,
+    )
+
+    app = QApplication.instance() or QApplication([])
+    folder = tmp_path / "shoot"
+    folder.mkdir()
+    path_a = folder / "a.jpg"
+    _make_jpeg(path_a)
+
+    service = ReviewService(db_path=tmp_path / "annotations.sqlite")
+    service.open_folder(folder)
+
+    dialog = LoupeDialog(service=service, image_paths=[str(path_a)], start_index=0)
+    view = dialog._view
+    view.set_pixmap(QPixmap(100, 100))
+    boxes = {
+        "source_size": (100, 100),
+        "selected": {"box": (10.0, 10.0, 40.0, 40.0)},
+        "others": [{"box": (50.0, 50.0, 70.0, 70.0)}],
+    }
+    eye = {"source_size": (100, 100), "accepted": True, "box": (5.0, 5.0, 15.0, 15.0), "left": None, "right": None}
+
+    view.set_detection_overlay(boxes, eye)
+
+    rects_by_z = {item.zValue(): item for item in view._overlay_items if isinstance(item, QGraphicsRectItem)}
+    assert rects_by_z[10].pen().widthF() == BOX_PEN_WIDTH_OTHER  # runner-up box
+    assert rects_by_z[11].pen().widthF() == BOX_PEN_WIDTH_SELECTED  # the chosen subject box
+    assert rects_by_z[12].pen().widthF() == BOX_PEN_WIDTH_EYE  # the eye box
+    # ~5x the pre-existing 4/3px widths, not merely "thicker than zero".
+    assert BOX_PEN_WIDTH_SELECTED >= 15
+    assert BOX_PEN_WIDTH_EYE >= 15
 
     dialog.close()
     service.close()

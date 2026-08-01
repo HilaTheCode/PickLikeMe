@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import argparse
 
-from .bird_crop import CropParams
+from .bird_crop import IMAGE_FORMAT_EXTENSIONS, CropParams
 from .config import fatal_errors_logged_to_stdout
 from .preprocess import default_decode_workers, preprocess_folders
 from .train import build_arg_parser, train_and_rank
@@ -32,7 +32,20 @@ def main() -> None:
     group = parser.add_argument_group("preprocessing (crop cache)")
     group.add_argument("--margin-frac", type=float, default=CropParams.margin_frac, help="Safety margin around the detected bird before cropping")
     group.add_argument("--conf-threshold", type=float, default=CropParams.conf_threshold, help="Detection confidence threshold")
-    group.add_argument("--max-side", type=int, default=CropParams.max_side, help="Max cached crop long side (pixels)")
+    group.add_argument(
+        "--max-side",
+        type=int,
+        default=CropParams.max_side,
+        help="Max cached crop long side in pixels (default: unlimited - the crop's own original resolution)",
+    )
+    group.add_argument(
+        "--image-format", choices=sorted(IMAGE_FORMAT_EXTENSIONS), default=CropParams.image_format,
+        help=f"Vision Cache file format (default: {CropParams.image_format})",
+    )
+    group.add_argument(
+        "--jpeg-quality", type=int, default=CropParams.jpeg_quality,
+        help=f"JPEG quality when --image-format=jpeg (default: {CropParams.jpeg_quality})",
+    )
     group.add_argument("--force-preprocess", action="store_true", help="Rebuild crops even if already cached")
     group.add_argument("--skip-preprocess", action="store_true", help="Skip the preprocess step and reuse the existing crop cache")
     group.add_argument(
@@ -58,6 +71,8 @@ def main() -> None:
                 margin_frac=args.margin_frac,
                 conf_threshold=args.conf_threshold,
                 max_side=args.max_side,
+                image_format=args.image_format,
+                jpeg_quality=args.jpeg_quality,
             )
             preprocess_folders(
                 args.select_root,

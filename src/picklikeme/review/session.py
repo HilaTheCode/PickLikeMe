@@ -30,6 +30,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from ..analyzer.annotations import REVIEW_KEEP, REVIEW_REASON_OTHER, REVIEW_REJECT, AnnotationStore
+from ..burst_analysis import BurstInfo, ScoredImage, analyze_bursts
 from ..identity import IdentityUnavailable
 from ..organize import (
     DEFAULT_SELECTION_PERCENTAGE,
@@ -137,6 +138,12 @@ class ReviewImage:
     def is_ranked(self) -> bool:
         return self.score is not None
 
+    def score_for(self, strategy_id: str) -> float | None:
+        """A specific strategy's score, or None if it never scored this
+        image - see `score` for why the AI model's own score stays a
+        separate, fixed-name property rather than being folded into this."""
+        return (self.ranking_results.get(strategy_id) or {}).get("score")
+
     @property
     def review_status(self) -> str:
         """The one true tri-state status this application ever shows or
@@ -144,7 +151,7 @@ class ReviewImage:
         otherwise - never inferred from the ranking."""
         return self.decision or REVIEW_STATUS_NEUTRAL
 
-    def as_dict(self, ai_suggestion: str | None) -> dict:
+    def as_dict(self, ai_suggestion: str | None, burst: "BurstInfo | None" = None) -> dict:
         return {
             "image_path": self.image_path,
             "filename": self.filename,
@@ -167,6 +174,13 @@ class ReviewImage:
             "reason": self.reason,
             "reason_note": self.reason_note,
             "missing_file": self.missing_file,
+            # Burst Analysis's own read-only output (see
+            # ReviewSession.burst_info) - every image gets one, even a burst
+            # of one, so these are never None once a session has loaded.
+            "burst_id": burst.burst_id if burst else None,
+            "burst_size": burst.burst_size if burst else 1,
+            "burst_rank": burst.burst_rank if burst else 1,
+            "burst_best": burst.burst_best if burst else True,
         }
 
 
@@ -183,6 +197,12 @@ class ReviewSession:
     ):
         self.store = store
         self.keep_percent = validate_selection_percentage(keep_percent)
+        # Which strategy's score Burst Analysis ranks each burst's members
+        # by (see burst_info) - the AI model until the photographer picks a
+        # different one (the desktop Gallery ties this to its own Color
+        # Source selector, so "the selected ranking strategy" only ever has
+        # one meaning across the app - see MainWindow._on_color_source_changed).
+        self.burst_strategy = AI_STRATEGY_ID
         self._state_lock = threading.RLock()
         self._background_lock = threading.Lock()
         self._loading_generation = 0
@@ -590,6 +610,29 @@ class ReviewSession:
         self.keep_percent = validate_selection_percentage(percent)
         return self.keep_percent
 
+    def set_burst_strategy(self, strategy_id: str) -> str:
+        """Which strategy's score Burst Analysis ranks bursts by from now
+        on - purely a display choice, exactly like keep_percent, and never
+        persisted: the next `as_dict()` call recomputes burst_info() fresh."""
+        self.burst_strategy = strategy_id
+        return self.burst_strategy
+
+    def burst_info(self) -> dict[str, BurstInfo]:
+        """Every image's burst membership and in-burst rank, from
+        `burst_analysis.analyze_bursts` - see that module for why it is
+        handed nothing but (path, captured_at, score) triples, never told
+        which strategy produced the score or anything else about this
+        session. Recomputed on every call rather than cached: it is cheap
+        (pure Python over data already in memory) and must never go stale
+        after set_burst_strategy or a new ranking changes the scores it
+        reads from `self.images`.
+        """
+        scored = [
+            ScoredImage(image.image_path, image.captured_at, image.score_for(self.burst_strategy))
+            for image in self.images
+        ]
+        return analyze_bursts(scored)
+
     @property
     def cut(self) -> int:
         """How many ranked images the AI threshold alone would flag as keep."""
@@ -739,6 +782,7 @@ class ReviewSession:
 
     def as_dict(self) -> dict:
         ai_suggestions = self._ai_suggestions()
+        burst = self.burst_info()
         with self._state_lock:
             loading = dict(self._loading_state)
             warnings = list(self.warnings)
@@ -755,7 +799,10 @@ class ReviewSession:
             "run": self.run_metadata,
             "workflow": self.workflow_state(),
             "loading": loading,
-            "images": [image.as_dict(ai_suggestions.get(image.image_path)) for image in images],
+            "images": [
+                image.as_dict(ai_suggestions.get(image.image_path), burst.get(image.image_path))
+                for image in images
+            ],
         }
 
     # -- writes ---------------------------------------------------------------

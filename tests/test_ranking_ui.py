@@ -214,7 +214,7 @@ def test_the_gallery_card_shows_one_row_per_analysis_module(app) -> None:
     assert item.score == pytest.approx(0.75)
     assert item.rank == 3
     rows = ThumbnailCardDelegate._score_rows(item)
-    assert [label for label, _ in rows] == ["AI", "Classic"]  # AI first
+    assert [label for label, _ in rows] == ["AI", "Classic (SuperAnimal)"]  # AI first
     assert rows[0][1] == "0.7500 · #3"
     assert rows[1][1] == "0.4200 · #11"
 
@@ -228,7 +228,7 @@ def test_a_card_shows_the_module_it_has_and_stays_quiet_about_the_rest(app) -> N
         ranking_results={"classic-vision": {"score": 0.9, "rank": 1}},
     )
     assert only_classic.score is None  # no "ai-model" entry - not the same as unranked-by-everyone
-    assert ThumbnailCardDelegate._score_rows(only_classic) == [("Classic", "0.9000 · #1")]
+    assert ThumbnailCardDelegate._score_rows(only_classic) == [("Classic (SuperAnimal)", "0.9000 · #1")]
 
     unscored = ImageItem(path="/x/c.nef", file_name="c.nef")
     assert ThumbnailCardDelegate._score_rows(unscored) == [("", "Unranked")]
@@ -264,21 +264,24 @@ def test_the_loupe_shows_every_module_score_on_one_line(app) -> None:
         }
     })
     assert "AI 0.7500 (#3)" in text
-    assert "Classic 0.4200 (#11)" in text
-    assert text.index("AI") < text.index("Classic")
+    assert "Classic (SuperAnimal) 0.4200 (#11)" in text
+    assert text.index("AI") < text.index("Classic (SuperAnimal)")
     assert LoupeDialog._scores_text({}) == "Unranked"
 
 
 def test_every_module_is_sortable(app) -> None:
     """Sorting options are generated from the registry, so a new module
-    becomes sortable at the moment it becomes runnable."""
+    becomes sortable at the moment it becomes runnable - including a second
+    Classic Vision backend, independently of the first."""
     from picklikeme.desktop.main_window import SORT_SCORE_PREFIX, sort_options
 
     fields = [field for field, _ in sort_options()]
     labels = [label for _, label in sort_options()]
     assert "score" in fields and "AI Score" in labels
     assert f"{SORT_SCORE_PREFIX}classic-vision" in fields
-    assert "Classic Vision Ranking Score" in labels
+    assert f"{SORT_SCORE_PREFIX}classic-vision-eyepose-v0" in fields
+    assert "Classic Vision Ranking (SuperAnimal) Score" in labels
+    assert "Classic Vision Ranking (EyePose-v0, recommended) Score" in labels
     assert fields[-2:] == ["filename", "captured_at"]
 
 
@@ -331,3 +334,196 @@ def test_the_status_line_reports_what_was_filtered_out(app) -> None:
     assert "skipped 10" in filtered
     assert "No visible eye: 7" in filtered
     assert "No subject detected: 3" in filtered
+
+
+def test_a_ranking_run_clears_the_thumbnail_cache(app, tmp_path, monkeypatch) -> None:
+    """Regression: the Gallery's in-memory thumbnail cache (cache_manager) is
+    keyed by (path, with_boxes) and was never invalidated by a ranking run.
+
+    The real-world sequence that broke: Detector Boxes gets toggled on while
+    only the AI model has ranked a folder - no eye data exists yet, so the
+    overlaid pixmap cached for (path, True) has no eye box. Running Classic
+    Vision afterward computes and saves eye data on disk, and
+    review_thumbnail() would happily build a fresh overlay for it - but the
+    Gallery never asked again, because the stale pixmap was still sitting in
+    cache_manager under the same key. The eye overlay silently never
+    appeared, in the Gallery specifically (the Loupe has no such cache - it
+    re-reads the eye record on every navigation).
+    """
+    from picklikeme.desktop.application import ApplicationState, WorkerManager
+    from picklikeme.desktop import main_window as main_window_module
+    from picklikeme.desktop.main_window import MainWindow
+    from picklikeme.desktop.services import ReviewService
+    from picklikeme.desktop.settings import DesktopSettings
+
+    folder = tmp_path / "shoot"
+    folder.mkdir()
+    image_path = str(folder / "a.jpg")
+
+    service = ReviewService(db_path=tmp_path / "annotations.sqlite")
+    service.open_folder(folder)
+    monkeypatch.setattr(
+        service, "rank_folder",
+        lambda **kwargs: {"state": service.load_session(), "image_count": 0, "filtered": {}},
+    )
+
+    window = MainWindow(
+        state=ApplicationState(), settings=DesktopSettings(),
+        service=service, worker_manager=WorkerManager(),
+    )
+    try:
+        window.state.current_folder = str(folder)
+        stale_pixmap = object()
+        window.cache_manager.put_thumbnail((image_path, True), stale_pixmap)
+        assert window.cache_manager.get_thumbnail((image_path, True)) is stale_pixmap
+
+        # Bypass parameter dialogs and the real background QThread: both are
+        # irrelevant to what this test checks (the cache-clearing wiring),
+        # and neither can run headless without its own modal event loop.
+        monkeypatch.setattr(window, "_collect_ranking_parameters", lambda strategy_id, info: {})
+
+        def fake_run_with_progress(parent, title, func, *, on_success, on_error=None):
+            del parent, title, on_error
+            on_success(func())
+
+            class _FakeThread:
+                class _Signal:
+                    def connect(self, *_args, **_kwargs) -> None:
+                        pass
+
+                finished = _Signal()
+
+            return _FakeThread()
+
+        monkeypatch.setattr(main_window_module, "run_with_progress", fake_run_with_progress)
+
+        window._rank_with_strategy("classic-vision")
+
+        assert window.cache_manager.get_thumbnail((image_path, True)) is None
+    finally:
+        window.close()
+        service.close()
+
+
+# ---------------------------------------------------------------------------
+# Color Source - which strategy's Keep/Reject-styled coloring is on screen.
+#
+# Before this, the Gallery always tinted a card green/red/neutral by
+# review_status alone with no way to tell whether that reflected the AI
+# model, Classic Vision, or the photographer's own decision - impossible to
+# debug the two strategies disagreeing. color_source_options() lists an
+# explicit choice per registered strategy (plus "Review Status", the old
+# behavior, kept as the default); the delegate paints a low-to-high gradient
+# between the same reject/keep colors for whichever one is picked, so a
+# strategy's ranking can be scanned across a folder at a glance without
+# sorting by it. Untested until now - these are the first tests this
+# mechanism had.
+# ---------------------------------------------------------------------------
+
+
+def test_color_source_options_lists_review_status_and_every_strategy(app) -> None:
+    from picklikeme.desktop.main_window import color_source_options
+
+    options = color_source_options()
+    assert options[0] == (None, "Review Status")
+    ids = [source for source, _ in options[1:]]
+    assert set(ids) == {info.strategy_id for info in available_strategies()}
+    labels = dict(options)
+    assert labels["ai-model"] == "AI Model Score"
+    assert labels["classic-vision"] == "Classic Vision Ranking (SuperAnimal) Score"
+    assert labels["classic-vision-eyepose-v0"] == "Classic Vision Ranking (EyePose-v0, recommended) Score"
+
+
+def test_default_coloring_is_unchanged_when_no_color_source_is_set(app) -> None:
+    """Backward compatibility: a delegate that never had set_color_source
+    called behaves exactly as before this feature existed - plain
+    review-status coloring, ignoring any strategy score on the item."""
+    from picklikeme.desktop import theme
+    from picklikeme.desktop.models.image_item import ImageItem
+    from picklikeme.desktop.views.gallery.thumbnail_delegate import ThumbnailCardDelegate
+
+    delegate = ThumbnailCardDelegate()
+    palette = theme.current_palette()
+    keep_item = ImageItem(path="/x/a.nef", file_name="a.nef", review_status="keep",
+                           ranking_results={"classic-vision": {"score": 0.1}})
+    assert delegate._get_background_color(palette, keep_item, False).name() == theme_color(palette.keep_bg)
+
+
+def theme_color(hex_value: str) -> str:
+    from PySide6.QtGui import QColor
+
+    return QColor(hex_value).name()
+
+
+def test_color_source_tints_by_the_chosen_strategy_s_score(app) -> None:
+    from picklikeme.desktop import theme
+    from picklikeme.desktop.models.image_item import ImageItem
+    from picklikeme.desktop.views.gallery.thumbnail_delegate import ThumbnailCardDelegate
+
+    delegate = ThumbnailCardDelegate()
+    palette = theme.current_palette()
+    delegate.set_color_source("classic-vision", (0.0, 10.0))
+
+    lowest = ImageItem(path="/x/low.nef", file_name="low.nef", review_status="reject",
+                        ranking_results={"classic-vision": {"score": 0.0}})
+    highest = ImageItem(path="/x/high.nef", file_name="high.nef", review_status="keep",
+                         ranking_results={"classic-vision": {"score": 10.0}})
+
+    # The low end of the range must render as the reject color and the high
+    # end as the keep color, regardless of that item's own review_status -
+    # the whole point is that this coloring is independent of it.
+    assert delegate._get_background_color(palette, lowest, False).name() == theme_color(palette.reject_bg)
+    assert delegate._get_background_color(palette, highest, False).name() == theme_color(palette.keep_bg)
+
+
+def test_an_image_the_chosen_strategy_never_scored_falls_back_to_neutral(app) -> None:
+    """An image Classic Vision filtered out (or that only the AI model has
+    scored) has no classic-vision score to tint by - it must fall back to
+    the same plain color an unranked image gets by default, not be mistaken
+    for a score of zero."""
+    from picklikeme.desktop import theme
+    from picklikeme.desktop.models.image_item import ImageItem
+    from picklikeme.desktop.views.gallery.thumbnail_delegate import ThumbnailCardDelegate
+
+    delegate = ThumbnailCardDelegate()
+    palette = theme.current_palette()
+    delegate.set_color_source("classic-vision", (0.0, 10.0))
+
+    unscored = ImageItem(path="/x/u.nef", file_name="u.nef", review_status="keep")
+    assert delegate._get_background_color(palette, unscored, False).name() == theme_color(palette.neutral_bg)
+
+
+def test_selecting_a_color_source_computes_the_range_from_visible_items_only(app, tmp_path) -> None:
+    """The gradient must span only what a filter is currently showing, not
+    every image the strategy ever scored - a folder with a wide overall
+    range but a narrow filtered view should still spread across the full
+    gradient for what is on screen."""
+    from picklikeme.desktop.application import ApplicationState, WorkerManager
+    from picklikeme.desktop.main_window import MainWindow
+    from picklikeme.desktop.models.image_item import ImageItem
+    from picklikeme.desktop.services import ReviewService
+    from picklikeme.desktop.settings import DesktopSettings
+
+    service = ReviewService(db_path=tmp_path / "annotations.sqlite")
+    window = MainWindow(
+        state=ApplicationState(), settings=DesktopSettings(),
+        service=service, worker_manager=WorkerManager(),
+    )
+    try:
+        window._color_source = "classic-vision"
+        visible = [
+            ImageItem(path="/x/a.nef", file_name="a.nef", ranking_results={"classic-vision": {"score": 2.0}}),
+            ImageItem(path="/x/b.nef", file_name="b.nef", ranking_results={"classic-vision": {"score": 5.0}}),
+            ImageItem(path="/x/c.nef", file_name="c.nef"),  # never scored by it - excluded from the range
+        ]
+        window._update_color_source(visible)
+        assert window._gallery_view._delegate._color_source == "classic-vision"
+        assert window._gallery_view._delegate._score_range == (2.0, 5.0)
+
+        window._color_source = None
+        window._update_color_source(visible)
+        assert window._gallery_view._delegate._color_source is None
+        assert window._gallery_view._delegate._score_range is None
+    finally:
+        window.close()
+        service.close()

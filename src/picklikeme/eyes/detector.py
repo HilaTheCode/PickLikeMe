@@ -136,20 +136,54 @@ class EyeDetector(Protocol):
     def detect(self, subject_crop_rgb: "np.ndarray") -> EyeDetection: ...
 
 
+def derive_eye_box(
+    center_x: float, center_y: float, width: int, height: int, frac: float, min_px: float
+) -> tuple[float, float, float, float]:
+    """A square region around a single (x, y) eye point, clamped inside the
+    crop it was found in - the "keypoint -> region" derivation every current
+    and future keypoint-based `EyeDetector` needs (see the module docstring's
+    "A box, not just a point").
+
+    Extracted from `superanimal_bird.SuperAnimalBirdEyeDetector.detect` so a
+    second detector (e.g. `eyepose_v0`) shares the exact same clamping
+    arithmetic rather than a second, potentially slightly different copy of
+    it - both backends' boxes must mean the same thing to `ranking.metrics`
+    and the overlay.
+
+    `frac` is a fraction of the crop's *shorter* side (so the box scales with
+    the subject, not a fixed pixel size); `min_px` floors it so a tiny crop
+    still yields a region a sharpness measure can work with.
+    """
+    side = max(min_px, frac * min(width, height))
+    half = side / 2.0
+    x1 = max(0.0, min(center_x - half, width - 1.0))
+    y1 = max(0.0, min(center_y - half, height - 1.0))
+    x2 = min(float(width), max(x1 + 1.0, center_x + half))
+    y2 = min(float(height), max(y1 + 1.0, center_y + half))
+    return (x1, y1, x2, y2)
+
+
 def build_eye_detector(name: str = "superanimal-bird", **kwargs) -> EyeDetector:
     """Construct a registered eye detector by name.
 
     A factory rather than a direct import for the same reason
-    `species.classifier.build_classifier` is one: the concrete detector
-    imports torch/timm inside its own `__init__`, so merely importing this
-    module - which the ranking registry does at startup to list the
-    available strategies - never pays for a heavy ML import that a session
-    ranking with the AI model would never use.
+    `species.classifier.build_classifier` is one: each concrete detector
+    imports its own heavy ML runtime (torch/timm for SuperAnimal-Bird,
+    onnxruntime for eyepose_v0) inside its own `__init__`, so merely
+    importing this module - which the ranking registry does at startup to
+    list the available strategies - never pays for either.
+
+    Registering a third backend later is exactly this: one import line, one
+    entry in `detectors` below. Classic Vision, the cache, the overlay and
+    everything else consume only the `EyeDetector`/`EyeDetection` interface
+    above and never need to change.
     """
+    from .eyepose_v0 import EyePoseV0EyeDetector
     from .superanimal_bird import SuperAnimalBirdEyeDetector
 
     detectors: dict[str, type] = {
         SuperAnimalBirdEyeDetector.detector_id: SuperAnimalBirdEyeDetector,
+        EyePoseV0EyeDetector.detector_id: EyePoseV0EyeDetector,
     }
     try:
         cls = detectors[name]

@@ -61,10 +61,15 @@ class ThumbnailCardDelegate(QAbstractItemDelegate):
         # score tints the background instead; set via set_color_source.
         self._color_source: str | None = None
         self._score_range: tuple[float, float] | None = None
+        # Off by default - see set_show_burst_badge / GalleryView.set_show_burst_badges.
+        self._show_burst_badge = False
 
     def set_color_source(self, strategy_id: str | None, score_range: tuple[float, float] | None) -> None:
         self._color_source = strategy_id
         self._score_range = score_range
+
+    def set_show_burst_badge(self, enabled: bool) -> None:
+        self._show_burst_badge = enabled
 
     def sizeHint(self, option, index) -> QSize:  # noqa: ARG002
         return QSize(self.CARD_WIDTH, self.CARD_HEIGHT)
@@ -153,6 +158,8 @@ class ThumbnailCardDelegate(QAbstractItemDelegate):
             crop_y = max(0, (scaled.height() - thumb_rect.height()) // 2)
             cropped = scaled.copy(crop_x, crop_y, thumb_rect.width(), thumb_rect.height())
             painter.drawPixmap(thumb_rect.topLeft(), cropped)
+            if self._show_burst_badge and item.burst_size > 1:
+                self._draw_burst_badge(painter, palette, thumb_rect, item.burst_size)
 
         text_y = card_rect.y() + self.PADDING + self.THUMBNAIL_SIZE + self.SPACING
         text_rect = QRect(card_rect.x() + self.PADDING, text_y, card_rect.width() - 2 * self.PADDING, 18)
@@ -267,6 +274,25 @@ class ThumbnailCardDelegate(QAbstractItemDelegate):
             painter.fillPath(pill_path, fill)
             painter.setPen(QColor(palette.accent))
             painter.drawText(pill_rect, Qt.AlignmentFlag.AlignCenter, ai_text)
+
+    def _draw_burst_badge(self, painter: QPainter, palette: theme.Palette, thumb_rect: QRect, burst_size: int) -> None:
+        """"+N" in the thumbnail's top-right corner - N other images share
+        this burst_best card's burst (see MainWindow._on_toggle_collapse_bursts).
+        Only ever drawn in Collapse Bursts mode, never in the gallery's
+        default one-card-per-image view."""
+        text = f"+{burst_size - 1}"
+        metrics = QFontMetrics(self._small_font)
+        painter.setFont(self._small_font)
+        width = metrics.horizontalAdvance(text) + 12
+        height = metrics.height() + 4
+        badge_rect = QRect(thumb_rect.right() - width - 4, thumb_rect.top() + 4, width, height)
+        path = QPainterPath()
+        path.addRoundedRect(float(badge_rect.x()), float(badge_rect.y()), float(badge_rect.width()), float(badge_rect.height()), height / 2.0, height / 2.0)
+        fill = QColor(palette.window_bg)
+        fill.setAlpha(210)
+        painter.fillPath(path, fill)
+        painter.setPen(QColor(palette.text_primary))
+        painter.drawText(badge_rect, Qt.AlignmentFlag.AlignCenter, text)
 
     def _draw_buttons(self, painter: QPainter, palette: theme.Palette, card_rect: QRect, item) -> None:
         rects = self.button_rects(card_rect)

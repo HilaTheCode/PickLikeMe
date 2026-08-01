@@ -158,6 +158,10 @@ class MainWindow(QMainWindow):
         self._sort_field = "score"  # matches ReviewSession.load()'s own default ordering
         self._sort_ascending = False
         self._show_detector_boxes = False
+        # See color_source_options() docstring below, and the "Collapse
+        # Bursts" View menu action - when true, the gallery shows only each
+        # burst's top-ranked (burst_best) image instead of every member.
+        self._collapse_bursts = False
         # None (the default) means "tint by review status" - see
         # color_source_options(). Anything else is a strategy id whose score
         # tints the background instead.
@@ -449,6 +453,13 @@ class MainWindow(QMainWindow):
         )
         self._detector_boxes_action.toggled.connect(self._on_toggle_detector_boxes)
         view_menu.addAction(self._detector_boxes_action)
+        self._collapse_bursts_action = QAction("Collapse Bursts", self, checkable=True)
+        self._collapse_bursts_action.setToolTip(
+            "Show only the top-ranked image of each burst; open one to flip through its "
+            "burst mates in rank order"
+        )
+        self._collapse_bursts_action.toggled.connect(self._on_toggle_collapse_bursts)
+        view_menu.addAction(self._collapse_bursts_action)
 
         tools_menu = menu_bar.addMenu("Tools")
         tools_menu.addMenu(self._rank_menu)
@@ -490,6 +501,7 @@ class MainWindow(QMainWindow):
         toolbar.addWidget(QLabel(" Color: "))
         toolbar.addWidget(self._color_combo)
         toolbar.addAction(self._detector_boxes_action)
+        toolbar.addAction(self._collapse_bursts_action)
         toolbar.addSeparator()
 
         toolbar.addAction(self._rank_action)
@@ -818,6 +830,10 @@ class MainWindow(QMainWindow):
                 ranking_results=image.get("ranking_results") or {},
                 filter_reasons=image.get("filter_reasons") or {},
                 metrics=image.get("metrics") or {},
+                burst_id=image.get("burst_id"),
+                burst_size=image.get("burst_size", 1),
+                burst_rank=image.get("burst_rank", 1),
+                burst_best=image.get("burst_best", True),
             )
             for image in state.get("images", [])
         ]
@@ -885,6 +901,16 @@ class MainWindow(QMainWindow):
         self._show_detector_boxes = checked
         self._gallery_view.viewport().update()
 
+    def _on_toggle_collapse_bursts(self, checked: bool) -> None:
+        """Disabled (the default) leaves the gallery exactly as it has
+        always behaved - every image, individually. Enabled narrows the
+        visible set to each burst's own burst_best image (see
+        _filter_items) and shows a "+N" badge on any card whose burst has
+        other members, so opening one (see _open_loupe) can offer them."""
+        self._collapse_bursts = checked
+        self._gallery_view.set_show_burst_badges(checked)
+        self._apply_filter()
+
     # -- filtering ------------------------------------------------------------
 
     def _on_filter_changed(self, index: int) -> None:
@@ -893,6 +919,8 @@ class MainWindow(QMainWindow):
 
     def _apply_filter(self) -> None:
         filtered = self._filter_items(self._all_items, self._current_filter)
+        if self._collapse_bursts:
+            filtered = [item for item in filtered if item.burst_best]
         filtered = self._sort_items(filtered)
         self._gallery_model.set_items(filtered)
         self._update_color_source(filtered)
@@ -902,7 +930,12 @@ class MainWindow(QMainWindow):
 
     def _on_color_source_changed(self, index: int) -> None:
         self._color_source = self._color_combo.itemData(index)
-        self._apply_filter()
+        # Burst Analysis ranks each burst's members by this same "selected
+        # ranking strategy" (see ReviewSession.set_burst_strategy) - "Review
+        # Status" (None) is not a ranking strategy, so that case falls back
+        # to the AI model, same as burst_strategy's own default.
+        self.service.set_burst_strategy(self._color_source or DEFAULT_STRATEGY_ID)
+        self._refresh_from_state(self.service.load_session())
 
     def _update_color_source(self, items: list[ImageItem]) -> None:
         """Recompute the score range the gallery tints card backgrounds
@@ -1144,14 +1177,38 @@ class MainWindow(QMainWindow):
     # -- loupe / zoom review ---------------------------------------------------
 
     def _open_loupe_for_index(self, index: QModelIndex) -> None:
-        self._open_loupe(start_row=index.row())
+        item = self._gallery_model.item_at(index.row()) if index.isValid() else None
+        self._open_loupe_for_item(item)
 
     def _open_loupe_for_selection(self) -> None:
         index = self._gallery_view.currentIndex()
-        self._open_loupe(start_row=index.row() if index.isValid() else 0)
+        item = self._gallery_model.item_at(index.row()) if index.isValid() else None
+        self._open_loupe_for_item(item)
 
-    def _open_loupe(self, *, start_row: int) -> None:
+    def _open_loupe_for_item(self, item: ImageItem | None) -> None:
+        """Opening a card normally scopes the Loupe to the current gallery's
+        own visible order (unchanged from before Burst Analysis existed).
+
+        In Collapse Bursts mode a visible card is one burst's burst_best
+        image standing in for the whole group, so opening it instead scopes
+        the Loupe to that burst's own members, ordered by burst_rank - "the
+        existing review workflow while allowing navigation through the
+        burst members" the feature asks for. Pulled from `self._all_items`,
+        not the collapsed, filtered gallery model: the other members are
+        deliberately not in that model's rows at all.
+        """
+        if self._collapse_bursts and item is not None and item.burst_id is not None:
+            members = sorted(
+                (i for i in self._all_items if i.burst_id == item.burst_id),
+                key=lambda i: i.burst_rank,
+            )
+            self._open_loupe(items=members, start_row=0)
+            return
         items = self._gallery_model.items()
+        start_row = items.index(item) if item is not None and item in items else 0
+        self._open_loupe(items=items, start_row=start_row)
+
+    def _open_loupe(self, *, items: list[ImageItem], start_row: int) -> None:
         if not items:
             self._set_status("No images to review in the current filter")
             return
@@ -1197,6 +1254,12 @@ class MainWindow(QMainWindow):
             )
 
         def _on_success(result: dict[str, Any]) -> None:
+            # A ranking run may change what a detector-box overlay shows for
+            # any image (new/updated detections, or - Classic Vision - eye
+            # data that did not exist the last time an overlaid thumbnail
+            # was cached), so every cached pixmap must be dropped before the
+            # gallery repaints, not just the session state refreshed.
+            self.cache_manager.clear_thumbnails()
             self._refresh_from_state(result["state"])
             self._set_status(self._ranking_summary(result))
             device = result.get("device")

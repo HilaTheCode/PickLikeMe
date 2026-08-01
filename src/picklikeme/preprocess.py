@@ -42,6 +42,7 @@ from pathlib import Path
 import numpy as np
 
 from .bird_crop import (
+    IMAGE_FORMAT_EXTENSIONS,
     SUPPORTED_ANIMAL_CLASSES,
     BirdDetector,
     CropParams,
@@ -148,18 +149,23 @@ def _decode_one(decoder: RawImageLoader, image_path: str) -> _Decoded:
         return _Decoded(rgb=None, error=exc)
 
 
-def _writer_loop(write_queue: "queue.Queue", failures: list[tuple[_WriteJob, BaseException]]) -> None:
+def _writer_loop(
+    write_queue: "queue.Queue", failures: list[tuple[_WriteJob, BaseException]], jpeg_quality: int
+) -> None:
     """Drain crops to disk until the sentinel arrives.
 
     Never exits on error: a failed write is recorded and the loop continues, so
     the main thread can never block forever on a queue whose consumer died.
+    `jpeg_quality` is fixed for the whole run (one CropParams, see build_cache)
+    and only actually used when job.target's own extension is JPEG - see
+    save_crop_png.
     """
     while True:
         job = write_queue.get()
         if job is None:
             return
         try:
-            save_crop_png(job.target, job.crop)
+            save_crop_png(job.target, job.crop, jpeg_quality=jpeg_quality)
         except BaseException as exc:  # noqa: BLE001 - recorded, reconciled by the main thread
             failures.append((job, exc))
 
@@ -215,6 +221,10 @@ def build_cache(
         "not one individual"
     )
     print(f"  {'decode workers:':<20}{decode_workers} (window {DECODE_WINDOW}, GPU stays sequential)")
+    max_side_desc = "unlimited (original crop resolution)" if params.max_side is None else f"{params.max_side}px"
+    format_desc = params.image_format + (f" q{params.jpeg_quality}" if params.image_format == "jpeg" else "")
+    print(f"  {'crop resolution:':<20}{max_side_desc}")
+    print(f"  {'crop format:':<20}{format_desc}")
 
     if PROFILE.enabled:
         print(f"  profiling:        ON (stage summary every {PROFILE_SUMMARY_INTERVAL_IMAGES} images)")
@@ -226,7 +236,7 @@ def build_cache(
     write_failures: list[tuple[_WriteJob, BaseException]] = []
     writer = threading.Thread(
         target=_writer_loop,
-        args=(write_queue, write_failures),
+        args=(write_queue, write_failures, params.jpeg_quality),
         name="picklikeme-writer",
         daemon=True,
     )
@@ -293,7 +303,7 @@ def build_cache(
             if image_path is None:
                 return
             with PROFILE.stage("cache lookup"):
-                target = crop_cache_path(cache_dir, image_path)
+                target = crop_cache_path(cache_dir, image_path, image_format=params.image_format)
                 has_detections = detections_cache_path(cache_dir, image_path).exists()
                 already_cached = target.exists() and has_detections and not force
             future = None if already_cached else pool.submit(_decode_one, decoder, image_path)
@@ -483,7 +493,26 @@ def main() -> None:
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--margin-frac", type=float, default=CropParams.margin_frac)
     parser.add_argument("--conf-threshold", type=float, default=CropParams.conf_threshold)
-    parser.add_argument("--max-side", type=int, default=CropParams.max_side)
+    parser.add_argument(
+        "--max-side",
+        type=int,
+        default=CropParams.max_side,
+        help="Cap the cached crop's long side in pixels (default: unlimited - the crop's own "
+        "original resolution, uncapped). Set an explicit value to trade detail for disk usage.",
+    )
+    parser.add_argument(
+        "--image-format",
+        choices=sorted(IMAGE_FORMAT_EXTENSIONS),
+        default=CropParams.image_format,
+        help=f"Vision Cache file format (default: {CropParams.image_format})",
+    )
+    parser.add_argument(
+        "--jpeg-quality",
+        type=int,
+        default=CropParams.jpeg_quality,
+        help=f"JPEG quality when --image-format=jpeg, 0-100 (default: {CropParams.jpeg_quality}); "
+        "ignored for --image-format=png, which is always lossless",
+    )
     parser.add_argument(
         "--area-tie-frac",
         type=float,
@@ -516,6 +545,8 @@ def main() -> None:
         max_side=args.max_side,
         area_tie_frac=args.area_tie_frac,
         group_scene_threshold=args.group_scene_threshold,
+        image_format=args.image_format,
+        jpeg_quality=args.jpeg_quality,
     )
     with fatal_errors_logged_to_stdout():
         preprocess_folders(

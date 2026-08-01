@@ -1057,5 +1057,82 @@ class RankingResultsSymmetryTests(SessionTestCase):
         self.assertEqual(payload["rank"], payload["ranking_results"]["ai-model"]["rank"])
 
 
+class BurstInfoTests(SessionTestCase):
+    """ReviewSession.burst_info / as_dict()'s burst_* fields - the session's
+    own wiring on top of burst_analysis.analyze_bursts (tested directly, in
+    isolation, in test_burst_analysis.py). These fixtures write plain byte
+    files with no real EXIF, so captured_at is None throughout unless a test
+    sets it directly - every image therefore starts as its own singleton
+    burst, which is itself a case worth pinning."""
+
+    def test_every_image_gets_burst_fields_even_with_no_captured_at(self):
+        shoot, images, _ = build_shoot(self.root, ranked=3)
+        session = self.session(shoot)
+
+        payload = session._image_for(str(images[0])).as_dict(
+            ai_suggestion=None, burst=session.burst_info()[str(images[0])]
+        )
+        self.assertIsNotNone(payload["burst_id"])
+        self.assertEqual(payload["burst_size"], 1)
+        self.assertEqual(payload["burst_rank"], 1)
+        self.assertTrue(payload["burst_best"])
+
+    def test_images_close_in_capture_time_are_grouped_and_ranked_by_ai_score(self):
+        """build_shoot's fixture scores descend with index (images[0] best),
+        so grouping the first three into one burst must make images[0] the
+        burst's best - the AI model is burst_strategy's default."""
+        shoot, images, _ = build_shoot(self.root, ranked=5)
+        session = self.session(shoot)
+        for index, offset in enumerate((0, 1, 2)):
+            session._image_for(str(images[index])).captured_at = f"2024-01-01T10:00:0{offset}"
+
+        info = session.burst_info()
+        burst_id = info[str(images[0])].burst_id
+        self.assertEqual(burst_id, info[str(images[1])].burst_id)
+        self.assertEqual(burst_id, info[str(images[2])].burst_id)
+        self.assertEqual(info[str(images[0])].burst_size, 3)
+        self.assertTrue(info[str(images[0])].burst_best)  # highest AI score of the three
+        self.assertFalse(info[str(images[1])].burst_best)
+        self.assertFalse(info[str(images[2])].burst_best)
+        # Untouched images stay outside that burst entirely.
+        self.assertNotEqual(burst_id, info[str(images[3])].burst_id)
+
+    def test_set_burst_strategy_switches_which_score_ranks_the_burst(self):
+        """The reported requirement: burst_rank is determined by whichever
+        strategy is selected, not hard-coded to the AI model. A second
+        strategy that disagrees with the AI about which image is best must
+        change burst_best once selected."""
+        from picklikeme.sidecar import strategy_ranking_path
+
+        shoot, images, _ = build_shoot(self.root, ranked=3)
+        # AI ranks images[0] highest; Classic Vision ranks images[2] highest.
+        write_strategy_ranking(
+            strategy_ranking_path(shoot, "classic-vision"),
+            [(images[2], 0.99), (images[1], 0.5), (images[0], 0.1)],
+        )
+        session = self.session(shoot)
+        for index, offset in enumerate((0, 1, 2)):
+            session._image_for(str(images[index])).captured_at = f"2024-01-01T10:00:0{offset}"
+
+        by_ai = session.burst_info()
+        self.assertTrue(by_ai[str(images[0])].burst_best)
+
+        session.set_burst_strategy("classic-vision")
+        by_classic = session.burst_info()
+        self.assertTrue(by_classic[str(images[2])].burst_best)
+        self.assertFalse(by_classic[str(images[0])].burst_best)
+
+    def test_as_dict_carries_burst_fields_for_every_image(self):
+        shoot, images, _ = build_shoot(self.root, ranked=2)
+        session = self.session(shoot)
+
+        payload = session.as_dict()
+        for image_payload in payload["images"]:
+            self.assertIn("burst_id", image_payload)
+            self.assertIn("burst_size", image_payload)
+            self.assertIn("burst_rank", image_payload)
+            self.assertIn("burst_best", image_payload)
+
+
 if __name__ == "__main__":
     unittest.main()

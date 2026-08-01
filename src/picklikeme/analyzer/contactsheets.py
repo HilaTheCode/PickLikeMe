@@ -339,11 +339,15 @@ def annotate_thumbnail(
     canvas = base.copy()
     draw = ImageDraw.Draw(canvas)
     font = _font()
-    # Thick enough to read at a glance even on a distant, small-boxed subject -
-    # a size-400 thumbnail (the review Gallery's default) now draws a 3px line
-    # instead of a barely-visible 2px one; _stroke still caps it against a
-    # small box's own dimensions below.
-    line = max(2, round(size / 120))
+    # Thick enough to read at a glance even on a distant, small-boxed subject.
+    # The overlay is PeakPic's primary debugging tool for judging a detector
+    # box or an eye box (see eyes.eyepose_v0's validation work), so the
+    # previous line width (a size-400 thumbnail drew 3px) was multiplied by
+    # ~5x here - both the subject box and the eye box derive their stroke
+    # from this same `line` value, so one change thickens both uniformly.
+    # _stroke still caps it against a small box's own dimensions below, so a
+    # distant, tiny subject's outline still cannot swallow the box it marks.
+    line = max(2, round(size / 120)) * 5
 
     def to_thumb(box) -> tuple[float, float, float, float]:
         return (

@@ -88,6 +88,15 @@ class GalleryView(QListView):
         self._delegate.set_color_source(strategy_id, score_range)
         self.viewport().update()
 
+    def set_show_burst_badges(self, enabled: bool) -> None:
+        """Show the "+N other in burst" badge on a card whose burst has
+        other members - only meaningful once Collapse Bursts is on (see
+        MainWindow._on_toggle_collapse_bursts); off by default so the
+        gallery's normal, one-card-per-image view is never decorated with
+        burst chrome it did not ask for."""
+        self._delegate.set_show_burst_badge(enabled)
+        self.viewport().update()
+
     def paintEvent(self, event) -> None:  # noqa: N802 - Qt override signature
         super().paintEvent(event)
         model = self.model()
