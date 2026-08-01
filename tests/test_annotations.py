@@ -16,7 +16,13 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from picklikeme.analyzer.annotations import DEFAULT_ANNOTATIONS_DB, AnnotationStore, summarise
+from picklikeme.analyzer.annotations import (
+    DEFAULT_ANNOTATIONS_DB,
+    REVIEW_KEEP,
+    REVIEW_REJECT,
+    AnnotationStore,
+    summarise,
+)
 from picklikeme.identity import IdentityUnavailable, cache_key, image_identity
 from picklikeme.analyzer.config import AnalysisConfig
 from test_analyzer import build_dataset, write_ranking  # reuse the analyzer fixtures
@@ -257,7 +263,134 @@ class StorageTests(unittest.TestCase):
 
     def test_default_database_lives_outside_any_output_directory(self):
         self.assertNotIn("analysis", DEFAULT_ANNOTATIONS_DB.parts[-2:])
-        self.assertEqual(DEFAULT_ANNOTATIONS_DB.name, "false_negatives.db")
+        self.assertEqual(DEFAULT_ANNOTATIONS_DB.name, "review.db")
+
+
+class LegacyDatabaseRenameMigrationTests(unittest.TestCase):
+    """review.db was renamed from false_negatives.db - see
+    annotations.py's own module docstring and _resolve_annotations_db_path.
+    An existing installation must keep working with zero manual action and
+    without losing any review decision, and the legacy file itself must
+    never be deleted (mirrors the Vision Cache's own "never silently delete
+    analysis data" principle)."""
+
+    def test_a_legacy_named_database_is_migrated_automatically(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            kb_dir = Path(tmp) / "kb"
+            legacy_path = kb_dir / "false_negatives.db"
+            new_path = kb_dir / "review.db"
+            path = make_image(Path(tmp) / "IMG_0001.NEF")
+
+            # Simulate an existing installation: decisions saved under the
+            # old filename, nothing yet at the new one.
+            with AnnotationStore(legacy_path) as legacy_store:
+                legacy_store.save(path, fields={"crop_quality": "too_small"})
+                legacy_store.set_review_decision(path, REVIEW_KEEP)
+
+            self.assertFalse(new_path.exists())
+
+            # Opening with the NEW default path is exactly what every
+            # existing caller (ReviewService, the analyzer CLI/server) does
+            # unchanged - no code anywhere had to learn about the old name.
+            with AnnotationStore(new_path) as migrated:
+                self.assertEqual(migrated.db_path, new_path)
+                annotation = migrated.get(path)
+                self.assertIsNotNone(annotation, "the diagnosis annotation must survive migration")
+                self.assertEqual(annotation.fields["crop_quality"], "too_small")
+                decisions = {row["image_path"]: row["decision"] for row in migrated.review_decisions()}
+                self.assertEqual(decisions[str(path)], REVIEW_KEEP)
+
+            # The legacy file is left in place, untouched - never deleted.
+            self.assertTrue(legacy_path.exists())
+
+    def test_migration_only_happens_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            kb_dir = Path(tmp) / "kb"
+            legacy_path = kb_dir / "false_negatives.db"
+            new_path = kb_dir / "review.db"
+            path = make_image(Path(tmp) / "a.NEF")
+
+            with AnnotationStore(legacy_path) as legacy_store:
+                legacy_store.save(path, fields={"crop_quality": "good"})
+
+            with AnnotationStore(new_path) as first_open:
+                first_open.save(path, fields={"crop_quality": "too_large"})  # overwrite post-migration
+
+            # A second open must not re-migrate (which would silently
+            # overwrite the post-migration edit with the legacy snapshot).
+            with AnnotationStore(new_path) as second_open:
+                self.assertEqual(second_open.get(path).fields["crop_quality"], "too_large")
+
+    def test_no_legacy_file_means_a_fresh_database_is_created_normally(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            new_path = Path(tmp) / "kb" / "review.db"
+            with AnnotationStore(new_path) as store:
+                self.assertEqual(store.db_path, new_path)
+                self.assertEqual(store.count(), 0)
+
+    def test_a_custom_db_path_migrates_a_same_directory_legacy_file_too(self):
+        """The migration is not hardcoded to the module's own default path -
+        it looks beside whatever db_path was actually requested (matching
+        --annotations-db / a custom ReviewService(db_path=...)), so a
+        photographer with a non-default location is covered too."""
+        with tempfile.TemporaryDirectory() as tmp:
+            custom_dir = Path(tmp) / "my_own_location"
+            legacy_path = custom_dir / "false_negatives.db"
+            requested_path = custom_dir / "review.db"
+            path = make_image(Path(tmp) / "a.NEF")
+
+            with AnnotationStore(legacy_path) as legacy_store:
+                legacy_store.set_review_decision(path, REVIEW_REJECT)
+
+            with AnnotationStore(requested_path) as migrated:
+                decisions = {row["image_path"]: row["decision"] for row in migrated.review_decisions()}
+                self.assertEqual(decisions[str(path)], REVIEW_REJECT)
+
+    def test_a_locked_legacy_file_falls_back_to_it_directly_without_data_loss(self):
+        """If the backup step itself cannot complete, the store must keep
+        working against the photographer's real decisions - appearing to
+        have lost them because migration hit a transient problem would be
+        far worse than briefly staying on the old filename."""
+        import sqlite3
+
+        from picklikeme.analyzer import annotations as annotations_module
+
+        with tempfile.TemporaryDirectory() as tmp:
+            kb_dir = Path(tmp) / "kb"
+            legacy_path = kb_dir / "false_negatives.db"
+            new_path = kb_dir / "review.db"
+            path = make_image(Path(tmp) / "a.NEF")
+
+            with AnnotationStore(legacy_path) as legacy_store:
+                legacy_store.set_review_decision(path, REVIEW_KEEP)
+
+            # sqlite3.Connection is a C type - its methods can't be patched
+            # directly. Wrap only the legacy connection so `.backup()` fails
+            # the way a locked/exotic filesystem would, without touching
+            # sqlite3.connect's real behaviour otherwise.
+            class RaisingBackupConnection:
+                def __init__(self, real):
+                    self._real = real
+
+                def backup(self, *a, **kw):
+                    raise sqlite3.Error("simulated lock")
+
+                def __getattr__(self, name):
+                    return getattr(self._real, name)
+
+            real_connect = sqlite3.connect
+
+            def fake_connect(target, *a, **kw):
+                conn = real_connect(target, *a, **kw)
+                return RaisingBackupConnection(conn) if str(target) == str(legacy_path) else conn
+
+            with mock.patch.object(annotations_module.sqlite3, "connect", side_effect=fake_connect):
+                resolved = annotations_module._resolve_annotations_db_path(new_path)
+
+            self.assertEqual(resolved, legacy_path, "must fall back to the legacy path, not silently proceed on an empty new one")
+            with AnnotationStore(resolved) as store:
+                decisions = {row["image_path"]: row["decision"] for row in store.review_decisions()}
+                self.assertEqual(decisions[str(path)], REVIEW_KEEP)
 
 
 def make_jpeg_with_capture_time(path: Path, timestamp: str | None = "2024:06:15 10:30:00", size: int = 4) -> Path:

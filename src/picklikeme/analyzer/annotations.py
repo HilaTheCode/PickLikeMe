@@ -70,7 +70,87 @@ logger = logging.getLogger(__name__)
 
 # Deliberately outside any analysis output directory: those are per-run and get
 # overwritten, and this database is meant to outlive every one of them.
-DEFAULT_ANNOTATIONS_DB = PROJECT_ROOT / "annotations" / "false_negatives.db"
+#
+# Named "review.db", not "false_negatives.db" - the original name, kept until
+# this rename, described only what this store held when it was first built:
+# the photographer's written diagnosis of why an image the model got wrong
+# (a false negative or false positive) was actually wrong. It has since grown
+# into the store for every persistent per-image judgement PeakPic keeps -
+# above all the Keep/Reject/Neutral review_decisions table (review.session's
+# whole reason for opening this store at all), plus identity_cache and
+# whatever this module's own annotation config adds next - and "review" is
+# what all of that actually is. See _resolve_annotations_db_path for the
+# automatic, lossless migration off the old name.
+DEFAULT_ANNOTATIONS_DB = PROJECT_ROOT / "annotations" / "review.db"
+
+# The name this database used before the rename above. Never removed from
+# this module: _resolve_annotations_db_path looks for a file under this name
+# beside a NEW db_path that does not exist yet, on every AnnotationStore
+# construction, for as long as an installation might still have one.
+LEGACY_ANNOTATIONS_DB_FILENAME = "false_negatives.db"
+
+
+def _resolve_annotations_db_path(requested: Path) -> Path:
+    """The path `AnnotationStore` should actually open - `requested` itself,
+    migrating a same-directory legacy-named database to it first if one is
+    found and `requested` does not exist yet.
+
+    Automatic and one-time: nothing about this requires a user to do
+    anything, and it runs on every construction but only ever *acts* the
+    first time (once `requested` exists, every later call is a single
+    `Path.exists()` check and returns immediately).
+
+    Uses sqlite3's own online backup API (`Connection.backup`) rather than a
+    raw file copy or rename, so a WAL-mode database (this store always runs
+    in WAL - see `_connect`) is migrated as one complete, consistent
+    snapshot regardless of what is still sitting in an unmerged `-wal` file
+    at the moment this runs - a plain file copy of just the `.db` file could
+    silently drop not-yet-checkpointed decisions.
+
+    The legacy file is **never deleted** - "review decisions must not be
+    lost" applies just as much to a migration as to the Vision Cache's own
+    "never silently delete analysis data" principle (see docs/vision_cache.md).
+    If the backup itself fails for any reason (a locked file, a permissions
+    problem), this falls back to returning the legacy path directly, so the
+    store keeps working against the photographer's existing decisions
+    un-migrated rather than appearing to have lost them; migration is simply
+    retried on the next launch.
+    """
+    if requested.exists():
+        return requested
+    legacy_path = requested.with_name(LEGACY_ANNOTATIONS_DB_FILENAME)
+    if legacy_path == requested or not legacy_path.is_file():
+        return requested  # nothing to migrate - a fresh store will be created at `requested`
+
+    logger.info(
+        "Migrating the review database from its old name (%s) to %s - "
+        "one-time and automatic, nothing was lost.",
+        legacy_path, requested,
+    )
+    try:
+        requested.parent.mkdir(parents=True, exist_ok=True)
+        legacy_conn = sqlite3.connect(str(legacy_path))
+        try:
+            new_conn = sqlite3.connect(str(requested))
+            try:
+                legacy_conn.backup(new_conn)
+            finally:
+                new_conn.close()
+        finally:
+            legacy_conn.close()
+        return requested
+    except sqlite3.Error as exc:
+        logger.warning(
+            "Could not migrate %s to %s (%s) - continuing to use the legacy database directly "
+            "this session; nothing was lost, and migration will be retried next launch.",
+            legacy_path, requested, exc,
+        )
+        if requested.exists():
+            try:
+                requested.unlink()  # remove a possibly-partial new file; never touches the legacy one
+            except OSError:
+                pass
+        return legacy_path
 
 # --- superseded vocabularies, retained for reading old records only ---------
 # The growable category checklist and the single primary-cause radio that the
@@ -352,7 +432,11 @@ class AnnotationStore:
         db_path: str | Path = DEFAULT_ANNOTATIONS_DB,
         fields_config: AnnotationFieldsConfig | None = None,
     ):
-        self.db_path = Path(db_path)
+        # See _resolve_annotations_db_path: transparently migrates a
+        # legacy-named database (false_negatives.db) to db_path the first
+        # time it is missing, so every existing caller of AnnotationStore
+        # keeps working with zero change and zero manual action.
+        self.db_path = _resolve_annotations_db_path(Path(db_path))
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         # Injectable so a test (or a future caller) can validate against a
         # fixture config instead of the real config/annotations.yaml; the CLI

@@ -74,8 +74,8 @@ def build_parser(add_help: bool = True) -> argparse.ArgumentParser:
     parser.add_argument(
         "--annotations-db",
         default=None,
-        help="SQLite knowledge base of false-negative diagnoses "
-        "(default: <project>/annotations/false_negatives.db, outside any output dir so it survives runs)",
+        help="SQLite review database (decisions, diagnoses, and other per-image annotations) "
+        "(default: <project>/annotations/review.db, outside any output dir so it survives runs)",
     )
     parser.add_argument(
         "--annotations-config",

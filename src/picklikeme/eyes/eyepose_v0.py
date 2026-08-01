@@ -41,6 +41,33 @@ own raw forward pass on real photos (same static 640x640 letterbox tensor
 in, same (1, 23, 8400) tensor out) before this module was written - see
 `docs/eyepose_v0_validation.md`.
 
+CPU vs GPU onnxruntime
+------------------------
+`onnxruntime` (CPU-only) and `onnxruntime-gpu` (adds CUDA) are mutually
+exclusive pip packages, not a runtime toggle - installing one over the
+other is a `pip install`, not a config change. Neither is in this
+project's base `dependencies` (a GPU-only 240MB wheel has no business being
+forced on a CPU-only contributor's machine); pick one via the
+`eyepose-cpu`/`eyepose-gpu` optional-dependency groups in pyproject.toml.
+`_select_providers` below always *asks* for CUDA when `device` requests it
+regardless of which package ended up installed - onnxruntime itself
+silently ignores a provider it has no compiled support for and falls back
+to CPU, so asking is always safe.
+
+Even with `onnxruntime-gpu` installed, asking is not sufficient by itself:
+CUDAExecutionProvider is a native DLL with its own cuBLAS/cuDNN dependency
+that has to be discoverable on the OS's library search path *before*
+onnxruntime tries to load it, or it silently fails and falls back to CPU
+with no error. `runtime_providers.ensure_provider_discoverable` is what
+makes that happen, and is deliberately the *only* place in this backend
+that knows how (today: sourced from torch's own bundled CUDA build) - see
+its own module docstring for the historical bug this replaces (CUDA used
+to work only by the accident of torch having already been imported
+elsewhere first) and why it's isolated there rather than inline here: this
+module has no reason to know or care that today's discovery strategy
+happens to involve torch at all, and neither would a future caller adding
+TensorRT/DirectML/OpenVINO support.
+
 Coordinate contract
 --------------------
 `detect(subject_crop_rgb)` returns coordinates in the SAME frame every other
@@ -91,6 +118,7 @@ import numpy as np
 from ..bird_crop import COCO_BIRD_CLASS
 from ..config import PROJECT_ROOT
 from .detector import EyeDetection, EyeKeypoint, derive_eye_box
+from .runtime_providers import describe_device, ensure_provider_discoverable
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     import onnxruntime as ort
@@ -214,6 +242,21 @@ def _select_providers(device: str) -> list[str]:
     return ["CPUExecutionProvider"]
 
 
+def _print_runtime_diagnostic(session: "ort.InferenceSession", ort_module) -> None:
+    """A short, one-time startup banner naming the execution provider and
+    ONNX Runtime version actually in use - not what was *requested*
+    (`device`/`_select_providers`), which is exactly why this reads
+    `session.get_providers()[0]` (the provider onnxruntime actually picked)
+    rather than echoing `device` back. That distinction is the whole point:
+    a silent CUDA-requested-but-CPU-used fallback is invisible without it.
+    """
+    active_provider = session.get_providers()[0]
+    print("EyePose runtime")
+    print(f"  Provider     : {active_provider}")
+    print(f"  Device       : {describe_device(active_provider)}")
+    print(f"  ONNX Runtime : {ort_module.__version__}")
+
+
 def _letterbox_forward(image: np.ndarray, size: int = INPUT_SIZE) -> tuple[np.ndarray, float, float, float]:
     """Resize `image` to fit within `size`x`size` preserving aspect ratio,
     then centre-pad to exactly `size`x`size` - Ultralytics' own `LetterBox`
@@ -328,17 +371,31 @@ class EyePoseV0EyeDetector:
         max_head_distance_ratio: float = DEFAULT_MAX_EYE_HEAD_DISTANCE_RATIO,
         weights_dir: str | Path | None = None,
     ) -> None:
-        import onnxruntime as ort
+        try:
+            import onnxruntime as ort
+        except ImportError as exc:
+            raise RuntimeError(
+                "EyePose-v0 requires onnxruntime, which is not installed. Pick one: "
+                "`pip install picklikeme[eyepose-cpu]` (any machine) or "
+                "`pip install picklikeme[eyepose-gpu]` (NVIDIA/CUDA machines) - "
+                "see eyepose_v0.py's module docstring for the difference."
+            ) from exc
 
         self.min_confidence = min_confidence
         self.eye_box_frac = eye_box_frac
         self.max_head_distance_ratio = max_head_distance_ratio
 
         onnx_path = ensure_onnx_weights(weights_dir)
-        self._session: "ort.InferenceSession" = ort.InferenceSession(
-            str(onnx_path), providers=_select_providers(device)
-        )
+        providers = _select_providers(device)
+        # Make each requested provider's native libraries discoverable
+        # *before* asking onnxruntime to load them - see
+        # runtime_providers.py's module docstring for why this can't be
+        # left implicit (it used to be, and CUDA only worked by accident).
+        for provider in providers:
+            ensure_provider_discoverable(provider)
+        self._session: "ort.InferenceSession" = ort.InferenceSession(str(onnx_path), providers=providers)
         self._input_name = self._session.get_inputs()[0].name
+        _print_runtime_diagnostic(self._session, ort)
 
     def supports(self, coco_label: int) -> bool:
         """Birds only, exactly like SuperAnimal-Bird - the model was

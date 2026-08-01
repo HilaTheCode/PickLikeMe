@@ -229,12 +229,94 @@ def test_recent_folders_are_persisted_in_qsettings(tmp_path) -> None:
     service = ReviewService(db_path=tmp_path / "annotations.sqlite")
     window = MainWindow(state=state, settings=settings, service=service, worker_manager=WorkerManager())
 
-    window._save_recent_folder(str(tmp_path / "one"))
-    window._save_recent_folder(str(tmp_path / "two"))
+    window._recent_folders_menu.remember(str(tmp_path / "one"))
+    window._recent_folders_menu.remember(str(tmp_path / "two"))
 
     persisted = window._settings.value("recent_folders", [])
     assert persisted[0] == str((tmp_path / "two").resolve())
     assert persisted[1] == str((tmp_path / "one").resolve())
+
+    window.close()
+    service.close()
+    app.quit()
+
+
+@pytest.mark.skipif(QApplication is None, reason="PySide6 not installed")
+def test_recent_folders_menu_keeps_only_the_five_most_recent(tmp_path) -> None:
+    app = QApplication.instance() or QApplication([])
+    state = ApplicationState()
+    settings = DesktopSettings()
+    service = ReviewService(db_path=tmp_path / "annotations.sqlite")
+    window = MainWindow(state=state, settings=settings, service=service, worker_manager=WorkerManager())
+
+    for i in range(8):
+        window._recent_folders_menu.remember(str(tmp_path / f"folder-{i}"))
+
+    assert len(window._recent_folders_menu.items()) == 5
+    assert window._recent_folders_menu.items()[0] == str((tmp_path / "folder-7").resolve())
+
+    window.close()
+    service.close()
+    app.quit()
+
+
+@pytest.mark.skipif(QApplication is None, reason="PySide6 not installed")
+def test_opening_a_missing_recent_folder_warns_and_removes_it(tmp_path, monkeypatch) -> None:
+    app = QApplication.instance() or QApplication([])
+    state = ApplicationState()
+    settings = DesktopSettings()
+    service = ReviewService(db_path=tmp_path / "annotations.sqlite")
+    window = MainWindow(state=state, settings=settings, service=service, worker_manager=WorkerManager())
+
+    missing_folder = str(tmp_path / "gone")
+    window._recent_folders_menu.remember(missing_folder)
+
+    # See the sibling test above for why QMessageBox.warning must be stubbed
+    # under the offscreen test platform.
+    warnings: list[tuple] = []
+    monkeypatch.setattr(
+        "picklikeme.desktop.main_window.QMessageBox.warning",
+        staticmethod(lambda *a, **k: warnings.append(a)),
+    )
+    opened: list[str] = []
+    monkeypatch.setattr(window, "_start_open_folder", lambda folder: opened.append(folder))
+
+    window._open_recent_folder(missing_folder)
+
+    assert opened == []  # never attempted to open a folder that isn't there
+    assert len(warnings) == 1
+    assert missing_folder not in window._recent_folders_menu.items()
+
+    window.close()
+    service.close()
+    app.quit()
+
+
+@pytest.mark.skipif(QApplication is None, reason="PySide6 not installed")
+def test_opening_an_existing_recent_folder_opens_it_without_warning(tmp_path, monkeypatch) -> None:
+    app = QApplication.instance() or QApplication([])
+    state = ApplicationState()
+    settings = DesktopSettings()
+    service = ReviewService(db_path=tmp_path / "annotations.sqlite")
+    window = MainWindow(state=state, settings=settings, service=service, worker_manager=WorkerManager())
+
+    real_folder = tmp_path / "shoot"
+    real_folder.mkdir()
+    window._recent_folders_menu.remember(str(real_folder))
+
+    warnings: list[tuple] = []
+    monkeypatch.setattr(
+        "picklikeme.desktop.main_window.QMessageBox.warning",
+        staticmethod(lambda *a, **k: warnings.append(a)),
+    )
+    opened: list[str] = []
+    monkeypatch.setattr(window, "_start_open_folder", lambda folder: opened.append(folder))
+
+    window._open_recent_folder(str(real_folder))
+
+    assert opened == [str(real_folder)]
+    assert warnings == []
+    assert str(real_folder) in window._recent_folders_menu.items()
 
     window.close()
     service.close()

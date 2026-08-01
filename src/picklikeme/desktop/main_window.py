@@ -37,6 +37,7 @@ from .core.caching import CacheManager
 from .core.events import EventBus
 from .core.jobs import JobManager, JobSpec, run_in_background as _real_run_in_background
 from .core.thumbnail_loader import ThumbnailLoadTask, ThumbnailReadySignal
+from .widgets.recent_items import DEFAULT_RECENT_ITEMS_LIMIT, RecentItemsMenu
 
 run_in_background = _real_run_in_background
 from .dialogs.loupe_dialog import LoupeDialog
@@ -178,8 +179,6 @@ class MainWindow(QMainWindow):
         self._folder_load_dialog: QProgressDialog | None = None
         self._folder_load_cancelled = False
         self._folder_load_snapshot: dict[str, Any] | None = None
-        self._recent_folders: list[str] = []
-        self._recent_folder_actions: list[QAction] = []
 
         # Thumbnails decode off the UI thread (see core/thumbnail_loader.py);
         # this signal is how a finished background decode gets back to the
@@ -242,8 +241,6 @@ class MainWindow(QMainWindow):
         self._color_combo.currentIndexChanged.connect(self._on_color_source_changed)
 
         self._build_ui()
-        self._load_recent_folders()
-        self._refresh_recent_folders_menu()
 
     def _build_ui(self) -> None:
         self.setWindowTitle("PeakPic Desktop")
@@ -414,8 +411,15 @@ class MainWindow(QMainWindow):
         file_menu = menu_bar.addMenu("File")
         file_menu.addAction(self._open_action)
         self._recent_menu = file_menu.addMenu("Recent Folders")
-        self._recent_menu.setEnabled(False)
-        self._refresh_recent_folders_menu()
+        self._recent_folders_menu = RecentItemsMenu(
+            self._recent_menu,
+            self._settings,
+            settings_key="recent_folders",
+            on_select=self._open_recent_folder,
+            empty_label="No recent folders yet",
+            clear_label="Clear Recent Folders",
+            limit=DEFAULT_RECENT_ITEMS_LIMIT,
+        )
         file_menu.addSeparator()
         file_menu.addAction(self._import_action)
         file_menu.addSeparator()
@@ -579,56 +583,23 @@ class MainWindow(QMainWindow):
         self.state.status_message = "Desktop shell ready"
         self._status_label.setText("Ready")
         self._status_message_label.setText(self.state.status_message)
-        self._load_recent_folders()
-        self._refresh_recent_folders_menu()
+        self._recent_folders_menu.reload()
 
     # -- folder loading, with a progress indicator while it runs ------------
 
-    def _load_recent_folders(self) -> None:
-        raw = self._settings.value("recent_folders", [])
-        if isinstance(raw, str):
-            raw = [raw]
-        self._recent_folders = [folder for folder in raw if isinstance(folder, str) and folder]
-        self._recent_folders = list(dict.fromkeys(self._recent_folders))
-
-    def _save_recent_folder(self, folder: str) -> None:
-        normalized = str(Path(folder).resolve())
-        self._recent_folders = [entry for entry in self._recent_folders if entry != normalized]
-        self._recent_folders.insert(0, normalized)
-        self._recent_folders = self._recent_folders[:10]
-        self._settings.setValue("recent_folders", self._recent_folders)
-        self._refresh_recent_folders_menu()
-
-    def _refresh_recent_folders_menu(self) -> None:
-        if not hasattr(self, "_recent_menu"):
+    def _open_recent_folder(self, folder: str) -> None:
+        """Click handler for a Recent Folders entry. A folder can vanish
+        between being remembered and being reopened - moved, renamed, or on
+        a drive that isn't mounted right now - so this checks before handing
+        off to _start_open_folder, rather than letting that fail deeper in
+        the stack with a less useful error."""
+        if not Path(folder).is_dir():
+            self._recent_folders_menu.remove(folder)
+            QMessageBox.warning(
+                self, "PeakPic - Open Folder", f"This folder could no longer be found:\n{folder}"
+            )
             return
-        for action in self._recent_folder_actions:
-            self._recent_menu.removeAction(action)
-            action.deleteLater()
-        self._recent_folder_actions = []
-        if self._recent_folders:
-            self._recent_menu.setEnabled(True)
-            for folder in self._recent_folders:
-                action = QAction(folder, self)
-                action.triggered.connect(lambda checked=False, selected=folder: self._start_open_folder(str(selected)))
-                self._recent_menu.addAction(action)
-                self._recent_folder_actions.append(action)
-            clear_action = QAction("Clear Recent Folders", self)
-            clear_action.triggered.connect(self._clear_recent_folders)
-            self._recent_menu.addSeparator()
-            self._recent_menu.addAction(clear_action)
-            self._recent_folder_actions.append(clear_action)
-        else:
-            self._recent_menu.setEnabled(False)
-            action = QAction("No recent folders yet", self)
-            action.setEnabled(False)
-            self._recent_menu.addAction(action)
-            self._recent_folder_actions.append(action)
-
-    def _clear_recent_folders(self) -> None:
-        self._recent_folders = []
-        self._settings.setValue("recent_folders", [])
-        self._refresh_recent_folders_menu()
+        self._start_open_folder(folder)
 
     def _default_folder_for_dialog(self) -> str:
         last_folder = self._settings.value("last_opened_folder", "")
@@ -717,7 +688,7 @@ class MainWindow(QMainWindow):
             self._finish_open_folder(generation)
             return self.service.load_session()
 
-        self._save_recent_folder(folder_path)
+        self._recent_folders_menu.remember(folder_path)
         self.state.current_folder = result.get("input_folder") or self.state.current_folder
         self.state.image_count = result.get("counts", {}).get("total", 0)
         self._refresh_from_state(result)

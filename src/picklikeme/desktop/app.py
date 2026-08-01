@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QApplication
 
 from .application import ApplicationState, WorkerManager
@@ -25,15 +26,23 @@ class DesktopApplication:
 
     def __init__(self, *, db_path: str | Path | None = None) -> None:
         self._app = QApplication.instance() or QApplication([])
-        # Belt-and-suspenders app identification: every dialog that shows a
-        # title bar sets its own explicit setWindowTitle() (the actual fix
-        # for windows that were showing "python" - QProgressDialog's first
-        # constructor argument is its label text, not a window title, and
-        # was never given one), but naming the application itself is still
-        # the correct Qt practice for OS-level identification (taskbar
-        # grouping, Alt-Tab, crash dialogs) independent of that.
+
+        # ------------------------------------------------------------------
+        # Application icon
+        # ------------------------------------------------------------------
+        project_root = Path(__file__).resolve().parents[2]
+        icon_path = project_root / "assets" / "peakpic.ico"
+
+        if icon_path.exists():
+            icon = QIcon(str(icon_path))
+            self._app.setWindowIcon(icon)
+
+        # ------------------------------------------------------------------
+        # Application identity
+        # ------------------------------------------------------------------
         self._app.setApplicationName("PeakPic")
         self._app.setApplicationDisplayName("PeakPic Desktop")
+
         self.state = ApplicationState()
         self.service = ReviewService(db_path=db_path)
         self.settings = SettingsStore()
@@ -41,6 +50,7 @@ class DesktopApplication:
         self.event_bus = EventBus()
         self.cache_manager = CacheManager()
         self.job_manager = JobManager()
+
         self.window = MainWindow(
             state=self.state,
             settings=self.settings.settings,
@@ -50,6 +60,10 @@ class DesktopApplication:
             cache_manager=self.cache_manager,
             job_manager=self.job_manager,
         )
+
+        # Give the main window the same icon
+        if icon_path.exists():
+            self.window.setWindowIcon(icon)
 
     def initialize(self) -> None:
         self.window.initialize()
@@ -65,7 +79,7 @@ class DesktopApplication:
             self.initialize()
             logger.info("Desktop application ready")
             return self._app.exec()
-        except Exception as exc:  # noqa: BLE001 - unexpected exceptions must not kill the app shell
+        except Exception as exc:  # noqa: BLE001
             logger.exception("Desktop application failed: %s", exc)
             return 1
         finally:
