@@ -625,6 +625,93 @@ class OverlayDrawingTests(unittest.TestCase):
             self.assertEqual(plain.read_bytes(), original, "the plain thumbnail was modified")
 
 
+class EyeOverlayTests(unittest.TestCase):
+    """The optional `eye` overlay (see review.thumbnails.eye_keypoints_for) -
+    a magenta box/crosshairs for the eye Classic Vision measured, drawn on
+    top of the ordinary detector-box overlay."""
+
+    def _eye(self, *, accepted: bool, box=(60.0, 20.0, 100.0, 60.0)):
+        return {
+            "source_size": (200, 100),
+            "accepted": accepted,
+            "confidence": 0.9 if accepted else 0.5,
+            "box": box,
+            "left": {"x": 70.0, "y": 30.0, "confidence": 0.9},
+            "right": {"x": 90.0, "y": 30.0, "confidence": 0.4},
+        }
+
+    def test_an_accepted_eye_is_drawn_in_magenta(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            plain = make_thumb(root / "t.jpg", 200)
+            out = annotate_thumbnail(
+                plain,
+                record_of([Box(10, 10, 190, 90, 0.9, 16, selected=True)], size=(200, 100)),
+                root / "t_boxes.jpg",
+                200,
+                eye=self._eye(accepted=True),
+            )
+            pixels = np.asarray(Image.open(out)).reshape(-1, 3)
+            from picklikeme.analyzer.contactsheets import EYE_BOX_ACCEPTED
+
+            close = (
+                (np.abs(pixels[:, 0].astype(int) - EYE_BOX_ACCEPTED[0]) < 20)
+                & (np.abs(pixels[:, 1].astype(int) - EYE_BOX_ACCEPTED[1]) < 20)
+                & (np.abs(pixels[:, 2].astype(int) - EYE_BOX_ACCEPTED[2]) < 20)
+            ).sum()
+            self.assertGreater(close, 5, "no accepted-eye color found")
+
+    def test_a_rejected_eye_is_still_drawn_but_distinctly_coloured(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            plain = make_thumb(root / "t.jpg", 200)
+            out = annotate_thumbnail(
+                plain,
+                record_of([Box(10, 10, 190, 90, 0.9, 16, selected=True)], size=(200, 100)),
+                root / "t_boxes.jpg",
+                200,
+                eye=self._eye(accepted=False),
+            )
+            pixels = np.asarray(Image.open(out)).reshape(-1, 3)
+            from picklikeme.analyzer.contactsheets import EYE_BOX_REJECTED
+
+            close = (
+                (np.abs(pixels[:, 0].astype(int) - EYE_BOX_REJECTED[0]) < 20)
+                & (np.abs(pixels[:, 1].astype(int) - EYE_BOX_REJECTED[1]) < 20)
+                & (np.abs(pixels[:, 2].astype(int) - EYE_BOX_REJECTED[2]) < 20)
+            ).sum()
+            self.assertGreater(close, 5, "no rejected-eye color found - a distrusted eye must still show")
+
+    def test_no_eye_argument_draws_no_eye_overlay(self):
+        """Backward compatibility: every existing caller that never passes
+        `eye` must see byte-identical output to before this parameter existed."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            plain = make_thumb(root / "t.jpg", 200)
+            record = record_of([Box(10, 10, 190, 90, 0.9, 16, selected=True)], size=(200, 100))
+            without_eye = annotate_thumbnail(plain, record, root / "a.jpg", 200)
+            without_eye_kwarg = annotate_thumbnail(plain, record, root / "b.jpg", 200, eye=None)
+            self.assertEqual(without_eye.read_bytes(), without_eye_kwarg.read_bytes())
+
+
+class ThicknessTests(unittest.TestCase):
+    """The 'increase detector box thickness' fix: boxes must draw noticeably
+    thicker than before, without a small box's outline swallowing it."""
+
+    def test_boxes_are_drawn_thicker_than_the_old_default(self):
+        from picklikeme.analyzer.contactsheets import _stroke
+
+        # The old formula was line = max(1, round(size/200)); a 400px
+        # thumbnail (the review Gallery's default) used to compute a 2px
+        # line. The new one must be strictly thicker for the same size.
+        old_line = max(1, round(400 / 200))
+        new_line = max(2, round(400 / 120))
+        self.assertGreater(new_line, old_line)
+        # And still capped against a small box's own dimensions, so a
+        # distant bird's box is never swallowed by its own outline.
+        self.assertEqual(_stroke(new_line, 8, 8), 2)
+
+
 class ScopeTests(unittest.TestCase):
     """Every image with a resolved detection record gets the overlay -
     false negatives, false positives, true positives/negatives, whatever

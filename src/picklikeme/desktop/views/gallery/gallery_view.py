@@ -81,6 +81,13 @@ class GalleryView(QListView):
         self._empty_message = message
         self.viewport().update()
 
+    def set_color_source(self, strategy_id: str | None, score_range: tuple[float, float] | None) -> None:
+        """Tint every card's background by `strategy_id`'s own score
+        instead of by review status - see MainWindow.color_source_options.
+        `None` restores the default (review-status) coloring."""
+        self._delegate.set_color_source(strategy_id, score_range)
+        self.viewport().update()
+
     def paintEvent(self, event) -> None:  # noqa: N802 - Qt override signature
         super().paintEvent(event)
         model = self.model()

@@ -28,13 +28,22 @@ class ThumbnailCardDelegate(QAbstractItemDelegate):
     # line without eliding - narrower cards truncated the score text
     # noticeably often.
     CARD_WIDTH = 220
-    CARD_HEIGHT = 252
     THUMBNAIL_SIZE = 160
     PADDING = 8
     SPACING = 4
     CORNER_RADIUS = 8
     BUTTON_HEIGHT = 24
     BUTTON_GAP = 4
+
+    # One line per analysis module's score. Cards are a fixed size (the view
+    # is a uniform grid), so the height reserves room for this many rows and
+    # `_score_rows` shows at most that many - a card cannot grow taller for
+    # one image without every card growing, and a folder scored by an unusual
+    # number of modules must not push the buttons off the bottom.
+    SCORE_ROW_HEIGHT = 15
+    MAX_SCORE_ROWS = 3
+    # 252 was the height with a single score row; the rest is the extra rows.
+    CARD_HEIGHT = 252 + (MAX_SCORE_ROWS - 1) * SCORE_ROW_HEIGHT
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -47,6 +56,15 @@ class ThumbnailCardDelegate(QAbstractItemDelegate):
         self._button_font = QFont()
         self._button_font.setPointSize(9)
         self._button_font.setBold(True)
+        # None (the default) means "tint by review status" - see
+        # MainWindow.color_source_options. Otherwise a strategy id whose
+        # score tints the background instead; set via set_color_source.
+        self._color_source: str | None = None
+        self._score_range: tuple[float, float] | None = None
+
+    def set_color_source(self, strategy_id: str | None, score_range: tuple[float, float] | None) -> None:
+        self._color_source = strategy_id
+        self._score_range = score_range
 
     def sizeHint(self, option, index) -> QSize:  # noqa: ARG002
         return QSize(self.CARD_WIDTH, self.CARD_HEIGHT)
@@ -146,7 +164,8 @@ class ThumbnailCardDelegate(QAbstractItemDelegate):
         elided_name = QFontMetrics(self._name_font).elidedText(item.display_name, Qt.TextElideMode.ElideRight, text_rect.width())
         painter.drawText(text_rect, Qt.AlignmentFlag.AlignVCenter, elided_name)
 
-        # Score/rank (left) and AI-suggestion pill (right) on one line.
+        # One line per analysis module's score, the first of which also
+        # carries the AI-suggestion pill on its right.
         # moveTop(), not setY(): QRect.setY() moves the top edge while
         # holding the *bottom* edge fixed (it's meant for resizing a rect
         # from its top, not translating one) - it collapsed this row's
@@ -154,34 +173,90 @@ class ThumbnailCardDelegate(QAbstractItemDelegate):
         # moveTop() translates the whole rect and preserves its size.
         score_rect = QRect(text_rect)
         score_rect.moveTop(score_rect.y() + 19)
-        self._draw_score_and_ai_badge(painter, palette, score_rect, item)
+        for row, (label, text) in enumerate(self._score_rows(item)):
+            row_rect = QRect(score_rect)
+            row_rect.moveTop(score_rect.y() + row * self.SCORE_ROW_HEIGHT)
+            self._draw_score_row(painter, palette, row_rect, label, text, item, badge=row == 0)
 
         # Keep/Reject/Neutral buttons
         self._draw_buttons(painter, palette, card_rect, item)
 
         painter.restore()
 
-    def _draw_score_and_ai_badge(self, painter: QPainter, palette: theme.Palette, rect: QRect, item) -> None:
-        parts = []
-        if item.score is not None:
-            parts.append(f"Score {item.score:.4f}")
-        if item.rank is not None:
-            parts.append(f"Rank {item.rank}")
-        score_text = " · ".join(parts) if parts else "Unranked"
+    @staticmethod
+    def _score_rows(item) -> list[tuple[str, str]]:
+        """(label, text) per analysis module that either scored this image
+        or explicitly filtered it out.
 
+        Driven entirely by what is in `item.ranking_results`/`.filter_reasons`,
+        so a future module shows up without touching this delegate. Labels
+        come from the ranking registry when it knows the strategy, and fall
+        back to the raw id when it does not - a folder scored by a module
+        PeakPic no longer ships still displays its numbers rather than
+        dropping them. A module that FILTERED this image (no score, but a
+        recorded reason - see `ranking.classic`'s filter phase) shows that
+        reason instead of being silently omitted, e.g. "Classic: No visible
+        eye" - the at-a-glance answer to "why isn't this ranked".
+
+        An image nothing has scored or filtered yields one "Unranked" row,
+        so the card keeps a consistent shape instead of the filename jumping
+        down.
+        """
+        from ....ranking import score_labels
+        from ....ranking.filters import REJECT_REASON_LABELS
+
+        labels = score_labels()
+        strategy_ids = set(item.ranking_results) | set(item.filter_reasons)
+        rows: list[tuple[str, str]] = []
+        for strategy_id in sorted(strategy_ids, key=lambda sid: (sid != "ai-model", sid)):
+            entry = item.ranking_results.get(strategy_id) or {}
+            score = entry.get("score")
+            label = labels.get(strategy_id, strategy_id)
+            if score is not None:
+                rank = entry.get("rank")
+                text = f"{score:.4f}" + (f" · #{rank}" if rank else "")
+            else:
+                reason = item.filter_reasons.get(strategy_id)
+                if reason is None:
+                    continue
+                text = REJECT_REASON_LABELS.get(reason, reason)
+            rows.append((label, text))
+            if len(rows) == ThumbnailCardDelegate.MAX_SCORE_ROWS:
+                break
+        return rows or [("", "Unranked")]
+
+    def _draw_score_row(
+        self, painter: QPainter, palette: theme.Palette, rect: QRect,
+        label: str, text: str, item, *, badge: bool,
+    ) -> None:
         painter.setFont(self._small_font)
-        painter.setPen(QColor(palette.text_muted))
         metrics = QFontMetrics(self._small_font)
 
         ai_text = ""
-        if item.ai_suggestion and item.ai_suggestion != item.review_status:
+        if badge and item.ai_suggestion and item.ai_suggestion != item.review_status:
             ai_text = f"AI {item.ai_suggestion.capitalize()}"
         ai_width = metrics.horizontalAdvance(ai_text) + 14 if ai_text else 0
 
         score_box = QRect(rect)
         score_box.setWidth(max(0, rect.width() - ai_width - (6 if ai_text else 0)))
-        elided_score = metrics.elidedText(score_text, Qt.TextElideMode.ElideRight, score_box.width())
-        painter.drawText(score_box, Qt.AlignmentFlag.AlignVCenter, elided_score)
+
+        # The module's name in the accent colour and its number in the muted
+        # one, so several stacked rows stay scannable - which module a score
+        # belongs to is the thing being read, not the digits.
+        label_width = 0
+        if label:
+            painter.setPen(QColor(palette.accent))
+            label_text = f"{label} "
+            label_width = metrics.horizontalAdvance(label_text)
+            painter.drawText(score_box, Qt.AlignmentFlag.AlignVCenter, label_text)
+
+        value_box = QRect(score_box)
+        value_box.setX(value_box.x() + label_width)
+        painter.setPen(QColor(palette.text_muted))
+        painter.drawText(
+            value_box, Qt.AlignmentFlag.AlignVCenter,
+            metrics.elidedText(text, Qt.TextElideMode.ElideRight, max(0, value_box.width())),
+        )
 
         if ai_text:
             pill_rect = QRect(rect.right() - ai_width, rect.y(), ai_width, rect.height())
@@ -213,8 +288,9 @@ class ThumbnailCardDelegate(QAbstractItemDelegate):
                 painter.setPen(QColor(palette.text_muted))
             painter.drawText(btn_rect, Qt.AlignmentFlag.AlignCenter, STATUS_SYMBOLS[status])
 
-    @staticmethod
-    def _get_background_color(palette: theme.Palette, item, is_hovered: bool) -> QColor:
+    def _get_background_color(self, palette: theme.Palette, item, is_hovered: bool) -> QColor:
+        if self._color_source is not None:
+            return self._score_background_color(palette, item, is_hovered)
         if item.review_status == "keep":
             return QColor(palette.keep_bg)
         if item.review_status == "reject":
@@ -222,6 +298,24 @@ class ThumbnailCardDelegate(QAbstractItemDelegate):
         if is_hovered:
             return QColor(palette.hover_bg)
         return QColor(palette.neutral_bg)
+
+    def _score_background_color(self, palette: theme.Palette, item, is_hovered: bool) -> QColor:
+        """A low-to-high gradient (reject color -> keep color) across
+        `self._score_range`, for scanning a strategy's ranking at a glance
+        without sorting by it. An image that strategy never scored - never
+        ran, or filtered it out - falls back to the plain neutral/hover
+        color, same as an unranked image does in the default coloring."""
+        score = item.score_for(self._color_source)
+        if score is None or self._score_range is None:
+            return QColor(palette.hover_bg) if is_hovered else QColor(palette.neutral_bg)
+        low, high = self._score_range
+        fraction = 0.5 if high - low <= 1e-12 else max(0.0, min(1.0, (score - low) / (high - low)))
+        low_color, high_color = QColor(palette.reject_bg), QColor(palette.keep_bg)
+        return QColor(
+            round(low_color.red() + (high_color.red() - low_color.red()) * fraction),
+            round(low_color.green() + (high_color.green() - low_color.green()) * fraction),
+            round(low_color.blue() + (high_color.blue() - low_color.blue()) * fraction),
+        )
 
     @staticmethod
     def _status_color(palette: theme.Palette, status: str) -> QColor:

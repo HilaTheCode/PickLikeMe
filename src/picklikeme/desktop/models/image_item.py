@@ -2,16 +2,16 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+
+from ...sidecar import AI_STRATEGY_ID
 
 
 @dataclass(slots=True)
 class ImageItem:
     path: str
     file_name: str
-    rank: int | None = None
-    score: float | None = None
     review_status: str = "neutral"
     ai_suggestion: str | None = None
     selected: bool = False
@@ -20,7 +20,53 @@ class ImageItem:
     # in chronological order, so gallery sort-by-capture-time needs no
     # date parsing.
     captured_at: str | None = None
+    # Every analysis module's result for this image, keyed by strategy id -
+    # {"ai-model": {"score": .., "rank": ..}, "classic-vision": {...}}. The
+    # UI-side mirror of ReviewImage.ranking_results: score and rank always
+    # belong together as properties of ONE strategy, never a separate global
+    # pair. A new module appears here automatically, which is why the gallery
+    # card and the Loupe iterate this rather than naming the two that exist
+    # today.
+    ranking_results: dict[str, dict] = field(default_factory=dict)
+    # The UI-side mirror of ReviewImage.filter_reasons - why a strategy did
+    # NOT score this image, keyed by strategy id -> reason (e.g.
+    # {"classic-vision": "NO_VISIBLE_EYE"}). Empty for an image nothing has
+    # filtered, even if nothing has scored it either - those are simply two
+    # different kinds of "unranked".
+    filter_reasons: dict[str, str] = field(default_factory=dict)
+    # The UI-side mirror of ReviewImage.metrics - a strategy's raw
+    # per-metric measurements, keyed by strategy id ->
+    # {metric_name: value}, for a diagnostics display of what its combined
+    # score was actually made of.
+    metrics: dict[str, dict[str, float]] = field(default_factory=dict)
 
     @property
     def display_name(self) -> str:
         return Path(self.path).name if self.path else self.file_name
+
+    @property
+    def score(self) -> float | None:
+        """The AI model's own score - see ReviewImage.score for why this
+        stays a fixed name rather than "whichever module ran last": the
+        AI cutoff, the AI-suggestion filters and the default sort are all
+        defined against this specific strategy's ordering."""
+        return self.score_for(AI_STRATEGY_ID)
+
+    @property
+    def rank(self) -> int | None:
+        """The AI model's own rank - see `score`."""
+        return self.rank_for(AI_STRATEGY_ID)
+
+    def score_for(self, strategy_id: str) -> float | None:
+        entry = self.ranking_results.get(strategy_id) or {}
+        return entry.get("score")
+
+    def rank_for(self, strategy_id: str) -> int | None:
+        entry = self.ranking_results.get(strategy_id) or {}
+        return entry.get("rank")
+
+    def reason_for(self, strategy_id: str) -> str | None:
+        """Why `strategy_id` did not score this image, or None if it was
+        never filtered by that strategy (it may simply never have run, or it
+        may have scored this image just fine - see `score_for`)."""
+        return self.filter_reasons.get(strategy_id)

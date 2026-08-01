@@ -212,6 +212,13 @@ def review_thumbnail(
     plain one, so the page can toggle between them without either being
     rebuilt. Falls back to the plain thumbnail when the image has no recorded
     detections, which is the honest answer: there are no boxes to draw.
+
+    Also draws the eye detector's result (see `eye_keypoints_for`) when
+    Classic Vision has run on this image. The overlaid file's own cache key
+    reflects whether eye data was available (see
+    `contactsheets.annotated_thumbnail_path`'s `has_eye`), so a folder
+    toggled to Detector Boxes before its first Classic Vision run does not
+    keep serving a stale, eye-less copy back once one exists.
     """
     from ..analyzer.contactsheets import annotate_thumbnail, annotated_thumbnail_path, build_thumbnail
 
@@ -220,7 +227,8 @@ def review_thumbnail(
     if plain is None or not with_boxes:
         return plain
 
-    overlaid = annotated_thumbnail_path(cache_dir, image_path, size)
+    eye = eye_keypoints_for(image_path)
+    overlaid = annotated_thumbnail_path(cache_dir, image_path, size, has_eye=eye is not None)
     if overlaid.exists():
         return overlaid
 
@@ -230,7 +238,7 @@ def review_thumbnail(
         logger.debug("No detections for %s: %s", image_path, exc)
         return plain
 
-    return annotate_thumbnail(plain, record, overlaid, size) or plain
+    return annotate_thumbnail(plain, record, overlaid, size, eye=eye) or plain
 
 
 def detected_category_for(image_path: str) -> str | None:
@@ -280,3 +288,64 @@ def close_detections() -> None:
     if _detection_cache is not None:
         _detection_cache.close()
         _detection_cache = None
+
+
+def eye_keypoints_for(image_path: str, *, crop_cache_dir: str | Path | None = None) -> dict | None:
+    """A Classic Vision run's eye-detector result for one image, in
+    full-frame pixel coordinates - the same read-only shape
+    `detection_boxes_for` returns, for a caller (the Gallery overlay, the
+    Loupe) that wants to draw the eye box and both raw left/right keypoints
+    alongside the subject box.
+
+    None when Classic Vision has never run on this image (no cached eye
+    record - see `eyes.cache`) or there is no recorded subject box to map it
+    against. Review must never run the eye detector itself, only ever read
+    what an earlier Classic Vision run already computed - the same rule
+    `detection_boxes_for` and `detected_category_for` already follow.
+
+    The eye record's box/keypoints are in the subject CROP's own pixel
+    space (see `eyes.detector.EyeDetection`'s docstring), so they are
+    rescaled here onto the subject's full-frame box using the crop size the
+    record itself carries (`EyeRecord.subject_crop_size`) - the same
+    scale-and-offset trick `contactsheets.annotate_thumbnail` already uses
+    for the subject box itself, just composed with one extra box.
+    """
+    from ..eyes.cache import read_eye_detection
+
+    eye = read_eye_detection(crop_cache_dir or DEFAULT_CROP_CACHE_DIR, image_path)
+    if eye is None:
+        return None
+    try:
+        record = _detections().get(image_path, allow_detect=False)
+    except Exception as exc:  # noqa: BLE001 - an unreadable cache is not fatal
+        logger.debug("No detections for %s: %s", image_path, exc)
+        return None
+    subject = record.selected
+    if subject is None or record.source_size is None:
+        return None
+    crop_width, crop_height = eye.subject_crop_size
+    if crop_width <= 0 or crop_height <= 0:
+        return None
+
+    scale_x = (subject.x2 - subject.x1) / crop_width
+    scale_y = (subject.y2 - subject.y1) / crop_height
+
+    def to_frame(x: float, y: float) -> tuple[float, float]:
+        return (subject.x1 + x * scale_x, subject.y1 + y * scale_y)
+
+    def keypoint_dict(keypoint) -> dict | None:
+        if keypoint is None:
+            return None
+        x, y = to_frame(keypoint.x, keypoint.y)
+        return {"x": x, "y": y, "confidence": keypoint.confidence}
+
+    x1, y1 = to_frame(eye.box[0], eye.box[1])
+    x2, y2 = to_frame(eye.box[2], eye.box[3])
+    return {
+        "source_size": record.source_size,
+        "accepted": eye.accepted,
+        "confidence": eye.confidence,
+        "box": (x1, y1, x2, y2),
+        "left": keypoint_dict(eye.left),
+        "right": keypoint_dict(eye.right),
+    }

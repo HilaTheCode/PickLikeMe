@@ -639,11 +639,18 @@ def write_results_csv(
     if rows_per_file <= 0:
         rows_per_file = max_rows
 
+    # An empty `ranked` still writes one header-only file, so this always
+    # returns at least one path. Unreachable from training or from
+    # `rank.rank_folder` (both refuse an empty dataset before getting here),
+    # but an ANALYSIS module can legitimately score nothing - Classic Vision
+    # filters images out, and a folder of subjects it cannot judge leaves it
+    # with zero rows. "Ran, and found nothing to score" is a real result that
+    # deserves a file recording it; returning no path at all just moved the
+    # failure to whoever indexed [0] of the result.
+    chunks = [ranked[i : i + rows_per_file] for i in range(0, len(ranked), rows_per_file)] or [[]]
+
     row_count = 0
-    for file_index, chunk in enumerate(
-        [ranked[i : i + rows_per_file] for i in range(0, len(ranked), rows_per_file)],
-        start=0,
-    ):
+    for file_index, chunk in enumerate(chunks, start=0):
         target_path = output if file_index == 0 else output.with_name(f"{output.stem}_{file_index}{output.suffix}")
         with target_path.open("w", newline="", encoding="utf-8") as handle:
             writer = csv.writer(handle)

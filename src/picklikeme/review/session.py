@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import logging
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from ..analyzer.annotations import REVIEW_KEEP, REVIEW_REASON_OTHER, REVIEW_REJECT, AnnotationStore
@@ -38,7 +38,7 @@ from ..organize import (
     selection_count,
     validate_selection_percentage,
 )
-from ..sidecar import ranking_path, read_run_metadata, rewrite_ranking_paths
+from ..sidecar import AI_STRATEGY_ID, ranking_path, read_run_metadata, rewrite_ranking_paths
 
 logger = logging.getLogger(__name__)
 
@@ -63,10 +63,37 @@ class ReviewImage:
 
     image_path: str
     filename: str
-    # AI metadata - read-only, never written by this application, never
-    # affected by anything the photographer does in it.
-    score: float | None = None
-    rank: int | None = None
+    # Every analysis module's result for this image, keyed by strategy id -
+    # {"ai-model": {"score": .., "rank": ..}, "classic-vision": {"score": .., "rank": ..}}.
+    # Score and rank always belong together as properties of ONE strategy;
+    # there is deliberately no single global rank anywhere in this class -
+    # "ranked" only ever means "ranked BY something", and `rank` always means
+    # "this strategy's position in its own ordering". Independent results
+    # that coexist: running one module never clears another's, and a module
+    # PeakPic no longer ships still displays whatever it left behind. Purely
+    # informational, read-only, never written by this application beyond
+    # `_load_ranked` populating it from disk.
+    ranking_results: dict[str, dict] = field(default_factory=dict)
+    # Why a strategy did NOT score this image, keyed by strategy id -
+    # {"classic-vision": "NO_VISIBLE_EYE"}. An image can be filtered by one
+    # strategy and scored by another at the same time, so this is a sibling
+    # dict to ranking_results rather than a single flag: absence from BOTH
+    # dicts for a strategy means that strategy has simply never run on this
+    # folder, while presence here with no matching ranking_results entry
+    # means it ran and explicitly excluded this image (see
+    # `ranking.classic`'s filter phase and `sidecar.discover_filter_reports`).
+    # Purely informational, exactly like ranking_results - never written by
+    # this application beyond `_load_ranked` populating it from disk.
+    filter_reasons: dict[str, str] = field(default_factory=dict)
+    # A strategy's raw, per-metric measurements for this image, keyed by
+    # strategy id -> {metric_name: value} - e.g.
+    # {"classic-vision": {"eye_sharpness": 0.8, "subject_size": 0.02, ...}}.
+    # The breakdown behind a single combined score (see
+    # `ranking.classic.write_metrics_report`), for a diagnostics display -
+    # "why did this image rank where it did" needs the individual numbers a
+    # weighted sum otherwise hides. Purely informational, exactly like
+    # ranking_results/filter_reasons.
+    metrics: dict[str, dict[str, float]] = field(default_factory=dict)
     # The file's own EXIF capture date/time (ISO-8601), or None if it has
     # none - a sort key, nothing more. See AnnotationStore.capture_timestamp_of.
     captured_at: str | None = None
@@ -90,6 +117,23 @@ class ReviewImage:
     missing_file: bool = False
 
     @property
+    def score(self) -> float | None:
+        """The AI model's own score - never "whichever module scored this
+        last". Computed from `ranking_results`, not stored separately, so
+        there is exactly one place per image where a strategy's score can
+        live. The AI-suggestion threshold, `cut`, and every agreement
+        statistic below are defined against this specific strategy's
+        ordering, which is why it keeps its own name instead of becoming
+        "the most recent score" - see the class docstring.
+        """
+        return (self.ranking_results.get(AI_STRATEGY_ID) or {}).get("score")
+
+    @property
+    def rank(self) -> int | None:
+        """The AI model's own rank - see `score`."""
+        return (self.ranking_results.get(AI_STRATEGY_ID) or {}).get("rank")
+
+    @property
     def is_ranked(self) -> bool:
         return self.score is not None
 
@@ -104,8 +148,15 @@ class ReviewImage:
         return {
             "image_path": self.image_path,
             "filename": self.filename,
+            # Kept at the top level for backward compatibility (the web
+            # review UI and existing tests read these directly) - always the
+            # AI model's own score/rank, exactly what they were before
+            # ranking_results existed. See the `score`/`rank` properties.
             "score": self.score,
             "rank": self.rank,
+            "ranking_results": self.ranking_results,
+            "filter_reasons": self.filter_reasons,
+            "metrics": self.metrics,
             "captured_at": self.captured_at,
             "detected_category": self.detected_category,
             "review_status": self.review_status,
@@ -209,6 +260,8 @@ class ReviewSession:
         with self._state_lock:
             self.images = images
 
+        self._apply_filter_reasons()
+        self._apply_metrics()
         self._apply_decisions()
 
         if self._loading_thread is not None and self._loading_thread.is_alive():
@@ -278,33 +331,68 @@ class ReviewSession:
                 self.warnings.append(f"Could not finish loading metadata: {exc}")
             self._set_loading_state("error", "Could not finish loading metadata", 100, False)
 
-    def _load_ranked(self) -> list[ReviewImage]:
-        if not self.ranking_file.is_file():
-            with self._state_lock:
-                self.warnings.append(f"No ranking at {self.ranking_file}; every image starts Neutral.")
-            return []
+    def _read_ranking(self, path: Path) -> dict[str, tuple[float, int, str]]:
+        """One analysis module's scores, keyed by resolved image path.
+
+        Returns `{}` for anything unreadable rather than raising: one broken
+        module's output must not take down a review session, nor prevent the
+        other modules' results from being shown.
+        """
         from ..analyzer.io import load_ranking
 
         try:
-            ranking = load_ranking(self.ranking_file)
+            ranking = load_ranking(path)
         except Exception as exc:  # noqa: BLE001 - a broken ranking must not end the session
-            logger.warning("Could not read %s: %s", self.ranking_file, exc)
+            logger.warning("Could not read %s: %s", path, exc)
             with self._state_lock:
-                self.warnings.append(f"Could not read the ranking ({exc}); every image starts Neutral.")
-            return []
-
+                self.warnings.append(f"Could not read {path.name} ({exc}).")
+            return {}
         with self._state_lock:
             self.warnings.extend(ranking.warnings)
-        return [
-            ReviewImage(
-                image_path=image.image_path,
-                filename=image.filename,
-                score=image.score,
-                rank=image.rank,
-                missing_file=not Path(image.image_path).is_file(),
-            )
+        return {
+            _key(image.image_path): (image.score, image.rank, image.image_path)
             for image in ranking.images
-        ]
+        }
+
+    def _load_ranked(self) -> list[ReviewImage]:
+        """Build the gallery's ranked rows from EVERY analysis module that has
+        scored this folder, not just the trained model.
+
+        Each module owns its own CSV (see `sidecar.discover_strategy_rankings`)
+        and they are merged per image into `ranking_results`, so a folder
+        scored by both carries both results and neither run erased the
+        other. `ReviewImage.score`/`.rank` read the AI model's own entry out
+        of that dict - there is no separate flat field to keep in sync, which
+        is the whole point: one place per image where a strategy's score and
+        rank live together.
+
+        An image that only a non-AI module scored still appears here with
+        that module's entry in `ranking_results` and no "ai-model" entry at
+        all; it shows as Unranked by the AI, which is exactly what it is.
+        """
+        from ..sidecar import discover_strategy_rankings
+
+        rankings = discover_strategy_rankings(self.input_folder)
+        if not rankings:
+            with self._state_lock:
+                self.warnings.append(
+                    f"No analysis results in {self.input_folder}; every image starts Neutral."
+                )
+            return []
+
+        by_key: dict[str, ReviewImage] = {}
+        for strategy_id, path in rankings.items():
+            for key, (score, rank, image_path) in self._read_ranking(path).items():
+                image = by_key.get(key)
+                if image is None:
+                    image = ReviewImage(
+                        image_path=image_path,
+                        filename=Path(image_path).name,
+                        missing_file=not Path(image_path).is_file(),
+                    )
+                    by_key[key] = image
+                image.ranking_results[strategy_id] = {"score": score, "rank": rank}
+        return list(by_key.values())
 
     def _enumerate_folder(self) -> list[Path]:
         """Images actually on disk, including any already filed by a previous
@@ -319,6 +407,48 @@ class ReviewSession:
                 self.warnings.append(str(exc))
             return []
         return [p for p in found if SIDECAR_DIRNAME not in p.parts]
+
+    def _apply_filter_reasons(self) -> None:
+        """Attach each analysis module's filter verdict (if any) to the
+        matching gallery image, by path - mirrors `_apply_decisions` below.
+
+        Runs for every image, not only the ones a ranking CSV produced: an
+        image every registered strategy filtered out (so no module's CSV
+        ever named it) still reaches the gallery through
+        `_enumerate_folder`'s on-disk fallback, and it deserves the same
+        "why was this skipped" a partially-filtered image gets.
+        """
+        from ..sidecar import discover_filter_reports
+
+        reports = discover_filter_reports(self.input_folder)
+        if not reports:
+            return
+        by_key: dict[str, dict[str, str]] = {}
+        for strategy_id, images in reports.items():
+            for image_path, reason in images.items():
+                by_key.setdefault(_key(image_path), {})[strategy_id] = reason
+        for image in self.images:
+            reasons = by_key.get(_key(image.image_path))
+            if reasons:
+                image.filter_reasons = reasons
+
+    def _apply_metrics(self) -> None:
+        """Attach each analysis module's raw per-metric measurements (if
+        any) to the matching gallery image, by path - mirrors
+        `_apply_filter_reasons` above."""
+        from ..sidecar import discover_metric_reports
+
+        reports = discover_metric_reports(self.input_folder)
+        if not reports:
+            return
+        by_key: dict[str, dict[str, dict[str, float]]] = {}
+        for strategy_id, metrics in reports.items():
+            for image_path, values in metrics.items():
+                by_key.setdefault(_key(image_path), {})[strategy_id] = values
+        for image in self.images:
+            values = by_key.get(_key(image.image_path))
+            if values:
+                image.metrics = values
 
     def _apply_decisions(self, store: AnnotationStore | None = None) -> None:
         """Attach stored manual decisions to the gallery.

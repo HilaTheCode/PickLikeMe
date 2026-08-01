@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
     QGraphicsPixmapItem,
     QGraphicsScene,
     QGraphicsView,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -40,7 +41,7 @@ from ...analyzer.annotations import (
     REVIEW_REASON_GOOD_QUALITY,
     REVIEW_REASON_OTHER,
 )
-from ...analyzer.contactsheets import OTHER_BOX, SELECTED_BOX
+from ...analyzer.contactsheets import EYE_BOX_ACCEPTED, EYE_BOX_REJECTED, OTHER_BOX, SELECTED_BOX
 from .. import theme
 from ..models.image_item import ImageItem
 from ..services import ReviewService
@@ -67,6 +68,27 @@ STATUS_LABELS = {"keep": "Keep", "reject": "Reject", "neutral": "Neutral"}
 # the Loupe's overlay bar is permanently dark-chrome (see module docstring
 # and theme.py), so it needs colors tuned for that background specifically.
 STATUS_COLORS = {"keep": theme.DARK.keep_fg, "reject": theme.DARK.reject_fg, "neutral": theme.DARK.neutral_fg}
+
+# Persistent tint on the Keep/Reject/Neutral buttons themselves, so the
+# action each button takes is color-coded even before a decision is made -
+# not just the eventual status readout. The active status additionally gets
+# a bright border (_ACTIVE_BUTTON_BORDER) so "what did I already pick for
+# this image" is answerable at a glance, matching the image-viewer border
+# below.
+_STATUS_BUTTON_STYLES = {
+    "keep": f"background-color: {theme.DARK.keep_bg}; color: {theme.DARK.keep_fg}; font-weight: 600;",
+    "reject": f"background-color: {theme.DARK.reject_bg}; color: {theme.DARK.reject_fg}; font-weight: 600;",
+    "neutral": f"background-color: {theme.DARK.neutral_bg}; color: {theme.DARK.neutral_fg}; font-weight: 600;",
+}
+_ACTIVE_BUTTON_BORDER = "border: 2px solid #ffffff;"
+
+# A thick border around the whole image viewer color-coded to the current
+# review status - the "can't miss it" signal the status label alone
+# (STATUS_COLORS, just colored text) doesn't provide at a glance across a
+# large maximized window. Neutral gets no border rather than a third color,
+# so an undecided image doesn't read as "has a status" at a glance.
+_VIEW_BORDER_COLORS = {"keep": theme.DARK.keep_fg, "reject": theme.DARK.reject_fg}
+_VIEW_BORDER_WIDTH = 8
 
 
 def _apply_brightness(pixmap: QPixmap, ev: float) -> QPixmap:
@@ -150,42 +172,75 @@ class _ZoomView(QGraphicsView):
             self._scene.removeItem(item)
         self._overlay_items = []
 
-    def set_detection_overlay(self, boxes_data: dict | None) -> None:
+    def set_detection_overlay(self, boxes_data: dict | None, eye_data: dict | None = None) -> None:
         """Draw the detector's boxes (review/thumbnails.detection_boxes_for)
-        over the current image - solid green for the box that became the
-        crop the model scored, dashed amber for runners-up it passed over.
-        Same colors as the gallery's own with_boxes thumbnail overlay
-        (contactsheets.SELECTED_BOX/OTHER_BOX) so both views agree.
+        and, when available, the eye detector's result
+        (review/thumbnails.eye_keypoints_for) over the current image - solid
+        green for the box that became the crop the model scored, dashed amber
+        for runners-up it passed over, and magenta for the eye Classic Vision
+        measured (solid when accepted, dashed when detected but distrusted -
+        see `eyes.detector.EyeDetection.accepted`). Same colors as the
+        gallery's own with_boxes thumbnail overlay
+        (contactsheets.SELECTED_BOX/OTHER_BOX/EYE_BOX_ACCEPTED/EYE_BOX_REJECTED)
+        so both views agree.
 
-        Coordinates in boxes_data are full-frame source pixels; scaled here
+        Coordinates in both dicts are full-frame source pixels; scaled here
         against the currently-displayed pixmap's own size rather than
         assumed to match 1:1, since nothing guarantees the preview was
         never resized relative to the source frame.
         """
         self.clear_detection_overlay()
-        if boxes_data is None or self._pixmap_item is None:
+        if self._pixmap_item is None:
             return
-        source_size = boxes_data.get("source_size")
+        source_size = (boxes_data or {}).get("source_size") or (eye_data or {}).get("source_size")
         if not source_size or source_size[0] <= 0 or source_size[1] <= 0:
             return
         pixmap_size = self._pixmap_item.pixmap().size()
         scale_x = pixmap_size.width() / source_size[0]
         scale_y = pixmap_size.height() / source_size[1]
 
-        def to_scene_rect(box: dict) -> QRectF:
-            x1, y1, x2, y2 = box["box"]
+        def to_scene_rect(box) -> QRectF:
+            x1, y1, x2, y2 = box
             return QRectF(x1 * scale_x, y1 * scale_y, (x2 - x1) * scale_x, (y2 - y1) * scale_y)
 
-        for box in boxes_data.get("others", []):
-            item = self._scene.addRect(to_scene_rect(box), QPen(QColor(*OTHER_BOX), 2, Qt.PenStyle.DashLine))
-            item.setZValue(10)
-            self._overlay_items.append(item)
+        if boxes_data is not None:
+            for box in boxes_data.get("others", []):
+                item = self._scene.addRect(
+                    to_scene_rect(box["box"]), QPen(QColor(*OTHER_BOX), 3, Qt.PenStyle.DashLine)
+                )
+                item.setZValue(10)
+                self._overlay_items.append(item)
 
-        selected = boxes_data.get("selected")
-        if selected is not None:
-            item = self._scene.addRect(to_scene_rect(selected), QPen(QColor(*SELECTED_BOX), 3))
-            item.setZValue(11)
-            self._overlay_items.append(item)
+            selected = boxes_data.get("selected")
+            if selected is not None:
+                item = self._scene.addRect(to_scene_rect(selected["box"]), QPen(QColor(*SELECTED_BOX), 4))
+                item.setZValue(11)
+                self._overlay_items.append(item)
+
+        if eye_data is not None:
+            self._add_eye_overlay(eye_data, to_scene_rect, scale_x, scale_y)
+
+    def _add_eye_overlay(self, eye_data: dict, to_scene_rect, scale_x: float, scale_y: float) -> None:
+        """The eye box plus both raw left/right keypoints - the debugging
+        signal for "why did an image with no visible eye still get scored":
+        a dashed box or widely separated crosshairs means the eye detector
+        found something the acceptance gate should have caught (or did, and
+        a different metric carried the ranking anyway)."""
+        colour = QColor(*(EYE_BOX_ACCEPTED if eye_data.get("accepted") else EYE_BOX_REJECTED))
+        pen = QPen(colour, 4) if eye_data.get("accepted") else QPen(colour, 4, Qt.PenStyle.DashLine)
+        item = self._scene.addRect(to_scene_rect(eye_data["box"]), pen)
+        item.setZValue(12)
+        self._overlay_items.append(item)
+
+        radius = 6
+        for keypoint in (eye_data.get("left"), eye_data.get("right")):
+            if keypoint is None:
+                continue
+            kx = keypoint["x"] * scale_x
+            ky = keypoint["y"] * scale_y
+            marker = self._scene.addEllipse(QRectF(kx - radius, ky - radius, radius * 2, radius * 2), QPen(colour, 3))
+            marker.setZValue(12)
+            self._overlay_items.append(marker)
 
     def _emit_zoom(self) -> None:
         self.zoomChanged.emit(self.transform().m11())
@@ -312,12 +367,18 @@ class LoupeDialog(QDialog):
         keep_btn = QPushButton("Keep (K)", self)
         reject_btn = QPushButton("Reject (R)", self)
         neutral_btn = QPushButton("Neutral (N)", self)
+        self._status_buttons = {"keep": keep_btn, "reject": reject_btn, "neutral": neutral_btn}
+        for name, btn in self._status_buttons.items():
+            btn.setStyleSheet(_STATUS_BUTTON_STYLES[name])
         exp_down_btn = QPushButton("−", self)
         exp_up_btn = QPushButton("+", self)
         self._boxes_btn = QPushButton("Boxes", self)
         self._boxes_btn.setCheckable(True)
         self._boxes_btn.setChecked(self._show_boxes)
-        self._boxes_btn.setToolTip("Show the AI's detected-subject bounding boxes on this image")
+        self._boxes_btn.setToolTip(
+            "Show the AI's detected-subject bounding box and, when Classic Vision has run, "
+            "the eye it measured, on this image"
+        )
         save_jpeg_btn = QPushButton("Save JPEG", self)
         close_btn = QPushButton("Close", self)
         for button in (exp_down_btn, exp_up_btn):
@@ -341,30 +402,57 @@ class LoupeDialog(QDialog):
             f"#loupeBottomBar QLabel {{ color: {theme.DARK.text_primary}; }}"
             "#loupeBottomBar QPushButton { padding: 4px 10px; }"
         )
-        bar_layout = QHBoxLayout(bottom_bar)
+        # Three-column grid (stretch 1 : 0 : 1) rather than a single row of
+        # widgets - a plain QHBoxLayout can only pin content to the edges or
+        # to one side of a single stretch, it can't center a group. Equal
+        # stretch on the outer columns keeps the center column (the core
+        # Prev/Keep/Reject/Neutral/Next workflow) visually centered in the
+        # bar regardless of how wide the info/tools columns end up.
+        bar_layout = QGridLayout(bottom_bar)
         bar_layout.setContentsMargins(10, 6, 10, 6)
-        bar_layout.setSpacing(10)
-        bar_layout.addWidget(self._counter_label)
-        bar_layout.addWidget(self._name_label)
-        bar_layout.addWidget(self._score_label)
-        bar_layout.addWidget(self._status_label)
-        bar_layout.addWidget(self._ai_badge_label)
-        bar_layout.addStretch(1)
-        bar_layout.addWidget(self._zoom_label)
-        bar_layout.addWidget(exp_down_btn)
-        bar_layout.addWidget(self._exposure_label)
-        bar_layout.addWidget(exp_up_btn)
-        bar_layout.addWidget(self._boxes_btn)
-        bar_layout.addWidget(save_jpeg_btn)
-        bar_layout.addWidget(QLabel("Reason:"))
-        bar_layout.addWidget(self._reason_combo)
-        bar_layout.addWidget(self._reason_note)
-        bar_layout.addWidget(prev_btn)
-        bar_layout.addWidget(keep_btn)
-        bar_layout.addWidget(reject_btn)
-        bar_layout.addWidget(neutral_btn)
-        bar_layout.addWidget(next_btn)
-        bar_layout.addWidget(close_btn)
+        bar_layout.setHorizontalSpacing(10)
+        bar_layout.setColumnStretch(0, 1)
+        bar_layout.setColumnStretch(1, 0)
+        bar_layout.setColumnStretch(2, 1)
+
+        info_group = QWidget(bottom_bar)
+        info_layout = QHBoxLayout(info_group)
+        info_layout.setContentsMargins(0, 0, 0, 0)
+        info_layout.setSpacing(10)
+        info_layout.addWidget(self._counter_label)
+        info_layout.addWidget(self._name_label)
+        info_layout.addWidget(self._score_label)
+        info_layout.addWidget(self._status_label)
+        info_layout.addWidget(self._ai_badge_label)
+
+        actions_group = QWidget(bottom_bar)
+        actions_layout = QHBoxLayout(actions_group)
+        actions_layout.setContentsMargins(0, 0, 0, 0)
+        actions_layout.setSpacing(10)
+        actions_layout.addWidget(QLabel("Reason:"))
+        actions_layout.addWidget(self._reason_combo)
+        actions_layout.addWidget(self._reason_note)
+        actions_layout.addWidget(prev_btn)
+        actions_layout.addWidget(keep_btn)
+        actions_layout.addWidget(reject_btn)
+        actions_layout.addWidget(neutral_btn)
+        actions_layout.addWidget(next_btn)
+
+        tools_group = QWidget(bottom_bar)
+        tools_layout = QHBoxLayout(tools_group)
+        tools_layout.setContentsMargins(0, 0, 0, 0)
+        tools_layout.setSpacing(10)
+        tools_layout.addWidget(self._zoom_label)
+        tools_layout.addWidget(exp_down_btn)
+        tools_layout.addWidget(self._exposure_label)
+        tools_layout.addWidget(exp_up_btn)
+        tools_layout.addWidget(self._boxes_btn)
+        tools_layout.addWidget(save_jpeg_btn)
+        tools_layout.addWidget(close_btn)
+
+        bar_layout.addWidget(info_group, 0, 0, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        bar_layout.addWidget(actions_group, 0, 1, Qt.AlignmentFlag.AlignCenter)
+        bar_layout.addWidget(tools_group, 0, 2, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -391,12 +479,75 @@ class LoupeDialog(QDialog):
         if self.items is not None:
             item = self.items[self.index]
             return {
-                "score": item.score,
-                "rank": item.rank,
+                "ranking_results": item.ranking_results,
+                "filter_reasons": item.filter_reasons,
+                "metrics": item.metrics,
                 "review_status": item.review_status,
                 "ai_suggestion": item.ai_suggestion,
             }
         return self._info_by_path.get(self._resolve_path(self._current_path()), {})
+
+    @staticmethod
+    def _scores_text(info: dict) -> str:
+        """Every analysis module's score - or, for one that filtered this
+        image instead of scoring it, why - on one bar line.
+
+        Iterates whatever the session supplied rather than naming the modules
+        that exist today, so a new one appears here for free. Labels come from
+        the ranking registry, falling back to the raw strategy id so results
+        from a module PeakPic no longer ships are still shown.
+        """
+        from ...ranking import score_labels
+        from ...ranking.filters import REJECT_REASON_LABELS
+
+        scores = info.get("ranking_results") or {}
+        filter_reasons = info.get("filter_reasons") or {}
+        labels = score_labels()
+        strategy_ids = set(scores) | set(filter_reasons)
+        parts = []
+        for strategy_id in sorted(strategy_ids, key=lambda sid: (sid != "ai-model", sid)):
+            entry = scores.get(strategy_id) or {}
+            score = entry.get("score")
+            label = labels.get(strategy_id, strategy_id)
+            if score is not None:
+                rank = entry.get("rank")
+                parts.append(f"{label} {score:.4f}" + (f" (#{rank})" if rank else ""))
+            else:
+                reason = filter_reasons.get(strategy_id)
+                if reason is None:
+                    continue
+                parts.append(f"{label}: {REJECT_REASON_LABELS.get(reason, reason)}")
+        return "   ".join(parts) if parts else "Unranked"
+
+    @staticmethod
+    def _diagnostics_text(info: dict) -> str:
+        """The raw measurements behind each strategy's combined score (see
+        `ranking.classic.write_metrics_report`) - "why did this image rank
+        where it did", not just the single weighted-sum number the score
+        line shows. Shown as the score label's tooltip rather than more bar
+        real estate, since it is a hover-for-detail diagnostic, not a
+        first-glance one.
+
+        Empty (no tooltip) for an image no module wrote a metrics report
+        for - most images, most of the time, since only Classic Vision
+        writes one today.
+        """
+        from ...ranking import metric_labels, score_labels
+
+        metrics = info.get("metrics") or {}
+        if not metrics:
+            return ""
+        strategy_labels = score_labels()
+        names_by_strategy = metric_labels()
+        lines = []
+        for strategy_id in sorted(metrics, key=lambda sid: (sid != "ai-model", sid)):
+            values = metrics.get(strategy_id) or {}
+            if not values:
+                continue
+            names = names_by_strategy.get(strategy_id, {})
+            breakdown = "  ".join(f"{names.get(name, name)}: {value:.3f}" for name, value in values.items())
+            lines.append(f"{strategy_labels.get(strategy_id, strategy_id)} - {breakdown}")
+        return "\n".join(lines)
 
     def _load_current(self) -> None:
         path = self._current_path()
@@ -419,7 +570,11 @@ class LoupeDialog(QDialog):
             boxes = self.service.detection_boxes(self._current_path())
         except Exception:  # noqa: BLE001 - a missing/unreadable detection record must not break the loupe
             boxes = None
-        self._view.set_detection_overlay(boxes)
+        try:
+            eye = self.service.eye_keypoints(self._current_path())
+        except Exception:  # noqa: BLE001 - a missing/unreadable eye record must not break the loupe
+            eye = None
+        self._view.set_detection_overlay(boxes, eye)
 
     def _on_boxes_toggled(self, checked: bool) -> None:
         self._show_boxes = checked
@@ -439,19 +594,14 @@ class LoupeDialog(QDialog):
         self._counter_label.setText(f"{self.index + 1} / {len(self.image_paths)}")
         self._name_label.setText(Path(path).name)
 
-        score = info.get("score")
-        rank = info.get("rank")
-        parts = []
-        if score is not None:
-            parts.append(f"Score {score:.4f}")
-        if rank is not None:
-            parts.append(f"Rank {rank}")
-        self._score_label.setText(" · ".join(parts) if parts else "Unranked")
+        self._score_label.setText(self._scores_text(info))
+        self._score_label.setToolTip(self._diagnostics_text(info))
 
         status = info.get("review_status") or "neutral"
         self._status_label.setText(STATUS_LABELS.get(status, status.capitalize()))
         color = STATUS_COLORS.get(status, STATUS_COLORS["neutral"])
         self._status_label.setStyleSheet(f"color: {color}; font-weight: 600;")
+        self._update_status_indicators(status)
 
         ai_suggestion = info.get("ai_suggestion")
         if ai_suggestion and ai_suggestion != status:
@@ -459,6 +609,22 @@ class LoupeDialog(QDialog):
             self._ai_badge_label.setStyleSheet(f"color: {theme.DARK.accent};")
         else:
             self._ai_badge_label.setText("")
+
+    def _update_status_indicators(self, status: str) -> None:
+        """Color-code the current review status two ways at once: a bright
+        border around the whole image viewer (visible even at a glance
+        across a maximized window) and a highlighted border on whichever of
+        the Keep/Reject/Neutral buttons is currently active."""
+        border_color = _VIEW_BORDER_COLORS.get(status)
+        if border_color:
+            self._view.setStyleSheet(f"border: {_VIEW_BORDER_WIDTH}px solid {border_color};")
+        else:
+            self._view.setStyleSheet("border: none;")
+        for name, btn in self._status_buttons.items():
+            style = _STATUS_BUTTON_STYLES[name]
+            if name == status:
+                style += _ACTIVE_BUTTON_BORDER
+            btn.setStyleSheet(style)
 
     def _on_zoom_changed(self, scale: float) -> None:
         self._zoom_label.setText("Fit" if self._view._fit_mode else f"{scale * 100:.0f}%")  # noqa: SLF001

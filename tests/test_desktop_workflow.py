@@ -69,7 +69,11 @@ def test_rank_folder_delegates_and_refreshes_session(tmp_path, monkeypatch) -> N
         calls["kwargs"] = kwargs
         return {"output_csv": "ranking.csv", "image_count": 1, "top": []}
 
-    monkeypatch.setattr("picklikeme.desktop.services.run_rank_folder", fake_rank_folder)
+    # Patched at picklikeme.rank, the module that actually owns the AI ranking
+    # entry point: ReviewService now dispatches through the ranking-strategy
+    # registry, and AIModelStrategy imports rank_folder from there. Same
+    # function, same arguments - only the seam this test observes moved.
+    monkeypatch.setattr("picklikeme.rank.rank_folder", fake_rank_folder)
 
     result = service.rank_folder(checkpoint="dummy.pt", crop_birds=False)
 
@@ -77,6 +81,10 @@ def test_rank_folder_delegates_and_refreshes_session(tmp_path, monkeypatch) -> N
     assert calls["kwargs"]["checkpoint"] == "dummy.pt"
     assert calls["kwargs"]["crop_birds"] is False
     assert "state" in result
+    # The AI model scores everything it is given, so a strategy-aware caller
+    # can rely on it never reporting filtered-out images.
+    assert result["strategy"] == "ai-model"
+    assert result["filtered"] == {}
     service.close()
 
 

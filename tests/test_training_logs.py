@@ -286,7 +286,7 @@ class FatalErrorLoggingTests(unittest.TestCase):
         the interval, so it must log once (the final image) rather than per
         image."""
         import picklikeme.preprocess as preprocess_module
-        from picklikeme.bird_crop import CropParams, crop_cache_path
+        from picklikeme.bird_crop import CropParams, crop_cache_path, detections_cache_path
 
         with tempfile.TemporaryDirectory() as tmpdir:
             cache = Path(tmpdir) / "crops"
@@ -296,6 +296,12 @@ class FatalErrorLoggingTests(unittest.TestCase):
                 entry = crop_cache_path(cache, path)
                 entry.parent.mkdir(parents=True, exist_ok=True)  # sharded layout
                 entry.write_bytes(b"cached")
+                # build_cache's incremental-skip check also requires the
+                # detections sidecar (see preprocess.build_cache._refill) -
+                # without it every image looks like it needs a healing
+                # re-detect, which is a different behavior than what this
+                # test is about (timer-based progress logging).
+                detections_cache_path(cache, path).write_text("{}", encoding="utf-8")
 
             captured = io.StringIO()
             with redirect_stdout(captured):

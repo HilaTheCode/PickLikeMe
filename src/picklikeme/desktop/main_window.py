@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QLabel,
     QMainWindow,
+    QMenu,
     QMenuBar,
     QMessageBox,
     QProgressDialog,
@@ -24,9 +25,12 @@ from PySide6.QtWidgets import (
     QStyleFactory,
     QTextEdit,
     QToolBar,
+    QToolButton,
     QWidget,
 )
 
+from ..ranking import DEFAULT_STRATEGY_ID
+from ..ranking.filters import REJECT_REASON_LABELS
 from . import theme
 from .application import ApplicationState, WorkerManager
 from .core.caching import CacheManager
@@ -37,7 +41,13 @@ from .core.thumbnail_loader import ThumbnailLoadTask, ThumbnailReadySignal
 run_in_background = _real_run_in_background
 from .dialogs.loupe_dialog import LoupeDialog
 from .dialogs.progress import run_with_progress
-from .dialogs.workflow_dialogs import AutoCropDialog, PreferencesDialog, RankDialog, SpeciesLanguageDialog
+from .dialogs.workflow_dialogs import (
+    AlgorithmParametersDialog,
+    AutoCropDialog,
+    PreferencesDialog,
+    RankDialog,
+    SpeciesLanguageDialog,
+)
 from .models.image_item import ImageItem
 from .models.image_model import ImageModel
 from .settings import DesktopSettings
@@ -47,13 +57,18 @@ from .views.gallery.gallery_view import GalleryView
 FILTERS = (
     "all", "keep", "reject", "neutral",
     "ai_keep", "ai_reject", "ai_keep_user_reject", "ai_reject_user_keep",
+    "filtered",
 )
 # Matches the web review UI's filterImages() exactly (review/page.py) -
 # ai_keep/ai_reject are "the AI currently suggests this" regardless of
 # the photographer's own decision; the two conflict filters narrow that
 # to specifically where the two disagree, one direction each (a single
 # combined "conflicts" filter can't tell a photographer which images
-# need which kind of attention).
+# need which kind of attention). "filtered" is Desktop-only (the web UI
+# predates non-AI strategies): any image at least one analysis module
+# explicitly excluded from scoring (see ImageItem.filter_reasons) - the
+# tool for a photographer investigating "why didn't Classic Vision rank
+# this", regardless of which strategy or reason.
 FILTER_LABELS = {
     "all": "All",
     "keep": "Keep",
@@ -63,10 +78,55 @@ FILTER_LABELS = {
     "ai_reject": "AI Reject",
     "ai_keep_user_reject": "Conflict: AI Keep / You Reject",
     "ai_reject_user_keep": "Conflict: AI Reject / You Keep",
+    "filtered": "Filtered (Skipped by an analysis module)",
 }
 KEEP_PERCENT_PRESETS = (5.0, 10.0, 20.0, 25.0, 35.0)
+# Sorting by any analysis module's score, plus the two intrinsic file
+# properties. A module's field is "score:<strategy_id>"; the bare "score" is
+# kept as the default because it is what the window opens on and what
+# ReviewSession's own load order already matches.
+SORT_SCORE_PREFIX = "score:"
 SORT_FIELDS = ("score", "filename", "captured_at")
-SORT_FIELD_LABELS = {"score": "Model Score", "filename": "File Name", "captured_at": "Capture Time"}
+SORT_FIELD_LABELS = {"score": "AI Score", "filename": "File Name", "captured_at": "Capture Time"}
+
+
+def sort_options() -> list[tuple[str, str]]:
+    """(field, label) for the Sort combo, one entry per analysis module.
+
+    Built from the ranking registry rather than listed, so a new module
+    becomes sortable at the same moment it becomes runnable. The AI model is
+    already covered by the default "score" field, so it is not repeated.
+    """
+    from ..ranking import DEFAULT_STRATEGY_ID, available_strategies
+
+    options = [("score", SORT_FIELD_LABELS["score"])]
+    for info in available_strategies():
+        if info.strategy_id == DEFAULT_STRATEGY_ID:
+            continue
+        options.append((f"{SORT_SCORE_PREFIX}{info.strategy_id}", f"{info.display_name} Score"))
+    options.append(("filename", SORT_FIELD_LABELS["filename"]))
+    options.append(("captured_at", SORT_FIELD_LABELS["captured_at"]))
+    return options
+
+
+def color_source_options() -> list[tuple[str | None, str]]:
+    """(strategy_id_or_None, label) for the Color combo, one entry per
+    analysis module plus the default.
+
+    `None` means "tint a card's background by review status" - Keep/Reject
+    green/red, Neutral the plain background - exactly today's behavior.
+    Anything else tints the background by that strategy's own score instead
+    (low to high, across whatever is currently visible), for scanning a
+    Classic Vision-ranked folder's ordering at a glance without needing to
+    sort by it first. Built from the registry, like `sort_options`, so a
+    future module is colorable the moment it is runnable.
+    """
+    from ..ranking import available_strategies
+
+    options: list[tuple[str | None, str]] = [(None, "Review Status")]
+    for info in available_strategies():
+        options.append((info.strategy_id, f"{info.display_name} Score"))
+    return options
 
 
 class MainWindow(QMainWindow):
@@ -98,7 +158,15 @@ class MainWindow(QMainWindow):
         self._sort_field = "score"  # matches ReviewSession.load()'s own default ordering
         self._sort_ascending = False
         self._show_detector_boxes = False
+        # None (the default) means "tint by review status" - see
+        # color_source_options(). Anything else is a strategy id whose score
+        # tints the background instead.
+        self._color_source: str | None = None
         self._last_counts: dict[str, Any] = {}
+        # Last-used parameters per ranking strategy, so re-running one starts
+        # from what was chosen before rather than the defaults. Session-scoped
+        # on purpose: these are per-shoot experiments, not a preference.
+        self._ranking_params: dict[str, Any] = {}
         self._active_threads: list[Any] = []  # keeps background QThreads alive while running
         self._open_folder_in_progress = False
         self._open_folder_generation = 0
@@ -153,9 +221,9 @@ class MainWindow(QMainWindow):
         self._cutoff_spin.setEnabled(False)
 
         self._sort_combo = QComboBox(self)
-        for field in SORT_FIELDS:
-            self._sort_combo.addItem(SORT_FIELD_LABELS[field], field)
-        self._sort_combo.setCurrentIndex(SORT_FIELDS.index(self._sort_field))
+        for field, label in sort_options():
+            self._sort_combo.addItem(label, field)
+        self._sort_combo.setCurrentIndex(max(0, self._sort_combo.findData(self._sort_field)))
         self._sort_combo.currentIndexChanged.connect(self._on_sort_field_changed)
 
         self._sort_direction_btn = QPushButton(self)
@@ -163,6 +231,11 @@ class MainWindow(QMainWindow):
         self._sort_direction_btn.setMaximumWidth(28)
         self._sort_direction_btn.clicked.connect(self._on_sort_direction_toggled)
         self._update_sort_direction_button()
+
+        self._color_combo = QComboBox(self)
+        for source, label in color_source_options():
+            self._color_combo.addItem(label, source)
+        self._color_combo.currentIndexChanged.connect(self._on_color_source_changed)
 
         self._build_ui()
         self._load_recent_folders()
@@ -289,10 +362,27 @@ class MainWindow(QMainWindow):
             tooltip="Select every currently visible (filtered) image", triggered=self._select_all_visible,
         )
 
+        # One entry per registered ranking strategy (picklikeme.ranking), built
+        # from the registry rather than listed here, so a new strategy appears
+        # in both the Tools menu and the toolbar without touching this file.
+        # The default strategy stays the AI model: clicking the toolbar button
+        # itself (rather than opening its dropdown) runs that, so the
+        # long-standing one-click "rank this folder" gesture is unchanged.
+        self._rank_menu = QMenu("Rank", self)
+        self._rank_strategy_actions: dict[str, QAction] = {}
+        for info in self.service.ranking_strategies():
+            action = self._make_action(
+                f"{info.display_name}…", tooltip=info.description,
+                triggered=lambda _checked=False, sid=info.strategy_id: self._rank_with_strategy(sid),
+            )
+            self._rank_menu.addAction(action)
+            self._rank_strategy_actions[info.strategy_id] = action
         self._rank_action = self._make_action(
-            "Rank by AI…", icon=SP.SP_BrowserReload,
-            tooltip="Score every image in the folder with the AI model", triggered=self._rank_by_ai,
+            "Rank…", icon=SP.SP_BrowserReload,
+            tooltip="Score every image in the folder — choose a ranking method",
+            triggered=lambda: self._rank_with_strategy(DEFAULT_STRATEGY_ID),
         )
+        self._rank_action.setMenu(self._rank_menu)
         self._apply_cutoff_action = self._make_action(
             "Apply Cutoff", icon=SP.SP_DialogOkButton,
             tooltip="Apply the AI keep-percent cutoff to the current folder", triggered=self._apply_cutoff,
@@ -353,12 +443,15 @@ class MainWindow(QMainWindow):
         self._light_theme_action.setChecked(theme.current_theme_name() == "light")
         view_menu.addSeparator()
         self._detector_boxes_action = QAction("Detector Boxes", self, checkable=True)
-        self._detector_boxes_action.setToolTip("Show the AI's detected-subject bounding boxes on gallery thumbnails and in the Loupe")
+        self._detector_boxes_action.setToolTip(
+            "Show the AI's detected-subject bounding boxes, and Classic Vision's measured eye, "
+            "on gallery thumbnails and in the Loupe"
+        )
         self._detector_boxes_action.toggled.connect(self._on_toggle_detector_boxes)
         view_menu.addAction(self._detector_boxes_action)
 
         tools_menu = menu_bar.addMenu("Tools")
-        tools_menu.addAction(self._rank_action)
+        tools_menu.addMenu(self._rank_menu)
         tools_menu.addAction(self._apply_cutoff_action)
         tools_menu.addSeparator()
         tools_menu.addAction(self._organize_action)
@@ -394,10 +487,26 @@ class MainWindow(QMainWindow):
         toolbar.addWidget(QLabel(" Sort: "))
         toolbar.addWidget(self._sort_combo)
         toolbar.addWidget(self._sort_direction_btn)
+        toolbar.addWidget(QLabel(" Color: "))
+        toolbar.addWidget(self._color_combo)
         toolbar.addAction(self._detector_boxes_action)
         toolbar.addSeparator()
 
         toolbar.addAction(self._rank_action)
+        # MenuButtonPopup, not InstantPopup: the button's own half still runs
+        # the default strategy on a single click (see _build_actions), and only
+        # the arrow opens the list of the others.
+        #
+        # The menu comes from the QAction (set in _build_actions), not from
+        # setMenu() on the button: QToolBar builds its button with
+        # setDefaultAction(), and the button paints and popups its default
+        # action's menu. Note that `QToolButton.menu()` still returns None in
+        # that arrangement - it only reports an explicitly-set menu - so it is
+        # a misleading thing to assert on; the style option's HasMenu feature
+        # is what actually decides whether the arrow is drawn.
+        rank_button = toolbar.widgetForAction(self._rank_action)
+        if isinstance(rank_button, QToolButton):
+            rank_button.setPopupMode(QToolButton.ToolButtonPopupMode.MenuButtonPopup)
         toolbar.addWidget(QLabel(" AI cutoff: "))
         toolbar.addWidget(self._cutoff_combo)
         toolbar.addWidget(self._cutoff_spin)
@@ -700,11 +809,15 @@ class MainWindow(QMainWindow):
             ImageItem(
                 path=image.get("image_path") or "",
                 file_name=Path(image.get("image_path") or "").name,
-                score=image.get("score"),
-                rank=image.get("rank"),
                 review_status=image.get("review_status", "neutral"),
                 ai_suggestion=image.get("ai_suggestion"),
                 captured_at=image.get("captured_at"),
+                # ranking_results already carries the AI model's own
+                # score/rank under "ai-model" - ImageItem.score/.rank read it
+                # from there, so there is nothing separate to pass here.
+                ranking_results=image.get("ranking_results") or {},
+                filter_reasons=image.get("filter_reasons") or {},
+                metrics=image.get("metrics") or {},
             )
             for image in state.get("images", [])
         ]
@@ -782,9 +895,29 @@ class MainWindow(QMainWindow):
         filtered = self._filter_items(self._all_items, self._current_filter)
         filtered = self._sort_items(filtered)
         self._gallery_model.set_items(filtered)
+        self._update_color_source(filtered)
         if filtered and not self._gallery_view.currentIndex().isValid():
             self._gallery_view.setCurrentIndex(self._gallery_model.index(0, 0))
         self._gallery_view.set_empty_message(self._empty_message_for_current_state())
+
+    def _on_color_source_changed(self, index: int) -> None:
+        self._color_source = self._color_combo.itemData(index)
+        self._apply_filter()
+
+    def _update_color_source(self, items: list[ImageItem]) -> None:
+        """Recompute the score range the gallery tints card backgrounds
+        against, whenever the visible set or the chosen source changes -
+        see color_source_options(). None (Review Status) needs no range at
+        all; anything else is scaled against the low/high of that strategy's
+        score among only the images actually visible right now, so the
+        gradient always spans the full range of what's on screen instead of
+        being skewed by images a filter has hidden."""
+        if self._color_source is None:
+            self._gallery_view.set_color_source(None, None)
+            return
+        scores = [s for s in (item.score_for(self._color_source) for item in items) if s is not None]
+        score_range = (min(scores), max(scores)) if scores else None
+        self._gallery_view.set_color_source(self._color_source, score_range)
 
     @staticmethod
     def _filter_items(items: list[ImageItem], current_filter: str) -> list[ImageItem]:
@@ -802,6 +935,11 @@ class MainWindow(QMainWindow):
             return [item for item in items if item.ai_suggestion == "keep" and item.review_status == "reject"]
         if current_filter == "ai_reject_user_keep":
             return [item for item in items if item.ai_suggestion == "reject" and item.review_status == "keep"]
+        if current_filter == "filtered":
+            # Desktop-only, no web-UI equivalent (see FILTER_LABELS): any
+            # image at least one analysis module explicitly excluded from
+            # scoring, regardless of which strategy or reason.
+            return [item for item in items if item.filter_reasons]
         return [item for item in items if item.review_status == current_filter]
 
     # -- sorting ----------------------------------------------------------------
@@ -848,6 +986,11 @@ class MainWindow(QMainWindow):
                 return item.display_name.lower()
             if field == "captured_at":
                 return item.captured_at
+            if field.startswith(SORT_SCORE_PREFIX):
+                # An image no module scored has no value for that module and
+                # sorts to the end, exactly as an unranked image already does
+                # for the AI score - see this method's docstring.
+                return item.score_for(field[len(SORT_SCORE_PREFIX):])
             return item.score
 
         with_value = [item for item in items if value_of(item) is not None]
@@ -1021,34 +1164,96 @@ class MainWindow(QMainWindow):
         dialog.exec()
         self._refresh_from_state(self.service.load_session())
 
-    # -- rank by AI -------------------------------------------------------------
+    # -- ranking ----------------------------------------------------------------
 
-    def _rank_by_ai(self) -> None:
+    def _rank_with_strategy(self, strategy_id: str) -> None:
+        """Collect the chosen strategy's parameters, then run it.
+
+        Only the parameter-collection step differs per strategy, and only
+        because the AI model's parameters (a checkpoint path, a checkbox) are
+        not the numeric knobs `AlgorithmParametersDialog` generates itself.
+        Everything after that - the background run, the progress dialog, the
+        session refresh, the status line - is shared, because a ranking is a
+        ranking whatever produced it.
+        """
         if not self.state.current_folder:
             self._set_status("Open a folder before ranking it")
             return
-        dialog = RankDialog(parent=self)
-        if dialog.exec() != RankDialog.DialogCode.Accepted:
+
+        info = next(
+            (i for i in self.service.ranking_strategies() if i.strategy_id == strategy_id), None
+        )
+        if info is None:
+            self._set_status(f"Unknown ranking strategy: {strategy_id}")
             return
-        checkpoint = dialog.checkpoint_path()
-        crop_birds = dialog.crop_birds()
+
+        kwargs = self._collect_ranking_parameters(strategy_id, info)
+        if kwargs is None:  # the photographer cancelled
+            return
 
         def _run(on_progress=None, on_stage=None):
             return self.service.rank_folder(
-                checkpoint=checkpoint, crop_birds=crop_birds, on_stage=on_stage, on_progress=on_progress
+                strategy=strategy_id, on_stage=on_stage, on_progress=on_progress, **kwargs
             )
 
         def _on_success(result: dict[str, Any]) -> None:
             self._refresh_from_state(result["state"])
-            self._set_status(f"Ranked {result.get('image_count', 0)} images")
+            self._set_status(self._ranking_summary(result))
             device = result.get("device")
             if device:
                 self.state.gpu_status = device
                 self._gpu_status_label.setText(f"Device: {device}")
 
-        thread = run_with_progress(self, "Rank by AI", _run, on_success=_on_success)
+        thread = run_with_progress(self, info.display_name, _run, on_success=_on_success)
         self._active_threads.append(thread)
         thread.finished.connect(lambda: self._active_threads.remove(thread) if thread in self._active_threads else None)
+
+    def _collect_ranking_parameters(self, strategy_id: str, info) -> dict[str, Any] | None:
+        """The keyword arguments for `ReviewService.rank_folder`, or None if
+        the photographer cancelled the parameter dialog.
+
+        A strategy that declares numeric `ParamSpec`s gets a dialog generated
+        from them, so adding one needs no code here. The single exception is
+        the AI model, whose parameters are a file path and a checkbox rather
+        than numbers - it keeps its own long-standing `RankDialog`, unchanged.
+        """
+        params_cls = self.service.ranking_params_class(strategy_id)
+        if params_cls is not None and params_cls.specs():
+            dialog = AlgorithmParametersDialog(
+                params_cls=params_cls,
+                title=f"{info.display_name} — Parameters",
+                initial=self._ranking_params.get(strategy_id),
+                parent=self,
+            )
+            if dialog.exec() != AlgorithmParametersDialog.DialogCode.Accepted:
+                return None
+            # Remembered for the session, so re-running with a tweak starts
+            # from what was used last rather than from the defaults each time.
+            params = dialog.parameters()
+            self._ranking_params[strategy_id] = params
+            return {"params": params}
+
+        if strategy_id == DEFAULT_STRATEGY_ID:
+            dialog = RankDialog(parent=self)
+            if dialog.exec() != RankDialog.DialogCode.Accepted:
+                return None
+            return {"checkpoint": dialog.checkpoint_path(), "crop_birds": dialog.crop_birds()}
+
+        return {}  # nothing to configure - run with the strategy's own defaults
+
+    @staticmethod
+    def _ranking_summary(result: dict[str, Any]) -> str:
+        """One status line covering both a plain ranking and a filtered one."""
+        ranked = result.get("image_count", 0)
+        filtered = result.get("filtered") or {}
+        if not filtered:
+            return f"Ranked {ranked} images"
+        breakdown = ", ".join(
+            f"{REJECT_REASON_LABELS.get(reason, reason)}: {count}"
+            for reason, count in sorted(filtered.items(), key=lambda item: -item[1])
+        )
+        skipped = sum(filtered.values())
+        return f"Ranked {ranked} images; skipped {skipped} ({breakdown})"
 
     # -- organize (Selected/Rejected) -------------------------------------------
 

@@ -1,4 +1,4 @@
-"""Small parameter dialogs for Rank by AI, Organize by Species, and Auto Crop."""
+"""Small parameter dialogs for the ranking strategies, Organize by Species, and Auto Crop."""
 
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QFormLayout,
     QHBoxLayout,
+    QLabel,
     QLineEdit,
     QPushButton,
     QRadioButton,
@@ -20,6 +21,7 @@ from PySide6.QtWidgets import (
 )
 
 from ...config import DEFAULT_CHECKPOINT_PATH
+from ...ranking import GROUP_WEIGHTS
 
 
 class RankDialog(QDialog):
@@ -67,6 +69,86 @@ class RankDialog(QDialog):
 
     def crop_birds(self) -> bool:
         return self._crop_birds_check.isChecked()
+
+
+class AlgorithmParametersDialog(QDialog):
+    """Parameters for a ranking strategy, built from the strategy's own specs.
+
+    Nothing here knows what "eye sharpness" means, or that there are three
+    weights rather than five. It reads `ParamSpec`s (see `ranking.base`) and
+    lays out one spin box per parameter, grouped into weights and everything
+    else. Adding a parameter to a strategy therefore adds a field to this
+    dialog with no change to this file - which is what makes this an
+    *algorithm parameters* dialog rather than a weights dialog that would
+    need rewriting the first time a non-weight knob appeared.
+
+    Weights are deliberately not constrained to sum to 100: any set of
+    numbers is valid and is normalised before scoring (see
+    `WeightedParams.normalized_weights`), so a photographer can type 5/3/2 or
+    50/30/20 and mean the same thing.
+    """
+
+    def __init__(self, *, params_cls, title: str, initial=None, parent=None) -> None:
+        super().__init__(parent)
+        self._params_cls = params_cls
+        self._specs = tuple(params_cls.specs())
+        self.setWindowTitle(title)
+        self.setMinimumWidth(420)
+
+        initial = initial or params_cls()
+        self._spins: dict[str, QDoubleSpinBox] = {}
+
+        weights_form = QFormLayout()
+        other_form = QFormLayout()
+        for spec in self._specs:
+            spin = QDoubleSpinBox(self)
+            spin.setRange(spec.minimum, spec.maximum)
+            spin.setDecimals(spec.decimals)
+            spin.setSingleStep(1.0 if spec.decimals == 0 else 10.0**-spec.decimals)
+            if spec.suffix:
+                spin.setSuffix(spec.suffix)
+            if spec.help:
+                spin.setToolTip(spec.help)
+            spin.setValue(float(getattr(initial, spec.name)))
+            self._spins[spec.name] = spin
+            (weights_form if spec.group == GROUP_WEIGHTS else other_form).addRow(
+                f"{spec.label}:", spin
+            )
+
+        layout = QVBoxLayout(self)
+        if weights_form.rowCount():
+            heading = QLabel("Weights (normalized automatically — any values are valid)", self)
+            heading.setWordWrap(True)
+            layout.addWidget(heading)
+            layout.addLayout(weights_form)
+        if other_form.rowCount():
+            layout.addWidget(QLabel("Thresholds", self))
+            layout.addLayout(other_form)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
+            | QDialogButtonBox.StandardButton.RestoreDefaults,
+            self,
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        buttons.button(QDialogButtonBox.StandardButton.RestoreDefaults).setText("Reset to Defaults")
+        buttons.button(QDialogButtonBox.StandardButton.RestoreDefaults).clicked.connect(
+            self.reset_to_defaults
+        )
+        layout.addWidget(buttons)
+
+    def reset_to_defaults(self) -> None:
+        """Every parameter back to the value its own spec declares."""
+        for spec in self._specs:
+            self._spins[spec.name].setValue(float(spec.default))
+
+    def parameters(self):
+        """The chosen values, as the strategy's own params dataclass."""
+        return self._params_cls.from_values(
+            {name: float(spin.value()) for name, spin in self._spins.items()}
+        )
 
 
 class SpeciesLanguageDialog(QDialog):

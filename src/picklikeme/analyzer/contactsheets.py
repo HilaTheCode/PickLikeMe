@@ -278,6 +278,11 @@ def generate_thumbnails(
 SELECTED_BOX = (16, 185, 129)   # the box that produced the crop the model scored
 OTHER_BOX = (250, 204, 21)      # runners-up: visible, clearly not the choice
 NO_DETECTION = (239, 68, 68)
+# The eye overlay (see eyes.cache / review.thumbnails.eye_keypoints_for) uses
+# its own colour family so it is never mistaken for a subject box even where
+# the two overlap - magenta appears nowhere else in this palette.
+EYE_BOX_ACCEPTED = (236, 72, 153)   # the eye Classic Vision actually scored
+EYE_BOX_REJECTED = (157, 23, 77)    # a detected-but-distrusted eye - still shown, dashed
 
 
 def annotate_thumbnail(
@@ -285,14 +290,24 @@ def annotate_thumbnail(
     record,
     output_path: Path,
     size: int,
+    *,
+    eye: dict | None = None,
 ) -> Path | None:
-    """Draw the detector's boxes onto a copy of an existing thumbnail.
+    """Draw the detector's boxes (and, optionally, the eye detector's result)
+    onto a copy of an existing thumbnail.
 
     The point is to answer, at a glance, whether the detector contributed to a
     mistake: solid green is the box that became the crop the model actually
     scored, thin dashed amber are the other candidates it passed over, and a red
     corner marker means it found nothing at all (so the model saw the whole
-    frame).
+    frame). When `eye` is given (the shape `review.thumbnails.eye_keypoints_for`
+    returns), a magenta box/crosshairs additionally show the primary eye Classic
+    Vision measured - solid when it was accepted, dashed when it was detected
+    but distrusted (see `eyes.detector.EyeDetection.accepted`) - which is
+    exactly the debugging signal for "why did this image with no visible eye
+    still get scored": a dashed or wildly separated pair of crosshairs means
+    the eye detector found something, but the acceptance gate should have
+    caught it (or did, and a different metric carried the ranking anyway).
 
     Boxes come from `record` in full-frame coordinates. They are mapped onto the
     thumbnail by normalising against the frame and scaling onto the letterboxed
@@ -324,7 +339,11 @@ def annotate_thumbnail(
     canvas = base.copy()
     draw = ImageDraw.Draw(canvas)
     font = _font()
-    line = max(1, round(size / 200))
+    # Thick enough to read at a glance even on a distant, small-boxed subject -
+    # a size-400 thumbnail (the review Gallery's default) now draws a 3px line
+    # instead of a barely-visible 2px one; _stroke still caps it against a
+    # small box's own dimensions below.
+    line = max(2, round(size / 120))
 
     def to_thumb(box) -> tuple[float, float, float, float]:
         return (
@@ -356,9 +375,42 @@ def annotate_thumbnail(
     if len(record.others):
         draw.text((3, base.height - 12), f"+{len(record.others)} more", fill=OTHER_BOX, font=font)
 
+    if eye is not None:
+        _draw_eye_overlay(draw, eye, scale, offset_x, offset_y, line)
+
     output_path.parent.mkdir(parents=True, exist_ok=True)
     canvas.save(output_path, "JPEG", quality=90)
     return output_path
+
+
+def _draw_eye_overlay(draw, eye: dict, scale: float, offset_x: float, offset_y: float, line: int) -> None:
+    """The eye box plus both raw left/right keypoints, already in full-frame
+    pixels (see `review.thumbnails.eye_keypoints_for`), mapped the same way
+    `to_thumb` maps a subject box.
+
+    Both keypoints are drawn whenever present, not only the primary one that
+    defines the box - the whole point of a debugging overlay is to show how
+    far apart the two channels landed (see `eyes.superanimal_bird`'s
+    left/right agreement check), which a single box cannot convey.
+    """
+    colour = EYE_BOX_ACCEPTED if eye.get("accepted") else EYE_BOX_REJECTED
+    x1 = offset_x + eye["box"][0] * scale
+    y1 = offset_y + eye["box"][1] * scale
+    x2 = offset_x + eye["box"][2] * scale
+    y2 = offset_y + eye["box"][3] * scale
+    stroke = _stroke(line, x2 - x1, y2 - y1)
+    if eye.get("accepted"):
+        draw.rectangle([x1, y1, x2, y2], outline=colour, width=stroke)
+    else:
+        _dashed_rectangle(draw, (x1, y1, x2, y2), colour, stroke)
+
+    radius = max(3, stroke + 1)
+    for keypoint in (eye.get("left"), eye.get("right")):
+        if keypoint is None:
+            continue
+        kx = offset_x + keypoint["x"] * scale
+        ky = offset_y + keypoint["y"] * scale
+        draw.ellipse([kx - radius, ky - radius, kx + radius, ky + radius], outline=colour, width=max(1, stroke - 1))
 
 
 def _stroke(preferred: int, box_width: float, box_height: float) -> int:
@@ -369,7 +421,7 @@ def _stroke(preferred: int, box_width: float, box_height: float) -> int:
     the box, so it renders as a filled blob and the reader learns nothing about
     where the detector actually drew it. Capped at a quarter of the shorter side.
     """
-    return max(1, min(preferred, int(min(box_width, box_height) / 4)))
+    return max(2, min(preferred, int(min(box_width, box_height) / 4)))
 
 
 def _draw_label(draw, text: str, box, colour, font, canvas_size) -> None:
@@ -409,10 +461,20 @@ def _dashed_rectangle(draw, box, colour, width: int, dash: int | None = None) ->
         draw.line([(x2, y), (x2, min(y + dash, y2))], fill=colour, width=width)
 
 
-def annotated_thumbnail_path(thumbnails_dir: Path, image_path: str, size: int) -> Path:
-    """Where the annotated copy lives: beside the plain one, distinct suffix."""
+def annotated_thumbnail_path(thumbnails_dir: Path, image_path: str, size: int, *, has_eye: bool = False) -> Path:
+    """Where the annotated copy lives: beside the plain one, distinct suffix.
+
+    `has_eye` gives a distinct path (`_boxes_eyes` instead of `_boxes`) when
+    an eye overlay will be drawn onto it, so the cache key itself reflects
+    whether Classic Vision had run yet - a folder opened and toggled to
+    Detector Boxes before its first Classic Vision run gets a plain
+    `_boxes` file; running Classic Vision afterward writes a fresh
+    `_boxes_eyes` one instead of serving the stale, eye-less copy back
+    forever (see `review.thumbnails.review_thumbnail`).
+    """
     plain = _thumbnail_cache_path(thumbnails_dir, image_path, size)
-    return plain.with_name(f"{plain.stem}_boxes{plain.suffix}")
+    suffix = "_boxes_eyes" if has_eye else "_boxes"
+    return plain.with_name(f"{plain.stem}{suffix}{plain.suffix}")
 
 
 def build_thumbnail_overlays(

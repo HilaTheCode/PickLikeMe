@@ -153,9 +153,20 @@ def collect_environment_status() -> list[dict[str, Any]]:
     return status
 
 
+def _safe_terminal_text(text: str) -> str:
+    """Return text that can be written safely to the current stdout encoding."""
+    encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+    try:
+        text.encode(encoding)
+        return text
+    except (LookupError, UnicodeEncodeError):
+        return text.encode("ascii", errors="replace").decode("ascii")
+
+
 def print_environment_status() -> None:
     """Print a concise startup diagnostics summary for external components."""
-    print("Environment check:")
+    print(_safe_terminal_text("Environment check:"))
     for item in collect_environment_status():
-        icon = "✓" if item["ok"] else "!"
-        print(f"  {icon} {item['name']}: {item['detail']}")
+        icon = "OK" if item["ok"] else "!"
+        line = f"  {icon} {item['name']}: {item['detail']}"
+        print(_safe_terminal_text(line))

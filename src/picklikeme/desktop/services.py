@@ -11,9 +11,9 @@ from ..auto_crop import generate_lightroom_crops
 from ..config import DEFAULT_CHECKPOINT_PATH
 from ..importer import import_selected_images
 from ..organize import SELECTED_DIRNAME
-from ..rank import rank_folder as run_rank_folder
+from ..ranking import DEFAULT_STRATEGY_ID, AIModelParams, available_strategies, get_strategy
 from ..review.session import ReviewSession
-from ..review.thumbnails import detection_boxes_for, review_preview, review_thumbnail
+from ..review.thumbnails import detection_boxes_for, eye_keypoints_for, review_preview, review_thumbnail
 
 
 class ReviewService:
@@ -67,6 +67,9 @@ class ReviewService:
     def detection_boxes(self, image_path: str) -> dict[str, Any] | None:
         return detection_boxes_for(image_path)
 
+    def eye_keypoints(self, image_path: str) -> dict[str, Any] | None:
+        return eye_keypoints_for(image_path)
+
     def save_jpeg(self, image_path: str, destination_path: str | Path) -> Path:
         from ..analyzer.contactsheets import export_jpeg_bytes
 
@@ -75,22 +78,51 @@ class ReviewService:
         destination.write_bytes(data)
         return destination
 
+    @staticmethod
+    def ranking_strategies() -> list[Any]:
+        """Every ranking strategy the Rank menu can offer (see
+        `picklikeme.ranking`). Cheap - no model is constructed or imported."""
+        return available_strategies()
+
+    @staticmethod
+    def ranking_params_class(strategy_id: str) -> type | None:
+        """The parameter dataclass a strategy accepts, so the UI can generate
+        its dialog from `params_class.specs()`. None for an unknown strategy
+        or one that takes no parameters at all."""
+        try:
+            return getattr(get_strategy(strategy_id), "params_class", None)
+        except ValueError:
+            return None
+
     def rank_folder(
         self,
         *,
+        strategy: str = DEFAULT_STRATEGY_ID,
+        params: Any = None,
         checkpoint: str | Path = DEFAULT_CHECKPOINT_PATH,
         crop_birds: bool = True,
         device: str | None = None,
         on_stage: Callable[[str], None] | None = None,
         on_progress: Callable[[int, int], None] | None = None,
     ) -> dict[str, Any]:
+        """Rank the open folder with the named strategy, then reload the session.
+
+        `checkpoint`/`crop_birds` are the AI model's own parameters and are
+        kept as explicit keywords rather than folded into `params`, so every
+        existing caller of this method keeps working unchanged. A strategy
+        that has richer parameters (Classic Vision) passes them as `params`
+        instead; the reload afterwards is identical either way, because a
+        ranking is a ranking however it was produced.
+        """
         if self.session.input_folder is None:
             raise ValueError("Open a folder before ranking it.")
-        result = run_rank_folder(
+        if strategy == DEFAULT_STRATEGY_ID and params is None:
+            params = AIModelParams(
+                checkpoint=str(checkpoint), crop_birds=crop_birds, device=device
+            )
+        result = get_strategy(strategy).rank_folder(
             self.session.input_folder,
-            checkpoint=checkpoint,
-            crop_birds=crop_birds,
-            device=device,
+            params=params,
             on_stage=on_stage,
             on_progress=on_progress,
         )

@@ -963,5 +963,99 @@ class NoFolderOpenTests(SessionTestCase):
         self.assertFalse(session.warnings)
 
 
+def write_strategy_ranking(target: Path, entries: list[tuple[Path, float]]) -> None:
+    """A second analysis module's scores file, in the same format
+    `build_shoot` writes the AI's - so a test can attach an independent
+    strategy's results to a shoot without depending on `picklikeme.ranking`."""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with target.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["metric", "value"])
+        writer.writerow([])
+        writer.writerow(["rank", "image_path", "score", "label"])
+        for rank, (path, score) in enumerate(entries, start=1):
+            writer.writerow([rank, str(path), f"{score:.6f}", 0])
+
+
+class RankingResultsSymmetryTests(SessionTestCase):
+    """Score and rank always belong together as properties of ONE strategy -
+    there is no single global rank anywhere in this data model, only
+    `ranking_results[strategy_id] = {"score": .., "rank": ..}` per module.
+
+    `ReviewImage.score`/`.rank` (and the AI cutoff, agreement stats, etc. that
+    are built on them) are a read-only VIEW onto `ranking_results["ai-model"]`,
+    not a second, separately-maintained pair - these tests pin exactly that,
+    so a future change cannot let the two drift apart again.
+    """
+
+    def test_the_ai_models_score_and_rank_live_together_under_its_own_key(self):
+        shoot, images, _ = build_shoot(self.root, ranked=3)
+        session = self.session(shoot)
+
+        image = session._image_for(str(images[0]))
+        self.assertIn("ai-model", image.ranking_results)
+        entry = image.ranking_results["ai-model"]
+        self.assertEqual(entry["score"], image.score)
+        self.assertEqual(entry["rank"], image.rank)
+        self.assertEqual(image.rank, 1)
+
+    def test_a_second_strategys_results_do_not_touch_the_ais(self):
+        """The reported motivation: two independent analysis modules coexist
+        without one's score/rank pair overwriting the other's."""
+        from picklikeme.sidecar import strategy_ranking_path
+
+        shoot, images, _ = build_shoot(self.root, ranked=3)
+        # Classic Vision disagrees with the AI about the order entirely.
+        write_strategy_ranking(
+            strategy_ranking_path(shoot, "classic-vision"),
+            [(images[2], 0.99), (images[1], 0.5), (images[0], 0.1)],
+        )
+
+        session = self.session(shoot)
+        best_by_ai = session._image_for(str(images[0]))
+
+        self.assertEqual(best_by_ai.rank, 1)  # unchanged: still the AI's #1
+        self.assertEqual(best_by_ai.ranking_results["ai-model"]["rank"], 1)
+        # Its OWN rank under classic-vision is independent and different.
+        self.assertEqual(best_by_ai.ranking_results["classic-vision"]["rank"], 3)
+        self.assertAlmostEqual(best_by_ai.ranking_results["classic-vision"]["score"], 0.1)
+
+    def test_an_image_only_a_second_strategy_scored_is_unranked_by_ai(self):
+        """`score`/`rank`/`is_ranked` mean specifically "the AI model has an
+        opinion" - an image with only a Classic Vision result must not read
+        as AI-ranked just because SOME module scored it."""
+        from picklikeme.sidecar import strategy_ranking_path
+
+        shoot, images, extra = build_shoot(self.root, ranked=2, unranked=1)
+        write_strategy_ranking(
+            strategy_ranking_path(shoot, "classic-vision"),
+            [(extra[0], 0.75)],
+        )
+
+        session = self.session(shoot)
+        image = session._image_for(str(extra[0]))
+
+        self.assertIsNone(image.score)
+        self.assertIsNone(image.rank)
+        self.assertFalse(image.is_ranked)
+        self.assertEqual(image.ranking_results["classic-vision"], {"score": 0.75, "rank": 1})
+
+    def test_as_dict_exposes_ranking_results_plus_backward_compatible_flat_fields(self):
+        """`ranking_results` is the real data; the flat `score`/`rank` keys
+        stay in the JSON for whatever already reads them directly (the web
+        review UI, existing tests) - but they are DERIVED, not separately
+        stored, so they can never disagree with `ranking_results["ai-model"]`.
+        """
+        shoot, images, _ = build_shoot(self.root, ranked=1)
+        session = self.session(shoot)
+
+        payload = session._image_for(str(images[0])).as_dict(ai_suggestion=None)
+
+        self.assertIn("ranking_results", payload)
+        self.assertNotIn("scores", payload, "the old key name must not linger")
+        self.assertEqual(payload["score"], payload["ranking_results"]["ai-model"]["score"])
+        self.assertEqual(payload["rank"], payload["ranking_results"]["ai-model"]["rank"])
+
+
 if __name__ == "__main__":
     unittest.main()
