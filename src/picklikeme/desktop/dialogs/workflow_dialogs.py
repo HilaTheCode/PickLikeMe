@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
 
 from ...config import DEFAULT_CHECKPOINT_PATH
 from ...ranking import GROUP_WEIGHTS
+from ...species.classifier import available_classifiers
 
 
 class RankDialog(QDialog):
@@ -152,9 +153,13 @@ class AlgorithmParametersDialog(QDialog):
 
 
 class SpeciesLanguageDialog(QDialog):
-    """Picks the language used for species subfolder names."""
+    """Picks the language used for species subfolder names, and which
+    species-classification backend runs the pass - one registered entry per
+    `species.classifier.available_classifiers()`, so a future third backend
+    appears here with no change to this file, exactly like
+    `AlgorithmParametersDialog` picks up a new ranking strategy's params."""
 
-    def __init__(self, *, default_language: str = "en", parent=None) -> None:
+    def __init__(self, *, default_language: str = "en", default_backend: str = "bioclip2", parent=None) -> None:
         super().__init__(parent)
         self.setWindowTitle("Organize by Species")
 
@@ -165,6 +170,18 @@ class SpeciesLanguageDialog(QDialog):
         else:
             self._english_radio.setChecked(True)
 
+        self._backend_radios: dict[str, QRadioButton] = {}
+        backend_group = QButtonGroup(self)
+        backend_column = QVBoxLayout()
+        for info in available_classifiers():
+            radio = QRadioButton(info.display_name, self)
+            radio.setToolTip(info.description)
+            backend_group.addButton(radio)
+            backend_column.addWidget(radio)
+            self._backend_radios[info.classifier_id] = radio
+        checked = self._backend_radios.get(default_backend) or next(iter(self._backend_radios.values()))
+        checked.setChecked(True)
+
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel, self)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
@@ -172,21 +189,37 @@ class SpeciesLanguageDialog(QDialog):
         layout = QVBoxLayout(self)
         layout.addWidget(self._english_radio)
         layout.addWidget(self._hebrew_radio)
+        layout.addWidget(QLabel("Classification backend:", self))
+        layout.addLayout(backend_column)
         layout.addWidget(buttons)
 
     def language(self) -> str:
         return "he" if self._hebrew_radio.isChecked() else "en"
 
+    def backend(self) -> str:
+        for classifier_id, radio in self._backend_radios.items():
+            if radio.isChecked():
+                return classifier_id
+        return "bioclip2"  # unreachable in practice - one radio is always checked
+
 
 class PreferencesDialog(QDialog):
-    """Application preferences: theme and the default species-organization
-    language. Both are settings that already exist and persist (theme.py /
-    QSettings "review/species_language") - this just gives them one
-    conventional home instead of a "not implemented yet" stub, and instead
-    of only being reachable via the View menu or by running Organize by
-    Species once."""
+    """Application preferences: theme, the default species-organization
+    language, and the default species-classification backend. All three are
+    settings that already exist and persist (theme.py / QSettings
+    "review/species_language" / "review/species_backend") - this just gives
+    them one conventional home instead of a "not implemented yet" stub, and
+    instead of only being reachable via the View menu or by running Organize
+    by Species once."""
 
-    def __init__(self, *, default_theme: str = "dark", default_language: str = "en", parent=None) -> None:
+    def __init__(
+        self,
+        *,
+        default_theme: str = "dark",
+        default_language: str = "en",
+        default_backend: str = "bioclip2",
+        parent=None,
+    ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Preferences")
 
@@ -222,9 +255,22 @@ class PreferencesDialog(QDialog):
         language_row.addWidget(self._english_radio)
         language_row.addWidget(self._hebrew_radio)
 
+        self._backend_radios: dict[str, QRadioButton] = {}
+        backend_group = QButtonGroup(self)
+        backend_row = QHBoxLayout()
+        for info in available_classifiers():
+            radio = QRadioButton(info.display_name, self)
+            radio.setToolTip(info.description)
+            backend_group.addButton(radio)
+            backend_row.addWidget(radio)
+            self._backend_radios[info.classifier_id] = radio
+        checked = self._backend_radios.get(default_backend) or next(iter(self._backend_radios.values()))
+        checked.setChecked(True)
+
         form = QFormLayout()
         form.addRow("Theme:", theme_row)
         form.addRow("Default species language:", language_row)
+        form.addRow("Default species backend:", backend_row)
 
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel, self)
         buttons.accepted.connect(self.accept)
@@ -239,6 +285,12 @@ class PreferencesDialog(QDialog):
 
     def species_language(self) -> str:
         return "he" if self._hebrew_radio.isChecked() else "en"
+
+    def species_backend(self) -> str:
+        for classifier_id, radio in self._backend_radios.items():
+            if radio.isChecked():
+                return classifier_id
+        return "bioclip2"  # unreachable in practice - one radio is always checked
 
 
 class AutoCropDialog(QDialog):

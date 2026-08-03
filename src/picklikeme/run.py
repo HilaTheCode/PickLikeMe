@@ -20,7 +20,7 @@ import argparse
 
 from .bird_crop import IMAGE_FORMAT_EXTENSIONS, CropParams
 from .config import fatal_errors_logged_to_stdout
-from .preprocess import default_decode_workers, preprocess_folders
+from .preprocess import CropCacheVersionMismatch, default_decode_workers, preprocess_folders
 from .train import build_arg_parser, train_and_rank
 
 
@@ -95,4 +95,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except CropCacheVersionMismatch as exc:
+        raise SystemExit(str(exc)) from None

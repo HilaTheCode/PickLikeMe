@@ -5,10 +5,14 @@ an image is judged at all, and three measurements decide how it scores. Run
 it twice on the same folder with the same parameters and it produces
 byte-identical numbers.
 
-    Phase 1 - filtering (ranking.filters)
+    Phase 1 - filtering (ranking.filters) - the "Decision Engine" (see
+    docs/EyePose_Investigation_Phase_1.md's Part 3)
         Filter 1  no detected subject          -> NO_SUBJECT
-        Filter 2  no visible eye               -> NO_VISIBLE_EYE
-                  (or UNSUPPORTED_SUBJECT, when no eye detector covers it)
+        Filter 2  no eye detector for this class -> UNSUPPORTED_SUBJECT
+                  no confident head detected     -> LOW_HEAD_CONFIDENCE
+                  no reliable visible eye        -> NO_VISIBLE_EYE
+                  (all three from EyeFilter - one detector call, three
+                  independent questions, each its own reason)
 
     Phase 2 - scoring (ranking.metrics), for survivors only
         Eye sharpness      focus inside the eye box alone      (default 50%)
@@ -57,6 +61,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
+from ..analytics import DEFAULT_ANALYTICS_DB, record_run
 from ..auto_crop import resolve_device
 from ..bird_crop import CropParams, crop_cache_path, read_detections
 from ..config import DEFAULT_CROP_CACHE_DIR, DEFAULT_MAX_CSV_ROWS
@@ -65,6 +70,7 @@ from ..eyes.eyepose_v0 import (
     DEFAULT_MAX_EYE_HEAD_DISTANCE_RATIO as EYEPOSE_DEFAULT_MAX_HEAD_DISTANCE_RATIO,
 )
 from ..eyes.eyepose_v0 import DEFAULT_MIN_CONFIDENCE as EYEPOSE_DEFAULT_MIN_CONFIDENCE
+from ..eyes.eyepose_v0 import DEFAULT_MIN_HEAD_CONFIDENCE as EYEPOSE_DEFAULT_MIN_HEAD_CONFIDENCE
 from ..eyes.superanimal_bird import DEFAULT_MAX_EYE_DISAGREEMENT, DEFAULT_MIN_CONFIDENCE
 from ..preprocess import build_cache
 from ..sidecar import (
@@ -201,6 +207,58 @@ def _scoring_weight_specs() -> tuple[ParamSpec, ...]:
     )
 
 
+def _detection_specs() -> tuple[ParamSpec, ...]:
+    """The two subject-detection/crop-selection tunables every Classic Vision
+    backend shares (see `bird_crop.select_best_detection`'s "v7" policy) -
+    factored out exactly like `_scoring_weight_specs()`, so both params
+    classes declare them identically rather than risking drift. Generic by
+    construction: neither parameter is bird-specific, and both apply the
+    same way to any current or future catalogued class - see
+    `bird_crop.py`'s module docstring.
+
+    Two genuinely different confidence concepts, not one - both map onto
+    `bird_crop.CropParams` fields but answer different questions:
+    `detection_confidence_threshold` (-> `CropParams.conf_threshold`) is the
+    detector's own, low, "worth recording at all" bar (cataloguing);
+    `crop_confidence_threshold` (-> `CropParams.min_crop_confidence`) is the
+    higher, "reliable enough to crop to" bar `select_best_detection` actually
+    gates on (EyePose Investigation Phase 1, Part 1).
+    """
+    return (
+        ParamSpec(
+            name="detection_confidence_threshold",
+            label="Detection confidence threshold",
+            default=CropParams.conf_threshold,
+            minimum=0.0,
+            maximum=1.0,
+            group=GROUP_THRESHOLDS,
+            decimals=2,
+            help=(
+                "Subject detections below this confidence are ignored entirely before "
+                "crop-target selection even runs. Affects the Vision Cache: changing this "
+                "rebuilds crops, since a different threshold can select a different subject."
+            ),
+        ),
+        ParamSpec(
+            name="crop_confidence_threshold",
+            label="Crop-target confidence threshold",
+            default=CropParams.min_crop_confidence,
+            minimum=0.0,
+            maximum=1.0,
+            group=GROUP_THRESHOLDS,
+            decimals=2,
+            help=(
+                "Among catalogued detections, only those reaching this confidence are "
+                "eligible to become the crop target; the largest-area one among them wins. "
+                "Rejects an unreliable detection outright rather than letting a big, "
+                "low-confidence box win by size alone (see the EyePose Investigation Phase 1 "
+                "report's Q1 - a real bird lost the crop to a much lower-confidence false "
+                "positive under the previous, area-first policy)."
+            ),
+        ),
+    )
+
+
 @dataclass(frozen=True)
 class ClassicVisionParams(WeightedParams):
     """Everything the photographer can tune before a Classic Vision
@@ -215,7 +273,10 @@ class ClassicVisionParams(WeightedParams):
     not carry over to a different backend's landmark schema unchanged, so
     each backend declares its own tunables rather than sharing one shape that
     would fit neither well - see `ranking.classic`'s module docstring and
-    `eyes.eyepose_v0`'s "Accept/reject gate" for why.
+    `eyes.eyepose_v0`'s "Accept/reject gate" for why. `detection_confidence_threshold`/
+    `crop_confidence_threshold`, by contrast, are shared verbatim (`_detection_specs`)
+    - they configure `rank_folder`'s own crop-cache step, not either backend's
+    eye detector, so both backends mean exactly the same thing by them.
     """
 
     eye_sharpness_weight: float = 50.0
@@ -223,6 +284,8 @@ class ClassicVisionParams(WeightedParams):
     subject_size_weight: float = 20.0
     min_eye_confidence: float = DEFAULT_MIN_CONFIDENCE
     max_eye_disagreement: float = DEFAULT_MAX_EYE_DISAGREEMENT
+    detection_confidence_threshold: float = CropParams.conf_threshold
+    crop_confidence_threshold: float = CropParams.min_crop_confidence
 
     @classmethod
     def specs(cls) -> tuple[ParamSpec, ...]:
@@ -252,6 +315,7 @@ class ClassicVisionParams(WeightedParams):
                     "confidence - catches a confidently-guessed eye on an occluded head."
                 ),
             ),
+            *_detection_specs(),
         )
 
 
@@ -263,20 +327,46 @@ class ClassicVisionEyePoseParams(WeightedParams):
     gates are genuinely different (see `eyes.eyepose_v0`'s "Accept/reject
     gate"), so their tunable thresholds are too. The three scoring weights
     are identical - see `_scoring_weight_specs`.
+
+    `eye_confidence_threshold` (named to match the EyePose Investigation
+    Phase 1 report exactly - see docs/EyePose_Investigation_Phase_1.md's
+    Part 3): EyePose-v0 reports a confidence for both the left and right eye
+    channel independently; `detect()` already keeps only the higher-confidence
+    one as `EyeDetection`'s primary eye/box (the weaker channel is recorded
+    for debugging - see `eyes.cache`'s module docstring - but never used for
+    scoring). This threshold decides whether that best channel is trusted at
+    all: below it, `EyeFilter` rejects the image as NO_VISIBLE_EYE
+    ("No reliable visible eye" - see `ranking.filters.REJECT_REASON_LABELS`)
+    and it never reaches `measure()`.
+
+    `detection_head_confidence_threshold` is a genuinely independent, earlier
+    check (Part 2/3 of the same report): is a real head instance in the crop
+    at all, before any individual landmark - including the eye - is trusted?
+    Gates `EyeFilter`'s own `LOW_HEAD_CONFIDENCE` rejection, gated on
+    `EyeDetection.head_confidence`/`eyes.eyepose_v0.head_visible` - see that
+    function's docstring for the measured signal (a wrong crop with no real
+    head scored 0.026 there, against 0.82-0.92 for every real head, despite
+    its own eye landmark reporting a misleading 0.97). Part 4's first pass
+    (weighting in the `head_top` *landmark's* own confidence) found no
+    independent signal - see `eyes.eyepose_v0.accepts_eye`'s docstring; this
+    is a different, later finding that does carry one.
     """
 
     eye_sharpness_weight: float = 50.0
     subject_sharpness_weight: float = 30.0
     subject_size_weight: float = 20.0
-    min_eye_confidence: float = EYEPOSE_DEFAULT_MIN_CONFIDENCE
+    eye_confidence_threshold: float = EYEPOSE_DEFAULT_MIN_CONFIDENCE
     max_head_distance_ratio: float = EYEPOSE_DEFAULT_MAX_HEAD_DISTANCE_RATIO
+    detection_head_confidence_threshold: float = EYEPOSE_DEFAULT_MIN_HEAD_CONFIDENCE
+    detection_confidence_threshold: float = CropParams.conf_threshold
+    crop_confidence_threshold: float = CropParams.min_crop_confidence
 
     @classmethod
     def specs(cls) -> tuple[ParamSpec, ...]:
         return (
             *_scoring_weight_specs(),
             ParamSpec(
-                name="min_eye_confidence",
+                name="eye_confidence_threshold",
                 label="Minimum eye confidence",
                 default=EYEPOSE_DEFAULT_MIN_CONFIDENCE,
                 minimum=0.0,
@@ -299,6 +389,22 @@ class ClassicVisionEyePoseParams(WeightedParams):
                     "on a shoulder or the background rather than the head."
                 ),
             ),
+            ParamSpec(
+                name="detection_head_confidence_threshold",
+                label="Minimum head confidence",
+                default=EYEPOSE_DEFAULT_MIN_HEAD_CONFIDENCE,
+                minimum=0.0,
+                maximum=1.0,
+                group=GROUP_THRESHOLDS,
+                decimals=2,
+                help=(
+                    "Below this, EyePose-v0 was not confident a real bird head was even in "
+                    "the crop, independent of any single landmark's own confidence (including "
+                    "the eye's) - the image is filtered out as LOW_HEAD_CONFIDENCE before the "
+                    "eye-specific checks above are even consulted."
+                ),
+            ),
+            *_detection_specs(),
         )
 
 
@@ -504,6 +610,7 @@ class ClassicVisionStrategy:
         max_rows: int = DEFAULT_MAX_CSV_ROWS,
         debug_dir: str | Path | None = None,
         force_preprocess: bool = False,
+        analytics_db: str | Path = DEFAULT_ANALYTICS_DB,
     ) -> dict:
         """See the class docstring. `debug_dir` is a development/
         troubleshooting aid, off by default and never exposed in the
@@ -521,6 +628,10 @@ class ClassicVisionStrategy:
         `crop_params.json` mismatch check). Same name and meaning as
         `rank.rank_folder`'s own parameter, so the same "rebuild the cache"
         action means the same thing from either ranking strategy.
+
+        `analytics_db` defaults to the real shared database - overridable so
+        tests (and any caller that wants an isolated run history) never
+        write into it. See `analytics.capture.record_run`.
         """
         from ..eyes import build_eye_detector
         from ..eyes.cache import save_eye_detection
@@ -547,11 +658,20 @@ class ClassicVisionStrategy:
         # has already ranked this is a fast pass that decodes nothing.
         if on_stage is not None:
             on_stage("Building subject-crop cache")
-        # A bare CropParams() picks up the Vision Cache's own current
-        # defaults (see bird_crop.CropParams) - original crop resolution,
-        # JPEG q98 - automatically, with nothing Classic-Vision-specific to
-        # configure; see bird_crop.py's module docstring.
-        build_cache(image_paths, crop_cache_dir, CropParams(), device=resolved_device, force=force_preprocess)
+        # Everything else (original crop resolution, JPEG q98, ...) picks up
+        # the Vision Cache's own current defaults automatically - see
+        # bird_crop.py's module docstring. detection_confidence_threshold/
+        # crop_confidence_threshold ARE Classic-Vision-configurable (see
+        # _detection_specs) because they change which subject gets cropped -
+        # unlike eye_confidence_threshold/max_head_distance_ratio below,
+        # changing either of these two legitimately requires a crop-cache
+        # rebuild (CropParams's own version-mismatch check already enforces
+        # this - see docs/EyePose_Investigation_Phase_1.md's Part 5).
+        crop_params = CropParams(
+            conf_threshold=params.detection_confidence_threshold,
+            min_crop_confidence=params.crop_confidence_threshold,
+        )
+        build_cache(image_paths, crop_cache_dir, crop_params, device=resolved_device, force=force_preprocess)
 
         if on_stage is not None:
             on_stage("Loading the eye detector")
@@ -626,6 +746,29 @@ class ClassicVisionStrategy:
             eye_detector=self._eye_detector_name,
             **self._eye_detector_kwargs(params),
         )
+        record_run(
+            input_folder,
+            strategy_id,
+            considered=len(image_paths),
+            accepted=len(ranked),
+            reject_counts=counts,
+            image_metrics={
+                m.image_path: {
+                    "eye_sharpness": m.eye_sharpness,
+                    "subject_sharpness": m.subject_sharpness,
+                    "subject_size": m.subject_size,
+                    "eye_confidence": m.eye_confidence,
+                }
+                for m in measurements
+            },
+            params={
+                "weights": params.normalized_weights(),
+                "eye_detector": self._eye_detector_name,
+                **self._eye_detector_kwargs(params),
+            },
+            device=resolved_device,
+            db_path=analytics_db,
+        )
 
         return {
             "strategy": strategy_id,
@@ -667,8 +810,16 @@ class ClassicVisionStrategy:
         if image_bgr is None:
             return candidate
 
+        expanded = record.get("expanded_box")
+
         candidate.subject_crop = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
         candidate.subject_box = tuple(float(v) for v in box)
+        # The crop's own rectangle - see FilterCandidate.crop_box's docstring.
+        # None only for a record written before expanded_box existed (a very
+        # old, pre-Vision-Cache cache entry); CROP_CACHE_VERSION's v6 bump
+        # already forces those to rebuild, so this is a defensive fallback,
+        # not the expected path.
+        candidate.crop_box = tuple(float(v) for v in expanded) if expanded and len(expanded) == 4 else None
         candidate.source_size = (int(source_size[0]), int(source_size[1]))
         candidate.subject_label = int(selected.get("label", -1))
         return candidate
@@ -711,6 +862,7 @@ class ClassicVisionEyePoseStrategy(ClassicVisionStrategy):
 
     def _eye_detector_kwargs(self, params: ClassicVisionEyePoseParams) -> dict:
         return {
-            "min_confidence": params.min_eye_confidence,
+            "min_confidence": params.eye_confidence_threshold,
             "max_head_distance_ratio": params.max_head_distance_ratio,
+            "min_head_confidence": params.detection_head_confidence_threshold,
         }

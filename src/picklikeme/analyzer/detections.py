@@ -40,7 +40,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
 
-from ..bird_crop import CROP_CACHE_VERSION, coco_class_name, detection_category, read_detections
+from ..bird_crop import (
+    CROP_CACHE_VERSION,
+    CropParams,
+    coco_class_name,
+    detection_category,
+    expand_and_clamp_box,
+    read_detections,
+)
 from ..config import PROJECT_ROOT
 from ..identity import IdentityUnavailable
 
@@ -96,6 +103,15 @@ class DetectionRecord:
     boxes: list[Box]
     source_size: tuple[int, int] | None  # (width, height)
     origin: str  # "preprocess" | "cache" | "detected" | "unavailable"
+    # The crop's own rectangle in full-frame pixels - `selected.box` grown by
+    # the margin `bird_crop.build_crop` actually applied before cropping (see
+    # `bird_crop.CropResult.expanded_box`). This, not `selected` (the tight
+    # detection box), is what any crop-space -> full-frame projection must
+    # scale/offset against, since the crop's pixels span this rectangle, not
+    # the tight one - see docs/EyePose_Investigation_Phase_1.md's Q1 finding
+    # for the bug this fixes (`review.thumbnails.eye_keypoints_for` used to
+    # read `selected` for this, silently mismatched against the actual crop).
+    expanded_box: tuple[float, float, float, float] | None = None
 
     @property
     def selected(self) -> Box | None:
@@ -110,10 +126,11 @@ class DetectionRecord:
             "origin": self.origin,
             "source_size": list(self.source_size) if self.source_size else None,
             "boxes": [box.as_dict() for box in self.boxes],
+            "expanded_box": list(self.expanded_box) if self.expanded_box else None,
         }
 
 
-EMPTY = DetectionRecord(boxes=[], source_size=None, origin="unavailable")
+EMPTY = DetectionRecord(boxes=[], source_size=None, origin="unavailable", expanded_box=None)
 
 
 def _from_payload(payload: dict, origin: str) -> DetectionRecord:
@@ -137,10 +154,12 @@ def _from_payload(payload: dict, origin: str) -> DetectionRecord:
                 label=int(selected.get("label", 0)), selected=True)
         )
     size = payload.get("source_size")
+    expanded = payload.get("expanded_box")
     return DetectionRecord(
         boxes=boxes,
         source_size=(int(size[0]), int(size[1])) if size and len(size) == 2 else None,
         origin=origin,
+        expanded_box=tuple(float(v) for v in expanded) if expanded and len(expanded) == 4 else None,
     )
 
 
@@ -263,6 +282,16 @@ class DetectionCache:
 
         self.detected_count += 1
         height, width = frame.shape[:2]
+        # Self-consistent with build_crop's own margin (CropParams.margin_frac's
+        # default - the only value this backfill path has, since it runs
+        # outside any real CropParams context): without this, a backfilled
+        # record's `expanded_box` would silently disagree with the margin an
+        # earlier `preprocess.build_cache` run actually cropped to.
+        expanded = (
+            None
+            if best is None
+            else expand_and_clamp_box(best.box, CropParams.margin_frac, width, height)
+        )
         return {
             "version": 1,
             "source_size": [width, height],
@@ -272,6 +301,7 @@ class DetectionCache:
             "detections": [
                 {"box": list(d.box), "score": d.score, "label": d.label} for d in accepted
             ],
+            "expanded_box": list(expanded) if expanded else None,
         }
 
     def get(

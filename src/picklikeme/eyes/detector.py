@@ -103,15 +103,34 @@ class EyeDetection:
     # decides `accepted`.
     left: EyeKeypoint | None = None
     right: EyeKeypoint | None = None
-    # Whether the caller (EyeFilter) should trust this detection at all -
-    # the actual filtering decision, computed from confidence AND from
-    # left/right agreement (see superanimal_bird.py's module docstring for
-    # why confidence alone is not sufficient). `box`/`confidence`/`center`
-    # are still populated even when this is False, specifically so a
-    # debugging overlay can show what a REJECTED image's eye guess looked
+    # Whether the EYE itself should be trusted - confidence AND (depending on
+    # the backend) a plausibility check, but NOT whether the subject's head
+    # was visible/localised at all in the first place (see `head_visible`
+    # below - a deliberately separate, independent question; EyeFilter
+    # checks both, with its own rejection reason for each - see
+    # docs/EyePose_Investigation_Phase_1.md's Part 2/3). `box`/`confidence`/
+    # `center` are still populated even when this is False, specifically so
+    # a debugging overlay can show what a REJECTED image's eye guess looked
     # like - that is the whole point of investigating a wrongly-accepted or
     # wrongly-rejected image after the fact.
     accepted: bool = False
+    # A holistic "is a real head instance actually present here" signal,
+    # independent of any single landmark's own confidence - None for a
+    # backend that does not compute one (e.g. SuperAnimal-Bird has no
+    # equivalent single scalar today), in which case `head_visible` below
+    # stays at its default (True: never gates a backend that cannot answer
+    # this question). For EyePose-v0 this is the winning anchor's own
+    # pre-decode "is this a bird head instance" score - see
+    # `eyepose_v0.head_visible`'s own docstring for why this catches a
+    # failure mode per-landmark confidence (including the primary eye's own)
+    # cannot: a crop containing no real bird head at all can still produce a
+    # confident-looking guess for where "the eye" would be.
+    head_confidence: float | None = None
+    # Whether `head_confidence` cleared the configured threshold - checked by
+    # EyeFilter as a gate independent of `accepted`, with its own rejection
+    # reason (LOW_HEAD_CONFIDENCE). Defaults to True (never rejects) so a
+    # backend that leaves `head_confidence` at None is never affected.
+    head_visible: bool = True
 
 
 class EyeDetector(Protocol):

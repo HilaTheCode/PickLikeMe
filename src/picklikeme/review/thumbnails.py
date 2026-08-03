@@ -305,10 +305,15 @@ def eye_keypoints_for(image_path: str, *, crop_cache_dir: str | Path | None = No
 
     The eye record's box/keypoints are in the subject CROP's own pixel
     space (see `eyes.detector.EyeDetection`'s docstring), so they are
-    rescaled here onto the subject's full-frame box using the crop size the
-    record itself carries (`EyeRecord.subject_crop_size`) - the same
-    scale-and-offset trick `contactsheets.annotate_thumbnail` already uses
-    for the subject box itself, just composed with one extra box.
+    rescaled here onto the full frame using `record.expanded_box` - the
+    crop's own rectangle (the tight detection box grown by
+    `bird_crop.CropParams.margin_frac` before cropping - see
+    `bird_crop.CropResult.expanded_box`), NOT `record.selected` (the tight
+    box). Those two rectangles differ by the margin on every image with a
+    margin > 0 (the default), and using the tight one here was a real,
+    proven bug - see docs/EyePose_Investigation_Phase_1.md's Q1 finding: it
+    silently shifted and rescaled every eye overlay by a consistent, wrong
+    amount, matching the original "eye systematically displaced" symptom.
     """
     from ..eyes.cache import read_eye_detection
 
@@ -320,18 +325,18 @@ def eye_keypoints_for(image_path: str, *, crop_cache_dir: str | Path | None = No
     except Exception as exc:  # noqa: BLE001 - an unreadable cache is not fatal
         logger.debug("No detections for %s: %s", image_path, exc)
         return None
-    subject = record.selected
-    if subject is None or record.source_size is None:
+    if record.selected is None or record.expanded_box is None or record.source_size is None:
         return None
     crop_width, crop_height = eye.subject_crop_size
     if crop_width <= 0 or crop_height <= 0:
         return None
 
-    scale_x = (subject.x2 - subject.x1) / crop_width
-    scale_y = (subject.y2 - subject.y1) / crop_height
+    ex1, ey1, ex2, ey2 = record.expanded_box
+    scale_x = (ex2 - ex1) / crop_width
+    scale_y = (ey2 - ey1) / crop_height
 
     def to_frame(x: float, y: float) -> tuple[float, float]:
-        return (subject.x1 + x * scale_x, subject.y1 + y * scale_y)
+        return (ex1 + x * scale_x, ey1 + y * scale_y)
 
     def keypoint_dict(keypoint) -> dict | None:
         if keypoint is None:

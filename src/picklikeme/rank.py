@@ -19,6 +19,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
+from .analytics import DEFAULT_ANALYTICS_DB, record_run
 from .auto_crop import resolve_device
 from .bird_crop import IMAGE_FORMAT_EXTENSIONS, CropParams
 from .config import DEFAULT_CHECKPOINT_PATH, DEFAULT_CROP_CACHE_DIR, DEFAULT_MAX_CSV_ROWS, cli_prefix
@@ -33,10 +34,10 @@ from .organize import (
     organize_ranked_images,
     validate_selection_percentage,
 )
-from .preprocess import build_cache
+from .preprocess import CropCacheVersionMismatch, build_cache
 from .profiling import PipelineProfiler
 from .raw_io import RawImageLoader
-from .sidecar import RANKING_FILENAME, SIDECAR_DIRNAME, ranking_path, write_run_metadata
+from .sidecar import AI_STRATEGY_ID, RANKING_FILENAME, SIDECAR_DIRNAME, ranking_path, write_run_metadata
 from .train import load_checkpoint, rank_dataset, timestamped_output_path, write_results_csv
 
 
@@ -66,6 +67,7 @@ def rank_folder(
     max_rows: int = DEFAULT_MAX_CSV_ROWS,
     on_stage: Callable[[str], None] | None = None,
     on_progress: Callable[[int, int], None] | None = None,
+    analytics_db: str | Path = DEFAULT_ANALYTICS_DB,
 ) -> dict:
     """Programmatic ranking entry point, reused by `main()` and by the
     desktop app's "Rank by AI" action.
@@ -75,6 +77,10 @@ def rank_folder(
     photographer reviews it and explicitly arranges the folder. Raises
     FileNotFoundError/ValueError instead of calling sys.exit, so a caller
     (a UI) can catch and display the error itself.
+
+    `analytics_db` defaults to the real shared database - overridable so
+    tests (and any caller that wants an isolated run history) never write
+    into it. See `analytics.capture.record_run`.
     """
     input_folder = Path(input_folder)
     if not input_folder.exists():
@@ -137,6 +143,17 @@ def rank_folder(
         checkpoint=str(checkpoint_path.resolve()),
         image_count=len(dataset),
         crop_birds=bool(crop_birds),
+    )
+    record_run(
+        input_folder,
+        AI_STRATEGY_ID,
+        considered=len(dataset),
+        accepted=len(dataset),  # the AI model scores every image - no filter stage, see ranking/classic.py's
+        reject_counts={},
+        image_metrics={path: {"ai_score": score} for _name, score, _label, path in ranked},
+        params={"backbone": backbone, "checkpoint": str(checkpoint_path.resolve()), "crop_birds": bool(crop_birds)},
+        device=resolved_device,
+        db_path=analytics_db,
     )
 
     return {
@@ -356,4 +373,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except CropCacheVersionMismatch as exc:
+        raise SystemExit(str(exc)) from None

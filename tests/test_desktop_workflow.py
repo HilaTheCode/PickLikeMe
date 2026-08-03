@@ -138,9 +138,13 @@ def test_organize_by_species_uses_language_transform(tmp_path, monkeypatch) -> N
     def fake_build_classifier(name, **kwargs):
         return object()
 
-    def fake_arrange_by_species(input_folder, classifier, cache, *, on_progress=None, folder_name_fn=None):
+    def fake_run_with_analytics(
+        input_folder, classifier, backend, cache, *, on_progress=None, folder_name_fn=None,
+        species_list_path=None, analytics_db=None,
+    ):
         captured["folder_name_fn"] = folder_name_fn
         captured["input_folder"] = input_folder
+        captured["backend"] = backend
 
         class Result:
             total = 1
@@ -151,16 +155,18 @@ def test_organize_by_species_uses_language_transform(tmp_path, monkeypatch) -> N
             species_counts = {"House Sparrow": 1}
 
         assert folder_name_fn("House Sparrow") == localized_species_name("House Sparrow", language="he")
-        return Result()
+        return Result(), "fake-run-id", object()
 
     monkeypatch.setattr("picklikeme.species.classifier.build_classifier", fake_build_classifier)
     monkeypatch.setattr("picklikeme.species.cache.SpeciesCache", lambda *a, **k: FakeCache())
-    monkeypatch.setattr("picklikeme.species.arrange.arrange_by_species", fake_arrange_by_species)
+    monkeypatch.setattr("picklikeme.species.experiment_capture.run_with_analytics", fake_run_with_analytics)
 
     result = service.organize_by_species(language="he")
 
     assert result["moved"] == 1
     assert result["species_counts"] == {"House Sparrow": 1}
+    assert result["experiment_id"] == "fake-run-id"
+    assert captured["backend"] == "bioclip2"
     service.close()
 
 

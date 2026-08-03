@@ -40,6 +40,7 @@ from .core.thumbnail_loader import ThumbnailLoadTask, ThumbnailReadySignal
 from .widgets.recent_items import DEFAULT_RECENT_ITEMS_LIMIT, RecentItemsMenu
 
 run_in_background = _real_run_in_background
+from .dialogs.analytics_dashboard import AnalyticsDashboard
 from .dialogs.loupe_dialog import LoupeDialog
 from .dialogs.progress import run_with_progress
 from .dialogs.workflow_dialogs import (
@@ -396,6 +397,11 @@ class MainWindow(QMainWindow):
             "Organize by Species…", icon=SP.SP_FileDialogListView,
             tooltip="Group images into per-species folders", triggered=self._organize_by_species,
         )
+        self._analytics_dashboard_action = self._make_action(
+            "Analytics Dashboard…", icon=SP.SP_FileDialogDetailedView,
+            tooltip="Browse past ranking/species-classification experiments and their metrics",
+            triggered=self._show_analytics_dashboard,
+        )
         self._crop_action = self._make_action(
             "Auto Crop…", icon=SP.SP_FileDialogDetailedView,
             tooltip="Generate Lightroom crop metadata around detected subjects", triggered=self._auto_crop,
@@ -472,6 +478,8 @@ class MainWindow(QMainWindow):
         tools_menu.addAction(self._organize_action)
         tools_menu.addAction(self._species_action)
         tools_menu.addAction(self._crop_action)
+        tools_menu.addSeparator()
+        tools_menu.addAction(self._analytics_dashboard_action)
 
         help_menu = menu_bar.addMenu("Help")
         help_menu.addAction(about_action)
@@ -1337,14 +1345,17 @@ class MainWindow(QMainWindow):
             self._set_status("Open a folder before organizing it by species")
             return
         default_language = self._settings.value("review/species_language", "en")
-        dialog = SpeciesLanguageDialog(default_language=default_language, parent=self)
+        default_backend = self._settings.value("review/species_backend", "bioclip2")
+        dialog = SpeciesLanguageDialog(default_language=default_language, default_backend=default_backend, parent=self)
         if dialog.exec() != SpeciesLanguageDialog.DialogCode.Accepted:
             return
         language = dialog.language()
+        backend = dialog.backend()
         self._settings.setValue("review/species_language", language)
+        self._settings.setValue("review/species_backend", backend)
 
         def _run(on_progress=None, on_stage=None):
-            return self.service.organize_by_species(language=language, on_progress=on_progress)
+            return self.service.organize_by_species(backend=backend, language=language, on_progress=on_progress)
 
         def _on_success(result: dict[str, Any]) -> None:
             self._refresh_from_state(self.service.load_session())
@@ -1390,11 +1401,27 @@ class MainWindow(QMainWindow):
 
     def _show_settings(self) -> None:
         current_language = self._settings.value("review/species_language", "en")
-        dialog = PreferencesDialog(default_theme=theme.current_theme_name(), default_language=current_language, parent=self)
+        current_backend = self._settings.value("review/species_backend", "bioclip2")
+        dialog = PreferencesDialog(
+            default_theme=theme.current_theme_name(),
+            default_language=current_language,
+            default_backend=current_backend,
+            parent=self,
+        )
         if dialog.exec() != PreferencesDialog.DialogCode.Accepted:
             return
         self._set_theme(dialog.theme_name())
         self._settings.setValue("review/species_language", dialog.species_language())
+        self._settings.setValue("review/species_backend", dialog.species_backend())
+
+    def _show_analytics_dashboard(self) -> None:
+        """Non-modal (`.show()`, not `.exec()`) so a photographer can keep
+        the dashboard open while switching back to Review/the Loupe -
+        browsing past experiments is a reference task, not a blocking
+        workflow step, unlike Organize by Species's own dialog."""
+        dialog = AnalyticsDashboard(parent=self)
+        dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        dialog.show()
 
     def _show_about(self) -> None:
         QMessageBox.about(self, "About PeakPic", "PeakPic Desktop\nNative desktop shell powered by the existing backend.")

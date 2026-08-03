@@ -83,27 +83,82 @@ and something has to decide what to crop to. That is `select_best_detection`.
   a deliberate size-first policy, not a weighted score: area and confidence
   are never combined into one number.
 
-- **v4 (current): group scenes crop to the whole group, not one member of it.**
-  Wildlife photography routinely and *intentionally* frames a flock, a herd, a
-  colony - a group of animals is the subject, not any single one of them.
-  Picking "the best" individual detection out of a flock of forty birds
-  (by area or by confidence, it does not matter which) crops to one bird and
-  discards the photograph's actual subject. So when the number of surviving
-  detections reaches `group_scene_threshold` (default 10), individual
-  selection is skipped entirely: the crop target becomes the smallest box
-  enclosing every surviving detection, then the normal margin and downstream
-  crop pipeline apply exactly as they do for a single subject. The full-frame
-  fallback (see "If no supported animal is detected" above) still only
-  applies when *nothing* was detected - a group scene never falls back to the
-  full frame, even when the group only occupies a small part of it: the whole
-  point is a tight crop around the actual subject, individual or group.
+- **v4 (superseded on its own, still the group-scene rule below
+  `group_scene_threshold`): group scenes crop to the whole group, not one
+  member of it.** Wildlife photography routinely and *intentionally* frames a
+  flock, a herd, a colony - a group of animals is the subject, not any single
+  one of them. Picking "the best" individual detection out of a flock of
+  forty birds (by area or by confidence, it does not matter which) crops to
+  one bird and discards the photograph's actual subject. So when the number
+  of surviving detections reaches `group_scene_threshold` (default 10),
+  individual selection is skipped entirely: the crop target becomes the
+  smallest box enclosing every surviving detection, then the normal margin
+  and downstream crop pipeline apply exactly as they do for a single subject.
+  The full-frame fallback (see "If no supported animal is detected" above)
+  still only applies when *nothing* was detected - a group scene never falls
+  back to the full frame, even when the group only occupies a small part of
+  it: the whole point is a tight crop around the actual subject, individual
+  or group. Group-scene selection itself is unchanged by v6 below - it is
+  never reached from v3's area-first policy or v6's confidence-first one:
+  both apply only below `group_scene_threshold`.
+
+- **v6 (superseded on its own): confidence dominates; area only breaks a
+  near-tie.** v3's area-first policy had a real failure mode found during
+  the EyePose investigation (`docs/EyePose_Investigation_Phase_1.md`): a
+  real bird detected at 0.998 confidence lost the crop to an unrelated,
+  much lower confidence (0.458) false-positive detection - mislabelled
+  "cow" - simply because the false positive's box happened to be larger.
+  Feeding EyePose a crop of the wrong region then produced a
+  confidently-reported eye that was not a bird's eye at all (the "no
+  visible eye should exist" symptom from the original bug report). v6
+  inverted v3 outright: the highest-confidence surviving detection won,
+  unless another detection's confidence was within a fraction of the
+  winner's own to trigger an area tie-break. This fixed the "cow" case,
+  but reopened v2's own original failure mode: a small, clean, very
+  confident detection could again beat a larger, legitimately-real subject
+  whose confidence was merely *good* rather than exceptional (motion blur,
+  an awkward pose, partial occlusion) - exactly why v2 was abandoned for v3
+  in the first place. Superseded after one investigation cycle once this
+  tension was recognised (`docs/EyePose_Investigation_Phase_1.md`'s
+  "Detection selection policy" discussion) - a pure ordering, in *either*
+  direction, cannot protect against both failure modes at once: proven
+  algebraically (a linear weighted score can't either - the two failure
+  modes impose contradictory constraints on the weights) rather than just
+  observed.
+
+- **v7 (current): an absolute confidence gate, then area decides among
+  what survives.** The resolution is not to make confidence or area
+  dominate the other, and not to blend them into one score - it is to use
+  each for what it actually measures. Confidence is a reliability signal:
+  good at telling a real detection from background clutter or a
+  misclassification (the "cow"), not a good proxy for which of several
+  *real* detections the photographer meant. Area is the opposite: a poor
+  reliability signal, but a reasonable proxy for photographic intent once
+  every candidate under consideration is already known to be real. So: any
+  candidate whose confidence is below `min_crop_confidence` (an absolute
+  floor, unrelated to any other candidate's own score - unlike v6's
+  relative tie band) is discarded outright, exactly like an unreliable
+  detection should be; among whatever remains, the largest wins, exactly
+  like a real, comparably-reliable candidate's size should decide. Checked
+  against the "cow" case (only the 0.998 bird clears a 0.5-0.7 gate; the
+  0.458 false positive does not, so no area comparison is even needed) and
+  the v6-reopened case (both a legitimately-real, moderately-confident
+  subject and a small, very-confident distractor clear a moderate gate, so
+  area - not confidence - correctly decides between two now-equally-trusted
+  candidates, restoring v3's original intent). Still never a weighted
+  score - confidence answers "is this candidate trustworthy at all",
+  area answers "which trustworthy candidate is the subject", and neither
+  question is allowed to answer the other. Detector- and class-agnostic by
+  construction: nothing here reads a detection's `label`, so the same rule
+  applies identically whether the competing detections are birds, mammals,
+  or any future class this project learns to catalogue.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Sequence
 
@@ -218,7 +273,7 @@ def detection_category(label: int) -> str | None:
     return COCO_CLASS_CATEGORY.get(int(label))
 
 
-CROP_CACHE_VERSION = "v5"
+CROP_CACHE_VERSION = "v7"
 CROP_PARAMS_FILENAME = "crop_params.json"
 
 # Cache entries live in cache_dir/<first 2 hex chars of digest>/<digest><ext>,
@@ -237,12 +292,15 @@ DEFAULT_IMAGE_FORMAT = "jpeg"
 DEFAULT_JPEG_QUALITY = 98
 IMAGE_FORMAT_EXTENSIONS: dict[str, str] = {"jpeg": ".jpg", "png": ".png"}
 
-# How close two surviving detections' areas must be, as a fraction of the
-# larger one, before confidence is allowed to decide between them. 0.10 means
-# a detection needs to reach 90% of the largest detection's area to even be
-# considered for the confidence tie-break; anything smaller loses on size
-# alone, however much more confident it is. See select_best_detection().
-DEFAULT_AREA_TIE_FRAC = 0.10
+# The absolute reliability floor a detection's confidence must clear to even
+# be considered for crop-target selection - unrelated to any other
+# candidate's own score, unlike v6's now-superseded relative tie band. See
+# select_best_detection() and the module docstring's "v7" policy entry.
+# Informed by (not exhaustively validated against) the EyePose Investigation
+# Phase 1 sample: every real, class-eligible detection observed was >= 0.94;
+# the one confirmed false positive topped out at 0.458. 0.6 sits with a
+# comfortable margin on both sides of that gap.
+DEFAULT_MIN_CROP_CONFIDENCE = 0.6
 
 # At or above this many surviving detections, the image is treated as a group
 # scene: the crop target becomes the box enclosing all of them, not a single
@@ -274,7 +332,7 @@ class CropParams:
     # docstring. Set an explicit int to cap disk usage at the cost of detail,
     # e.g. for a quick experiment or a disk-constrained machine.
     max_side: int | None = None
-    area_tie_frac: float = DEFAULT_AREA_TIE_FRAC  # size-tie tolerance for select_best_detection
+    min_crop_confidence: float = DEFAULT_MIN_CROP_CONFIDENCE  # absolute reliability floor for select_best_detection
     group_scene_threshold: int = DEFAULT_GROUP_SCENE_THRESHOLD  # >= this many detections -> group scene
     detector: str = "fasterrcnn_resnet50_fpn_v2"
     # "jpeg" (default) or "png". See DEFAULT_IMAGE_FORMAT/crop_cache_path -
@@ -412,11 +470,28 @@ def write_crop_params(cache_dir: str | Path, params: CropParams) -> Path:
 
 
 def read_crop_params(cache_dir: str | Path) -> CropParams | None:
+    """The params an existing cache was built with, or None if there is no
+    cache yet.
+
+    Silently drops any key in the stored JSON that is not a current
+    `CropParams` field, rather than raising `TypeError` - an older cache's
+    `crop_params.json` may have a field name from a since-renamed generation
+    (`area_tie_frac` -> `confidence_tie_frac` in v6 -> `min_crop_confidence`
+    in v7; see the module docstring's policy history), and a raw
+    `CropParams(**data)` unpack would crash on an unrecognised key before
+    `build_cache`'s own version-mismatch check ever runs. Dropping it here
+    does not weaken that check: the stored `version` field (still read
+    normally) will not match the current `CROP_CACHE_VERSION`, so
+    `build_cache`'s `existing != params` comparison still refuses a stale
+    cache exactly as it refuses any other mismatch, with the same
+    "pass --force to rebuild" message rather than a stack trace.
+    """
     path = Path(cache_dir) / CROP_PARAMS_FILENAME
     if not path.exists():
         return None
     data = json.loads(path.read_text(encoding="utf-8"))
-    return CropParams(**data)
+    known_fields = {f.name for f in fields(CropParams)}
+    return CropParams(**{key: value for key, value in data.items() if key in known_fields})
 
 
 DETECTIONS_SUFFIX = ".detections.json"
@@ -543,7 +618,7 @@ def _group_scene_detection(candidates: Sequence[BirdDetection]) -> BirdDetection
 
 def select_best_detection(
     candidates: Sequence[BirdDetection],
-    area_tie_frac: float = DEFAULT_AREA_TIE_FRAC,
+    min_crop_confidence: float = DEFAULT_MIN_CROP_CONFIDENCE,
     group_scene_threshold: int = DEFAULT_GROUP_SCENE_THRESHOLD,
 ) -> BirdDetection | None:
     """The crop target build_crop should use, chosen from every detection that
@@ -553,13 +628,21 @@ def select_best_detection(
 
     Two policies, chosen by how many detections survived:
 
-    - **Fewer than `group_scene_threshold`: bounding-box area dominates.** The
-      largest candidate wins, unless another candidate's area is within
-      `area_tie_frac` of it, in which case confidence breaks the tie among
-      that near-largest group only. This is deliberately not a weighted score
-      - area and confidence are never combined into one number - so a
-      detection that is not close in size to the largest can never win by
-      being more confident, however large the gap.
+    - **Fewer than `group_scene_threshold`: an absolute reliability gate,
+      then area decides.** Any candidate whose confidence is below
+      `min_crop_confidence` is discarded outright - an absolute floor,
+      unrelated to any other candidate's own score (unlike v6's now-
+      superseded relative tie band). Among whatever remains, the largest
+      wins. This is deliberately not a weighted score - confidence and area
+      are never combined into one number, and neither is allowed to answer
+      the question the other is better suited to: confidence decides which
+      candidates are trustworthy at all, area decides which trustworthy
+      candidate is the photographic subject. See the module docstring's "v7"
+      entry for why a pure ordering in either direction (v3's area-first, or
+      v6's confidence-first) cannot protect against both of the real
+      failure modes this project has actually hit. Detector- and
+      class-agnostic: nothing here reads `label`, so this applies
+      identically to any current or future catalogued class.
 
     - **`group_scene_threshold` or more: the image is a group scene.** Picking
       one detection out of a flock, a herd or a colony would crop to a single
@@ -568,14 +651,24 @@ def select_best_detection(
       enclosing every surviving detection (see `_group_scene_detection`). The
       normal crop margin and downstream pipeline still apply to that box
       exactly as they would to a single detection; there is no full-frame
-      fallback here, because a group is still a real, locatable subject.
+      fallback here, because a group is still a real, locatable subject. This
+      branch is unaffected by v7 - it never consults confidence or area to
+      pick a winner at all, and never applies the reliability gate either (a
+      group scene's own members were already confidence-filtered upstream,
+      by the detector's own catalogue threshold).
 
     The single source of truth for subject selection: BirdDetector.detect_best_bird
     and detect_with_all both call this rather than each implementing their own
     comparison, so the two can never disagree about the crop target.
 
-    Returns None for an empty `candidates` (nothing survived filtering),
-    mirroring "no detection" everywhere else in this module.
+    Returns None for an empty `candidates` (nothing survived filtering) OR
+    when no candidate clears `min_crop_confidence` - the latter is a
+    deliberate choice, not a gap: a subject none of whose candidates are
+    reliable is treated the same as no subject at all (`build_crop`'s
+    existing full-frame fallback takes over), rather than cropping to a
+    detection already judged unreliable. Every candidate is still recorded
+    in `BirdDetector.detect_with_all`'s own `catalogued` list regardless -
+    only crop-target *selection* applies this gate, never cataloguing.
     """
     if not candidates:
         return None
@@ -583,19 +676,11 @@ def select_best_detection(
     if len(candidates) >= group_scene_threshold:
         return _group_scene_detection(candidates)
 
-    areas = [(candidate, box_area(candidate.box)) for candidate in candidates]
-    largest_area = max(area for _, area in areas)
+    reliable = [candidate for candidate in candidates if candidate.score >= min_crop_confidence]
+    if not reliable:
+        return None
 
-    if largest_area <= 0.0:
-        # Degenerate boxes only (zero width or height, which a real detector
-        # should never emit): area carries no information here, so fall back
-        # to confidence alone rather than an arbitrary choice among equally
-        # uninformative candidates.
-        return max(candidates, key=lambda detection: detection.score)
-
-    tie_threshold = largest_area * (1.0 - area_tie_frac)
-    contenders = [candidate for candidate, area in areas if area >= tie_threshold]
-    return max(contenders, key=lambda detection: detection.score)
+    return max(reliable, key=lambda detection: box_area(detection.box))
 
 
 @dataclass
@@ -656,7 +741,7 @@ class BirdDetector:
         conf_threshold: float = 0.30,
         classes: "dict[int, str] | set[int] | None" = None,
         catalogue_classes: "dict[int, str] | set[int] | None" = None,
-        area_tie_frac: float = DEFAULT_AREA_TIE_FRAC,
+        min_crop_confidence: float = DEFAULT_MIN_CROP_CONFIDENCE,
         group_scene_threshold: int = DEFAULT_GROUP_SCENE_THRESHOLD,
     ):
         import torch
@@ -679,7 +764,7 @@ class BirdDetector:
             if catalogue_classes is None
             else catalogue_classes
         )
-        self.area_tie_frac = area_tie_frac
+        self.min_crop_confidence = min_crop_confidence
         self.group_scene_threshold = group_scene_threshold
         weights = FasterRCNN_ResNet50_FPN_V2_Weights.COCO_V1
         self.model = fasterrcnn_resnet50_fpn_v2(weights=weights).to(device).eval()
@@ -717,7 +802,7 @@ class BirdDetector:
                 if int(label) in self.catalogue_classes and score >= self.conf_threshold
             ]
             crop_candidates = [d for d in catalogued if d.label in self.classes]
-            best = select_best_detection(crop_candidates, self.area_tie_frac, self.group_scene_threshold)
+            best = select_best_detection(crop_candidates, self.min_crop_confidence, self.group_scene_threshold)
         return best, catalogued
 
     def detect_best_bird(self, image_rgb: np.ndarray) -> BirdDetection | None:

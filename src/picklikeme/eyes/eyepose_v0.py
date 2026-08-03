@@ -72,7 +72,7 @@ Coordinate contract
 --------------------
 `detect(subject_crop_rgb)` returns coordinates in the SAME frame every other
 `EyeDetector` does: pixels in the crop it was given, never the model's own
-640x640 input tensor. `_predict_landmarks` is the one place that boundary is
+640x640 input tensor. `_predict` is the one place that boundary is
 crossed - forward transform (`_letterbox_forward`) into model space, decode
 (`_decode_best`), inverse transform (`_letterbox_inverse`) back out - and
 each of those three is a small, independently unit-tested pure function
@@ -82,28 +82,52 @@ tests) independent of whether the model's *predictions* are any good.
 
 Accept/reject gate
 -------------------
-Two independent checks, mirroring SuperAnimal-Bird's own two-gate shape
-(confidence, then a geometric plausibility check) without literally reusing
-its arithmetic - the two models' landmark schemas are different enough that
-a direct port would not mean the same thing:
+Two genuinely different questions, kept as two independent checks rather
+than one combined score - see docs/EyePose_Investigation_Phase_1.md's Part
+2/3 for the investigation that established this split:
 
-- **Confidence.** The primary eye's own visibility score must clear
-  `min_confidence`.
-- **Anatomical plausibility.** The primary eye must lie reasonably close to
-  the beak<->head_top axis (the two most reliably-detected, highest-contrast
-  points on a bird's head, the same reasoning SuperAnimal-Bird applied to
-  its own choice of crown/bill) - distance from that line segment, floored
-  and normalised by beak<->head_top's own length (the head-scale reference),
-  must stay under `max_head_distance_ratio`. Catches a keypoint that landed
-  on a shoulder or the background: confidently, but nowhere near a head.
+1. **Is a bird head actually here at all?** (`head_visible`, below) - a
+   holistic, pre-decode signal (`detection_confidence`, the winning anchor's
+   own "is this a real bird instance" score), independent of any single
+   landmark. A crop containing no real bird head can still produce a
+   confident-*looking* guess for individual landmarks - measured directly:
+   a wrong crop that missed the bird entirely (a subject-selection bug,
+   since fixed - see the report's Q1) had `detection_confidence` of 0.026
+   against 0.82-0.92 for every real head in the same investigation's sample,
+   while its "eye" landmark's own confidence was a misleading 0.97. Gated by
+   `min_head_confidence` - checked by `EyeFilter` as its own, independent
+   rejection reason (`LOW_HEAD_CONFIDENCE`), before the eye-specific gate
+   below is even consulted.
+
+2. **Given a head is there, is THIS eye trustworthy?** (`accepts_eye`,
+   mirroring SuperAnimal-Bird's own two-gate shape without literally
+   reusing its arithmetic - the two models' landmark schemas differ too
+   much for a direct port to mean the same thing):
+   - **Confidence.** The primary eye's own visibility score must clear
+     `min_confidence`.
+   - **Anatomical plausibility.** The primary eye must lie reasonably close
+     to the beak<->head_top axis (the two most reliably-detected,
+     highest-contrast points on a bird's head, the same reasoning
+     SuperAnimal-Bird applied to its own choice of crown/bill) - distance
+     from that line segment, floored and normalised by beak<->head_top's own
+     length (the head-scale reference), must stay under
+     `max_head_distance_ratio`. Catches a keypoint that landed on a
+     shoulder or the background: confidently, but nowhere near a head.
+
+Question 1 answers "is there anything here worth asking question 2 about at
+all" - a crop with no real head can still pass question 2's own confidence
+check (see the 0.97 example above), which is exactly why the two are
+independent gates with independent rejection reasons, not one combined
+check: collapsing them would hide *which* thing was wrong from a
+photographer looking at why an image was filtered.
 
 Unlike SuperAnimal-Bird's `DEFAULT_MAX_EYE_DISAGREEMENT` (tuned against a
 30-image hand-adjudicated sample of this project's own archive), the
 defaults below are reasonable starting points, not empirically validated
 ones - this project has no equivalent adjudicated sample for eye-pose-v0 yet.
-Tune `min_confidence`/`max_head_distance_ratio` after reviewing real results
-through the Gallery/Loupe debug overlay, the same way SuperAnimal-Bird's own
-numbers were originally derived.
+Tune `min_confidence`/`max_head_distance_ratio`/`min_head_confidence` after
+reviewing real results through the Gallery/Loupe debug overlay, the same way
+SuperAnimal-Bird's own numbers were originally derived.
 """
 
 from __future__ import annotations
@@ -150,6 +174,12 @@ PAD_VALUE = 114
 # A starting default, not an empirically validated one - see the module
 # docstring's "Accept/reject gate" section.
 DEFAULT_MIN_CONFIDENCE = 0.5
+# Gates head_visible() - see the module docstring's "Accept/reject gate"
+# section, question 1. 0.5 sits with a wide margin below every real head
+# observed in the EyePose Investigation Phase 1 sample (0.82-0.92) and a
+# wide margin above the one confirmed no-head case (0.026) - informed by
+# that data, not exhaustively validated by it (10 images).
+DEFAULT_MIN_HEAD_CONFIDENCE = 0.5
 # Matches SuperAnimal-Bird's own default: the two backends' eye boxes should
 # be comparably sized for a fair side-by-side comparison, and 0.08 is not
 # tied to anything model-specific - see eyes.detector.derive_eye_box.
@@ -354,6 +384,101 @@ def _point_to_segment_distance(px: float, py: float, ax: float, ay: float, bx: f
     return math.hypot(px - (ax + t * abx), py - (ay + t * aby))
 
 
+def accepts_eye(
+    primary: EyeKeypoint,
+    landmarks: dict[str, EyeKeypoint],
+    *,
+    min_confidence: float,
+    max_head_distance_ratio: float,
+) -> bool:
+    """The full accept/reject gate (see the module docstring's "Accept/reject
+    gate") as a pure function of already-decoded keypoints and thresholds -
+    no model, no I/O, no `EyePoseV0EyeDetector` instance needed. `detect()`
+    calls this directly; nothing else about `detect()`'s behaviour changed
+    when this was pulled out of it.
+
+    This is the "Decision Engine" from the EyePose Investigation Phase 1
+    report's Part 5: the crop cache and EyePose's own inference are both
+    already independently cached (`bird_crop`'s Vision Cache and
+    `eyes.cache.EyeRecord` respectively - see that module's docstring), and
+    this function is the one place that turns a cached confidence value into
+    an accept/reject decision. Being a pure function of numbers already on
+    disk (`EyeRecord.confidence`) is what makes re-evaluating a new
+    `min_confidence` "almost instantaneous" (the report's own phrase) and
+    requiring neither a crop-cache rebuild nor a fresh EyePose forward pass -
+    only `EyeRecord`'s own `left`/`right` are cached today, so a full
+    re-evaluation (this function's `max_head_distance_ratio` term needs
+    `beak`/`head_top` too) still requires the original `EyeDetection`; only
+    the confidence term is re-decidable from `EyeRecord` alone right now.
+
+    Two independent checks - see the module docstring's "Accept/reject gate":
+
+    - **Confidence.** `primary.confidence >= min_confidence`.
+    - **Anatomical plausibility.** `primary` must lie close to the
+      beak<->head_top line, relative to head size (`_point_to_segment_distance`,
+      floored by `MIN_HEAD_SCALE_PX`) - catches a keypoint that landed on a
+      shoulder or the background rather than the head.
+
+    Investigated whether also weighting in `landmarks["head_top"].confidence`
+    improves reliability (EyePose Investigation Phase 1, Part 4, first pass)
+    - it does not, on the investigation's own data, and is deliberately NOT
+    folded in here:
+
+    - The one sample where confidence alone correctly rejected a bad
+      detection (a tern with one wing raised over its head) had a LOW
+      head_top confidence too (0.23) - combining would not have changed that
+      already-correct reject.
+    - The one sample where confidence alone WRONGLY accepted a detection (a
+      crop that missed the bird entirely due to a since-fixed subject-
+      selection bug - see the report's Q1) had a HIGH head_top confidence
+      (0.92) - combining would NOT have caught that failure either; both
+      channels were fooled together, because the failure was upstream (the
+      crop itself), not something either keypoint's own confidence could
+      diagnose.
+
+    Per-landmark head_top confidence tracked eye confidence rather than
+    adding independent signal - but that turned out to be the wrong
+    question. `head_visible` (below) asks a DIFFERENT one - not "does the
+    head_top *landmark's* confidence agree with the eye's", but "is a real
+    head instance present at all, independent of any single landmark" - and
+    that one DOES carry independent signal (Part 4, second pass): the same
+    wrong-crop case had a `detection_confidence` of 0.026, dramatically
+    separated from every real head's 0.82-0.92, even though its eye
+    landmark's own confidence was a misleading 0.97. `accepts_eye` and
+    `head_visible` are deliberately two separate functions, checked
+    independently by `EyeFilter` - see the module docstring's "Accept/reject
+    gate" section.
+    """
+    accepted = primary.confidence >= min_confidence
+    if not accepted:
+        return False
+    beak, head_top = landmarks["beak"], landmarks["head_top"]
+    head_scale = max(MIN_HEAD_SCALE_PX, math.hypot(beak.x - head_top.x, beak.y - head_top.y))
+    distance = _point_to_segment_distance(primary.x, primary.y, beak.x, beak.y, head_top.x, head_top.y)
+    return distance / head_scale <= max_head_distance_ratio
+
+
+def head_visible(detection_confidence: float, min_detection_confidence: float) -> bool:
+    """Is a real bird head instance actually present in the crop at all -
+    independent of any single landmark's own confidence, including the
+    primary eye's? See the module docstring's "Accept/reject gate" section,
+    question 1, and `accepts_eye`'s own docstring for the measured example
+    (`detection_confidence=0.026` on a crop with no real bird head, against
+    0.82-0.92 for every real head in the same sample, despite that crop's
+    own eye landmark reporting a misleading 0.97 confidence).
+
+    `detection_confidence` is the winning anchor's own pre-decode score from
+    `_decode_best` (`predictions[4, :]`, the same row used to pick which
+    anchor to decode at all) - genuinely independent of the six per-landmark
+    visibility values decoded from that anchor afterwards, not derived from
+    them. A pure function, like `accepts_eye`, for the same "Decision
+    Engine" reasons (EyePose Investigation Phase 1, Part 5): re-evaluating a
+    new `min_detection_confidence` against an already-cached
+    `EyeRecord.head_confidence` needs no fresh inference.
+    """
+    return detection_confidence >= min_detection_confidence
+
+
 class EyePoseV0EyeDetector:
     """Bird eye localisation from the `synthet/eye-pose-v0` checkpoint, via
     ONNX Runtime. Implements `eyes.detector.EyeDetector` - see this module's
@@ -369,6 +494,7 @@ class EyePoseV0EyeDetector:
         min_confidence: float = DEFAULT_MIN_CONFIDENCE,
         eye_box_frac: float = DEFAULT_EYE_BOX_FRAC,
         max_head_distance_ratio: float = DEFAULT_MAX_EYE_HEAD_DISTANCE_RATIO,
+        min_head_confidence: float = DEFAULT_MIN_HEAD_CONFIDENCE,
         weights_dir: str | Path | None = None,
     ) -> None:
         try:
@@ -384,6 +510,7 @@ class EyePoseV0EyeDetector:
         self.min_confidence = min_confidence
         self.eye_box_frac = eye_box_frac
         self.max_head_distance_ratio = max_head_distance_ratio
+        self.min_head_confidence = min_head_confidence
 
         onnx_path = ensure_onnx_weights(weights_dir)
         providers = _select_providers(device)
@@ -410,22 +537,28 @@ class EyePoseV0EyeDetector:
         height, width = (subject_crop_rgb.shape[:2] if subject_crop_rgb is not None else (0, 0))
         if subject_crop_rgb is None or subject_crop_rgb.size == 0:
             return EyeDetection(
-                box=(0.0, 0.0, 1.0, 1.0), confidence=0.0, detector_id=self.detector_id, accepted=False
+                box=(0.0, 0.0, 1.0, 1.0), confidence=0.0, detector_id=self.detector_id, accepted=False,
+                head_confidence=None, head_visible=False,
             )
 
-        landmarks = self._predict_landmarks(subject_crop_rgb)
-        if landmarks is None:
+        predicted = self._predict(subject_crop_rgb)
+        if predicted is None:
             return EyeDetection(
                 box=(0.0, 0.0, float(width), float(height)),
                 confidence=0.0, detector_id=self.detector_id, accepted=False,
+                head_confidence=None, head_visible=False,
             )
+        detection_confidence, landmarks = predicted
 
         left, right = landmarks["left_eye"], landmarks["right_eye"]
         primary, other = (left, right) if left.confidence >= right.confidence else (right, left)
 
-        accepted = primary.confidence >= self.min_confidence
-        if accepted:
-            accepted = self._anatomically_plausible(primary, landmarks)
+        accepted = accepts_eye(
+            primary, landmarks,
+            min_confidence=self.min_confidence,
+            max_head_distance_ratio=self.max_head_distance_ratio,
+        )
+        head_ok = head_visible(detection_confidence, self.min_head_confidence)
 
         box = derive_eye_box(primary.x, primary.y, width, height, self.eye_box_frac, MIN_EYE_BOX_PX)
         return EyeDetection(
@@ -436,19 +569,29 @@ class EyePoseV0EyeDetector:
             left=left,
             right=right,
             accepted=accepted,
+            head_confidence=detection_confidence,
+            head_visible=head_ok,
         )
 
-    def _predict_landmarks(self, crop_rgb: np.ndarray) -> dict[str, EyeKeypoint] | None:
-        """All six landmarks, in `crop_rgb`'s own pixel space - the forward
+    def _predict(self, crop_rgb: np.ndarray) -> tuple[float, dict[str, EyeKeypoint]] | None:
+        """`(detection_confidence, landmarks)` - `detection_confidence` is
+        the winning anchor's own pre-decode "is a real bird head instance
+        here" score (see `head_visible`'s own docstring); `landmarks` is all
+        six keypoints, in `crop_rgb`'s own pixel space - the forward
         transform, one ONNX Runtime call, decode, then the inverse
-        transform. Split out from `detect()` (mirroring
-        SuperAnimal-Bird's own `_predict_keypoints`) so a test can
-        monkeypatch this one method with controlled, crop-space keypoints
-        and exercise the accept/reject arithmetic without a real model."""
+        transform. Split out from `detect()` (mirroring SuperAnimal-Bird's
+        own `_predict_keypoints`) so a test can monkeypatch this one method
+        with a controlled `(detection_confidence, {name: EyeKeypoint})` pair
+        and exercise the accept/reject arithmetic without a real model.
+        Renamed from `_predict_landmarks` (EyePose Investigation Phase 1,
+        Part 2) when `detection_confidence` stopped being silently discarded
+        here - it used to be computed by `_run_model` and then dropped
+        before `detect()` ever saw it.
+        """
         debug = self._run_model(crop_rgb)
         if debug is None:
             return None
-        return debug["landmarks_crop"]
+        return debug["detection_confidence"], debug["landmarks_crop"]
 
     def debug_predict(self, crop_rgb: np.ndarray) -> dict | None:
         """Every intermediate value of one forward pass, for the coordinate-
@@ -458,15 +601,16 @@ class EyePoseV0EyeDetector:
 
         Returns `{"padded_input": the exact 640x640 uint8 RGB array the
         model saw, "detection_confidence": the winning anchor's own "is
-        this a bird" score, "landmarks_640": {name: (x, y, vis)} in the
-        model's own input-pixel space, "landmarks_crop": {name:
-        EyeKeypoint} in `crop_rgb`'s space - the same dict `_predict_landmarks`
-        returns}`, or None on a degenerate all-zero model output.
+        this a bird" score (see `head_visible`'s own docstring), "landmarks_640":
+        {name: (x, y, vis)} in the model's own input-pixel space,
+        "landmarks_crop": {name: EyeKeypoint} in `crop_rgb`'s space - the
+        same pair `_predict` returns}`, or None on a degenerate all-zero
+        model output.
         """
         return self._run_model(crop_rgb)
 
     def _run_model(self, crop_rgb: np.ndarray) -> dict | None:
-        """The one place `detect()`/`_predict_landmarks()`/`debug_predict()`
+        """The one place `detect()`/`_predict()`/`debug_predict()`
         all funnel through: forward transform, one ONNX Runtime call,
         decode. Keeping this single-sourced is what guarantees
         `debug_predict`'s intermediate values are ALWAYS exactly what a
@@ -490,9 +634,3 @@ class EyePoseV0EyeDetector:
             "landmarks_crop": landmarks_crop,
         }
 
-    def _anatomically_plausible(self, eye: EyeKeypoint, landmarks: dict[str, EyeKeypoint]) -> bool:
-        """See the class/module docstring's "Anatomical plausibility"."""
-        beak, head_top = landmarks["beak"], landmarks["head_top"]
-        head_scale = max(MIN_HEAD_SCALE_PX, math.hypot(beak.x - head_top.x, beak.y - head_top.y))
-        distance = _point_to_segment_distance(eye.x, eye.y, beak.x, beak.y, head_top.x, head_top.y)
-        return distance / head_scale <= self.max_head_distance_ratio

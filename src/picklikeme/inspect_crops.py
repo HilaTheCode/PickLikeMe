@@ -364,7 +364,7 @@ def inspect_folder(args) -> None:
         margin_frac=args.margin_frac,
         conf_threshold=args.conf_threshold,
         max_side=args.max_side,
-        area_tie_frac=args.area_tie_frac,
+        min_crop_confidence=args.min_crop_confidence,
         group_scene_threshold=args.group_scene_threshold,
     )
     loader = _build_loader(str(input_folder), args)
@@ -373,7 +373,7 @@ def inspect_folder(args) -> None:
     detector = BirdDetector(
         device=device,
         conf_threshold=params.conf_threshold,
-        area_tie_frac=params.area_tie_frac,
+        min_crop_confidence=params.min_crop_confidence,
         group_scene_threshold=params.group_scene_threshold,
     )
 
@@ -472,7 +472,7 @@ def inspect_cache(args) -> None:
     detector = BirdDetector(
         device=device,
         conf_threshold=params.conf_threshold,
-        area_tie_frac=params.area_tie_frac,
+        min_crop_confidence=params.min_crop_confidence,
         group_scene_threshold=params.group_scene_threshold,
     )
 
@@ -514,7 +514,7 @@ def main() -> None:
     parser.add_argument("--margin-frac", type=float, default=CropParams.margin_frac, help="Folder mode: crop safety margin (match preprocess)")
     parser.add_argument("--conf-threshold", type=float, default=CropParams.conf_threshold, help="Folder mode: detection threshold (match preprocess)")
     parser.add_argument("--max-side", type=int, default=CropParams.max_side, help="Folder mode: crop long-side cap (match preprocess)")
-    parser.add_argument("--area-tie-frac", type=float, default=CropParams.area_tie_frac, help="Folder mode: size-tie tolerance for detection selection (match preprocess)")
+    parser.add_argument("--min-crop-confidence", type=float, default=CropParams.min_crop_confidence, help="Folder mode: absolute confidence floor for detection selection (match preprocess)")
     parser.add_argument("--group-scene-threshold", type=int, default=CropParams.group_scene_threshold, help="Folder mode: detections at/above this count crop the whole group (match preprocess)")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default=None, help="Device (default: auto - CUDA if available, else CPU)")

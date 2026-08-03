@@ -332,7 +332,7 @@ def test_the_status_line_reports_what_was_filtered_out(app) -> None:
     )
     assert "Ranked 10 images" in filtered
     assert "skipped 10" in filtered
-    assert "No visible eye: 7" in filtered
+    assert "No reliable visible eye: 7" in filtered
     assert "No subject detected: 3" in filtered
 
 

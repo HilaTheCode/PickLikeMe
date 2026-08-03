@@ -42,13 +42,21 @@ def _projected_eye_box(candidate: FilterCandidate, eye_box: tuple[float, float, 
     full original frame - the same scale-and-offset trick
     `review.thumbnails.eye_keypoints_for` already uses for the Gallery/Loupe
     overlay, reproduced here so the debug image shows the SAME "final
-    projected coordinates" a photographer would see there."""
-    if candidate.subject_box is None or candidate.subject_crop is None:
+    projected coordinates" a photographer would see there.
+
+    Scales against `candidate.crop_box` (the crop's own rectangle -
+    `subject_box` grown by `bird_crop.CropParams.margin_frac`), NOT
+    `candidate.subject_box` (the tight detection box) - `subject_crop`'s
+    pixels span `crop_box`, not `subject_box`. Using the tight box here was a
+    real, proven bug - see docs/EyePose_Investigation_Phase_1.md's Q1
+    finding.
+    """
+    if candidate.crop_box is None or candidate.subject_crop is None:
         return None
     crop_h, crop_w = candidate.subject_crop.shape[:2]
     if crop_w <= 0 or crop_h <= 0:
         return None
-    sx1, sy1, sx2, sy2 = candidate.subject_box
+    sx1, sy1, sx2, sy2 = candidate.crop_box
     scale_x, scale_y = (sx2 - sx1) / crop_w, (sy2 - sy1) / crop_h
     x1, y1, x2, y2 = eye_box
     return (sx1 + x1 * scale_x, sy1 + y1 * scale_y, sx1 + x2 * scale_x, sy1 + y2 * scale_y)

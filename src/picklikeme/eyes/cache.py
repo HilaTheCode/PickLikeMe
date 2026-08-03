@@ -33,7 +33,9 @@ logger = logging.getLogger(__name__)
 # version is never misread as the current one - the same discipline
 # bird_crop.CROP_CACHE_VERSION and analyzer.detections.DETECTION_CACHE_VERSION
 # already apply to their own sidecars.
-EYE_CACHE_VERSION = 1
+# v2 (EyePose Investigation Phase 1, Part 2): added head_confidence, the
+# independent "is a real head present" signal - see eyepose_v0.head_visible.
+EYE_CACHE_VERSION = 2
 EYE_SUFFIX = ".eye.json"
 
 
@@ -59,6 +61,10 @@ class EyeRecord:
     confidence: float
     left: EyeKeypoint | None
     right: EyeKeypoint | None
+    # The independent "is a real head present at all" signal - see
+    # eyes.detector.EyeDetection.head_confidence's own docstring. None for a
+    # backend (or an older cached row) that doesn't have one.
+    head_confidence: float | None = None
 
 
 def save_eye_detection(
@@ -83,6 +89,7 @@ def save_eye_detection(
         "confidence": detection.confidence,
         "left": _keypoint_to_dict(detection.left),
         "right": _keypoint_to_dict(detection.right),
+        "head_confidence": detection.head_confidence,
     }
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -111,6 +118,7 @@ def read_eye_detection(cache_dir: str | Path, source_path: str | Path) -> EyeRec
 
     size = payload.get("subject_crop_size") or (0, 0)
     box = payload.get("box") or (0.0, 0.0, 0.0, 0.0)
+    head_confidence = payload.get("head_confidence")
     return EyeRecord(
         detector_id=payload.get("detector_id", ""),
         subject_crop_size=(int(size[0]), int(size[1])),
@@ -119,6 +127,7 @@ def read_eye_detection(cache_dir: str | Path, source_path: str | Path) -> EyeRec
         confidence=float(payload.get("confidence", 0.0)),
         left=_keypoint_from_dict(payload.get("left")),
         right=_keypoint_from_dict(payload.get("right")),
+        head_confidence=float(head_confidence) if head_confidence is not None else None,
     )
 
 

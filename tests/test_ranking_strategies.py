@@ -23,11 +23,13 @@ from picklikeme.eyes.detector import EyeDetection
 from picklikeme.ranking import (
     DEFAULT_STRATEGY_ID,
     AIModelParams,
+    ClassicVisionEyePoseParams,
     ClassicVisionParams,
     available_strategies,
     get_strategy,
 )
 from picklikeme.ranking.classic import (
+    ClassicVisionEyePoseStrategy,
     ClassicVisionStrategy,
     ImageMetrics,
     combine,
@@ -38,6 +40,7 @@ from picklikeme.ranking.classic import (
     write_metrics_report,
 )
 from picklikeme.ranking.filters import (
+    LOW_HEAD_CONFIDENCE,
     NO_SUBJECT,
     NO_VISIBLE_EYE,
     REJECT_REASONS,
@@ -213,6 +216,64 @@ def test_every_param_spec_is_usable_by_a_generated_dialog() -> None:
 
 
 # ---------------------------------------------------------------------------
+# ClassicVisionEyePoseParams - EyePose Investigation Phase 1, Parts 1/3/6:
+# eye_confidence_threshold (renamed from min_eye_confidence to match the
+# report exactly), detection_head_confidence_threshold (Part 2's independent
+# head-visibility gate, EyePose-only), and the two crop-selection thresholds
+# (detection_confidence_threshold/crop_confidence_threshold) both backends
+# share.
+# ---------------------------------------------------------------------------
+
+
+def test_eyepose_params_every_spec_is_usable_by_a_generated_dialog() -> None:
+    for spec in ClassicVisionEyePoseParams.specs():
+        assert spec.minimum <= spec.default <= spec.maximum
+        assert spec.label and spec.help
+        assert hasattr(ClassicVisionEyePoseParams(), spec.name)
+
+
+def test_eyepose_params_round_trip_through_a_dialogs_raw_values() -> None:
+    values = {spec.name: spec.default for spec in ClassicVisionEyePoseParams.specs()}
+    values["unrelated_widget"] = 123.0  # ignored, not an error
+    assert ClassicVisionEyePoseParams.from_values(values) == ClassicVisionEyePoseParams()
+
+
+def test_eye_confidence_threshold_is_the_declared_name() -> None:
+    """Named to match the EyePose Investigation Phase 1 report's Part 3
+    exactly, not min_eye_confidence (ClassicVisionParams/SuperAnimal-Bird's
+    own, different gate - see ClassicVisionEyePoseParams's own docstring for
+    why the two backends do not share one name here)."""
+    names = {spec.name for spec in ClassicVisionEyePoseParams.specs()}
+    assert "eye_confidence_threshold" in names
+    assert "min_eye_confidence" not in names
+
+
+def test_both_backends_share_the_same_detection_threshold_param_names() -> None:
+    """detection_confidence_threshold/crop_confidence_threshold configure
+    rank_folder's shared crop-cache step (see _detection_specs), not either
+    backend's own eye detector - so both params classes declare them
+    identically. detection_head_confidence_threshold, by contrast, is
+    EyePose-only - SuperAnimal-Bird has no equivalent signal."""
+    eyepose_names = {spec.name for spec in ClassicVisionEyePoseParams.specs()}
+    superanimal_names = {spec.name for spec in ClassicVisionParams.specs()}
+    for name in ("detection_confidence_threshold", "crop_confidence_threshold"):
+        assert name in eyepose_names
+        assert name in superanimal_names
+    assert "detection_head_confidence_threshold" in eyepose_names
+    assert "detection_head_confidence_threshold" not in superanimal_names
+
+
+def test_eyepose_detector_kwargs_maps_eye_confidence_threshold_to_min_confidence() -> None:
+    """The EyePoseV0EyeDetector constructor kwarg is (and stays) `min_confidence`
+    - matching SuperAnimalBirdEyeDetector's own constructor - only the outer,
+    photographer-facing params field was renamed."""
+    strategy = ClassicVisionEyePoseStrategy()
+    params = ClassicVisionEyePoseParams(eye_confidence_threshold=0.42)
+    kwargs = strategy._eye_detector_kwargs(params)
+    assert kwargs["min_confidence"] == pytest.approx(0.42)
+
+
+# ---------------------------------------------------------------------------
 # metrics
 # ---------------------------------------------------------------------------
 
@@ -333,6 +394,30 @@ def test_a_subject_with_no_locatable_eye_is_rejected_as_no_visible_eye() -> None
     chain = FilterChain([SubjectFilter(), EyeFilter(detector)])
     assert chain.reject_reason(_candidate()) == NO_VISIBLE_EYE
     assert detector.detect_calls == 1
+
+
+def test_a_subject_with_no_confidently_detected_head_is_rejected_separately() -> None:
+    """LOW_HEAD_CONFIDENCE (EyePose Investigation Phase 1, Part 2/3) - a
+    genuinely independent question from NO_VISIBLE_EYE, checked first, with
+    its own reason. Still only ONE call to the (expensive) detector."""
+    low_head_confidence_eye = EyeDetection(
+        box=(10.0, 10.0, 30.0, 30.0), confidence=0.97, accepted=True,  # eye gate alone would pass this
+        head_confidence=0.026, head_visible=False,
+    )
+    detector = _FakeEyeDetector(detection=low_head_confidence_eye)
+    chain = FilterChain([SubjectFilter(), EyeFilter(detector)])
+    assert chain.reject_reason(_candidate()) == LOW_HEAD_CONFIDENCE
+    assert detector.detect_calls == 1
+
+
+def test_a_backend_with_no_head_confidence_signal_is_never_gated_by_it() -> None:
+    """head_visible defaults to True (EyeDetection's own default) - a
+    backend that leaves head_confidence at None (no equivalent signal, e.g.
+    SuperAnimal-Bird today) must never be rejected by a check it cannot
+    answer."""
+    detector = _FakeEyeDetector(detection=_eye())  # head_confidence=None, head_visible=True by default
+    chain = FilterChain([SubjectFilter(), EyeFilter(detector)])
+    assert chain.reject_reason(_candidate()) is None
 
 
 def test_a_subject_no_detector_covers_is_reported_separately() -> None:
@@ -484,7 +569,9 @@ def test_a_missing_or_corrupt_metrics_report_reads_as_empty(tmp_path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _write_cache_entry(cache_dir, image_path, *, label=COCO_BIRD_CLASS, box=(10, 10, 60, 60)):
+def _write_cache_entry(
+    cache_dir, image_path, *, label=COCO_BIRD_CLASS, box=(10, 10, 60, 60), expanded_box=(5, 5, 65, 65)
+):
     crop = crop_cache_path(cache_dir, image_path)
     crop.parent.mkdir(parents=True, exist_ok=True)
     cv2.imwrite(str(crop), cv2.cvtColor(_sharp_image(64), cv2.COLOR_RGB2BGR))
@@ -493,6 +580,7 @@ def _write_cache_entry(cache_dir, image_path, *, label=COCO_BIRD_CLASS, box=(10,
         "source_size": [800, 600],
         "selected": {"box": list(box), "score": 0.9, "label": label},
         "detections": [{"box": list(box), "score": 0.9, "label": label}],
+        "expanded_box": list(expanded_box) if expanded_box is not None else None,
     }
     crop.with_name(crop.stem + ".detections.json").write_text(json.dumps(payload), encoding="utf-8")
     return crop
@@ -508,8 +596,25 @@ def test_a_candidate_is_assembled_from_the_existing_crop_cache(tmp_path) -> None
     candidate = ClassicVisionStrategy._load_candidate(image_path, cache_dir)
     assert candidate.subject_crop is not None
     assert candidate.subject_box == (10.0, 10.0, 60.0, 60.0)
+    # crop_box is the crop's own (margin-expanded) rectangle, distinct from
+    # subject_box (the tight detection box) - see FilterCandidate.crop_box's
+    # docstring and docs/EyePose_Investigation_Phase_1.md's Q1 finding.
+    assert candidate.crop_box == (5.0, 5.0, 65.0, 65.0)
     assert candidate.source_size == (800, 600)
     assert candidate.subject_label == COCO_BIRD_CLASS
+
+
+def test_crop_box_is_none_for_a_pre_v6_cache_entry_missing_expanded_box(tmp_path) -> None:
+    """A defensive fallback, not the expected path - CROP_CACHE_VERSION's v6
+    bump already forces such an entry to rebuild before it would ever reach
+    here for real."""
+    cache_dir = tmp_path / "crops"
+    image_path = str(tmp_path / "shoot" / "a.nef")
+    _write_cache_entry(cache_dir, image_path, expanded_box=None)
+
+    candidate = ClassicVisionStrategy._load_candidate(image_path, cache_dir)
+    assert candidate.crop_box is None
+    assert candidate.subject_box == (10.0, 10.0, 60.0, 60.0)  # unaffected
 
 
 def test_an_image_with_no_cached_detection_reads_as_having_no_subject(tmp_path) -> None:
@@ -568,6 +673,7 @@ def test_classic_vision_ranks_a_folder_and_writes_the_usual_sidecar(tmp_path, mo
         device="cpu",
         on_stage=stages.append,
         on_progress=lambda done, total: progress.append((done, total)),
+        analytics_db=tmp_path / "analytics.db",
     )
 
     assert result["strategy"] == "classic-vision"
@@ -595,6 +701,47 @@ def test_classic_vision_ranks_a_folder_and_writes_the_usual_sidecar(tmp_path, mo
     assert set(metrics_report[mammal]) == {"eye_sharpness", "subject_sharpness", "subject_size", "eye_confidence"}
 
 
+def test_rank_folder_forwards_detection_thresholds_into_the_crop_cache_build(tmp_path, monkeypatch) -> None:
+    """detection_confidence_threshold/crop_confidence_threshold (EyePose
+    Investigation Phase 1, Part 6) must actually reach build_cache's
+    CropParams - not just exist as unused params fields. Both backends share
+    this wiring (see ClassicVisionStrategy.rank_folder), checked here against
+    the SuperAnimal-Bird strategy since it needs no EyePose-specific setup."""
+    from picklikeme.bird_crop import CropParams
+    from picklikeme.ranking import classic as classic_module
+
+    folder = tmp_path / "shoot"
+    folder.mkdir()
+    cache_dir = tmp_path / "crops"
+    path = str(folder / "bird.nef")
+    Path(path).write_bytes(b"not really a raw file")
+    _write_cache_entry(cache_dir, path)
+
+    captured: dict = {}
+
+    def fake_build_cache(image_paths, crop_cache_dir, params, **kwargs):
+        captured["params"] = params
+        return {}
+
+    monkeypatch.setattr(classic_module, "build_cache", fake_build_cache)
+    monkeypatch.setattr(
+        "picklikeme.eyes.build_eye_detector",
+        lambda name, **kwargs: _FakeEyeDetector(detection=_eye(), supported=True),
+    )
+
+    ClassicVisionStrategy().rank_folder(
+        folder,
+        params=ClassicVisionParams(detection_confidence_threshold=0.55, crop_confidence_threshold=0.25),
+        crop_cache_dir=cache_dir,
+        device="cpu",
+        analytics_db=tmp_path / "analytics.db",
+    )
+
+    assert isinstance(captured["params"], CropParams)
+    assert captured["params"].conf_threshold == pytest.approx(0.55)
+    assert captured["params"].min_crop_confidence == pytest.approx(0.25)
+
+
 def test_classic_vision_writes_debug_images_only_when_debug_dir_is_given(tmp_path, monkeypatch) -> None:
     """Off by default (see ranking.debug's module docstring) - a run with no
     `debug_dir` must write nothing extra; a run with one gets one debug
@@ -616,12 +763,16 @@ def test_classic_vision_writes_debug_images_only_when_debug_dir_is_given(tmp_pat
         lambda name, **kwargs: _FakeEyeDetector(detection=_eye(), supported=True),
     )
 
-    ClassicVisionStrategy().rank_folder(folder, params=ClassicVisionParams(), crop_cache_dir=cache_dir, device="cpu")
+    ClassicVisionStrategy().rank_folder(
+        folder, params=ClassicVisionParams(), crop_cache_dir=cache_dir, device="cpu",
+        analytics_db=tmp_path / "analytics.db",
+    )
     debug_dir = tmp_path / "debug"
     assert not debug_dir.exists(), "no debug_dir was requested - nothing extra should be written"
 
     ClassicVisionStrategy().rank_folder(
         folder, params=ClassicVisionParams(), crop_cache_dir=cache_dir, device="cpu", debug_dir=debug_dir,
+        analytics_db=tmp_path / "analytics.db",
     )
     for path in scoring:
         assert debug_image_path(debug_dir, path).is_file()
@@ -714,7 +865,8 @@ def test_a_fully_organized_folder_still_ranks(tmp_path, monkeypatch) -> None:
     )
 
     result = ClassicVisionStrategy().rank_folder(
-        folder, params=ClassicVisionParams(), crop_cache_dir=cache_dir, device="cpu"
+        folder, params=ClassicVisionParams(), crop_cache_dir=cache_dir, device="cpu",
+        analytics_db=tmp_path / "analytics.db",
     )
     assert result["considered"] == 2
     assert result["image_count"] == 2
@@ -740,7 +892,8 @@ def test_a_folder_where_everything_is_filtered_still_finishes(tmp_path, monkeypa
     )
 
     result = ClassicVisionStrategy().rank_folder(
-        folder, params=ClassicVisionParams(), crop_cache_dir=cache_dir, device="cpu"
+        folder, params=ClassicVisionParams(), crop_cache_dir=cache_dir, device="cpu",
+        analytics_db=tmp_path / "analytics.db",
     )
     assert result["image_count"] == 0
     assert result["filtered"] == {UNSUPPORTED_SUBJECT: 1}

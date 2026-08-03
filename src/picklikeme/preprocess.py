@@ -177,6 +177,24 @@ def _resolve_device(requested: str) -> str:
     return resolve_torch_device(requested)
 
 
+class CropCacheVersionMismatch(RuntimeError):
+    """Raised by `build_cache` when an existing cache was built with
+    different `CropParams` and `force` wasn't passed.
+
+    A normal, catchable exception - NOT `SystemExit` - because `build_cache`
+    is called from library/GUI code (`ranking.classic.rank_folder`,
+    `rank.rank_folder`, both reachable from the Desktop app's background
+    ranking thread) as well as from this module's own CLI `main()`.
+    `SystemExit` is a `BaseException`, not an `Exception`, so it silently
+    skips every `except Exception` handler in between - including the
+    Desktop app's background-job error handling (`desktop/core/jobs.py`) -
+    and crashes the whole app instead of surfacing as a normal error dialog.
+    Each CLI entry point (`preprocess.py`, `rank.py`) catches this at its own
+    `if __name__ == "__main__"` boundary and converts it to `SystemExit`
+    there, preserving the previous clean-message-no-traceback CLI behaviour.
+    """
+
+
 def build_cache(
     image_paths: list[str],
     cache_dir: str | Path,
@@ -191,7 +209,7 @@ def build_cache(
 
     existing = read_crop_params(cache_dir)
     if existing is not None and existing != params and not force:
-        raise SystemExit(
+        raise CropCacheVersionMismatch(
             f"Existing cache at {cache_dir} was built with different parameters:\n"
             f"  existing: {existing}\n  requested: {params}\n"
             "Pass --force to rebuild, or delete the cache directory."
@@ -203,7 +221,7 @@ def build_cache(
     detector = BirdDetector(
         device=device,
         conf_threshold=params.conf_threshold,
-        area_tie_frac=params.area_tie_frac,
+        min_crop_confidence=params.min_crop_confidence,
         group_scene_threshold=params.group_scene_threshold,
     )
 
@@ -215,7 +233,7 @@ def build_cache(
     print(f"  {'cache dir:':<20}{Path(cache_dir).resolve()}")
     print(f"  {'accepted classes:':<20}{', '.join(sorted(SUPPORTED_ANIMAL_CLASSES.values()))}")
     print(f"  {'min confidence:':<20}{params.conf_threshold}")
-    print(f"  {'selection:':<20}largest area wins; confidence ties within {params.area_tie_frac:.0%} of it")
+    print(f"  {'selection:':<20}reject below {params.min_crop_confidence:.0%} confidence; largest area wins among the rest")
     print(
         f"  {'group scenes:':<20}{params.group_scene_threshold}+ detections -> crop the whole group, "
         "not one individual"
@@ -514,12 +532,12 @@ def main() -> None:
         "ignored for --image-format=png, which is always lossless",
     )
     parser.add_argument(
-        "--area-tie-frac",
+        "--min-crop-confidence",
         type=float,
-        default=CropParams.area_tie_frac,
-        help="Detections within this fraction of the largest survivor's area are tied on "
-        "size and broken by confidence; anything smaller loses on size alone "
-        f"(default: {CropParams.area_tie_frac})",
+        default=CropParams.min_crop_confidence,
+        help="Detections below this confidence are ignored entirely for crop-target selection "
+        "(though still catalogued); the largest-area detection among the rest wins "
+        f"(default: {CropParams.min_crop_confidence})",
     )
     parser.add_argument(
         "--group-scene-threshold",
@@ -543,7 +561,7 @@ def main() -> None:
         margin_frac=args.margin_frac,
         conf_threshold=args.conf_threshold,
         max_side=args.max_side,
-        area_tie_frac=args.area_tie_frac,
+        min_crop_confidence=args.min_crop_confidence,
         group_scene_threshold=args.group_scene_threshold,
         image_format=args.image_format,
         jpeg_quality=args.jpeg_quality,
@@ -561,4 +579,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except CropCacheVersionMismatch as exc:
+        raise SystemExit(str(exc)) from None

@@ -86,13 +86,37 @@ class EyeKeypointsForTests(unittest.TestCase):
         )
         with mock.patch("picklikeme.eyes.cache.read_eye_detection", return_value=record):
             with mock.patch("picklikeme.review.thumbnails._detections") as detections:
-                detections.return_value.get.return_value = mock.Mock(selected=None, source_size=(800, 600))
+                detections.return_value.get.return_value = mock.Mock(
+                    selected=None, source_size=(800, 600), expanded_box=None,
+                )
+                self.assertIsNone(thumbnails_module.eye_keypoints_for("some/path.jpg"))
+
+    def test_no_expanded_box_means_no_overlay(self):
+        """A record with a selected subject but no recorded expanded_box (a
+        pre-v6 cache entry) must not fall back to the tight `selected` box -
+        that would silently reintroduce the Q1 projection bug (see
+        docs/EyePose_Investigation_Phase_1.md)."""
+        from picklikeme.eyes.cache import EyeRecord
+
+        record = EyeRecord(
+            detector_id="fake", subject_crop_size=(50, 50), accepted=True,
+            box=(10.0, 10.0, 20.0, 20.0), confidence=0.9, left=None, right=None,
+        )
+        with mock.patch("picklikeme.eyes.cache.read_eye_detection", return_value=record):
+            with mock.patch("picklikeme.review.thumbnails._detections") as detections:
+                detections.return_value.get.return_value = mock.Mock(
+                    selected=mock.Mock(x1=0.0, y1=0.0, x2=10.0, y2=10.0),
+                    source_size=(800, 600),
+                    expanded_box=None,
+                )
                 self.assertIsNone(thumbnails_module.eye_keypoints_for("some/path.jpg"))
 
     def test_rescales_the_box_and_keypoints_from_crop_space_to_frame_space(self):
         """A 100x100 subject crop mapped onto a 200x200 full-frame box at
         (400, 300) - a plain 2x scale plus an offset, the same trick
-        contactsheets.annotate_thumbnail uses for the subject box itself."""
+        contactsheets.annotate_thumbnail uses for the subject box itself.
+        `expanded_box` (not `selected`) is what actually drives the
+        scale/offset - see docs/EyePose_Investigation_Phase_1.md's Q1."""
         from picklikeme.eyes.cache import EyeRecord
         from picklikeme.eyes.detector import EyeKeypoint
 
@@ -102,10 +126,14 @@ class EyeKeypointsForTests(unittest.TestCase):
             left=EyeKeypoint(x=15.0, y=25.0, confidence=0.9),
             right=EyeKeypoint(x=18.0, y=22.0, confidence=0.4),
         )
-        subject = mock.Mock(x1=400.0, y1=300.0, x2=600.0, y2=500.0)
+        # Deliberately different from expanded_box, so a test that still used
+        # `selected` for the projection would fail this - proving the fix.
+        subject = mock.Mock(x1=411.0, y1=322.0, x2=633.0, y2=544.0)
         with mock.patch("picklikeme.eyes.cache.read_eye_detection", return_value=record):
             with mock.patch("picklikeme.review.thumbnails._detections") as detections:
-                detections.return_value.get.return_value = mock.Mock(selected=subject, source_size=(1920, 1080))
+                detections.return_value.get.return_value = mock.Mock(
+                    selected=subject, source_size=(1920, 1080), expanded_box=(400.0, 300.0, 600.0, 500.0),
+                )
                 result = thumbnails_module.eye_keypoints_for("some/path.jpg")
 
         self.assertEqual(result["source_size"], (1920, 1080))
@@ -130,7 +158,9 @@ class EyeKeypointsForTests(unittest.TestCase):
         with mock.patch("picklikeme.eyes.cache.read_eye_detection", return_value=record):
             with mock.patch("picklikeme.review.thumbnails._detections") as detections:
                 detections.return_value.get.return_value = mock.Mock(
-                    selected=mock.Mock(x1=0.0, y1=0.0, x2=10.0, y2=10.0), source_size=(100, 100)
+                    selected=mock.Mock(x1=0.0, y1=0.0, x2=10.0, y2=10.0),
+                    source_size=(100, 100),
+                    expanded_box=(0.0, 0.0, 10.0, 10.0),
                 )
                 thumbnails_module.eye_keypoints_for("some/path.jpg")
                 _, kwargs = detections.return_value.get.call_args

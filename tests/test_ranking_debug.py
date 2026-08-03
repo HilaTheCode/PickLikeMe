@@ -16,7 +16,7 @@ import pytest
 from PIL import Image
 
 from picklikeme.eyes.detector import EyeDetection, EyeKeypoint
-from picklikeme.ranking.debug import debug_image_path, render_debug_image, save_debug_image
+from picklikeme.ranking.debug import _projected_eye_box, debug_image_path, render_debug_image, save_debug_image
 from picklikeme.ranking.filters import FilterCandidate
 
 
@@ -29,6 +29,11 @@ def _candidate(*, eye=None, subject_crop=True) -> FilterCandidate:
     if subject_crop:
         candidate.subject_crop = _crop()
         candidate.subject_box = (100.0, 100.0, 500.0, 500.0)
+        # The crop's own (margin-expanded) rectangle - distinct from
+        # subject_box (the tight detection box). _projected_eye_box must
+        # scale against THIS, not subject_box - see
+        # docs/EyePose_Investigation_Phase_1.md's Q1 finding.
+        candidate.crop_box = (80.0, 80.0, 520.0, 520.0)
         candidate.source_size = (2000, 1500)
     candidate.eye = eye
     return candidate
@@ -44,6 +49,34 @@ def _eye(*, accepted: bool = True, confidence: float = 0.9) -> EyeDetection:
         right=EyeKeypoint(x=25.0, y=16.0, confidence=confidence - 0.1),
         accepted=accepted,
     )
+
+
+class TestProjectedEyeBox:
+    """The exact bug proven in docs/EyePose_Investigation_Phase_1.md's Q1:
+    the crop's pixels span `crop_box` (the margin-expanded rectangle), not
+    `subject_box` (the tight detection box) - projection must scale/offset
+    against the former."""
+
+    def test_scales_against_crop_box_not_subject_box(self) -> None:
+        candidate = FilterCandidate(image_path="/shoot/a.NEF")
+        candidate.subject_crop = _crop(size=100)  # 100x100 crop
+        candidate.subject_box = (1000.0, 1000.0, 1100.0, 1100.0)  # tight box - deliberately WRONG if used
+        candidate.crop_box = (2000.0, 2000.0, 2100.0, 2100.0)  # the crop's real span - 1:1 scale
+
+        projected = _projected_eye_box(candidate, (10.0, 10.0, 20.0, 20.0))
+
+        assert projected == (2010.0, 2010.0, 2020.0, 2020.0)
+
+    def test_none_when_crop_box_is_missing(self) -> None:
+        """A pre-v6 cache entry with no expanded_box recorded (see
+        FilterCandidate.crop_box) - must not silently fall back to the tight
+        subject_box, which would reintroduce the Q1 bug."""
+        candidate = FilterCandidate(image_path="/shoot/a.NEF")
+        candidate.subject_crop = _crop(size=100)
+        candidate.subject_box = (1000.0, 1000.0, 1100.0, 1100.0)
+        candidate.crop_box = None
+
+        assert _projected_eye_box(candidate, (10.0, 10.0, 20.0, 20.0)) is None
 
 
 class TestRenderDebugImage:

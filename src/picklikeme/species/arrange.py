@@ -20,13 +20,14 @@ from __future__ import annotations
 import logging
 import re
 import shutil
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
 from ..organize import unique_destination
 from .cache import SpeciesCache
-from .classifier import UNKNOWN_SPECIES, SpeciesClassifier
+from .classifier import UNKNOWN_SPECIES, SpeciesClassifier, SpeciesPrediction
 
 logger = logging.getLogger(__name__)
 
@@ -94,6 +95,7 @@ def arrange_by_species(
     dry_run: bool = False,
     on_progress: Callable[[int, int], None] | None = None,
     folder_name_fn: Callable[[str], str] | None = None,
+    on_result: Callable[[str, SpeciesPrediction, float], None] | None = None,
 ) -> SpeciesArrangeResult:
     """Classify and file every image in `input_folder`.
 
@@ -112,6 +114,20 @@ def arrange_by_species(
     the folder name actually used (e.g. translating an English common name
     to Hebrew) - defaults to `sanitize_species_folder_name`, applied
     directly to the classifier's answer.
+
+    `on_result(image_path, prediction, elapsed_seconds)`, if given, is
+    called once per image right after classification - the seam
+    `species.experiment_capture.run_with_analytics` uses to observe every
+    result (including a cache hit's already-known answer, and a fresh
+    classification's full `top_predictions`) without a second classifier
+    call or a second enumeration of the folder. A raised exception from
+    this callback is logged and swallowed, never allowed to turn an
+    analytics observer into a reason the real classify-and-file pass
+    fails - the same "must never break the real work" contract `on_progress`
+    already has implicitly by being a plain, un-try/excepted call the
+    caller is trusted not to break; `on_result` is wrapped explicitly since
+    an analytics callback is more likely to do real (and thus fallible)
+    work than a progress-bar update.
     """
     from ..analyzer.io import enumerate_ground_truth
 
@@ -122,7 +138,14 @@ def arrange_by_species(
 
     for index, source in enumerate(images, start=1):
         try:
+            classify_started = time.monotonic()
             prediction = cache.get_or_classify(str(source), classifier)
+            elapsed = time.monotonic() - classify_started
+            if on_result is not None:
+                try:
+                    on_result(str(source), prediction, elapsed)
+                except Exception as exc:  # noqa: BLE001 - an analytics observer must never break arranging
+                    logger.warning("on_result callback failed for %s: %s", source, exc)
             result.classified += 1
             folder_name = name_fn(prediction.species)
             result.species_counts[folder_name] = result.species_counts.get(folder_name, 0) + 1

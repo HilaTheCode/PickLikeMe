@@ -58,7 +58,10 @@ def build_arrange_species_parser(add_help: bool = True) -> argparse.ArgumentPars
         help="SQLite file caching predictions by content identity (default: cache/species.db). "
         "Re-running an already-classified folder reads from here instead of reclassifying.",
     )
-    parser.add_argument("--device", default="cpu", help="torch device for the classifier (default: cpu).")
+    parser.add_argument(
+        "--device", default=None,
+        help="torch device for the classifier (default: auto - CUDA if available, else CPU).",
+    )
     parser.add_argument(
         "--dry-run", action="store_true", help="Classify and report what would happen; move nothing."
     )
@@ -75,6 +78,7 @@ def _configure_logging(verbose: bool) -> None:
 
 
 def run_arrange_species(args: argparse.Namespace) -> int:
+    from ..platform import resolve_torch_device
     from .arrange import arrange_by_species
     from .cache import DEFAULT_SPECIES_DB, SpeciesCache
     from .classifier import build_classifier
@@ -85,12 +89,13 @@ def run_arrange_species(args: argparse.Namespace) -> int:
     if not folder.is_dir():
         raise SystemExit(f"Folder not found: {folder}")
 
-    print(f"Loading the species classifier ({args.classifier})...")
+    resolved_device = resolve_torch_device(args.device)
+    print(f"Loading the species classifier ({args.classifier}) on {resolved_device}...")
     classifier = build_classifier(
         args.classifier,
         species_list_path=args.species_list,
         min_confidence=args.min_confidence,
-        device=args.device,
+        device=resolved_device,
     )
 
     db_path = Path(args.species_db) if args.species_db else DEFAULT_SPECIES_DB

@@ -6,6 +6,7 @@ exact accounting, and resume-after-interruption.
 """
 
 import io
+import json
 import sys
 import tempfile
 import threading
@@ -31,7 +32,7 @@ from picklikeme.bird_crop import (
     save_crop_png,
     write_crop_params,
 )
-from picklikeme.preprocess import DECODE_WINDOW, build_cache, default_decode_workers
+from picklikeme.preprocess import DECODE_WINDOW, CropCacheVersionMismatch, build_cache, default_decode_workers
 from picklikeme.raw_io import RawImageLoader
 
 BOX = (10.0, 10.0, 30.0, 30.0)
@@ -300,8 +301,36 @@ class CacheVersionMismatchTests(unittest.TestCase):
         """Pins the version string itself, so a future accidental revert of
         the bump is caught immediately rather than silently reopening this
         exact hole."""
-        self.assertEqual(CROP_CACHE_VERSION, "v5")
-        self.assertEqual(CropParams().version, "v5")
+        self.assertEqual(CROP_CACHE_VERSION, "v7")
+        self.assertEqual(CropParams().version, "v7")
+
+    def test_an_older_cache_params_file_with_a_since_renamed_field_does_not_crash(self):
+        """The literal v5 -> v7 scenario (EyePose Investigation Phase 1,
+        Part 1/7): a real older crop_params.json has field names (`area_tie_frac`,
+        then `confidence_tie_frac`) the current `CropParams` no longer has at
+        all (now `min_crop_confidence` - see bird_crop.py's module
+        docstring's policy history). read_crop_params must tolerate the
+        unrecognised key rather than crash with TypeError, and the version
+        mismatch must still be caught normally (via the `version` field,
+        which an older file always has) - not silently bypassed."""
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = Path(tmp) / "crops"
+            cache.mkdir(parents=True)
+            v5_payload = {
+                "margin_frac": 0.05, "conf_threshold": 0.30, "max_side": None,
+                "area_tie_frac": 0.10, "group_scene_threshold": 10,
+                "detector": "fasterrcnn_resnet50_fpn_v2", "image_format": "jpeg",
+                "jpeg_quality": 98, "version": "v5",
+            }
+            (cache / "crop_params.json").write_text(json.dumps(v5_payload), encoding="utf-8")
+
+            existing = read_crop_params(cache)  # must not raise TypeError
+            self.assertEqual(existing.version, "v5")
+            self.assertEqual(existing.min_crop_confidence, CropParams().min_crop_confidence, "unknown key silently dropped, not misapplied")
+
+            with self.assertRaises(CropCacheVersionMismatch) as ctx:
+                build_cache(_fake_paths(tmp, 3), cache, CropParams(), device="cpu", force=False)
+            self.assertIn("--force", str(ctx.exception))
 
     def test_a_cache_from_a_previous_selection_algorithm_is_refused(self):
         """The literal scenario this protects against: an existing cache built
@@ -316,7 +345,7 @@ class CacheVersionMismatchTests(unittest.TestCase):
                     cache = Path(tmp) / "crops"
                     self._seed_stale_cache(cache, version=stale_version)
 
-                    with self.assertRaises(SystemExit) as ctx:
+                    with self.assertRaises(CropCacheVersionMismatch) as ctx:
                         build_cache(_fake_paths(tmp, 3), cache, CropParams(), device="cpu", force=False)
                     message = str(ctx.exception)
                     self.assertIn("different parameters", message)
@@ -337,7 +366,7 @@ class CacheVersionMismatchTests(unittest.TestCase):
 
             self.assertEqual(stats["cached"], 3, "a stale cache must be rebuilt in full, not skipped")
             self.assertEqual(len(decoder.decoded), 3)
-            self.assertEqual(read_crop_params(cache).version, "v5")
+            self.assertEqual(read_crop_params(cache).version, "v7")
 
     def test_a_cache_already_at_the_current_version_is_reused_normally(self):
         """The mismatch guard must not become a reason to always rebuild -
@@ -366,7 +395,7 @@ class CacheVersionMismatchTests(unittest.TestCase):
             _run_build(paths, cache, decoder, FakeDetector(decoder), params=CropParams(jpeg_quality=98))
 
             decoder2 = FakeDecoder()
-            with self.assertRaises(SystemExit) as ctx:
+            with self.assertRaises(CropCacheVersionMismatch) as ctx:
                 build_cache(
                     paths, cache, CropParams(jpeg_quality=50), device="cpu",
                     force=False, decode_workers=4,

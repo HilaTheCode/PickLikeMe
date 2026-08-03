@@ -52,11 +52,29 @@ NO_VISIBLE_EYE = "NO_VISIBLE_EYE"
 # which.
 UNSUPPORTED_SUBJECT = "UNSUPPORTED_SUBJECT"
 
-REJECT_REASONS: tuple[str, ...] = (NO_SUBJECT, NO_VISIBLE_EYE, UNSUPPORTED_SUBJECT)
+# A subject was found and an eye detector covers it, but the detector itself
+# was not confident a real head instance was even in the crop - independent
+# of, and checked BEFORE, whether any specific eye landmark looks trustworthy
+# (see eyes.detector.EyeDetection.head_visible's own docstring and
+# eyes.eyepose_v0.head_visible for the measured signal this reads). Reported
+# separately from NO_VISIBLE_EYE because the two mean genuinely different
+# things: this one is "there was nothing head-shaped here to judge an eye
+# on at all" (a wing covering the head, the bird facing away, a bad crop),
+# NO_VISIBLE_EYE is "a head was there, but this particular eye still wasn't
+# trustworthy" - see docs/EyePose_Investigation_Phase_1.md's Part 2/3.
+LOW_HEAD_CONFIDENCE = "LOW_HEAD_CONFIDENCE"
+
+REJECT_REASONS: tuple[str, ...] = (NO_SUBJECT, LOW_HEAD_CONFIDENCE, NO_VISIBLE_EYE, UNSUPPORTED_SUBJECT)
 
 REJECT_REASON_LABELS: dict[str, str] = {
     NO_SUBJECT: "No subject detected",
-    NO_VISIBLE_EYE: "No visible eye",
+    LOW_HEAD_CONFIDENCE: "Head not confidently detected",
+    # "reliable" is deliberate (EyePose Investigation Phase 1, Part 3): this
+    # also covers a spatially-found-but-untrusted eye (confidence below
+    # threshold, or anatomically implausible), not only a literal absence of
+    # any eye channel - "No visible eye" alone underclaimed what the gate
+    # actually checks.
+    NO_VISIBLE_EYE: "No reliable visible eye",
     UNSUPPORTED_SUBJECT: "No eye detector for this subject",
 }
 
@@ -78,9 +96,20 @@ class FilterCandidate:
     image_path: str
     # The cached subject crop, RGB. None when the crop could not be read.
     subject_crop: "np.ndarray | None" = None
-    # The selected detection's box in FULL-FRAME pixels, and the frame's own
-    # (width, height) - both straight from the detection sidecar.
+    # The selected detection's TIGHT box in FULL-FRAME pixels (pre-margin),
+    # and the frame's own (width, height) - both straight from the detection
+    # sidecar. Used for the subject-size metric and the subject-box overlay,
+    # where the tight box is exactly what should be shown/measured.
     subject_box: tuple[float, float, float, float] | None = None
+    # The crop's own rectangle in FULL-FRAME pixels - the tight `subject_box`
+    # grown by the margin `bird_crop.build_crop` actually applied before
+    # cropping (`bird_crop.CropResult.expanded_box`). `subject_crop`'s pixels
+    # span THIS rectangle, not `subject_box` - anything projecting a
+    # crop-space coordinate (e.g. an eye keypoint) back onto the full frame
+    # must scale/offset against `crop_box`, never `subject_box`. Conflating
+    # the two was a real, proven bug - see
+    # docs/EyePose_Investigation_Phase_1.md's Q1 finding.
+    crop_box: tuple[float, float, float, float] | None = None
     source_size: tuple[int, int] | None = None
     # The COCO class of the selected detection (see bird_crop), used to ask an
     # eye detector whether it covers this animal at all.
@@ -123,17 +152,40 @@ class SubjectFilter:
 
 
 class EyeFilter:
-    """Filter 2: is at least one eye visible?
+    """Filter 2: is at least one eye visible - and, before that question is
+    even asked, was a real head instance actually here to look at?
 
     One eye is enough, deliberately - see
     `SuperAnimalBirdEyeDetector.detect` for why requiring both would reject
     most of a wildlife archive.
 
-    Also the only filter that can reject for a *second* reason: a subject the
-    configured detector does not cover is reported as UNSUPPORTED_SUBJECT, not
-    as a missing eye. `reason` therefore reports the last rejection's cause
-    rather than being a constant - which is exactly why `FilterChain` reads it
-    after `check` rather than caching it up front.
+    This is the "Decision Engine" from the EyePose Investigation Phase 1
+    report's Part 3: three genuinely independent questions, each with its
+    own reason, evaluated in this order once the eye detector has run
+    (`SubjectFilter`, upstream, already answered "is there a subject at
+    all" - `NO_SUBJECT`):
+
+    1. Does a detector even cover this subject's class? -> `UNSUPPORTED_SUBJECT`
+    2. Is the detector confident a real head instance is in the crop at all,
+       independent of any individual landmark (`EyeDetection.head_visible`)?
+       -> `LOW_HEAD_CONFIDENCE`
+    3. Given a head is there, is the specific eye trustworthy
+       (`EyeDetection.accepted`)? -> `NO_VISIBLE_EYE`
+
+    Question 2 matters as its own, separate check because it catches a
+    failure question 3 alone cannot: a crop with no real head can still
+    produce a confident-*looking* individual eye landmark (measured, not
+    hypothetical - see `eyes.eyepose_v0`'s own module docstring for the
+    example). Checking it first means a photographer sees "no head" rather
+    than a misleadingly specific "eye not visible" for that case.
+
+    Only ONE call to the (expensive) detector regardless of how many of
+    these three checks end up mattering - `detect()` already computes
+    `head_visible` and `accepted` together in a single forward pass, this
+    filter simply reads both off the one result. `reason` therefore reports
+    whichever of the three questions actually failed, not a constant -
+    which is exactly why `FilterChain` reads it after `check` rather than
+    caching it up front.
     """
 
     def __init__(self, detector: "EyeDetector") -> None:
@@ -152,6 +204,10 @@ class EyeFilter:
             self._reason = UNSUPPORTED_SUBJECT
             return False
         candidate.eye = self._detector.detect(candidate.subject_crop)
+        if not candidate.eye.head_visible:
+            self._reason = LOW_HEAD_CONFIDENCE
+            return False
+        self._reason = NO_VISIBLE_EYE
         return candidate.eye.accepted
 
 

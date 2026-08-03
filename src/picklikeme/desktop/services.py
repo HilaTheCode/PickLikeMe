@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any, Callable
+
+logger = logging.getLogger(__name__)
 
 from ..analyzer.annotation_config import DEFAULT_ANNOTATIONS_CONFIG, load_annotation_fields
 from ..analyzer.annotations import DEFAULT_ANNOTATIONS_DB, AnnotationStore
@@ -190,30 +193,67 @@ class ReviewService:
     def organize_by_species(
         self,
         *,
+        backend: str = "bioclip2",
         language: str = "en",
         min_confidence: float = 0.5,
-        device: str = "cpu",
+        device: str | None = None,
         on_progress: Callable[[int, int], None] | None = None,
+        analytics_db: str | Path | None = None,
     ) -> dict[str, Any]:
+        """`backend` is any id `species.classifier.available_classifiers()`
+        lists ("bioclip2" - the default - or "bioclip", the original
+        BioCLIP kept for comparison). This method never imports a concrete
+        classifier class - `build_classifier` is the only thing that
+        resolves a backend id to a model, so this stays backend-agnostic
+        the same way `ReviewService.rank_folder` stays ranking-strategy-
+        agnostic.
+
+        `device=None` (the default) auto-selects CUDA when available,
+        exactly like every other model in this project (`resolve_torch_
+        device`). Previously this method defaulted to a hardcoded "cpu"
+        regardless of GPU availability - see docs/BioCLIP_Backend_
+        Architecture_Review.md Section 7/§3 of the follow-up infrastructure
+        work for how that was found and confirmed. Desktop's caller
+        (`main_window._organize_by_species`) never overrode it, so species
+        classification silently ran on CPU only, every time, until now.
+        """
         if self.session.input_folder is None:
             raise ValueError("Open a folder before organizing it by species.")
 
-        from ..species.arrange import arrange_by_species, sanitize_species_folder_name
+        from ..species.arrange import sanitize_species_folder_name
         from ..species.cache import DEFAULT_SPECIES_DB, SpeciesCache
+        from ..analytics import DEFAULT_ANALYTICS_DB
         from ..species.classifier import build_classifier
+        from ..species.experiment_capture import run_with_analytics
         from ..species.translations import localized_species_name
 
-        classifier = build_classifier("bioclip2", min_confidence=min_confidence, device=device)
+        logger.info("Organize by Species: selected backend=%r (requested device=%r)", backend, device)
+        # device resolution (None -> auto-detect CUDA) happens inside
+        # BioClipSpeciesClassifier itself now, not here - see its own
+        # __init__ docstring - so every caller gets the right default even
+        # if it forgets to resolve one, not just this call site.
+        classifier = build_classifier(backend, min_confidence=min_confidence, device=device)
         cache = SpeciesCache(DEFAULT_SPECIES_DB)
         try:
-            result = arrange_by_species(
+            # run_with_analytics runs the exact same arrange_by_species pass
+            # as before (identical file-moving behaviour), plus records a
+            # full analytics experiment for it - see species/experiment_
+            # capture.py's own docstring. An analytics failure never blocks
+            # this (record_run's "never fatal" contract), so `run_id` may
+            # legitimately be None; the arrange result itself is unaffected.
+            # analytics_db=None (the default) uses the real shared database -
+            # overridable so tests never write into it, matching rank_folder's
+            # own analytics_db parameter.
+            result, run_id, _metadata = run_with_analytics(
                 self.session.input_folder,
                 classifier,
+                backend,
                 cache,
                 on_progress=on_progress,
                 folder_name_fn=lambda species: sanitize_species_folder_name(
                     localized_species_name(species, language=language)
                 ),
+                analytics_db=analytics_db or DEFAULT_ANALYTICS_DB,
             )
         finally:
             cache.close()
@@ -224,6 +264,7 @@ class ReviewService:
             "skipped": result.skipped,
             "errors": result.errors,
             "species_counts": dict(result.species_counts),
+            "experiment_id": run_id,
         }
 
     def close(self) -> None:

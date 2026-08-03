@@ -11,9 +11,10 @@ Three layers, tested separately:
   output tensor, so the "pick the highest-confidence anchor and read its 23
   channels" arithmetic is pinned independent of any real model.
 - **The accept/reject gate** (`EyePoseV0EyeDetector.detect`) - exercised
-  against a stubbed detector with `_predict_landmarks` monkeypatched to
-  controlled, crop-space keypoints, mirroring how test_eye_detector.py tests
-  SuperAnimal-Bird's own gate without a real network.
+  against a stubbed detector with `_predict` monkeypatched to a controlled
+  `(detection_confidence, crop-space keypoints)` pair, mirroring how
+  test_eye_detector.py tests SuperAnimal-Bird's own gate without a real
+  network.
 
 The one test needing the real ONNX graph is skipped unless it is already
 cached (same convention test_eye_detector.py uses for SuperAnimal-Bird's own
@@ -31,11 +32,14 @@ from picklikeme.eyes.detector import EyeKeypoint
 from picklikeme.eyes.eyepose_v0 import (
     DEFAULT_MAX_EYE_HEAD_DISTANCE_RATIO,
     DEFAULT_MIN_CONFIDENCE,
+    DEFAULT_MIN_HEAD_CONFIDENCE,
     DEFAULT_WEIGHTS_DIR,
     INPUT_SIZE,
     KPT_NAMES,
     ONNX_FILENAME,
     EyePoseV0EyeDetector,
+    accepts_eye,
+    head_visible,
     _decode_best,
     _letterbox_forward,
     _letterbox_inverse,
@@ -45,18 +49,19 @@ from picklikeme.eyes.eyepose_v0 import (
 
 def _stub_detector(**overrides) -> EyePoseV0EyeDetector:
     """A detector with no ONNX session, no onnxruntime - only the plain
-    attributes `detect()` reads. `_predict_landmarks` is monkeypatched per
-    test onto a controlled {name: EyeKeypoint} dict, so the accept/reject
-    logic is tested directly without running the real model."""
+    attributes `detect()` reads. `_predict` is monkeypatched per test onto a
+    controlled `(detection_confidence, {name: EyeKeypoint})` pair, so the
+    accept/reject logic is tested directly without running the real model."""
     detector = EyePoseV0EyeDetector.__new__(EyePoseV0EyeDetector)
     detector.min_confidence = overrides.get("min_confidence", DEFAULT_MIN_CONFIDENCE)
     detector.eye_box_frac = overrides.get("eye_box_frac", 0.08)
     detector.max_head_distance_ratio = overrides.get("max_head_distance_ratio", DEFAULT_MAX_EYE_HEAD_DISTANCE_RATIO)
+    detector.min_head_confidence = overrides.get("min_head_confidence", DEFAULT_MIN_HEAD_CONFIDENCE)
     return detector
 
 
 def _landmarks(*, left, right, beak=(50.0, 60.0, 0.95), head_top=(50.0, 20.0, 0.95), **extra) -> dict[str, EyeKeypoint]:
-    """A full six-name landmark dict - the shape `_predict_landmarks`
+    """A full six-name landmark dict - the landmarks half of what `_predict`
     returns - with sensible defaults for the two anatomical-reference
     points and the two shoulders, so a test only has to specify what it's
     actually exercising."""
@@ -69,6 +74,62 @@ def _landmarks(*, left, right, beak=(50.0, 60.0, 0.95), head_top=(50.0, 20.0, 0.
         "right_shoulder": extra.get("right_shoulder", (90.0, 40.0, 0.3)),
     }
     return {name: EyeKeypoint(*xy_conf[:2], confidence=xy_conf[2]) for name, xy_conf in values.items()}
+
+
+# ---------------------------------------------------------------------------
+# The Decision Engine (EyePose Investigation Phase 1, Part 5): a pure
+# function of already-decoded keypoints and thresholds, with no model and no
+# I/O - detect() calls this directly rather than duplicating the gate logic,
+# so these tests pin the SAME code path detect()'s own tests exercise
+# indirectly, just without needing a stubbed detector instance at all.
+# ---------------------------------------------------------------------------
+
+
+class TestAcceptsEye:
+    def test_confidence_at_or_above_threshold_with_a_plausible_position_is_accepted(self):
+        landmarks = _landmarks(left=(50.0, 40.0, 0.9), right=(20.0, 20.0, 0.1))
+        assert accepts_eye(landmarks["left_eye"], landmarks, min_confidence=0.5, max_head_distance_ratio=1.5)
+
+    def test_confidence_below_threshold_is_rejected_without_checking_position(self):
+        landmarks = _landmarks(left=(50.0, 40.0, 0.49), right=(20.0, 20.0, 0.1))
+        assert not accepts_eye(landmarks["left_eye"], landmarks, min_confidence=0.5, max_head_distance_ratio=1.5)
+
+    def test_confident_but_anatomically_implausible_is_rejected(self):
+        """High confidence alone must not be sufficient - a keypoint
+        confidently placed far from the beak<->head_top line (e.g. on a
+        shoulder) is still rejected. Mirrors the EyePose Investigation Phase
+        1 Q1 case (DSC03129) where a confident keypoint landed nowhere near
+        an actual head."""
+        landmarks = _landmarks(left=(500.0, 500.0, 0.99), right=(20.0, 20.0, 0.1))
+        assert not accepts_eye(landmarks["left_eye"], landmarks, min_confidence=0.5, max_head_distance_ratio=1.5)
+
+    def test_the_thresholds_are_parameters_not_hardcoded(self):
+        landmarks = _landmarks(left=(50.0, 40.0, 0.6), right=(20.0, 20.0, 0.1))
+        assert not accepts_eye(landmarks["left_eye"], landmarks, min_confidence=0.7, max_head_distance_ratio=1.5)
+        assert accepts_eye(landmarks["left_eye"], landmarks, min_confidence=0.5, max_head_distance_ratio=1.5)
+
+
+class TestHeadVisible:
+    """head_visible() answers a different question than accepts_eye(): is a
+    real bird-head instance present at all, using the anchor's own pre-decode
+    detection_confidence (EyePose Investigation Phase 1, Part 2) - never the
+    per-landmark eye confidence."""
+
+    def test_detection_confidence_at_or_above_threshold_is_visible(self):
+        assert head_visible(0.5, min_detection_confidence=0.5)
+
+    def test_detection_confidence_below_threshold_is_not_visible(self):
+        assert not head_visible(0.49, min_detection_confidence=0.5)
+
+    def test_the_dsc03129_false_positive_is_rejected_despite_a_confident_eye_landmark(self):
+        """The measured case that motivated this gate: detection_confidence
+        0.026 vs real heads' 0.82-0.92, even though the eye landmark itself
+        reported a misleading 0.97."""
+        assert not head_visible(0.026, min_detection_confidence=0.5)
+
+    def test_the_threshold_is_a_parameter_not_hardcoded(self):
+        assert not head_visible(0.6, min_detection_confidence=0.7)
+        assert head_visible(0.6, min_detection_confidence=0.5)
 
 
 # ---------------------------------------------------------------------------
@@ -231,12 +292,12 @@ class TestPointToSegmentDistance:
 
 class TestAcceptRejectGate:
     def test_a_confident_plausibly_placed_eye_is_accepted(self, monkeypatch) -> None:
-        detector = _stub_detector(min_confidence=0.5, max_head_distance_ratio=1.5)
+        detector = _stub_detector(min_confidence=0.5, max_head_distance_ratio=1.5, min_head_confidence=0.5)
         landmarks = _landmarks(
             left=(48.0, 35.0, 0.95), right=(52.0, 36.0, 0.40),  # left is primary, on the beak<->head_top line
             beak=(50.0, 60.0, 0.95), head_top=(50.0, 20.0, 0.95),
         )
-        monkeypatch.setattr(detector, "_predict_landmarks", lambda crop: landmarks)
+        monkeypatch.setattr(detector, "_predict", lambda crop: (0.9, landmarks))
 
         detection = detector.detect(np.zeros((100, 100, 3), dtype=np.uint8))
 
@@ -245,11 +306,14 @@ class TestAcceptRejectGate:
         assert detection.detector_id == "eyepose-v0"
         assert (detection.left.x, detection.left.y) == pytest.approx((48.0, 35.0))
         assert (detection.right.x, detection.right.y) == pytest.approx((52.0, 36.0))
+        # head_visible is independent of (and, here, does not gate) accepted.
+        assert detection.head_confidence == pytest.approx(0.9)
+        assert detection.head_visible is True
 
     def test_low_confidence_is_rejected_before_the_plausibility_check_even_runs(self, monkeypatch) -> None:
         detector = _stub_detector(min_confidence=0.80)
         landmarks = _landmarks(left=(48.0, 35.0, 0.50), right=(52.0, 36.0, 0.40))
-        monkeypatch.setattr(detector, "_predict_landmarks", lambda crop: landmarks)
+        monkeypatch.setattr(detector, "_predict", lambda crop: (0.9, landmarks))
 
         detection = detector.detect(np.zeros((100, 100, 3), dtype=np.uint8))
 
@@ -269,7 +333,7 @@ class TestAcceptRejectGate:
             right=(52.0, 36.0, 0.10),
             beak=(50.0, 60.0, 0.95), head_top=(50.0, 20.0, 0.95),
         )
-        monkeypatch.setattr(detector, "_predict_landmarks", lambda crop: landmarks)
+        monkeypatch.setattr(detector, "_predict", lambda crop: (0.9, landmarks))
 
         detection = detector.detect(np.zeros((100, 100, 3), dtype=np.uint8))
 
@@ -288,26 +352,45 @@ class TestAcceptRejectGate:
             left=(50.0, 50.0, 0.95), right=(51.0, 50.0, 0.40),
             beak=(50.0, 50.0, 0.9), head_top=(50.0, 50.0, 0.9),  # coincide exactly
         )
-        monkeypatch.setattr(detector, "_predict_landmarks", lambda crop: landmarks)
+        monkeypatch.setattr(detector, "_predict", lambda crop: (0.9, landmarks))
 
         detection = detector.detect(np.zeros((100, 100, 3), dtype=np.uint8))  # must not raise
         assert detection.accepted is True  # ~0px separation is still tiny even against the floor
 
+    def test_a_low_head_confidence_is_rejected_independent_of_eye_confidence(self, monkeypatch) -> None:
+        """The exact measured EyePose Investigation Phase 1 failure mode: a
+        crop with no real bird head can still produce a confident-looking
+        eye landmark - head_visible must catch it as its own, independent
+        gate, without accepted itself changing."""
+        detector = _stub_detector(min_confidence=0.5, max_head_distance_ratio=1.5, min_head_confidence=0.5)
+        landmarks = _landmarks(left=(48.0, 35.0, 0.97), right=(52.0, 36.0, 0.40))
+        monkeypatch.setattr(detector, "_predict", lambda crop: (0.026, landmarks))  # the DSC03129 measurement
+
+        detection = detector.detect(np.zeros((100, 100, 3), dtype=np.uint8))
+
+        assert detection.head_confidence == pytest.approx(0.026)
+        assert detection.head_visible is False
+        assert detection.accepted is True  # unaffected - a genuinely separate question, see EyeFilter
+        assert detection.confidence == pytest.approx(0.97)
+
     def test_an_empty_crop_is_declined_rather_than_crashing(self) -> None:
         detector = EyePoseV0EyeDetector.__new__(EyePoseV0EyeDetector)
-        assert detector.detect(np.zeros((0, 0, 3), dtype=np.uint8)).accepted is False
+        detection = detector.detect(np.zeros((0, 0, 3), dtype=np.uint8))
+        assert detection.accepted is False
+        assert detection.head_visible is False
         assert detector.detect(None).accepted is False
 
     def test_no_detection_at_all_is_declined_rather_than_crashing(self, monkeypatch) -> None:
-        """_predict_landmarks returning None (a degenerate all-zero model
-        output - see DecodeBestTests) must decline gracefully, exactly like
-        an empty crop."""
+        """_predict returning None (a degenerate all-zero model output - see
+        DecodeBestTests) must decline gracefully, exactly like an empty
+        crop."""
         detector = _stub_detector()
-        monkeypatch.setattr(detector, "_predict_landmarks", lambda crop: None)
+        monkeypatch.setattr(detector, "_predict", lambda crop: None)
 
         detection = detector.detect(np.zeros((100, 100, 3), dtype=np.uint8))
         assert detection.accepted is False
         assert detection.confidence == pytest.approx(0.0)
+        assert detection.head_visible is False
 
 
 def test_the_detector_only_claims_to_understand_birds() -> None:
@@ -336,9 +419,11 @@ def test_the_real_onnx_graph_loads_and_returns_a_bounded_box() -> None:
     every one of the six landmarks was actually decoded."""
     detector = build_eye_detector("eyepose-v0", device="cpu", min_confidence=0.0)
     crop = np.random.default_rng(7).integers(0, 256, (300, 400, 3), dtype=np.uint8)
-    landmarks = detector._predict_landmarks(crop)
+    predicted = detector._predict(crop)
 
-    assert landmarks is not None
+    assert predicted is not None
+    detection_confidence, landmarks = predicted
+    assert 0.0 <= detection_confidence <= 1.0
     assert set(landmarks) == set(KPT_NAMES)
 
     detection = detector.detect(crop)

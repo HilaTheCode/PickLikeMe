@@ -1,5 +1,29 @@
 """BioCLIP-2 - the default local, offline species classifier.
 
+Also backs the original BioCLIP (v1) as a second, independently-selectable
+backend - see `BIOCLIP_V1_MODEL_ID` below. Both are the same `open_clip`
+OpenCLIP-family model loaded through the identical
+`create_model_and_transforms`/`get_tokenizer` API (confirmed directly
+against both models' official Hugging Face model cards and by loading each
+one locally, including on CUDA - not assumed), so `BioClipSpeciesClassifier`
+already needed no code change to serve either: it was already parameterized
+by `model_id`. What differs between the two, verified the same way:
+
+|                | BioCLIP (v1)                  | BioCLIP 2 (default)            |
+|----------------|--------------------------------|---------------------------------|
+| `model_id`     | `hf-hub:imageomics/bioclip`    | `hf-hub:imageomics/bioclip-2`  |
+| Architecture   | ViT-B/16                       | ViT-L/14                       |
+| Training data  | TreeOfLife-10M, ~450K taxa     | TreeOfLife-200M, ~952K taxa    |
+| Released       | Nov 2023 (CVPR 2024)           | newer, larger                  |
+| Local weights  | ~571MB                         | ~1.6GB                         |
+| Preprocessing  | identical - Resize(224, bicubic) -> CenterCrop(224,224) -> Normalize(CLIP mean/std) for both |
+
+Same dependencies (`open_clip_torch`, already a project dependency), same
+one-time-download-then-offline shape, same Hugging Face Hub cache location
+(`~/.cache/huggingface/hub/models--imageomics--<name>`) - registering a
+second model is exactly `species/classifier.py` binding a second `model_id`
+default via `functools.partial`, not a new class.
+
 Why BioCLIP rather than the MegaDetector + SpeciesNet pairing suggested
 earlier: SpeciesNet is trained overwhelmingly on Wildlife Insights' camera
 trap imagery - fixed position, motion-triggered, often monochrome/IR,
@@ -48,11 +72,31 @@ logger = logging.getLogger(__name__)
 # change between BioCLIP versions.
 DEFAULT_MODEL_ID = "hf-hub:imageomics/bioclip-2"
 
+# The original BioCLIP (v1) - see the module docstring's comparison table.
+# A second, independently-selectable backend (`species/classifier.py`
+# registers it as "bioclip"), not a replacement for the default above.
+BIOCLIP_V1_MODEL_ID = "hf-hub:imageomics/bioclip"
+
+# Bumped whenever THIS class's own preprocessing/prompt/decision logic
+# changes in a way that could change a prediction - independent of the
+# model checkpoint's own version (see species/experiment.py's
+# ExperimentMetadata.model_version) and independent of the open_clip
+# library's own version. An experiment record needs all three, separately,
+# to answer "what exactly produced this result" - see experiment.py's
+# module docstring.
+CLASSIFIER_VERSION = "1"
+
 # CLIP-style zero-shot classification is sensitive to the prompt template;
 # this is the standard generic CLIP convention, not BioCLIP's own
 # fine-tuned template - a reasonable starting point, tunable later without
 # touching anything outside this one constant.
 DEFAULT_PROMPT_TEMPLATE = "a photo of a {}"
+
+# How many ranked (species, confidence) pairs classify() keeps on
+# SpeciesPrediction.top_predictions by default - see classify()'s own
+# docstring on why this costs nothing extra (the full ranking already
+# exists in memory before the single winning answer is taken).
+DEFAULT_TOP_N = 5
 
 # A starting vocabulary covering common subjects across the taxonomy this
 # project already recognises structurally (bird_crop.DETECTION_CATEGORIES) -
@@ -101,7 +145,7 @@ class BioClipSpeciesClassifier:
         model_id: str = DEFAULT_MODEL_ID,
         prompt_template: str = DEFAULT_PROMPT_TEMPLATE,
         min_confidence: float = 0.5,
-        device: str = "cpu",
+        device: str | None = None,
     ):
         if species_list_path is not None:
             species_list = _read_species_list(species_list_path)
@@ -111,7 +155,21 @@ class BioClipSpeciesClassifier:
         self.model_id = model_id
         self.prompt_template = prompt_template
         self.min_confidence = min_confidence
-        self.device = device
+
+        # Resolved here, at the source, not left to every caller to get
+        # right - `device=None` (or omitted entirely) auto-selects CUDA
+        # when available, the same fallback chain every other model in
+        # this project already uses. Previously this defaulted to a
+        # hardcoded "cpu", and both current callers (desktop/services.py,
+        # species/cli.py) also independently defaulted to "cpu" - meaning
+        # species classification silently never used a GPU regardless of
+        # availability. Fixing the default here means a *future* caller
+        # that also forgets to resolve a device gets the right behaviour
+        # anyway, not just today's two known call sites - see
+        # docs/BioCLIP_Backend_Architecture_Review.md.
+        from ..platform import resolve_torch_device
+
+        self.device = resolve_torch_device(device)
 
         # Lazy, exactly like BirdDetector's torch/torchvision: importing
         # this module (or even constructing a classifier for a --help run)
@@ -123,24 +181,59 @@ class BioClipSpeciesClassifier:
         self._torch = torch
         model, _, preprocess = open_clip.create_model_and_transforms(model_id)
         tokenizer = open_clip.get_tokenizer(model_id)
-        self._model = model.to(device).eval()
+        self._model = model.to(self.device).eval()
         self._preprocess = preprocess
 
         prompts = [prompt_template.format(species) for species in self.species_list]
         with torch.no_grad():
-            tokens = tokenizer(prompts).to(device)
+            tokens = tokenizer(prompts).to(self.device)
             text_features = self._model.encode_text(tokens)
             self._text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+
+        gpu_name = None
+        if torch.cuda.is_available():
+            try:
+                gpu_name = torch.cuda.get_device_name(0)
+            except Exception:  # noqa: BLE001 - a GPU name query must never break construction
+                gpu_name = None
+        logger.info(
+            "Species classifier ready: backend model_id=%s | requested device=%r -> execution device=%s "
+            "| CUDA available=%s | GPU=%s | species_count=%d",
+            model_id, device, self.device, torch.cuda.is_available(), gpu_name or "n/a", len(self.species_list),
+        )
 
     @property
     def classifier_id(self) -> str:
         """The model plus exactly which species it was asked to consider -
         both determine the answer, so both must invalidate a cached one.
-        See SpeciesClassifier's own docstring for why this matters."""
-        digest = hashlib.sha1("\n".join(self.species_list).encode("utf-8")).hexdigest()[:12]
-        return f"bioclip2:{Path(self.model_id).name or self.model_id}:{digest}"
+        See SpeciesClassifier's own docstring for why this matters.
 
-    def classify(self, image: "Image.Image") -> SpeciesPrediction:
+        Derived from `self.model_id` itself (e.g. "bioclip-2" or "bioclip"),
+        not hardcoded - this class now backs more than one BioCLIP version
+        (see the module docstring), and a hardcoded "bioclip2" prefix would
+        mislabel a BioCLIP-v1-backed instance's cached predictions as if
+        they came from v2, silently defeating any future benchmark that
+        compares the two by classifier_id. This does change the exact
+        string for the existing default model (previously
+        "bioclip2:bioclip-2:<digest>", now "bioclip-2:<digest>") - safe:
+        `SpeciesCache` treats any classifier_id it does not recognise as a
+        cache miss, never a wrong answer, so already-organized folders just
+        get re-classified once, the same safe-by-construction behaviour
+        `bird_crop.CROP_CACHE_VERSION` and `eyes.cache.EYE_CACHE_VERSION`
+        bumps already rely on elsewhere in this project.
+        """
+        digest = hashlib.sha1("\n".join(self.species_list).encode("utf-8")).hexdigest()[:12]
+        model_name = Path(self.model_id).name or self.model_id
+        return f"{model_name}:{digest}"
+
+    def classify(self, image: "Image.Image", *, top_n: int = DEFAULT_TOP_N) -> SpeciesPrediction:
+        """The single winning answer (`species`/`confidence`/`classifier_id`
+        - unchanged contract, exactly as before), plus `top_predictions`:
+        the `top_n` best (species, confidence) pairs from the SAME forward
+        pass - no second inference call. `top_n` only controls how much of
+        the already-computed similarity vector is kept, never how much
+        work is done; pass 0 to omit `top_predictions` entirely (e.g. a
+        hot loop that only ever needs the single answer)."""
         torch = self._torch
         with torch.no_grad():
             pixels = self._preprocess(image).unsqueeze(0).to(self.device)
@@ -151,8 +244,15 @@ class BioClipSpeciesClassifier:
             confidence = float(confidence.item())
             index = int(index.item())
 
-        if confidence < self.min_confidence:
-            return SpeciesPrediction(species=UNKNOWN_SPECIES, confidence=confidence, classifier_id=self.classifier_id)
+            top_predictions = None
+            if top_n > 0:
+                ranked = torch.argsort(similarity, descending=True)[:top_n]
+                top_predictions = tuple(
+                    (self.species_list[int(i)], float(similarity[int(i)].item())) for i in ranked
+                )
+
+        species = UNKNOWN_SPECIES if confidence < self.min_confidence else self.species_list[index]
         return SpeciesPrediction(
-            species=self.species_list[index], confidence=confidence, classifier_id=self.classifier_id
+            species=species, confidence=confidence, classifier_id=self.classifier_id,
+            top_predictions=top_predictions,
         )
