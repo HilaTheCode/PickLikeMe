@@ -151,7 +151,9 @@ class ReviewImage:
         otherwise - never inferred from the ranking."""
         return self.decision or REVIEW_STATUS_NEUTRAL
 
-    def as_dict(self, ai_suggestion: str | None, burst: "BurstInfo | None" = None) -> dict:
+    def as_dict(
+        self, ai_suggestion: str | None, burst: "BurstInfo | None" = None, algorithm_suggestion: str | None = None
+    ) -> dict:
         return {
             "image_path": self.image_path,
             "filename": self.filename,
@@ -171,6 +173,14 @@ class ReviewImage:
             # threshold - "keep"/"reject", or None if unranked. Informational
             # only; see ReviewSession._ai_suggestions.
             "ai_suggestion": ai_suggestion,
+            # The same kind of suggestion, but for whichever strategy is
+            # currently selected (ReviewSession.burst_strategy - the same
+            # selection Burst Analysis and the desktop Color Source picker
+            # already share, see burst_strategy's own docstring). Equal to
+            # ai_suggestion whenever that strategy IS the AI model - a
+            # distinct field regardless, so a caller never has to guess
+            # which one it got. See ReviewSession.suggestions_for.
+            "algorithm_suggestion": algorithm_suggestion,
             "reason": self.reason,
             "reason_note": self.reason_note,
             "missing_file": self.missing_file,
@@ -643,16 +653,39 @@ class ReviewSession:
         current threshold - "keep"/"reject" for a ranked image, None for one
         the model never scored. Never written anywhere, never fed into
         review_status or arrange() by itself - purely the hint shown next to
-        the photographer's own, independent verdict."""
-        cut = self.cut
-        suggestions: dict[str, str | None] = {}
-        ranked_position = 0
-        for image in self.images:
-            if image.is_ranked:
-                suggestions[image.image_path] = REVIEW_STATUS_KEEP if ranked_position < cut else REVIEW_STATUS_REJECT
-                ranked_position += 1
-            else:
-                suggestions[image.image_path] = None
+        the photographer's own, independent verdict.
+
+        Deliberately still AI-specific (not `suggestions_for(AI_STRATEGY_ID)`
+        below, even though the two would compute the same thing today) -
+        this backs `agreement_stats`/`disagreements`/`apply_ai_suggestions`/
+        `evaluation_report.py`, which are their own, explicitly AI-focused
+        feature (evaluating the trained model against human judgement over
+        time) and were not asked to be generalized. `suggestions_for` is the
+        one used by the filter UI's now-per-strategy conflict filters - see
+        its own docstring."""
+        return self.suggestions_for(AI_STRATEGY_ID)
+
+    def suggestions_for(self, strategy_id: str) -> dict[str, str | None]:
+        """What `strategy_id` alone would recommend for each image at the
+        current keep-percent threshold - "keep"/"reject" for an image that
+        strategy scored, None for one it never scored (never filtered into
+        a false "reject" - see `SubjectFilter`/`EyeFilter`'s own NO_SUBJECT/
+        NO_VISIBLE_EYE/etc. reasons for why an image has no score to begin
+        with). The general form of `_ai_suggestions` - see that method's own
+        docstring for why the AI-specific evaluation features keep using a
+        fixed AI-only version rather than this one.
+
+        Same threshold (`self.keep_percent`) for every strategy - there is
+        only one photographer-facing "how selective" setting, applied to
+        whichever strategy's own score ordering is being asked about, not a
+        second per-strategy setting to keep in sync.
+        """
+        scored = [image for image in self.images if image.score_for(strategy_id) is not None]
+        cut = selection_count(len(scored), self.keep_percent)
+        ranked = sorted(scored, key=lambda image: image.score_for(strategy_id), reverse=True)
+        suggestions: dict[str, str | None] = {image.image_path: None for image in self.images}
+        for position, image in enumerate(ranked):
+            suggestions[image.image_path] = REVIEW_STATUS_KEEP if position < cut else REVIEW_STATUS_REJECT
         return suggestions
 
     def agreement_stats(self) -> dict:
@@ -782,6 +815,16 @@ class ReviewSession:
 
     def as_dict(self) -> dict:
         ai_suggestions = self._ai_suggestions()
+        # burst_strategy is the one "which ranking strategy is currently
+        # selected" the app shares across Burst Analysis, the desktop Color
+        # Source picker, and now this - see its own docstring. Recomputing
+        # suggestions_for(AI_STRATEGY_ID) here whenever burst_strategy
+        # happens to already be the AI model would just repeat the exact
+        # same work _ai_suggestions() already did above, so that case is
+        # shortcut rather than calling suggestions_for a second time.
+        algorithm_suggestions = (
+            ai_suggestions if self.burst_strategy == AI_STRATEGY_ID else self.suggestions_for(self.burst_strategy)
+        )
         burst = self.burst_info()
         with self._state_lock:
             loading = dict(self._loading_state)
@@ -793,6 +836,11 @@ class ReviewSession:
             "ranking_file": str(self.ranking_file) if self.ranking_file else None,
             "has_ranking": bool(self.ranking_file and self.ranking_file.is_file()),
             "keep_percent": self.keep_percent,
+            # Which strategy algorithm_suggestion (on every image below) is
+            # currently computed against - the UI needs this to label the
+            # suggestion/conflict filters correctly (e.g. "Classic Vision
+            # suggests Keep" instead of an unconditional "AI suggests...").
+            "suggestion_strategy": self.burst_strategy,
             "counts": self.counts(),
             "agreement": self.agreement_stats(),
             "warnings": warnings,
@@ -800,7 +848,11 @@ class ReviewSession:
             "workflow": self.workflow_state(),
             "loading": loading,
             "images": [
-                image.as_dict(ai_suggestions.get(image.image_path), burst.get(image.image_path))
+                image.as_dict(
+                    ai_suggestions.get(image.image_path),
+                    burst.get(image.image_path),
+                    algorithm_suggestions.get(image.image_path),
+                )
                 for image in images
             ],
         }

@@ -40,6 +40,7 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QPushButton,
     QSplitter,
+    QStackedWidget,
     QTableWidget,
     QTableWidgetItem,
     QTabWidget,
@@ -283,7 +284,6 @@ class AnalyticsDashboard(QDialog):
 
         self._experiment_list = QListWidget(self)
         self._experiment_list.currentItemChanged.connect(self._on_experiment_selected)
-        self._refresh_experiment_list()
 
         refresh_button = QPushButton("Refresh", self)
         refresh_button.clicked.connect(self._refresh_experiment_list)
@@ -304,16 +304,40 @@ class AnalyticsDashboard(QDialog):
         self._tabs.addTab(self._species_analysis_tab, "Species Analysis")
         self._tabs.addTab(self._image_inspector_tab, "Image Inspector")
 
+        # Shown instead of the (otherwise blank-looking) tabs when there is
+        # nothing recorded yet - a dashboard with 1161 tests behind it but
+        # zero real runs still needs to say so in plain language, not just
+        # render an empty table that looks like something broke.
+        self._empty_state_label = QLabel(
+            "No experiments recorded yet.\n\n"
+            "Run “Rank…” or “Organize by Species…” from the Tools menu to record one - "
+            "this dashboard only shows runs completed after analytics recording was added.\n\n"
+            "Already ran one and still see this? Click Refresh.",
+            self,
+        )
+        self._empty_state_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._empty_state_label.setWordWrap(True)
+        self._empty_state_label.setStyleSheet("padding: 32px; color: palette(mid);")
+
+        self._detail_stack = QStackedWidget(self)
+        self._detail_stack.addWidget(self._tabs)
+        self._detail_stack.addWidget(self._empty_state_label)
+
         splitter = QSplitter(self)
         splitter.addWidget(browser_container)
-        splitter.addWidget(self._tabs)
+        splitter.addWidget(self._detail_stack)
         splitter.setStretchFactor(1, 1)
 
         layout = QVBoxLayout(self)
         layout.addWidget(splitter)
 
+        self._refresh_experiment_list()
         if self._experiment_list.count():
             self._experiment_list.setCurrentRow(0)
+
+    def _update_empty_state(self) -> None:
+        has_experiments = self._experiment_list.count() > 0
+        self._detail_stack.setCurrentWidget(self._tabs if has_experiments else self._empty_state_label)
 
     def _refresh_experiment_list(self) -> None:
         self._experiment_list.clear()
@@ -322,6 +346,7 @@ class AnalyticsDashboard(QDialog):
             item = QListWidgetItem(label)
             item.setData(Qt.ItemDataRole.UserRole, run["run_id"])
             self._experiment_list.addItem(item)
+        self._update_empty_state()
 
     def _on_experiment_selected(self, current: QListWidgetItem | None, _previous) -> None:
         if current is None:

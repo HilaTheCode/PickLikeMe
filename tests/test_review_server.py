@@ -560,6 +560,66 @@ class KeepPercentEndpointTests(ReviewServerTestCase):
         self.assertEqual(ctx.exception.code, 400)
 
 
+class BurstStrategyEndpointTests(unittest.TestCase):
+    """The web UI's equivalent of the desktop Color Source picker -
+    switching which strategy `algorithm_suggestion` (and, via burst_
+    strategy, Burst Analysis) is computed against. Builds its own shoot
+    with a second strategy's ranking attached, since the shared
+    ReviewServerTestCase fixture only ever has the AI model's."""
+
+    def setUp(self):
+        from test_review_session import build_shoot, write_strategy_ranking
+
+        self._tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.root = Path(self._tmp.name)
+        self.store = AnnotationStore(self.root / "kb.db")
+        self.shoot, self.images, _extra = build_shoot(self.root, ranked=3)
+        make_real_images(self.images)
+        # Classic Vision disagrees with the AI about the order entirely -
+        # the same shape RankingResultsSymmetryTests uses, so a strategy
+        # switch is actually observable, not a same-order coincidence.
+        from picklikeme.sidecar import strategy_ranking_path
+
+        write_strategy_ranking(
+            strategy_ranking_path(self.shoot, "classic-vision"),
+            [(self.images[2], 0.99), (self.images[1], 0.5), (self.images[0], 0.1)],
+        )
+        self.session = ReviewSession(self.shoot, self.store, keep_percent=34)
+        self.server = make_review_server(self.session, self.store, port=0)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.base = f"http://127.0.0.1:{self.server.server_address[1]}"
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.store.close()
+        self._tmp.cleanup()
+
+    def post(self, path: str, payload: dict):
+        request = urllib.request.Request(
+            self.base + path,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(request) as response:
+            return json.load(response)
+
+    def test_switching_strategy_changes_algorithm_suggestion_not_ai_suggestion(self):
+        payload = self.post("/api/review/burst-strategy", {"strategy_id": "classic-vision"})
+
+        self.assertEqual(payload["state"]["suggestion_strategy"], "classic-vision")
+        by_path = {img["image_path"]: img for img in payload["state"]["images"]}
+        # Classic Vision's favorite (images[2]) is the AI's least favorite.
+        self.assertEqual(by_path[str(self.images[2])]["algorithm_suggestion"], "keep")
+        self.assertEqual(by_path[str(self.images[2])]["ai_suggestion"], "reject")
+
+    def test_a_missing_strategy_id_is_refused(self):
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            self.post("/api/review/burst-strategy", {})
+        self.assertEqual(ctx.exception.code, 400)
+
+
 class ThumbnailEndpointTests(ReviewServerTestCase):
     def test_a_thumbnail_is_served_for_an_image_in_the_folder(self):
         url = "/thumb?path=" + quote(str(self.images[0]), safe="")
@@ -1192,6 +1252,29 @@ class GalleryFilterTests(unittest.TestCase):
         self.assertIn("i.ai_suggestion === 'reject'", body)
         self.assertIn("i.ai_suggestion === 'keep' && i.review_status === 'reject'", body)
         self.assertIn("i.ai_suggestion === 'reject' && i.review_status === 'keep'", body)
+
+    def test_generalized_algorithm_conflict_filters_exist(self):
+        """The generalized form of the AI-only conflict filters - compares
+        the user's decision against whichever strategy the "Compare
+        against" select currently names, not always the AI model."""
+        from picklikeme.review.page import build_js, build_page
+
+        html = build_page()
+        self.assertIn('data-filter="algorithm_keep"', html)
+        self.assertIn('data-filter="algorithm_reject"', html)
+        self.assertIn('data-filter="algorithm_keep_user_reject"', html)
+        self.assertIn('data-filter="algorithm_reject_user_keep"', html)
+        self.assertIn('id="strategy-select"', html)
+
+        js = build_js()
+        filter_images = re.search(r"function filterImages\(images\)\{(.*?)\n\}", js, re.S)
+        body = filter_images.group(1)
+        self.assertIn("i.algorithm_suggestion === 'keep'", body)
+        self.assertIn("i.algorithm_suggestion === 'reject'", body)
+        self.assertIn("i.algorithm_suggestion === 'keep' && i.review_status === 'reject'", body)
+        self.assertIn("i.algorithm_suggestion === 'reject' && i.review_status === 'keep'", body)
+        self.assertIn("function setStrategy(strategyId)", js)
+        self.assertIn("api/review/burst-strategy", js)
 
     def test_filter_buttons_are_wired_to_set_filter(self):
         from picklikeme.review.page import build_js

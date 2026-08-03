@@ -14,6 +14,14 @@ class ImageItem:
     file_name: str
     review_status: str = "neutral"
     ai_suggestion: str | None = None
+    # The same kind of suggestion as ai_suggestion, but for whichever
+    # strategy is currently selected (the same selection Burst Analysis and
+    # the toolbar's Color Source picker already share - see
+    # ReviewSession.burst_strategy's own docstring). Equal to ai_suggestion
+    # whenever that strategy IS the AI model. Backs the generalized
+    # "Algorithm Keep/Reject" conflict filters (main_window.py's
+    # _filter_items) - see ReviewSession.suggestions_for.
+    algorithm_suggestion: str | None = None
     selected: bool = False
     # The file's own EXIF capture date/time (ISO-8601), or None if it has
     # none - see ReviewImage.captured_at. ISO-8601 sorts lexicographically

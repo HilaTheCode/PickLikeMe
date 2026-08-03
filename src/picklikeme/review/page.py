@@ -337,6 +337,20 @@ function filterImages(images){
   if(PLM.filter === 'ai_reject_user_keep') {
     return images.filter(i => i.ai_suggestion === 'reject' && i.review_status === 'keep');
   }
+  // Same four filters, generalized to whichever strategy is currently
+  // selected (see the "Compare against" select and /api/review/burst-
+  // strategy) instead of always the AI model - algorithm_suggestion is
+  // ai_suggestion's per-strategy counterpart, see ReviewSession.
+  // suggestions_for. The ai_* filters above are deliberately left alone:
+  // "AI Keep" always means the AI model, regardless of this selection.
+  if(PLM.filter === 'algorithm_keep') return images.filter(i => i.algorithm_suggestion === 'keep');
+  if(PLM.filter === 'algorithm_reject') return images.filter(i => i.algorithm_suggestion === 'reject');
+  if(PLM.filter === 'algorithm_keep_user_reject') {
+    return images.filter(i => i.algorithm_suggestion === 'keep' && i.review_status === 'reject');
+  }
+  if(PLM.filter === 'algorithm_reject_user_keep') {
+    return images.filter(i => i.algorithm_suggestion === 'reject' && i.review_status === 'keep');
+  }
   // Subject category (bird/mammal/human/...) - one dynamic filter per
   // category actually present in this folder, see renderCategoryFilters().
   if(PLM.filter.indexOf('category:') === 0){
@@ -350,6 +364,39 @@ function filterImages(images){
 // categories actually present in this folder get a button, so the section
 // simply grows (or shows nothing at all, on a folder with no recorded
 // detections) as the detector's own coverage grows, with no UI code change.
+// The web UI's equivalent of the desktop Color Source picker - which
+// strategy algorithm_suggestion (and the algorithm_* filters above) is
+// currently computed against. Options are derived from whatever strategies
+// actually scored at least one image in this folder (ranking_results'
+// own keys), not a fixed list - a future analysis module needs no change
+// here, the same "discovered, not enumerated" rule sidecar.py's own
+// discover_strategy_rankings already follows for the CSVs themselves.
+function renderStrategySelector(images, s){
+  const select = q('#strategy-select');
+  if(!select) return;
+  const present = new Set();
+  images.forEach(i => Object.keys(i.ranking_results || {}).forEach(id => present.add(id)));
+  present.add('ai-model');  // always offered, even before any ranking exists
+  const ids = Array.from(present).sort();
+  const current = select.value;
+  select.innerHTML = ids.map(id =>
+    '<option value="' + esc(id) + '">' + esc(id === 'ai-model' ? 'AI Model' : id) + '</option>'
+  ).join('');
+  select.value = ids.includes(s.suggestion_strategy) ? s.suggestion_strategy : (ids.includes(current) ? current : ids[0]);
+}
+
+async function setStrategy(strategyId){
+  try{
+    PLM.state = (await api('api/review/burst-strategy', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({strategy_id: strategyId}),
+    })).state;
+    render();
+    say('');
+  }catch(e){ say('Could not switch the comparison algorithm: ' + e.message, true); }
+}
+
 function renderCategoryFilters(images){
   const section = q('#category-section');
   const present = Array.from(new Set(images.map(i => i.detected_category).filter(Boolean))).sort();
@@ -498,6 +545,7 @@ function render(){
     b.classList.toggle('on', b.dataset.filter === PLM.filter);
   });
   renderCategoryFilters(s.images);
+  renderStrategySelector(s.images, s);
   q('#sort-key').value = PLM.sort.key;
   q('#sort-dir').textContent = PLM.sort.dir === 'desc' ? '↓' : '↑';
   q('#sort-dir').title = PLM.sort.dir === 'desc' ? 'Descending (click for ascending)' : 'Ascending (click for descending)';
@@ -1565,6 +1613,7 @@ async function boot(){
   });
   q('#sort-key').addEventListener('change', e => setSortKey(e.target.value));
   q('#sort-dir').addEventListener('click', toggleSortDir);
+  q('#strategy-select').addEventListener('change', e => setStrategy(e.target.value));
   q('#select-all-visible').addEventListener('click', selectAllVisible);
   q('#panel-toggle').addEventListener('click', togglePanel);
   q('#auto-crop').addEventListener('click', runAutoCrop);
@@ -1742,6 +1791,14 @@ def build_page(title: str = "PeakPic") -> str:
         <button class="filter" data-filter="ai_reject">AI Reject</button>
         <button class="filter" data-filter="ai_keep_user_reject" title="AI Keep / You Reject">AI Keep / You Reject</button>
         <button class="filter" data-filter="ai_reject_user_keep" title="AI Reject / You Keep">AI Reject / You Keep</button>
+        <button class="filter" data-filter="algorithm_keep" title="Whichever algorithm is selected below suggests Keep">Algorithm Keep</button>
+        <button class="filter" data-filter="algorithm_reject" title="Whichever algorithm is selected below suggests Reject">Algorithm Reject</button>
+        <button class="filter" data-filter="algorithm_keep_user_reject" title="Algorithm Keep / You Reject">Algorithm Keep / You Reject</button>
+        <button class="filter" data-filter="algorithm_reject_user_keep" title="Algorithm Reject / You Keep">Algorithm Reject / You Keep</button>
+      </div>
+      <div class="panel-row">
+        <label for="strategy-select" style="font-size:12px">Compare against:</label>
+        <select id="strategy-select" aria-label="Which algorithm the Algorithm filters above compare against"></select>
       </div>
       <div class="panel-row">
         <button id="boxes" title="Show/hide the detector's bounding boxes on thumbnails">Detector Boxes</button>

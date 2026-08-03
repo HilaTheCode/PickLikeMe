@@ -59,6 +59,7 @@ from .views.gallery.gallery_view import GalleryView
 FILTERS = (
     "all", "keep", "reject", "neutral",
     "ai_keep", "ai_reject", "ai_keep_user_reject", "ai_reject_user_keep",
+    "algorithm_keep", "algorithm_reject", "algorithm_keep_user_reject", "algorithm_reject_user_keep",
     "filtered",
 )
 # Matches the web review UI's filterImages() exactly (review/page.py) -
@@ -71,6 +72,17 @@ FILTERS = (
 # explicitly excluded from scoring (see ImageItem.filter_reasons) - the
 # tool for a photographer investigating "why didn't Classic Vision rank
 # this", regardless of which strategy or reason.
+#
+# algorithm_* are the generalized form of the ai_* filters above - they
+# read item.algorithm_suggestion (ReviewSession.suggestions_for, computed
+# against whichever strategy the Color Source picker currently selects -
+# see _on_color_source_changed) instead of always the AI model
+# specifically. The ai_* filters are deliberately left unchanged rather
+# than being redefined in terms of the current strategy: "AI Keep" should
+# always mean the AI model, exactly as it always has, even after a
+# photographer switches Color Source to Classic Vision - algorithm_* is
+# the new, separate way to ask "whichever strategy I'm currently looking
+# at, where does it disagree with me."
 FILTER_LABELS = {
     "all": "All",
     "keep": "Keep",
@@ -80,6 +92,10 @@ FILTER_LABELS = {
     "ai_reject": "AI Reject",
     "ai_keep_user_reject": "Conflict: AI Keep / You Reject",
     "ai_reject_user_keep": "Conflict: AI Reject / You Keep",
+    "algorithm_keep": "Algorithm Keep (current Color Source)",
+    "algorithm_reject": "Algorithm Reject (current Color Source)",
+    "algorithm_keep_user_reject": "Conflict: Algorithm Keep / You Reject",
+    "algorithm_reject_user_keep": "Conflict: Algorithm Reject / You Keep",
     "filtered": "Filtered (Skipped by an analysis module)",
 }
 KEEP_PERCENT_PRESETS = (5.0, 10.0, 20.0, 25.0, 35.0)
@@ -496,15 +512,15 @@ class MainWindow(QMainWindow):
         toolbar.addAction(self._open_action)
         toolbar.addSeparator()
 
+        toolbar.addWidget(QLabel(" Filter: "))
+        toolbar.addWidget(self._filter_combo)
+        toolbar.addSeparator()
+
         toolbar.addAction(self._select_all_action)
         toolbar.addAction(self._keep_action)
         toolbar.addAction(self._reject_action)
         toolbar.addAction(self._neutral_action)
         toolbar.addAction(self._loupe_action)
-        toolbar.addSeparator()
-
-        toolbar.addWidget(QLabel(" Filter: "))
-        toolbar.addWidget(self._filter_combo)
         toolbar.addSeparator()
 
         toolbar.addWidget(QLabel(" Sort: "))
@@ -802,6 +818,7 @@ class MainWindow(QMainWindow):
                 file_name=Path(image.get("image_path") or "").name,
                 review_status=image.get("review_status", "neutral"),
                 ai_suggestion=image.get("ai_suggestion"),
+                algorithm_suggestion=image.get("algorithm_suggestion"),
                 captured_at=image.get("captured_at"),
                 # ranking_results already carries the AI model's own
                 # score/rank under "ai-model" - ImageItem.score/.rank read it
@@ -947,6 +964,14 @@ class MainWindow(QMainWindow):
             return [item for item in items if item.ai_suggestion == "keep" and item.review_status == "reject"]
         if current_filter == "ai_reject_user_keep":
             return [item for item in items if item.ai_suggestion == "reject" and item.review_status == "keep"]
+        if current_filter == "algorithm_keep":
+            return [item for item in items if item.algorithm_suggestion == "keep"]
+        if current_filter == "algorithm_reject":
+            return [item for item in items if item.algorithm_suggestion == "reject"]
+        if current_filter == "algorithm_keep_user_reject":
+            return [item for item in items if item.algorithm_suggestion == "keep" and item.review_status == "reject"]
+        if current_filter == "algorithm_reject_user_keep":
+            return [item for item in items if item.algorithm_suggestion == "reject" and item.review_status == "keep"]
         if current_filter == "filtered":
             # Desktop-only, no web-UI equivalent (see FILTER_LABELS): any
             # image at least one analysis module explicitly excluded from

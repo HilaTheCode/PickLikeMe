@@ -339,6 +339,7 @@ class ReviewRequestHandler(AnnotationRequestHandler):
             "/api/review/bulk-status": self._post_bulk_status,
             "/api/review/apply-ai-suggestions": self._post_apply_ai_suggestions,
             "/api/review/keep-percent": self._post_keep_percent,
+            "/api/review/burst-strategy": self._post_burst_strategy,
             "/api/review/arrange": self._post_arrange,
             "/api/review/reconcile": self._post_reconcile,
             "/api/review/auto-crop": self._post_auto_crop,
@@ -424,6 +425,20 @@ class ReviewRequestHandler(AnnotationRequestHandler):
 
     def _post_keep_percent(self, payload: dict) -> None:
         self.session.set_keep_percent(payload.get("keep_percent"))
+        self._send_json(self._state_payload())
+
+    def _post_burst_strategy(self, payload: dict) -> None:
+        """Which strategy `algorithm_suggestion` (on every image in the next
+        state payload) is computed against - see ReviewSession.
+        burst_strategy's own docstring. The web UI's equivalent of the
+        desktop Color Source picker's `set_burst_strategy` call - the same
+        one backend field, so switching it in either app is visible in the
+        other the next time state is loaded there."""
+        strategy_id = (payload.get("strategy_id") or "").strip()
+        if not strategy_id:
+            self._send_json({"error": "strategy_id is required"}, status=400)
+            return
+        self.session.set_burst_strategy(strategy_id)
         self._send_json(self._state_payload())
 
     def _post_arrange(self, payload: dict) -> None:

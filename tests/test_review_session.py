@@ -34,7 +34,7 @@ from picklikeme.review.session import (
     InvalidReviewStatus,
     ReviewSession,
 )
-from picklikeme.sidecar import ranking_path
+from picklikeme.sidecar import AI_STRATEGY_ID, ranking_path
 
 
 def build_shoot(root: Path, ranked: int = 10, unranked: int = 0) -> tuple[Path, list[Path], list[Path]]:
@@ -129,6 +129,78 @@ class AiSuggestionTests(SessionTestCase):
         suggestions = session._ai_suggestions()
         for path in extra:
             self.assertIsNone(suggestions[str(path)])
+
+
+class SuggestionsForAnyStrategyTests(SessionTestCase):
+    """suggestions_for(strategy_id) - the generalization behind the
+    per-strategy "algorithm_suggestion" field and the desktop conflict
+    filters, added so the "AI vs user" conflict filter can compare the
+    user's decision against whichever strategy is currently selected
+    (ReviewSession.burst_strategy), not only the AI model."""
+
+    def test_suggestions_for_the_ai_strategy_matches_ai_suggestions(self):
+        shoot, images, _ = build_shoot(self.root, ranked=10)
+        session = self.session(shoot, keep_percent=30)
+        self.assertEqual(session.suggestions_for(AI_STRATEGY_ID), session._ai_suggestions())
+
+    def test_suggestions_for_a_second_strategy_uses_its_own_score_order(self):
+        """The reported motivation: Classic Vision (or any other module)
+        disagreeing entirely with the AI about ranking order must produce
+        its own, independently-correct keep/reject suggestions."""
+        from picklikeme.sidecar import strategy_ranking_path
+
+        shoot, images, _ = build_shoot(self.root, ranked=3)
+        # Classic Vision's favorite is the AI's least favorite, and vice versa.
+        write_strategy_ranking(
+            strategy_ranking_path(shoot, "classic-vision"),
+            [(images[2], 0.99), (images[1], 0.5), (images[0], 0.1)],
+        )
+        session = self.session(shoot, keep_percent=34)  # top 1 of 3
+
+        ai_suggestions = session.suggestions_for(AI_STRATEGY_ID)
+        classic_suggestions = session.suggestions_for("classic-vision")
+
+        self.assertEqual(ai_suggestions[str(images[0])], REVIEW_STATUS_KEEP)
+        self.assertEqual(classic_suggestions[str(images[0])], REVIEW_STATUS_REJECT)
+        self.assertEqual(classic_suggestions[str(images[2])], REVIEW_STATUS_KEEP)
+
+    def test_an_image_only_the_ai_scored_gets_no_suggestion_from_a_second_strategy(self):
+        shoot, images, _ = build_shoot(self.root, ranked=3)
+        session = self.session(shoot, keep_percent=50)
+        suggestions = session.suggestions_for("classic-vision")
+        for path in images:
+            self.assertIsNone(suggestions[str(path)])
+
+    def test_as_dict_exposes_algorithm_suggestion_and_which_strategy_it_is_for(self):
+        shoot, images, _ = build_shoot(self.root, ranked=3)
+        session = self.session(shoot, keep_percent=34)
+        state = session.as_dict()
+
+        self.assertEqual(state["suggestion_strategy"], AI_STRATEGY_ID)
+        by_path = {img["image_path"]: img for img in state["images"]}
+        # With no other strategy selected, algorithm_suggestion equals ai_suggestion.
+        self.assertEqual(
+            by_path[str(images[0])]["algorithm_suggestion"], by_path[str(images[0])]["ai_suggestion"]
+        )
+
+    def test_as_dict_reflects_a_non_ai_burst_strategy_selection(self):
+        from picklikeme.sidecar import strategy_ranking_path
+
+        shoot, images, _ = build_shoot(self.root, ranked=3)
+        write_strategy_ranking(
+            strategy_ranking_path(shoot, "classic-vision"),
+            [(images[2], 0.99), (images[1], 0.5), (images[0], 0.1)],
+        )
+        session = self.session(shoot, keep_percent=34)
+        session.set_burst_strategy("classic-vision")
+
+        state = session.as_dict()
+        self.assertEqual(state["suggestion_strategy"], "classic-vision")
+        by_path = {img["image_path"]: img for img in state["images"]}
+        self.assertEqual(by_path[str(images[2])]["algorithm_suggestion"], REVIEW_STATUS_KEEP)
+        self.assertEqual(by_path[str(images[0])]["algorithm_suggestion"], REVIEW_STATUS_REJECT)
+        # ai_suggestion is untouched by the burst_strategy selection - still the AI's own opinion.
+        self.assertEqual(by_path[str(images[0])]["ai_suggestion"], REVIEW_STATUS_KEEP)
 
 
 class ReviewStatusTests(SessionTestCase):
