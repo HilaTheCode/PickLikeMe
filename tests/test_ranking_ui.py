@@ -405,6 +405,147 @@ def test_a_ranking_run_clears_the_thumbnail_cache(app, tmp_path, monkeypatch) ->
         service.close()
 
 
+def test_a_crop_cache_mismatch_offers_to_rebuild_and_retries(app, tmp_path, monkeypatch) -> None:
+    """The reported real-world block: a CropCacheVersionMismatch's dialog
+    used to tell a photographer to "Pass --force to rebuild" - CLI language
+    with no equivalent in the desktop UI, so the run was simply stuck. This
+    pins the fix: on that specific error, desktop now offers to rebuild and
+    retries the exact same run with force_preprocess=True through the same
+    path, rather than leaving the photographer at a dead end.
+    """
+    from picklikeme.desktop.application import ApplicationState, WorkerManager
+    from picklikeme.desktop import main_window as main_window_module
+    from picklikeme.desktop.main_window import MainWindow
+    from picklikeme.desktop.services import ReviewService
+    from picklikeme.desktop.settings import DesktopSettings
+
+    folder = tmp_path / "shoot"
+    folder.mkdir()
+
+    service = ReviewService(db_path=tmp_path / "annotations.sqlite")
+    service.open_folder(folder)
+
+    calls: list[bool] = []
+
+    def fake_rank_folder(**kwargs):
+        force = kwargs.get("force_preprocess", False)
+        calls.append(force)
+        if not force:
+            raise RuntimeError(
+                "Existing cache at cache\\crops was built with different parameters:\n"
+                "  existing: CropParams(conf_threshold=0.3, min_crop_confidence=0.6, version='v7')\n"
+                "  requested: CropParams(conf_threshold=0.8, min_crop_confidence=0.8, version='v7')\n"
+                "Pass --force to rebuild, or delete the cache directory."
+            )
+        return {"state": service.load_session(), "image_count": 0, "filtered": {}}
+
+    monkeypatch.setattr(service, "rank_folder", fake_rank_folder)
+
+    window = MainWindow(
+        state=ApplicationState(), settings=DesktopSettings(),
+        service=service, worker_manager=WorkerManager(),
+    )
+    try:
+        window.state.current_folder = str(folder)
+        monkeypatch.setattr(window, "_collect_ranking_parameters", lambda strategy_id, info: {})
+
+        def fake_run_with_progress(parent, title, func, *, on_success, on_error=None):
+            del parent, title
+            try:
+                on_success(func())
+            except Exception as exc:  # noqa: BLE001 - mirrors ProgressWorker's own except Exception
+                if on_error is not None:
+                    on_error(str(exc))
+
+            class _FakeThread:
+                class _Signal:
+                    def connect(self, *_args, **_kwargs) -> None:
+                        pass
+
+                finished = _Signal()
+
+            return _FakeThread()
+
+        monkeypatch.setattr(main_window_module, "run_with_progress", fake_run_with_progress)
+        # Simulate the photographer clicking "Yes" on the rebuild prompt.
+        monkeypatch.setattr(
+            main_window_module.QMessageBox, "question",
+            lambda *args, **kwargs: main_window_module.QMessageBox.StandardButton.Yes,
+        )
+
+        window._rank_with_strategy("classic-vision")
+
+        assert calls == [False, True], "must retry once, and the retry must pass force_preprocess=True"
+    finally:
+        window.close()
+        service.close()
+
+
+def test_declining_the_rebuild_prompt_shows_the_plain_error_instead(app, tmp_path, monkeypatch) -> None:
+    from picklikeme.desktop.application import ApplicationState, WorkerManager
+    from picklikeme.desktop import main_window as main_window_module
+    from picklikeme.desktop.main_window import MainWindow
+    from picklikeme.desktop.services import ReviewService
+    from picklikeme.desktop.settings import DesktopSettings
+
+    folder = tmp_path / "shoot"
+    folder.mkdir()
+    service = ReviewService(db_path=tmp_path / "annotations.sqlite")
+    service.open_folder(folder)
+
+    calls: list[bool] = []
+
+    def fake_rank_folder(**kwargs):
+        calls.append(kwargs.get("force_preprocess", False))
+        raise RuntimeError("Existing cache ... different parameters ...\nPass --force to rebuild, or delete the cache directory.")
+
+    monkeypatch.setattr(service, "rank_folder", fake_rank_folder)
+
+    window = MainWindow(
+        state=ApplicationState(), settings=DesktopSettings(),
+        service=service, worker_manager=WorkerManager(),
+    )
+    try:
+        window.state.current_folder = str(folder)
+        monkeypatch.setattr(window, "_collect_ranking_parameters", lambda strategy_id, info: {})
+
+        def fake_run_with_progress(parent, title, func, *, on_success, on_error=None):
+            del parent, title
+            try:
+                on_success(func())
+            except Exception as exc:  # noqa: BLE001
+                if on_error is not None:
+                    on_error(str(exc))
+
+            class _FakeThread:
+                class _Signal:
+                    def connect(self, *_args, **_kwargs) -> None:
+                        pass
+
+                finished = _Signal()
+
+            return _FakeThread()
+
+        monkeypatch.setattr(main_window_module, "run_with_progress", fake_run_with_progress)
+        monkeypatch.setattr(
+            main_window_module.QMessageBox, "question",
+            lambda *args, **kwargs: main_window_module.QMessageBox.StandardButton.No,
+        )
+        warned = []
+        monkeypatch.setattr(
+            main_window_module.QMessageBox, "warning",
+            lambda *args, **kwargs: warned.append(args),
+        )
+
+        window._rank_with_strategy("classic-vision")
+
+        assert calls == [False]  # no retry
+        assert len(warned) == 1  # the plain failure dialog was shown instead
+    finally:
+        window.close()
+        service.close()
+
+
 # ---------------------------------------------------------------------------
 # Color Source - which strategy's Keep/Reject-styled coloring is on screen.
 #

@@ -113,6 +113,7 @@ class ReviewService:
         device: str | None = None,
         on_stage: Callable[[str], None] | None = None,
         on_progress: Callable[[int, int], None] | None = None,
+        force_preprocess: bool = False,
     ) -> dict[str, Any]:
         """Rank the open folder with the named strategy, then reload the session.
 
@@ -122,6 +123,15 @@ class ReviewService:
         that has richer parameters (Classic Vision) passes them as `params`
         instead; the reload afterwards is identical either way, because a
         ranking is a ranking however it was produced.
+
+        `force_preprocess` reaches `preprocess.build_cache` unchanged - both
+        `rank.rank_folder` and `ranking.classic`'s strategies already accept
+        it, this was simply never threaded through the desktop layer before,
+        which is exactly why a `CropCacheVersionMismatch` (see preprocess.py)
+        used to leave a photographer stuck: the error dialog says "Pass
+        --force to rebuild," but nothing in the desktop UI could actually do
+        that. `main_window._rank_with_strategy`'s retry-on-mismatch prompt is
+        what calls this with `force_preprocess=True`.
         """
         if self.session.input_folder is None:
             raise ValueError("Open a folder before ranking it.")
@@ -134,6 +144,7 @@ class ReviewService:
             params=params,
             on_stage=on_stage,
             on_progress=on_progress,
+            force_preprocess=force_preprocess,
         )
         self.session.open_folder(self.session.input_folder)
         self.session.reconcile_by_identity()
@@ -197,6 +208,7 @@ class ReviewService:
         language: str = "en",
         min_confidence: float = 0.5,
         device: str | None = None,
+        species_list_path: str | Path | None = None,
         on_progress: Callable[[int, int], None] | None = None,
         analytics_db: str | Path | None = None,
     ) -> dict[str, Any]:
@@ -216,6 +228,15 @@ class ReviewService:
         work for how that was found and confirmed. Desktop's caller
         (`main_window._organize_by_species`) never overrode it, so species
         classification silently ran on CPU only, every time, until now.
+
+        `species_list_path=None` (the default) uses the classifier's own
+        built-in vocabulary. Any external text file (see `species.
+        classifier.read_species_list`) is used directly, never copied into
+        the project - `main_window._organize_by_species` already validates
+        it (species count, or a clear error) before this is ever called, so
+        a bad path reaching here would already be a UI bug, not an expected
+        case; this method still lets whatever `BioClipSpeciesClassifier`
+        itself raises propagate, rather than re-validating.
         """
         if self.session.input_folder is None:
             raise ValueError("Open a folder before organizing it by species.")
@@ -227,12 +248,18 @@ class ReviewService:
         from ..species.experiment_capture import run_with_analytics
         from ..species.translations import localized_species_name
 
-        logger.info("Organize by Species: selected backend=%r (requested device=%r)", backend, device)
+        logger.info(
+            "Organize by Species: selected backend=%r (requested device=%r), species_list_path=%r",
+            backend, device, species_list_path,
+        )
         # device resolution (None -> auto-detect CUDA) happens inside
         # BioClipSpeciesClassifier itself now, not here - see its own
         # __init__ docstring - so every caller gets the right default even
         # if it forgets to resolve one, not just this call site.
-        classifier = build_classifier(backend, min_confidence=min_confidence, device=device)
+        classifier = build_classifier(
+            backend, min_confidence=min_confidence, device=device,
+            species_list_path=str(species_list_path) if species_list_path else None,
+        )
         cache = SpeciesCache(DEFAULT_SPECIES_DB)
         try:
             # run_with_analytics runs the exact same arrange_by_species pass
@@ -253,6 +280,7 @@ class ReviewService:
                 folder_name_fn=lambda species: sanitize_species_folder_name(
                     localized_species_name(species, language=language)
                 ),
+                species_list_path=str(species_list_path) if species_list_path else None,
                 analytics_db=analytics_db or DEFAULT_ANALYTICS_DB,
             )
         finally:

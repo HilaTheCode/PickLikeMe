@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import QRectF, Qt, Signal
+from PySide6.QtCore import QRectF, QSettings, Qt, Signal
 from PySide6.QtGui import QColor, QKeyEvent, QMouseEvent, QPainter, QPen, QPixmap, QWheelEvent
 from PySide6.QtWidgets import (
     QComboBox,
@@ -63,6 +63,17 @@ EXPOSURE_STEP = 1 / 3
 EXPOSURE_MIN_STEPS = -9
 EXPOSURE_MAX_STEPS = 9
 
+# Burst-scoped Loupe sort options (see LoupeDialog's `burst_scoped`). Burst
+# Analysis's own burst_rank is ALREADY score-ordered (highest first) - see
+# burst_analysis.py's module docstring - so BURST_SCORE reuses it directly,
+# with no recomputation. CAPTURE_TIME re-sorts by ImageItem.captured_at, the
+# order the burst's members were actually shot in. Persisted via QSettings
+# under BURST_SORT_SETTINGS_KEY so the photographer only picks it once.
+BURST_SORT_CAPTURE_TIME = "capture_time"
+BURST_SORT_BURST_SCORE = "burst_score"
+BURST_SORT_SETTINGS_KEY = "review/burst_sort_mode"
+DEFAULT_BURST_SORT_MODE = BURST_SORT_BURST_SCORE
+
 STATUS_LABELS = {"keep": "Keep", "reject": "Reject", "neutral": "Neutral"}
 # Always the dark palette's semantic colors, regardless of the app theme -
 # the Loupe's overlay bar is permanently dark-chrome (see module docstring
@@ -89,6 +100,19 @@ _ACTIVE_BUTTON_BORDER = "border: 2px solid #ffffff;"
 # so an undecided image doesn't read as "has a status" at a glance.
 _VIEW_BORDER_COLORS = {"keep": theme.DARK.keep_fg, "reject": theme.DARK.reject_fg}
 _VIEW_BORDER_WIDTH = 8
+
+
+def _format_burst_label(burst_id: str) -> str:
+    """"burst-0018" (burst_analysis.analyze_bursts's own id format) -> "Burst
+    18" - the bare, human-facing number the photographer actually cares
+    about. Falls back to the raw id verbatim for anything that doesn't
+    follow that pattern, so an unexpected id still displays instead of
+    raising."""
+    suffix = burst_id.removeprefix("burst-") if burst_id else burst_id
+    try:
+        return f"Burst {int(suffix)}"
+    except ValueError:
+        return f"Burst {burst_id}"
 
 
 def _apply_brightness(pixmap: QPixmap, ev: float) -> QPixmap:
@@ -316,6 +340,8 @@ class LoupeDialog(QDialog):
         start_index: int = 0,
         items: list[ImageItem] | None = None,
         show_boxes: bool = False,
+        burst_scoped: bool = False,
+        settings: QSettings | None = None,
         parent=None,
     ) -> None:
         super().__init__(parent)
@@ -325,6 +351,27 @@ class LoupeDialog(QDialog):
         self.image_paths = image_paths
         self.items = items
         self.index = max(0, min(start_index, len(image_paths) - 1))
+        # Set by MainWindow._open_loupe_for_item only when this Loupe session
+        # was opened from a single collapsed burst card (Collapse Bursts on) -
+        # never inferred from `items` itself, since a normal, non-burst Loupe
+        # session's items still carry burst_id/burst_rank (every image is
+        # "a burst of one" - see ImageItem's own docstring) and must NOT show
+        # burst sort/info UI that would only ever read "Burst Rank #1 of 1".
+        self._burst_scoped = burst_scoped and self.items is not None
+        self._settings = settings
+        self._burst_sort_mode = DEFAULT_BURST_SORT_MODE
+        if self._burst_scoped and self._settings is not None:
+            stored_mode = self._settings.value(BURST_SORT_SETTINGS_KEY, DEFAULT_BURST_SORT_MODE)
+            if stored_mode in (BURST_SORT_CAPTURE_TIME, BURST_SORT_BURST_SCORE):
+                self._burst_sort_mode = stored_mode
+        if self._burst_scoped:
+            # Apply the persisted sort mode before the dialog ever renders a
+            # frame - MainWindow always hands members in burst_rank order and
+            # start_index=0 (the top-ranked image), so a photographer who
+            # last chose Capture Time would otherwise see a mismatched
+            # combo/order for one frame. remap_index keeps the same image
+            # (whichever start_index pointed at) in view across the resort.
+            self._sort_burst_members(self._burst_sort_mode, remap_index=True)
         self._exposure_steps = 0
         self._current_raw_pixmap: QPixmap | None = None
         # Starts synced with the gallery's own Detector Boxes toggle (see
@@ -380,6 +427,25 @@ class LoupeDialog(QDialog):
         self._ai_badge_label = QLabel(self)
         self._zoom_label = QLabel("Fit", self)
         self._exposure_label = QLabel("+0.0 EV", self)
+
+        self._burst_sort_combo: QComboBox | None = None
+        self._burst_id_label = QLabel(self)
+        self._burst_rank_label = QLabel(self)
+        self._burst_best_label = QLabel(self)
+        self._burst_score_label = QLabel(self)
+        if self._burst_scoped:
+            self._burst_sort_combo = QComboBox(self)
+            self._burst_sort_combo.addItem("Capture Time", BURST_SORT_CAPTURE_TIME)
+            self._burst_sort_combo.addItem("Burst Score (highest first)", BURST_SORT_BURST_SCORE)
+            # Sorting a burst of one member is a no-op the photographer
+            # never needs to think about - disabled rather than hidden, so
+            # the burst info block's layout doesn't jump around burst to
+            # burst as this dialog is reused for the "Next" navigation.
+            self._burst_sort_combo.setEnabled(len(self.image_paths) > 1)
+            index = self._burst_sort_combo.findData(self._burst_sort_mode)
+            if index >= 0:
+                self._burst_sort_combo.setCurrentIndex(index)
+            self._burst_sort_combo.currentIndexChanged.connect(self._on_burst_sort_changed)
 
         prev_btn = QPushButton("< Prev", self)
         next_btn = QPushButton("Next >", self)
@@ -472,6 +538,24 @@ class LoupeDialog(QDialog):
         bar_layout.addWidget(info_group, 0, 0, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         bar_layout.addWidget(actions_group, 0, 1, Qt.AlignmentFlag.AlignCenter)
         bar_layout.addWidget(tools_group, 0, 2, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+        if self._burst_scoped:
+            # A second bar row, only added for a burst-scoped session - the
+            # sort toggle plus "Burst 18 / Burst Rank #2 of 7 / Best Image:
+            # Yes / Score 94.8" the photographer asked for, kept separate
+            # from info_group above so a non-burst Loupe session's bar is
+            # byte-for-byte unchanged.
+            burst_group = QWidget(bottom_bar)
+            burst_layout = QHBoxLayout(burst_group)
+            burst_layout.setContentsMargins(0, 0, 0, 0)
+            burst_layout.setSpacing(10)
+            burst_layout.addWidget(QLabel("Sort:"))
+            burst_layout.addWidget(self._burst_sort_combo)
+            burst_layout.addWidget(self._burst_id_label)
+            burst_layout.addWidget(self._burst_rank_label)
+            burst_layout.addWidget(self._burst_best_label)
+            burst_layout.addWidget(self._burst_score_label)
+            bar_layout.addWidget(burst_group, 1, 0, 1, 3, Qt.AlignmentFlag.AlignCenter)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -610,8 +694,9 @@ class LoupeDialog(QDialog):
         path = self._current_path()
         info = self._current_item_info()
 
-        self._counter_label.setText(f"{self.index + 1} / {len(self.image_paths)}")
+        self._counter_label.setText(f"Image {self.index + 1} of {len(self.image_paths)}")
         self._name_label.setText(Path(path).name)
+        self._update_burst_info_labels()
 
         self._score_label.setText(self._scores_text(info))
         self._score_label.setToolTip(self._diagnostics_text(info))
@@ -628,6 +713,67 @@ class LoupeDialog(QDialog):
             self._ai_badge_label.setStyleSheet(f"color: {theme.DARK.accent};")
         else:
             self._ai_badge_label.setText("")
+
+    def _update_burst_info_labels(self) -> None:
+        """Burst ID / Burst Rank #X of N / Best Image / Score - only
+        populated for a burst-scoped session (see `_burst_scoped`); the
+        labels stay empty text otherwise so a non-burst Loupe session shows
+        nothing where this row would be."""
+        if not self._burst_scoped or self.items is None:
+            return
+        item = self.items[self.index]
+        self._burst_id_label.setText(_format_burst_label(item.burst_id) if item.burst_id else "")
+        self._burst_rank_label.setText(f"Burst Rank #{item.burst_rank} of {item.burst_size}")
+        self._burst_best_label.setText(f"Best Image: {'Yes' if item.burst_best else 'No'}")
+        # The score that actually produced burst_rank - whichever ranking
+        # strategy Burst Analysis is currently keyed to (ReviewSession.
+        # burst_strategy), not necessarily the AI model. *100 to match a
+        # "94.8"-style readout instead of the score bar's raw "0.9480".
+        strategy_id = getattr(self.service.session, "burst_strategy", None)
+        score = item.score_for(strategy_id) if strategy_id else None
+        self._burst_score_label.setText(f"Score {score * 100:.1f}" if score is not None else "Score -")
+
+    def _sort_burst_members(self, mode: str, *, remap_index: bool = False) -> None:
+        """Reorder self.items/self.image_paths using data Burst Analysis
+        already computed - never recomputed here. Capture Time sorts by
+        ImageItem.captured_at (missing timestamps sort first, same as an
+        empty string); Burst Score reuses burst_rank as-is, which
+        `burst_analysis.analyze_bursts` already produced in score-descending
+        order (see that module's own docstring).
+
+        `remap_index` keeps whichever image was showing in view before the
+        resort still in view after it - the position within the burst (X of
+        N) can change, but the photographer's current frame never jumps.
+        """
+        if self.items is None:
+            return
+        current_path = self._current_path() if remap_index else None
+        if mode == BURST_SORT_CAPTURE_TIME:
+            self.items.sort(key=lambda i: i.captured_at or "")
+        else:
+            self.items.sort(key=lambda i: i.burst_rank)
+        self.image_paths = [item.path for item in self.items]
+        if remap_index and current_path is not None:
+            try:
+                self.index = self.image_paths.index(current_path)
+            except ValueError:
+                self.index = max(0, min(self.index, len(self.image_paths) - 1))
+
+    def _on_burst_sort_changed(self) -> None:
+        if self._burst_sort_combo is None:
+            return
+        mode = self._burst_sort_combo.currentData()
+        if mode == self._burst_sort_mode:
+            return
+        self._burst_sort_mode = mode
+        # Reorders in place and keeps the same image in view - no preview
+        # reload, no re-scoring, exactly the "immediately reorder... no
+        # recomputation" the sort toggle asks for. Only the position labels
+        # (Image X of N / Burst Rank) can actually change.
+        self._sort_burst_members(mode, remap_index=True)
+        if self._settings is not None:
+            self._settings.setValue(BURST_SORT_SETTINGS_KEY, mode)
+        self._update_info_labels()
 
     def _update_status_indicators(self, status: str) -> None:
         """Color-code the current review status two ways at once: a bright

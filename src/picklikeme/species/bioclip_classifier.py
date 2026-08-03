@@ -60,7 +60,7 @@ import logging
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from .classifier import UNKNOWN_SPECIES, SpeciesPrediction
+from .classifier import UNKNOWN_SPECIES, SpeciesPrediction, read_species_list
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from PIL import Image
@@ -119,14 +119,6 @@ DEFAULT_SPECIES_LIST: tuple[str, ...] = (
 )
 
 
-def _read_species_list(path: str | Path) -> tuple[str, ...]:
-    """One species name per line, blank lines and '#' comments ignored."""
-    lines = Path(path).read_text(encoding="utf-8").splitlines()
-    return tuple(
-        stripped for line in lines if (stripped := line.strip()) and not stripped.startswith("#")
-    )
-
-
 class BioClipSpeciesClassifier:
     """Zero-shot species classification via BioCLIP-2.
 
@@ -148,7 +140,20 @@ class BioClipSpeciesClassifier:
         device: str | None = None,
     ):
         if species_list_path is not None:
-            species_list = _read_species_list(species_list_path)
+            species_list = read_species_list(species_list_path)
+            if not species_list:
+                # Deliberately NOT "species_list or DEFAULT_SPECIES_LIST"
+                # below for this case - a photographer who explicitly chose
+                # a file gets a clear error if it turns out to have no
+                # usable species, never a silent, unannounced fallback to
+                # the 55-species built-in list. That silent-substitution
+                # bug is exactly what this branch exists to prevent - see
+                # the "Species List Selection" feature's own validation
+                # requirement.
+                raise ValueError(
+                    f"Species list file has no valid species (every line was blank or a "
+                    f"'#' comment): {species_list_path}"
+                )
         self.species_list = species_list or DEFAULT_SPECIES_LIST
         if not self.species_list:
             raise ValueError("species_list must not be empty")

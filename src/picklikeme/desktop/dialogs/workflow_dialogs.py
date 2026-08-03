@@ -159,9 +159,17 @@ class SpeciesLanguageDialog(QDialog):
     appears here with no change to this file, exactly like
     `AlgorithmParametersDialog` picks up a new ranking strategy's params."""
 
-    def __init__(self, *, default_language: str = "en", default_backend: str = "bioclip2", parent=None) -> None:
+    def __init__(
+        self,
+        *,
+        default_language: str = "en",
+        default_backend: str = "bioclip2",
+        default_species_list_path: str | None = None,
+        parent=None,
+    ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Organize by Species")
+        self.setMinimumWidth(420)
 
         self._english_radio = QRadioButton("English species names", self)
         self._hebrew_radio = QRadioButton("Hebrew species names (falls back to English if untranslated)", self)
@@ -182,16 +190,43 @@ class SpeciesLanguageDialog(QDialog):
         checked = self._backend_radios.get(default_backend) or next(iter(self._backend_radios.values()))
         checked.setChecked(True)
 
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel, self)
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
+        # Species List: any external text file, one species per line - see
+        # species.classifier.read_species_list. Never copied into the
+        # project; the classifier reads it directly from wherever the
+        # photographer keeps it (All_Birds.txt, Israel_Birds.txt, ...).
+        self._species_list_path: str | None = None
+        self._species_list_edit = QLineEdit(self)
+        self._species_list_edit.setReadOnly(True)
+        self._species_list_edit.setPlaceholderText("(built-in default species list)")
+        browse_btn = QPushButton("Browse…", self)
+        browse_btn.clicked.connect(self._browse_species_list)
+        clear_btn = QPushButton("Clear", self)
+        clear_btn.setToolTip("Go back to the built-in default species list")
+        clear_btn.clicked.connect(self._clear_species_list)
+        species_row = QHBoxLayout()
+        species_row.addWidget(self._species_list_edit, 1)
+        species_row.addWidget(browse_btn)
+        species_row.addWidget(clear_btn)
+
+        self._species_list_info = QLabel(self)
+        self._species_list_info.setWordWrap(True)
+
+        self._buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel, self)
+        self._buttons.accepted.connect(self.accept)
+        self._buttons.rejected.connect(self.reject)
 
         layout = QVBoxLayout(self)
         layout.addWidget(self._english_radio)
         layout.addWidget(self._hebrew_radio)
         layout.addWidget(QLabel("Classification backend:", self))
         layout.addLayout(backend_column)
-        layout.addWidget(buttons)
+        layout.addWidget(QLabel("Species List:", self))
+        layout.addLayout(species_row)
+        layout.addWidget(self._species_list_info)
+        layout.addWidget(self._buttons)
+
+        if default_species_list_path:
+            self._set_species_list_path(default_species_list_path)
 
     def language(self) -> str:
         return "he" if self._hebrew_radio.isChecked() else "en"
@@ -201,6 +236,57 @@ class SpeciesLanguageDialog(QDialog):
             if radio.isChecked():
                 return classifier_id
         return "bioclip2"  # unreachable in practice - one radio is always checked
+
+    def species_list_path(self) -> str | None:
+        """The chosen external species-list file, or None to use the
+        classifier's own built-in default."""
+        return self._species_list_path
+
+    def _browse_species_list(self) -> None:
+        start_dir = str(Path(self._species_list_path).parent) if self._species_list_path else ""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Choose a species list", start_dir, "Text files (*.txt);;All files (*)"
+        )
+        if path:
+            self._set_species_list_path(path)
+
+    def _clear_species_list(self) -> None:
+        self._species_list_path = None
+        self._species_list_edit.clear()
+        self._species_list_edit.setToolTip("")
+        self._species_list_info.setText("")
+        self._buttons.button(QDialogButtonBox.StandardButton.Ok).setEnabled(True)
+
+    def _set_species_list_path(self, path: str) -> None:
+        """Validates and previews `path` immediately (species count, or a
+        clear error) - reading a text file is cheap, unlike constructing a
+        classifier, so this happens the moment a file is chosen, not only
+        when the dialog is accepted. An invalid file disables OK rather
+        than being silently accepted and only failing later, mid-run."""
+        from ...species.classifier import read_species_list
+
+        self._species_list_path = path
+        self._species_list_edit.setText(Path(path).name)
+        self._species_list_edit.setToolTip(path)
+
+        ok_button = self._buttons.button(QDialogButtonBox.StandardButton.Ok)
+        try:
+            species = read_species_list(path)
+        except OSError as exc:
+            self._species_list_info.setText(f"Could not read this file: {exc}")
+            self._species_list_info.setStyleSheet("color: #dc3545;")
+            ok_button.setEnabled(False)
+            return
+        if not species:
+            self._species_list_info.setText(
+                "This file contains no valid species - every line is blank or a '#' comment."
+            )
+            self._species_list_info.setStyleSheet("color: #dc3545;")
+            ok_button.setEnabled(False)
+            return
+        self._species_list_info.setText(f"{len(species)} species loaded")
+        self._species_list_info.setStyleSheet("color: #28a745;")
+        ok_button.setEnabled(True)
 
 
 class PreferencesDialog(QDialog):

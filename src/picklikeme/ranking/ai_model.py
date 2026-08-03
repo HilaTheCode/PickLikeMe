@@ -69,6 +69,7 @@ class AIModelStrategy:
         params: AIModelParams | None = None,
         on_stage: Callable[[str], None] | None = None,
         on_progress: Callable[[int, int], None] | None = None,
+        force_preprocess: bool = False,
     ) -> dict:
         from ..rank import rank_folder as run_rank_folder
 
@@ -80,6 +81,7 @@ class AIModelStrategy:
             device=params.device,
             on_stage=on_stage,
             on_progress=on_progress,
+            force_preprocess=force_preprocess,
         )
         # The two keys every strategy reports, added around (never instead of)
         # what rank_folder already returns, so existing consumers of its

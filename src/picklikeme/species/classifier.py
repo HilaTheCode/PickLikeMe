@@ -21,12 +21,34 @@ from __future__ import annotations
 
 import functools
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Protocol
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from PIL import Image
 
 UNKNOWN_SPECIES = "Unknown"
+
+
+def read_species_list(path: str | Path) -> tuple[str, ...]:
+    """One species name per line, blank lines and '#' comments ignored.
+
+    Public and backend-agnostic - moved here (from bioclip_classifier.py)
+    because reading a species-list text file has nothing BioCLIP-specific
+    about it, and the Desktop "Organize by Species" dialog needs the exact
+    same parsing to validate a photographer's chosen file (show a species
+    count, or a clear error) *before* a classifier is ever constructed -
+    constructing one downloads/loads a model, which is far too heavy just
+    to check whether a text file parses. Raises `OSError` (including
+    `FileNotFoundError`) if `path` cannot be read at all; returns an empty
+    tuple - never raises - if the file reads fine but has no valid lines,
+    so a caller can distinguish "unreadable" from "empty" and word its own
+    error message accordingly.
+    """
+    lines = Path(path).read_text(encoding="utf-8").splitlines()
+    return tuple(
+        stripped for line in lines if (stripped := line.strip()) and not stripped.startswith("#")
+    )
 
 
 @dataclass(frozen=True)

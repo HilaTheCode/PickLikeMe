@@ -170,6 +170,99 @@ def test_organize_by_species_uses_language_transform(tmp_path, monkeypatch) -> N
     service.close()
 
 
+def test_organize_by_species_forwards_species_list_path(tmp_path, monkeypatch) -> None:
+    """An external species list must reach BOTH the classifier construction
+    (which actually reads the file) and the analytics experiment metadata
+    (species_list_filename/species_count/species_list_hash) - see
+    species.experiment.build_experiment_metadata."""
+    folder = tmp_path / "shoot"
+    folder.mkdir()
+    _make_jpeg(folder / "a.jpg")
+    species_list = tmp_path / "Israel_Birds.txt"
+    species_list.write_text("Kingfisher\nEuropean Bee-eater\n", encoding="utf-8")
+
+    service = ReviewService(db_path=tmp_path / "annotations.sqlite")
+    service.open_folder(folder)
+
+    class FakeCache:
+        def close(self) -> None:
+            pass
+
+    captured = {}
+
+    def fake_build_classifier(name, **kwargs):
+        captured["build_classifier_species_list_path"] = kwargs.get("species_list_path")
+        return object()
+
+    def fake_run_with_analytics(
+        input_folder, classifier, backend, cache, *, on_progress=None, folder_name_fn=None,
+        species_list_path=None, analytics_db=None,
+    ):
+        captured["run_with_analytics_species_list_path"] = species_list_path
+
+        class Result:
+            total = 1
+            classified = 1
+            moved = 1
+            skipped = 0
+            errors = 0
+            species_counts = {}
+
+        return Result(), "fake-run-id", object()
+
+    monkeypatch.setattr("picklikeme.species.classifier.build_classifier", fake_build_classifier)
+    monkeypatch.setattr("picklikeme.species.cache.SpeciesCache", lambda *a, **k: FakeCache())
+    monkeypatch.setattr("picklikeme.species.experiment_capture.run_with_analytics", fake_run_with_analytics)
+
+    service.organize_by_species(species_list_path=str(species_list))
+
+    assert captured["build_classifier_species_list_path"] == str(species_list)
+    assert captured["run_with_analytics_species_list_path"] == str(species_list)
+    service.close()
+
+
+def test_organize_by_species_with_no_species_list_path_passes_none(tmp_path, monkeypatch) -> None:
+    """The built-in-default case must reach the classifier as None, never
+    an empty string - BioClipSpeciesClassifier treats `species_list_path
+    is not None` as "an explicit file was chosen"."""
+    folder = tmp_path / "shoot"
+    folder.mkdir()
+    _make_jpeg(folder / "a.jpg")
+
+    service = ReviewService(db_path=tmp_path / "annotations.sqlite")
+    service.open_folder(folder)
+
+    class FakeCache:
+        def close(self) -> None:
+            pass
+
+    captured = {}
+
+    def fake_build_classifier(name, **kwargs):
+        captured["species_list_path"] = kwargs.get("species_list_path")
+        return object()
+
+    def fake_run_with_analytics(input_folder, classifier, backend, cache, **kwargs):
+        class Result:
+            total = 0
+            classified = 0
+            moved = 0
+            skipped = 0
+            errors = 0
+            species_counts = {}
+
+        return Result(), None, object()
+
+    monkeypatch.setattr("picklikeme.species.classifier.build_classifier", fake_build_classifier)
+    monkeypatch.setattr("picklikeme.species.cache.SpeciesCache", lambda *a, **k: FakeCache())
+    monkeypatch.setattr("picklikeme.species.experiment_capture.run_with_analytics", fake_run_with_analytics)
+
+    service.organize_by_species()
+
+    assert captured["species_list_path"] is None
+    service.close()
+
+
 def test_organize_by_species_requires_open_folder(tmp_path) -> None:
     service = ReviewService(db_path=tmp_path / "annotations.sqlite")
     with pytest.raises(ValueError):
@@ -248,6 +341,82 @@ def test_species_language_dialog_defaults_and_selection() -> None:
     assert dialog.language() == "he"
     dialog._english_radio.setChecked(True)
     assert dialog.language() == "en"
+    dialog.close()
+    app.quit()
+
+
+@pytest.mark.skipif(QApplication is None, reason="PySide6 not installed")
+def test_species_language_dialog_defaults_to_no_species_list(tmp_path) -> None:
+    from picklikeme.desktop.dialogs.workflow_dialogs import SpeciesLanguageDialog
+
+    app = QApplication.instance() or QApplication([])
+    dialog = SpeciesLanguageDialog()
+    assert dialog.species_list_path() is None
+    dialog.close()
+    app.quit()
+
+
+@pytest.mark.skipif(QApplication is None, reason="PySide6 not installed")
+def test_species_language_dialog_preselects_and_validates_a_species_list(tmp_path) -> None:
+    from picklikeme.desktop.dialogs.workflow_dialogs import SpeciesLanguageDialog
+
+    app = QApplication.instance() or QApplication([])
+    species_list = tmp_path / "Israel_Birds.txt"
+    species_list.write_text("Kingfisher\nEuropean Bee-eater\nBlack Kite\n", encoding="utf-8")
+
+    dialog = SpeciesLanguageDialog(default_species_list_path=str(species_list))
+
+    assert dialog.species_list_path() == str(species_list)
+    assert "3 species loaded" in dialog._species_list_info.text()
+    assert dialog._buttons.button(dialog._buttons.StandardButton.Ok).isEnabled()
+    dialog.close()
+    app.quit()
+
+
+@pytest.mark.skipif(QApplication is None, reason="PySide6 not installed")
+def test_species_language_dialog_shows_a_clear_error_for_an_empty_file(tmp_path) -> None:
+    from picklikeme.desktop.dialogs.workflow_dialogs import SpeciesLanguageDialog
+
+    app = QApplication.instance() or QApplication([])
+    empty_file = tmp_path / "empty.txt"
+    empty_file.write_text("# nothing here\n\n", encoding="utf-8")
+
+    dialog = SpeciesLanguageDialog()
+    dialog._set_species_list_path(str(empty_file))
+
+    assert "no valid species" in dialog._species_list_info.text()
+    assert not dialog._buttons.button(dialog._buttons.StandardButton.Ok).isEnabled()
+    dialog.close()
+    app.quit()
+
+
+@pytest.mark.skipif(QApplication is None, reason="PySide6 not installed")
+def test_species_language_dialog_shows_a_clear_error_for_a_missing_file(tmp_path) -> None:
+    from picklikeme.desktop.dialogs.workflow_dialogs import SpeciesLanguageDialog
+
+    app = QApplication.instance() or QApplication([])
+    dialog = SpeciesLanguageDialog()
+    dialog._set_species_list_path(str(tmp_path / "does_not_exist.txt"))
+
+    assert "Could not read this file" in dialog._species_list_info.text()
+    assert not dialog._buttons.button(dialog._buttons.StandardButton.Ok).isEnabled()
+    dialog.close()
+    app.quit()
+
+
+@pytest.mark.skipif(QApplication is None, reason="PySide6 not installed")
+def test_species_language_dialog_clear_button_reverts_to_built_in(tmp_path) -> None:
+    from picklikeme.desktop.dialogs.workflow_dialogs import SpeciesLanguageDialog
+
+    app = QApplication.instance() or QApplication([])
+    species_list = tmp_path / "species.txt"
+    species_list.write_text("Kingfisher\n", encoding="utf-8")
+    dialog = SpeciesLanguageDialog(default_species_list_path=str(species_list))
+
+    dialog._clear_species_list()
+
+    assert dialog.species_list_path() is None
+    assert dialog._buttons.button(dialog._buttons.StandardButton.Ok).isEnabled()
     dialog.close()
     app.quit()
 
@@ -376,6 +545,215 @@ def test_loupe_dialog_save_jpeg(tmp_path, monkeypatch) -> None:
 
     assert destination.is_file()
     dialog.close()
+    service.close()
+    app.quit()
+
+
+# ---------------------------------------------------------------------------
+# Loupe burst sort mode + burst info display
+# ---------------------------------------------------------------------------
+
+
+def _make_burst_items(folder) -> list:
+    """Three members of one burst: burst_rank order (score-descending, what
+    burst_analysis.analyze_bursts already produces) deliberately disagrees
+    with captured_at order, so a test can tell the two sort modes apart."""
+    from picklikeme.desktop.models.image_item import ImageItem
+
+    paths = [folder / f"{name}.jpg" for name in ("a", "b", "c")]
+    for path in paths:
+        _make_jpeg(path)
+    return [
+        ImageItem(
+            path=str(paths[0]), file_name="a.jpg", captured_at="2026-01-01T10:00:02",
+            burst_id="burst-0018", burst_size=3, burst_rank=2, burst_best=False,
+            ranking_results={"ai-model": {"score": 0.700, "rank": 2}},
+        ),
+        ImageItem(
+            path=str(paths[1]), file_name="b.jpg", captured_at="2026-01-01T10:00:00",
+            burst_id="burst-0018", burst_size=3, burst_rank=1, burst_best=True,
+            ranking_results={"ai-model": {"score": 0.948, "rank": 1}},
+        ),
+        ImageItem(
+            path=str(paths[2]), file_name="c.jpg", captured_at="2026-01-01T10:00:01",
+            burst_id="burst-0018", burst_size=3, burst_rank=3, burst_best=False,
+            ranking_results={"ai-model": {"score": 0.512, "rank": 3}},
+        ),
+    ]
+
+
+@pytest.mark.skipif(QApplication is None, reason="PySide6 not installed")
+def test_loupe_burst_defaults_to_score_order_matching_burst_rank(tmp_path) -> None:
+    """Burst Analysis's burst_rank is already score-descending (see
+    burst_analysis.py's own docstring) - the actual current default
+    Loupe navigation order, which the new toggle must not silently change
+    the default of."""
+    from picklikeme.desktop.dialogs.loupe_dialog import BURST_SORT_BURST_SCORE, LoupeDialog
+
+    app = QApplication.instance() or QApplication([])
+    folder = tmp_path / "shoot"
+    folder.mkdir()
+    items = _make_burst_items(folder)
+
+    service = ReviewService(db_path=tmp_path / "annotations.sqlite")
+    service.open_folder(folder)
+
+    dialog = LoupeDialog(
+        service=service, image_paths=[i.path for i in items], items=list(items),
+        start_index=0, burst_scoped=True,
+    )
+
+    assert dialog._burst_sort_mode == BURST_SORT_BURST_SCORE
+    assert [i.file_name for i in dialog.items] == ["b.jpg", "a.jpg", "c.jpg"]
+    assert dialog._burst_sort_combo.currentData() == BURST_SORT_BURST_SCORE
+
+    dialog.close()
+    service.close()
+    app.quit()
+
+
+@pytest.mark.skipif(QApplication is None, reason="PySide6 not installed")
+def test_loupe_burst_sort_by_capture_time_reorders_with_no_recomputation(tmp_path) -> None:
+    """Switching the combo to Capture Time re-sorts using ImageItem.
+    captured_at alone - no rescoring, no calls back into the service for
+    new data."""
+    from picklikeme.desktop.dialogs.loupe_dialog import BURST_SORT_CAPTURE_TIME, LoupeDialog
+
+    app = QApplication.instance() or QApplication([])
+    folder = tmp_path / "shoot"
+    folder.mkdir()
+    items = _make_burst_items(folder)
+
+    service = ReviewService(db_path=tmp_path / "annotations.sqlite")
+    service.open_folder(folder)
+
+    dialog = LoupeDialog(
+        service=service, image_paths=[i.path for i in items], items=list(items),
+        start_index=0, burst_scoped=True,
+    )
+    # start_index=0 was given against the unsorted [a, b, c] list, so the
+    # image actually in view is "a.jpg" - the initial burst-score sort
+    # (applied in __init__) must have kept it in view across the reorder.
+    assert dialog.items[dialog.index].file_name == "a.jpg"
+
+    index = dialog._burst_sort_combo.findData(BURST_SORT_CAPTURE_TIME)
+    dialog._burst_sort_combo.setCurrentIndex(index)
+
+    assert [i.file_name for i in dialog.items] == ["b.jpg", "c.jpg", "a.jpg"]
+    # The same image ("a.jpg") is still the one in view after reordering.
+    assert dialog.items[dialog.index].file_name == "a.jpg"
+
+    dialog.close()
+    service.close()
+    app.quit()
+
+
+@pytest.mark.skipif(QApplication is None, reason="PySide6 not installed")
+def test_loupe_burst_info_labels_show_id_rank_best_and_score(tmp_path) -> None:
+    from picklikeme.desktop.dialogs.loupe_dialog import LoupeDialog
+
+    app = QApplication.instance() or QApplication([])
+    folder = tmp_path / "shoot"
+    folder.mkdir()
+    items = _make_burst_items(folder)
+
+    service = ReviewService(db_path=tmp_path / "annotations.sqlite")
+    service.open_folder(folder)
+
+    dialog = LoupeDialog(
+        service=service, image_paths=[i.path for i in items], items=list(items),
+        start_index=0, burst_scoped=True,
+    )
+    # Sort applied in __init__ leaves "a.jpg" (rank #2) in view - jump to
+    # position 0 explicitly to check the top-ranked member's own labels.
+    dialog.index = 0
+    dialog._update_info_labels()
+
+    # Sorted to burst-score order -> position 0 is "b.jpg", rank #1 of 3, best, score 0.948.
+    assert dialog._burst_id_label.text() == "Burst 18"
+    assert dialog._burst_rank_label.text() == "Burst Rank #1 of 3"
+    assert dialog._burst_best_label.text() == "Best Image: Yes"
+    assert dialog._burst_score_label.text() == "Score 94.8"
+
+    dialog._go_next()
+    assert dialog._burst_rank_label.text() == "Burst Rank #2 of 3"
+    assert dialog._burst_best_label.text() == "Best Image: No"
+
+    dialog.close()
+    service.close()
+    app.quit()
+
+
+@pytest.mark.skipif(QApplication is None, reason="PySide6 not installed")
+def test_loupe_non_burst_session_shows_no_burst_sort_ui(tmp_path) -> None:
+    """A Loupe session opened outside Collapse Bursts (burst_scoped=False,
+    the default) must not grow the new sort combo or burst info row - every
+    ImageItem still carries burst_id/burst_rank ("a burst of one"), so this
+    only works if the UI keys off the explicit flag, not inferred data."""
+    from picklikeme.desktop.dialogs.loupe_dialog import LoupeDialog
+
+    app = QApplication.instance() or QApplication([])
+    folder = tmp_path / "shoot"
+    folder.mkdir()
+    path_a = folder / "a.jpg"
+    _make_jpeg(path_a)
+
+    service = ReviewService(db_path=tmp_path / "annotations.sqlite")
+    service.open_folder(folder)
+
+    dialog = LoupeDialog(service=service, image_paths=[str(path_a)], start_index=0)
+
+    assert dialog._burst_sort_combo is None
+    assert dialog._burst_id_label.text() == ""
+
+    dialog.close()
+    service.close()
+    app.quit()
+
+
+@pytest.mark.skipif(QApplication is None, reason="PySide6 not installed")
+def test_loupe_burst_sort_mode_is_remembered_via_qsettings(tmp_path) -> None:
+    from PySide6.QtCore import QSettings
+
+    from picklikeme.desktop.dialogs.loupe_dialog import (
+        BURST_SORT_CAPTURE_TIME,
+        BURST_SORT_SETTINGS_KEY,
+        LoupeDialog,
+    )
+
+    app = QApplication.instance() or QApplication([])
+    folder = tmp_path / "shoot"
+    folder.mkdir()
+    items = _make_burst_items(folder)
+
+    service = ReviewService(db_path=tmp_path / "annotations.sqlite")
+    service.open_folder(folder)
+
+    settings_path = str(tmp_path / "settings.ini")
+    settings = QSettings(settings_path, QSettings.Format.IniFormat)
+
+    dialog = LoupeDialog(
+        service=service, image_paths=[i.path for i in items], items=list(items),
+        start_index=0, burst_scoped=True, settings=settings,
+    )
+    index = dialog._burst_sort_combo.findData(BURST_SORT_CAPTURE_TIME)
+    dialog._burst_sort_combo.setCurrentIndex(index)
+    dialog.close()
+    settings.sync()
+
+    assert settings.value(BURST_SORT_SETTINGS_KEY) == BURST_SORT_CAPTURE_TIME
+
+    # A fresh dialog reading the same settings file restores the mode and
+    # opens already sorted by capture time, with no further user action.
+    settings_reloaded = QSettings(settings_path, QSettings.Format.IniFormat)
+    dialog2 = LoupeDialog(
+        service=service, image_paths=[i.path for i in items], items=list(items),
+        start_index=0, burst_scoped=True, settings=settings_reloaded,
+    )
+    assert dialog2._burst_sort_mode == BURST_SORT_CAPTURE_TIME
+    assert [i.file_name for i in dialog2.items] == ["b.jpg", "c.jpg", "a.jpg"]
+
+    dialog2.close()
     service.close()
     app.quit()
 

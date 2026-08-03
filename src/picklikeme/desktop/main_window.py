@@ -1206,13 +1206,13 @@ class MainWindow(QMainWindow):
                 (i for i in self._all_items if i.burst_id == item.burst_id),
                 key=lambda i: i.burst_rank,
             )
-            self._open_loupe(items=members, start_row=0)
+            self._open_loupe(items=members, start_row=0, burst_scoped=True)
             return
         items = self._gallery_model.items()
         start_row = items.index(item) if item is not None and item in items else 0
         self._open_loupe(items=items, start_row=start_row)
 
-    def _open_loupe(self, *, items: list[ImageItem], start_row: int) -> None:
+    def _open_loupe(self, *, items: list[ImageItem], start_row: int, burst_scoped: bool = False) -> None:
         if not items:
             self._set_status("No images to review in the current filter")
             return
@@ -1220,7 +1220,8 @@ class MainWindow(QMainWindow):
         start_row = max(0, min(start_row, len(paths) - 1))
         dialog = LoupeDialog(
             service=self.service, image_paths=paths, items=items, start_index=start_row,
-            show_boxes=self._show_detector_boxes, parent=self,
+            show_boxes=self._show_detector_boxes, burst_scoped=burst_scoped,
+            settings=self._settings if burst_scoped else None, parent=self,
         )
         dialog.exec()
         self._refresh_from_state(self.service.load_session())
@@ -1251,10 +1252,18 @@ class MainWindow(QMainWindow):
         kwargs = self._collect_ranking_parameters(strategy_id, info)
         if kwargs is None:  # the photographer cancelled
             return
+        self._run_ranking(strategy_id, info, kwargs, force_preprocess=False)
+
+    def _run_ranking(self, strategy_id: str, info, kwargs: dict[str, Any], *, force_preprocess: bool) -> None:
+        """The actual background run, factored out of `_rank_with_strategy`
+        so a `CropCacheVersionMismatch` (see `_on_error` below) can retry
+        itself with `force_preprocess=True` through the exact same path,
+        rather than duplicating the thread-launch wiring."""
 
         def _run(on_progress=None, on_stage=None):
             return self.service.rank_folder(
-                strategy=strategy_id, on_stage=on_stage, on_progress=on_progress, **kwargs
+                strategy=strategy_id, on_stage=on_stage, on_progress=on_progress,
+                force_preprocess=force_preprocess, **kwargs
             )
 
         def _on_success(result: dict[str, Any]) -> None:
@@ -1271,7 +1280,30 @@ class MainWindow(QMainWindow):
                 self.state.gpu_status = device
                 self._gpu_status_label.setText(f"Device: {device}")
 
-        thread = run_with_progress(self, info.display_name, _run, on_success=_on_success)
+        def _on_error(message: str) -> None:
+            # CropCacheVersionMismatch's own message shape (preprocess.py) -
+            # matched by text rather than exception type because run_with_
+            # progress's worker only ever reports str(exc) across the thread
+            # boundary (see core/jobs.py), never the exception object itself.
+            # The message text is already a pinned, tested contract (see
+            # test_preprocess_pipeline.py's own assertIn("--force", ...)), so
+            # this is a stable thing to match on, not a fragile guess.
+            if not force_preprocess and "different parameters" in message and "--force" in message:
+                answer = QMessageBox.question(
+                    self,
+                    f"PeakPic - {info.display_name}",
+                    "The subject-crop cache was built with different detection/crop settings and "
+                    "needs to be rebuilt before this ranking can continue - this re-runs subject "
+                    "detection for every image in the folder, which can take a while.\n\n"
+                    "Rebuild the cache now and retry?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                )
+                if answer == QMessageBox.StandardButton.Yes:
+                    self._run_ranking(strategy_id, info, kwargs, force_preprocess=True)
+                    return
+            QMessageBox.warning(self, f"PeakPic - {info.display_name}", f"{info.display_name} failed:\n{message}")
+
+        thread = run_with_progress(self, info.display_name, _run, on_success=_on_success, on_error=_on_error)
         self._active_threads.append(thread)
         thread.finished.connect(lambda: self._active_threads.remove(thread) if thread in self._active_threads else None)
 
@@ -1371,16 +1403,29 @@ class MainWindow(QMainWindow):
             return
         default_language = self._settings.value("review/species_language", "en")
         default_backend = self._settings.value("review/species_backend", "bioclip2")
-        dialog = SpeciesLanguageDialog(default_language=default_language, default_backend=default_backend, parent=self)
+        default_species_list_path = self._settings.value("review/species_list_path", "") or None
+        dialog = SpeciesLanguageDialog(
+            default_language=default_language,
+            default_backend=default_backend,
+            default_species_list_path=default_species_list_path,
+            parent=self,
+        )
         if dialog.exec() != SpeciesLanguageDialog.DialogCode.Accepted:
             return
         language = dialog.language()
         backend = dialog.backend()
+        species_list_path = dialog.species_list_path()
         self._settings.setValue("review/species_language", language)
         self._settings.setValue("review/species_backend", backend)
+        # "" (not None) so QSettings.value's own "" default above reads back
+        # cleanly next time - QSettings round-trips None inconsistently
+        # across platforms, "" does not.
+        self._settings.setValue("review/species_list_path", species_list_path or "")
 
         def _run(on_progress=None, on_stage=None):
-            return self.service.organize_by_species(backend=backend, language=language, on_progress=on_progress)
+            return self.service.organize_by_species(
+                backend=backend, language=language, species_list_path=species_list_path, on_progress=on_progress
+            )
 
         def _on_success(result: dict[str, Any]) -> None:
             self._refresh_from_state(self.service.load_session())

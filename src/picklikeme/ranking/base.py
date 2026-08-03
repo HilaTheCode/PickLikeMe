@@ -111,6 +111,7 @@ class RankingStrategy(Protocol):
         params: Any = None,
         on_stage: Callable[[str], None] | None = None,
         on_progress: Callable[[int, int], None] | None = None,
+        force_preprocess: bool = False,
     ) -> dict: ...
 
 
