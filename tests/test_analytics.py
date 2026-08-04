@@ -170,6 +170,33 @@ def test_rejection_analysis_reports_counts_and_percentages_sorted_descending(tmp
     assert rows[1]["percent_of_considered"] == pytest.approx(10.0)
 
 
+def test_metric_statistics_reports_mean_median_min_max(tmp_path: Path) -> None:
+    from picklikeme.analytics.reports import metric_statistics
+
+    with AnalyticsStore(tmp_path / "analytics.db") as store:
+        store.insert_run(
+            "run-1", folder="/f", strategy_id="classic", started_at="t",
+            considered=4, accepted=4, device=None, params={}, reject_counts={},
+            image_metrics={
+                "a.jpg": {"score": 0.5}, "b.jpg": {"score": 0.9}, "c.jpg": {"score": 0.6}, "d.jpg": {"score": 0.2},
+            },
+        )
+        stats = metric_statistics(store, "run-1", "score")
+
+    assert stats == {"mean": 0.55, "median": 0.55, "min": 0.2, "max": 0.9, "count": 4}
+
+
+def test_metric_statistics_is_none_for_a_metric_this_run_never_recorded(tmp_path: Path) -> None:
+    from picklikeme.analytics.reports import metric_statistics
+
+    with AnalyticsStore(tmp_path / "analytics.db") as store:
+        store.insert_run(
+            "run-1", folder="/f", strategy_id="classic", started_at="t",
+            considered=1, accepted=1, device=None, params={}, reject_counts={}, image_metrics={},
+        )
+        assert metric_statistics(store, "run-1", "score") is None
+
+
 def test_confidence_distribution_returns_the_raw_values_for_tuning(tmp_path: Path) -> None:
     with AnalyticsStore(tmp_path / "analytics.db") as store:
         store.insert_run(

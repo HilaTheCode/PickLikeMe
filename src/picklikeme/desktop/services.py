@@ -12,6 +12,7 @@ from ..analyzer.annotation_config import DEFAULT_ANNOTATIONS_CONFIG, load_annota
 from ..analyzer.annotations import DEFAULT_ANNOTATIONS_DB, AnnotationStore
 from ..auto_crop import generate_lightroom_crops
 from ..config import DEFAULT_CHECKPOINT_PATH
+from ..ground_truth import GroundTruthPlan
 from ..importer import import_selected_images
 from ..organize import SELECTED_DIRNAME
 from ..ranking import DEFAULT_STRATEGY_ID, AIModelParams, available_strategies, get_strategy
@@ -27,6 +28,11 @@ class ReviewService:
         self.fields_config = load_annotation_fields(DEFAULT_ANNOTATIONS_CONFIG)
         self.store = AnnotationStore(self.db_path, fields_config=self.fields_config)
         self.session = ReviewSession(None, self.store)
+        # Set by preview_ground_truth_import, consumed by
+        # apply_ground_truth_import - see ground_truth.py's own docstring on
+        # why apply must reuse the exact plan preview computed, never
+        # re-walk the folders a second time.
+        self._ground_truth_plan: GroundTruthPlan | None = None
 
     def open_folder(self, folder: str | Path) -> dict[str, Any]:
         self.session.open_folder(folder)
@@ -182,6 +188,49 @@ class ReviewService:
             store=self.store,
             on_progress=on_progress,
         )
+        result["state"] = self.load_session()
+        return result
+
+    def preview_ground_truth_import(
+        self,
+        *,
+        keep_folder: str | Path | None = None,
+        reject_folder: str | Path | None = None,
+        neutral_folder: str | Path | None = None,
+        on_progress: Callable[[int, int], None] | None = None,
+    ) -> dict[str, Any]:
+        """"Set User Decisions by Subfolders" - step 1. Walks whichever
+        folders were given (all optional) and reports counts only; nothing
+        is written yet. See ground_truth.py's own module docstring - this
+        is never an import, only `review_decisions` rows are ever touched,
+        and only once `apply_ground_truth_import` is called with this exact
+        plan still cached."""
+        from ..ground_truth import build_plan
+
+        plan = build_plan(
+            self.store, keep_folder=keep_folder, reject_folder=reject_folder,
+            neutral_folder=neutral_folder, on_progress=on_progress,
+        )
+        self._ground_truth_plan = plan
+        return {
+            "totals": plan.totals(),
+            "keep": {"will_change": plan.keep.will_change, "already_matching": plan.keep.already_matching, "skipped": len(plan.keep.skipped)},
+            "reject": {"will_change": plan.reject.will_change, "already_matching": plan.reject.already_matching, "skipped": len(plan.reject.skipped)},
+            "neutral": {"will_change": plan.neutral.will_change, "already_matching": plan.neutral.already_matching, "skipped": len(plan.neutral.skipped)},
+            "conflicts": len(plan.conflicts),
+        }
+
+    def apply_ground_truth_import(self) -> dict[str, Any]:
+        """"Set User Decisions by Subfolders" - step 2. Applies the plan
+        `preview_ground_truth_import` computed last - never re-walks the
+        folders, so what gets written is provably the same set the
+        photographer's confirmation dialog just showed them."""
+        from ..ground_truth import apply_plan
+
+        if self._ground_truth_plan is None:
+            raise ValueError("Preview the folders before applying - call preview_ground_truth_import first.")
+        result = apply_plan(self.store, self._ground_truth_plan)
+        self._ground_truth_plan = None
         result["state"] = self.load_session()
         return result
 

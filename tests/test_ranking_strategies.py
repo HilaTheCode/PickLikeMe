@@ -552,6 +552,7 @@ def test_the_metrics_report_records_every_surviving_image_s_raw_measurements(tmp
     assert report["strategy"] == "classic-vision"
     assert report["metrics"]["a.nef"] == {
         "eye_sharpness": 1.5, "subject_sharpness": 2.5, "subject_size": 0.1, "eye_confidence": 0.9,
+        "head_confidence": None,
     }
     assert report["metrics"]["b.nef"]["eye_confidence"] == pytest.approx(0.8)
 
@@ -698,7 +699,34 @@ def test_classic_vision_ranks_a_folder_and_writes_the_usual_sidecar(tmp_path, mo
     # And each surviving image's raw metrics, behind that combined score.
     metrics_report = read_metrics_report(folder)["metrics"]
     assert set(metrics_report) == set(scoring) | {mammal}
-    assert set(metrics_report[mammal]) == {"eye_sharpness", "subject_sharpness", "subject_size", "eye_confidence"}
+    assert set(metrics_report[mammal]) == {
+        "eye_sharpness", "subject_sharpness", "subject_size", "eye_confidence", "head_confidence",
+    }
+
+    # The Analytics Dashboard's Experiment Metadata / Run Summary need a
+    # per-image "score" metric (the same generic name every strategy uses,
+    # not just this one's own eye_sharpness/subject_sharpness/subject_size),
+    # a runtime/images-per-second summary, and enough params to answer
+    # "exactly how was this run produced" - algorithm version plus the
+    # environment facts every run records (see analytics.environment).
+    from picklikeme.analytics.store import AnalyticsStore
+
+    with AnalyticsStore(tmp_path / "analytics.db") as store:
+        (run,) = store.list_runs()
+        run_id = run["run_id"]
+        params = store.get_run(run_id)["params"]
+        assert params["algorithm_version"]
+        assert "git_commit" in params
+        assert "application_version" in params
+        assert "gpu_name" in params
+        assert "cuda_available" in params
+
+        summary = store.summary_metrics(run_id)
+        assert summary["runtime_seconds"] >= 0.0
+        assert summary["images_per_second"] >= 0.0
+
+        for path in scoring:
+            assert "score" in store.image_metrics(run_id, path)
 
 
 def test_rank_folder_forwards_detection_thresholds_into_the_crop_cache_build(tmp_path, monkeypatch) -> None:

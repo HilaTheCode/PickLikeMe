@@ -81,11 +81,13 @@ class GalleryView(QListView):
         self._empty_message = message
         self.viewport().update()
 
-    def set_color_source(self, strategy_id: str | None, score_range: tuple[float, float] | None) -> None:
-        """Tint every card's background by `strategy_id`'s own score
-        instead of by review status - see MainWindow.color_source_options.
-        `None` restores the default (review-status) coloring."""
-        self._delegate.set_color_source(strategy_id, score_range)
+    def set_color_source(self, strategy_id: str | None) -> None:
+        """Which strategy's own keep/reject suggestion colors an undecided
+        card's background (Priority #2 of the coloring policy - see
+        ThumbnailCardDelegate._get_background_color's own docstring).
+        `None` ("Review Status") leaves an undecided card neutral, same as
+        before this feature existed."""
+        self._delegate.set_color_source(strategy_id)
         self.viewport().update()
 
     def set_show_burst_badges(self, enabled: bool) -> None:

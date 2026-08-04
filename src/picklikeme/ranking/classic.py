@@ -57,11 +57,13 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
 from ..analytics import DEFAULT_ANALYTICS_DB, record_run
+from ..analytics.environment import resolve_environment_info
 from ..auto_crop import resolve_device
 from ..bird_crop import CropParams, crop_cache_path, read_detections
 from ..config import DEFAULT_CROP_CACHE_DIR, DEFAULT_MAX_CSV_ROWS
@@ -91,6 +93,14 @@ from .metrics import (
 logger = logging.getLogger(__name__)
 
 STRATEGY_ID = "classic-vision"
+
+# Bumped whenever this module's own filtering/scoring logic changes in a way
+# that could change a result - independent of the eye-detector backend's own
+# identity (see `_eye_detector_name`) and of open_clip/torch versions, the
+# same "which exact axis changed" discipline `BioClipSpeciesClassifier.
+# CLASSIFIER_VERSION` already applies to species classification. Shown in
+# the Analytics Dashboard's Experiment Metadata as "Algorithm Version".
+ALGORITHM_VERSION = "1"
 
 # Where the per-image filter verdicts land, beside the ranking CSV the same
 # run produced. Not merged into run.json (which is provenance about the run as
@@ -423,6 +433,11 @@ class ImageMetrics:
     subject_sharpness: float
     subject_size: float
     eye_confidence: float
+    # The eye detector's own head-visibility confidence (see eyes.detector.
+    # EyeDetection.head_confidence) - independent of eye_confidence, which is
+    # about the visible eye specifically. None for a detector backend that
+    # never computes this (EyeDetection's own default), never fabricated.
+    head_confidence: float | None = None
 
 
 def measure(candidate: FilterCandidate) -> ImageMetrics:
@@ -445,6 +460,7 @@ def measure(candidate: FilterCandidate) -> ImageMetrics:
             candidate.subject_box, candidate.source_size or (0, 0)
         ),
         eye_confidence=candidate.eye.confidence,
+        head_confidence=candidate.eye.head_confidence,
     )
 
 
@@ -529,6 +545,7 @@ def write_metrics_report(
                 "subject_sharpness": m.subject_sharpness,
                 "subject_size": m.subject_size,
                 "eye_confidence": m.eye_confidence,
+                "head_confidence": m.head_confidence,
             }
             for m in metrics
         },
@@ -638,6 +655,7 @@ class ClassicVisionStrategy:
         from ..train import write_results_csv
         from .debug import save_debug_image
 
+        start_time = time.perf_counter()
         params = params or self.params_class()
         input_folder = Path(input_folder)
         if not input_folder.exists():
@@ -719,6 +737,9 @@ class ClassicVisionStrategy:
             (Path(m.image_path).name, score, 0, str(m.image_path))
             for m, score in zip(measurements, scores)
         ]
+        # Kept before the sort below reorders `ranked` - zip(measurements,
+        # scores) pairs by position, not by name/path.
+        score_by_path = {m.image_path: score for m, score in zip(measurements, scores)}
         ranked.sort(key=lambda entry: entry[1], reverse=True)
 
         strategy_id = self.info.strategy_id
@@ -746,6 +767,7 @@ class ClassicVisionStrategy:
             eye_detector=self._eye_detector_name,
             **self._eye_detector_kwargs(params),
         )
+        runtime_seconds = time.perf_counter() - start_time
         record_run(
             input_folder,
             strategy_id,
@@ -754,17 +776,25 @@ class ClassicVisionStrategy:
             reject_counts=counts,
             image_metrics={
                 m.image_path: {
+                    "score": score_by_path[m.image_path],
                     "eye_sharpness": m.eye_sharpness,
                     "subject_sharpness": m.subject_sharpness,
                     "subject_size": m.subject_size,
                     "eye_confidence": m.eye_confidence,
+                    "head_confidence": m.head_confidence,
                 }
                 for m in measurements
             },
+            summary_metrics={
+                "runtime_seconds": runtime_seconds,
+                "images_per_second": len(image_paths) / runtime_seconds if runtime_seconds > 0 else 0.0,
+            },
             params={
+                "algorithm_version": ALGORITHM_VERSION,
                 "weights": params.normalized_weights(),
                 "eye_detector": self._eye_detector_name,
                 **self._eye_detector_kwargs(params),
+                **resolve_environment_info(),
             },
             device=resolved_device,
             db_path=analytics_db,

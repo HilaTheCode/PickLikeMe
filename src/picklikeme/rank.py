@@ -15,11 +15,13 @@ frames instead of bird crops (only sensible if the model was trained that way).
 from __future__ import annotations
 
 import argparse
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
 from .analytics import DEFAULT_ANALYTICS_DB, record_run
+from .analytics.environment import resolve_environment_info
 from .auto_crop import resolve_device
 from .bird_crop import IMAGE_FORMAT_EXTENSIONS, CropParams
 from .config import DEFAULT_CHECKPOINT_PATH, DEFAULT_CROP_CACHE_DIR, DEFAULT_MAX_CSV_ROWS, cli_prefix
@@ -82,6 +84,7 @@ def rank_folder(
     tests (and any caller that wants an isolated run history) never write
     into it. See `analytics.capture.record_run`.
     """
+    start_time = time.perf_counter()
     input_folder = Path(input_folder)
     if not input_folder.exists():
         raise FileNotFoundError(f"Input folder does not exist: {input_folder}")
@@ -144,14 +147,26 @@ def rank_folder(
         image_count=len(dataset),
         crop_birds=bool(crop_birds),
     )
+    runtime_seconds = time.perf_counter() - start_time
+    epoch = checkpoint_data.get("epoch")
     record_run(
         input_folder,
         AI_STRATEGY_ID,
         considered=len(dataset),
         accepted=len(dataset),  # the AI model scores every image - no filter stage, see ranking/classic.py's
         reject_counts={},
-        image_metrics={path: {"ai_score": score} for _name, score, _label, path in ranked},
-        params={"backbone": backbone, "checkpoint": str(checkpoint_path.resolve()), "crop_birds": bool(crop_birds)},
+        image_metrics={path: {"score": score} for _name, score, _label, path in ranked},
+        summary_metrics={
+            "runtime_seconds": runtime_seconds,
+            "images_per_second": len(dataset) / runtime_seconds if runtime_seconds > 0 else 0.0,
+        },
+        params={
+            "algorithm_version": f"epoch-{epoch}" if epoch is not None else None,
+            "backbone": backbone,
+            "checkpoint": str(checkpoint_path.resolve()),
+            "crop_birds": bool(crop_birds),
+            **resolve_environment_info(),
+        },
         device=resolved_device,
         db_path=analytics_db,
     )

@@ -421,3 +421,92 @@ class AutoCropDialog(QDialog):
             if radio.isChecked():
                 return preset
         return self._PRESETS[0]
+
+
+class SetUserDecisionsBySubfoldersDialog(QDialog):
+    """"Set User Decisions by Subfolders..." - collects the three (all
+    optional) folder paths only. Never touches AnnotationStore itself - see
+    ground_truth.py's own docstring; the actual preview/confirm/apply
+    sequence runs afterward, in MainWindow, exactly like every other
+    workflow dialog here only collects parameters and lets the caller run
+    the operation (with a progress bar, since walking+hashing thousands of
+    images is not instant)."""
+
+    def __init__(self, *, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Set User Decisions by Subfolders")
+        self.setMinimumWidth(480)
+
+        intro = QLabel(
+            "Recursively scans each folder below and sets the User Decision for every "
+            "image found in it - Keep, Reject, or back to Neutral. Images are matched by "
+            "content, not just their path, so a copy or a rename still matches. Nothing is "
+            "copied or moved; only the decision changes. All three folders are optional.",
+            self,
+        )
+        intro.setWordWrap(True)
+
+        self._keep_edit = QLineEdit(self)
+        self._keep_edit.setReadOnly(True)
+        self._keep_edit.setPlaceholderText("(not set)")
+        self._reject_edit = QLineEdit(self)
+        self._reject_edit.setReadOnly(True)
+        self._reject_edit.setPlaceholderText("(not set)")
+        self._neutral_edit = QLineEdit(self)
+        self._neutral_edit.setReadOnly(True)
+        self._neutral_edit.setPlaceholderText("(not set)")
+
+        form = QFormLayout()
+        form.addRow("Keep Folder:", self._browse_row(self._keep_edit, self._browse_keep))
+        form.addRow("Reject Folder:", self._browse_row(self._reject_edit, self._browse_reject))
+        form.addRow("Neutral Folder:", self._browse_row(self._neutral_edit, self._browse_neutral))
+
+        self._buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel, self)
+        self._buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Preview…")
+        self._buttons.accepted.connect(self.accept)
+        self._buttons.rejected.connect(self.reject)
+        self._update_ok_enabled()
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(intro)
+        layout.addLayout(form)
+        layout.addWidget(self._buttons)
+
+    @staticmethod
+    def _browse_row(edit: QLineEdit, on_browse) -> QHBoxLayout:
+        row = QHBoxLayout()
+        row.addWidget(edit, 1)
+        button = QPushButton("Browse…")
+        button.clicked.connect(on_browse)
+        row.addWidget(button)
+        return row
+
+    def _browse_keep(self) -> None:
+        self._browse_into(self._keep_edit)
+
+    def _browse_reject(self) -> None:
+        self._browse_into(self._reject_edit)
+
+    def _browse_neutral(self) -> None:
+        self._browse_into(self._neutral_edit)
+
+    def _browse_into(self, edit: QLineEdit) -> None:
+        start_dir = edit.text() or ""
+        path = QFileDialog.getExistingDirectory(self, "Choose a folder", start_dir)
+        if path:
+            edit.setText(path)
+            edit.setToolTip(path)
+        self._update_ok_enabled()
+
+    def _update_ok_enabled(self) -> None:
+        any_folder = bool(self._keep_edit.text() or self._reject_edit.text() or self._neutral_edit.text())
+        self._buttons.button(QDialogButtonBox.StandardButton.Ok).setEnabled(any_folder)
+
+    def keep_folder(self) -> str | None:
+        return self._keep_edit.text() or None
+
+    def reject_folder(self) -> str | None:
+        return self._reject_edit.text() or None
+
+    def neutral_folder(self) -> str | None:
+        return self._neutral_edit.text() or None

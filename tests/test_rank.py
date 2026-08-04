@@ -118,6 +118,51 @@ class RankCliWiringTests(unittest.TestCase):
             self.assertIn("written_at", metadata)
             self.assertIn("checkpoint", metadata)
 
+    def test_analytics_capture_records_score_runtime_and_environment(self):
+        """The Analytics Dashboard's Experiment Metadata / Run Summary need
+        the same shape of data from the AI model path that ranking.classic
+        already records: a per-image "score", a runtime/images-per-second
+        summary, and environment facts (git commit, application version,
+        GPU) in params - see analytics.environment."""
+        import picklikeme.rank as rank_module
+        from picklikeme.analytics.store import AnalyticsStore
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "x.nef").write_bytes(b"raw")
+            checkpoint = root / "ckpt.pt"
+            checkpoint.write_bytes(b"fake")
+            analytics_db = root / "analytics.db"
+
+            with mock.patch.object(rank_module, "PreferenceHead"), \
+                    mock.patch.object(
+                        rank_module, "load_checkpoint", return_value={"model_state_dict": {}, "epoch": 7}
+                    ), \
+                    mock.patch.object(rank_module, "RawImageLoader"), \
+                    mock.patch.object(
+                        rank_module, "rank_dataset",
+                        return_value=[("x.nef", 0.75, 0, str(root / "x.nef"))],
+                    ), \
+                    mock.patch.object(rank_module, "write_results_csv", return_value=[root / "written.csv"]):
+                rank_module.rank_folder(
+                    root, checkpoint=checkpoint, device="cpu", crop_birds=False, analytics_db=analytics_db,
+                )
+
+            with AnalyticsStore(analytics_db) as store:
+                (run,) = store.list_runs()
+                params = store.get_run(run["run_id"])["params"]
+                self.assertEqual(params["algorithm_version"], "epoch-7")
+                self.assertIn("git_commit", params)
+                self.assertIn("application_version", params)
+                self.assertIn("gpu_name", params)
+                self.assertIn("cuda_available", params)
+
+                summary = store.summary_metrics(run["run_id"])
+                self.assertGreaterEqual(summary["runtime_seconds"], 0.0)
+                self.assertGreaterEqual(summary["images_per_second"], 0.0)
+
+                self.assertEqual(store.image_metrics(run["run_id"], str(root / "x.nef")), {"score": 0.75})
+
     def test_explicit_output_csv_still_overrides_and_is_timestamped(self):
         """The escape hatch: an explicit path opts out of the sidecar entirely,
         and keeps the timestamp so consecutive runs never overwrite."""

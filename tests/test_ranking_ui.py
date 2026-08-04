@@ -596,49 +596,64 @@ def theme_color(hex_value: str) -> str:
     return QColor(hex_value).name()
 
 
-def test_color_source_tints_by_the_chosen_strategy_s_score(app) -> None:
+def test_color_source_colors_by_the_chosen_strategy_s_keep_reject_suggestion(app) -> None:
+    """Priority #2 of the coloring policy: with no User Decision, an
+    image's background follows the chosen Color Source's own keep/reject
+    suggestion (ImageItem.algorithm_suggestion) - a binary call at the
+    current threshold, not a score gradient."""
     from picklikeme.desktop import theme
     from picklikeme.desktop.models.image_item import ImageItem
     from picklikeme.desktop.views.gallery.thumbnail_delegate import ThumbnailCardDelegate
 
     delegate = ThumbnailCardDelegate()
     palette = theme.current_palette()
-    delegate.set_color_source("classic-vision", (0.0, 10.0))
+    delegate.set_color_source("classic-vision")
 
-    lowest = ImageItem(path="/x/low.nef", file_name="low.nef", review_status="reject",
-                        ranking_results={"classic-vision": {"score": 0.0}})
-    highest = ImageItem(path="/x/high.nef", file_name="high.nef", review_status="keep",
-                         ranking_results={"classic-vision": {"score": 10.0}})
+    suggested_reject = ImageItem(path="/x/low.nef", file_name="low.nef", algorithm_suggestion="reject")
+    suggested_keep = ImageItem(path="/x/high.nef", file_name="high.nef", algorithm_suggestion="keep")
 
-    # The low end of the range must render as the reject color and the high
-    # end as the keep color, regardless of that item's own review_status -
-    # the whole point is that this coloring is independent of it.
-    assert delegate._get_background_color(palette, lowest, False).name() == theme_color(palette.reject_bg)
-    assert delegate._get_background_color(palette, highest, False).name() == theme_color(palette.keep_bg)
+    assert delegate._get_background_color(palette, suggested_reject, False).name() == theme_color(palette.reject_bg)
+    assert delegate._get_background_color(palette, suggested_keep, False).name() == theme_color(palette.keep_bg)
+
+
+def test_a_user_decision_always_overrides_the_color_source_suggestion(app) -> None:
+    """Priority #1: the photographer's own Keep/Reject wins even when the
+    algorithm's own suggestion, for the very same image, disagrees."""
+    from picklikeme.desktop import theme
+    from picklikeme.desktop.models.image_item import ImageItem
+    from picklikeme.desktop.views.gallery.thumbnail_delegate import ThumbnailCardDelegate
+
+    delegate = ThumbnailCardDelegate()
+    palette = theme.current_palette()
+    delegate.set_color_source("classic-vision")
+
+    user_kept_algo_rejects = ImageItem(
+        path="/x/a.nef", file_name="a.nef", review_status="keep", algorithm_suggestion="reject",
+    )
+    user_rejected_algo_keeps = ImageItem(
+        path="/x/b.nef", file_name="b.nef", review_status="reject", algorithm_suggestion="keep",
+    )
+    assert delegate._get_background_color(palette, user_kept_algo_rejects, False).name() == theme_color(palette.keep_bg)
+    assert delegate._get_background_color(palette, user_rejected_algo_keeps, False).name() == theme_color(palette.reject_bg)
 
 
 def test_an_image_the_chosen_strategy_never_scored_falls_back_to_neutral(app) -> None:
     """An image Classic Vision filtered out (or that only the AI model has
-    scored) has no classic-vision score to tint by - it must fall back to
-    the same plain color an unranked image gets by default, not be mistaken
-    for a score of zero."""
+    scored) has no algorithm_suggestion from it - it must fall back to the
+    same plain color an unranked image gets by default, never be guessed at."""
     from picklikeme.desktop import theme
     from picklikeme.desktop.models.image_item import ImageItem
     from picklikeme.desktop.views.gallery.thumbnail_delegate import ThumbnailCardDelegate
 
     delegate = ThumbnailCardDelegate()
     palette = theme.current_palette()
-    delegate.set_color_source("classic-vision", (0.0, 10.0))
+    delegate.set_color_source("classic-vision")
 
-    unscored = ImageItem(path="/x/u.nef", file_name="u.nef", review_status="keep")
+    unscored = ImageItem(path="/x/u.nef", file_name="u.nef", algorithm_suggestion=None)
     assert delegate._get_background_color(palette, unscored, False).name() == theme_color(palette.neutral_bg)
 
 
-def test_selecting_a_color_source_computes_the_range_from_visible_items_only(app, tmp_path) -> None:
-    """The gradient must span only what a filter is currently showing, not
-    every image the strategy ever scored - a folder with a wide overall
-    range but a narrow filtered view should still spread across the full
-    gradient for what is on screen."""
+def test_selecting_a_color_source_propagates_to_the_gallery_delegate(app, tmp_path) -> None:
     from picklikeme.desktop.application import ApplicationState, WorkerManager
     from picklikeme.desktop.main_window import MainWindow
     from picklikeme.desktop.models.image_item import ImageItem
@@ -652,19 +667,13 @@ def test_selecting_a_color_source_computes_the_range_from_visible_items_only(app
     )
     try:
         window._color_source = "classic-vision"
-        visible = [
-            ImageItem(path="/x/a.nef", file_name="a.nef", ranking_results={"classic-vision": {"score": 2.0}}),
-            ImageItem(path="/x/b.nef", file_name="b.nef", ranking_results={"classic-vision": {"score": 5.0}}),
-            ImageItem(path="/x/c.nef", file_name="c.nef"),  # never scored by it - excluded from the range
-        ]
+        visible = [ImageItem(path="/x/a.nef", file_name="a.nef", algorithm_suggestion="keep")]
         window._update_color_source(visible)
         assert window._gallery_view._delegate._color_source == "classic-vision"
-        assert window._gallery_view._delegate._score_range == (2.0, 5.0)
 
         window._color_source = None
         window._update_color_source(visible)
         assert window._gallery_view._delegate._color_source is None
-        assert window._gallery_view._delegate._score_range is None
     finally:
         window.close()
         service.close()

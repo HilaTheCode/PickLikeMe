@@ -37,11 +37,16 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import subprocess
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from uuid import uuid4
+
+from ..analytics.environment import (
+    resolve_application_version as _resolve_application_version,
+)
+from ..analytics.environment import resolve_git_commit as _resolve_git_commit
+from ..analytics.environment import resolve_gpu_name as _resolve_gpu_name
 
 logger = logging.getLogger(__name__)
 
@@ -132,36 +137,6 @@ def _resolve_open_clip_version() -> str | None:
         return getattr(open_clip, "__version__", None)
     except Exception:  # noqa: BLE001 - version reporting must never break a run
         return None
-
-
-def _resolve_application_version() -> str | None:
-    try:
-        import importlib.metadata
-        return importlib.metadata.version("pick-likeme")
-    except Exception:  # noqa: BLE001
-        return None
-
-
-def _resolve_git_commit() -> str | None:
-    """Best-effort - a packaged/non-git install must not fail this."""
-    try:
-        result = subprocess.run(
-            ["git", "rev-parse", "HEAD"], capture_output=True, text=True, timeout=5, check=False,
-        )
-        if result.returncode == 0:
-            return result.stdout.strip() or None
-    except (OSError, subprocess.SubprocessError):
-        pass
-    return None
-
-
-def _resolve_gpu_name(torch_module) -> str | None:
-    try:
-        if torch_module.cuda.is_available():
-            return torch_module.cuda.get_device_name(0)
-    except Exception:  # noqa: BLE001 - a GPU query must never break a run
-        pass
-    return None
 
 
 def build_experiment_metadata(

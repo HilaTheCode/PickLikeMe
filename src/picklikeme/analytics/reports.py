@@ -69,6 +69,25 @@ def rejection_analysis(store: AnalyticsStore, run_id: str) -> list[dict]:
     return rows
 
 
+def metric_statistics(store: AnalyticsStore, run_id: str, metric_name: str) -> dict | None:
+    """Mean/median/min/max for one per-image metric across a run - the
+    richer sibling of `run_statistics`'s own `metric_means` (mean only),
+    for a Run Summary that wants "highest/lowest/median score" alongside
+    the average, not just the average. `None` if this run never recorded
+    `metric_name` at all (not every strategy computes the same metrics -
+    see store.py's own docstring) - never a fabricated zero."""
+    values = store.metric_values(run_id, metric_name)
+    if not values:
+        return None
+    return {
+        "mean": round(statistics.fmean(values), 4),
+        "median": round(statistics.median(values), 4),
+        "min": round(min(values), 4),
+        "max": round(max(values), 4),
+        "count": len(values),
+    }
+
+
 def confidence_distribution(store: AnalyticsStore, run_id: str, metric_name: str) -> list[float]:
     """The raw values for one metric across every image in this run - the
     material for a histogram (or, today, a CSV column) rather than only a

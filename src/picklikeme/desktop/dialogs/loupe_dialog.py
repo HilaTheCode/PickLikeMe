@@ -115,6 +115,20 @@ def _format_burst_label(burst_id: str) -> str:
         return f"Burst {burst_id}"
 
 
+def _strategy_label(strategy_id: str | None) -> str:
+    """"ai-model" -> "AI Model" - the same registry `_scores_text` already
+    reads from, so the Loupe's own "Color Source: ..." readout never
+    invents a second naming scheme for a strategy the score bar already
+    names. Falls back to the raw id for one the registry does not
+    recognise (or None) rather than raising - a label is never worth
+    crashing the Loupe over."""
+    if not strategy_id:
+        return "(none)"
+    from ...ranking import score_labels
+
+    return score_labels().get(strategy_id, strategy_id)
+
+
 def _apply_brightness(pixmap: QPixmap, ev: float) -> QPixmap:
     """Approximate a CSS brightness(2^ev) filter on a QPixmap.
 
@@ -350,6 +364,22 @@ class LoupeDialog(QDialog):
         self.service = service
         self.image_paths = image_paths
         self.items = items
+        # The burst's members exactly as handed in, never touched again -
+        # every sort mode is rebuilt FROM this fixed list, never by
+        # re-sorting whatever self.items currently holds. Sorting the
+        # currently-displayed list in place is what broke Capture Time
+        # after a Burst Score sort: list.sort() is stable, so re-sorting an
+        # already Burst-Score-ordered list by captured_at only reorders
+        # images with genuinely DIFFERENT timestamps - any two images that
+        # share the same one (common within a burst, since EXIF
+        # DateTimeOriginal is only 1-second resolution) kept whatever
+        # relative order the PREVIOUS sort left them in, instead of
+        # reverting to true chronological order. Deriving fresh from an
+        # immutable original every time makes each mode's result a pure
+        # function of fixed input - switching Burst Score -> Capture Time
+        # -> Burst Score -> ... always reproduces the exact same sequence
+        # for a given mode, regardless of what was selected in between.
+        self._burst_members_original: list[ImageItem] | None = list(items) if items is not None else None
         self.index = max(0, min(start_index, len(image_paths) - 1))
         # Set by MainWindow._open_loupe_for_item only when this Loupe session
         # was opened from a single collapsed burst card (Collapse Bursts on) -
@@ -359,13 +389,35 @@ class LoupeDialog(QDialog):
         # burst sort/info UI that would only ever read "Burst Rank #1 of 1".
         self._burst_scoped = burst_scoped and self.items is not None
         self._settings = settings
+        # The strategy Burst Analysis is currently keyed to (the gallery's
+        # Color Source selector - see ReviewSession.burst_strategy) - and
+        # whether it has actually scored ANY member of this specific burst.
+        # When it hasn't (photographer ranked with a different strategy, or
+        # hasn't ranked at all), burst_rank carries no real signal - see
+        # _sort_burst_members's own docstring on why that makes Burst Score
+        # coincide with Capture Time, which reads as "the toggle does
+        # nothing" from the photographer's side. Surfaced explicitly rather
+        # than left to look broken.
+        self._burst_color_source = getattr(self.service.session, "burst_strategy", None) if self._burst_scoped else None
+        self._burst_score_available = (
+            self._burst_members_original is not None and self._burst_color_source is not None
+            and any(item.score_for(self._burst_color_source) is not None for item in self._burst_members_original)
+        )
         self._burst_sort_mode = DEFAULT_BURST_SORT_MODE
         if self._burst_scoped and self._settings is not None:
             stored_mode = self._settings.value(BURST_SORT_SETTINGS_KEY, DEFAULT_BURST_SORT_MODE)
             if stored_mode in (BURST_SORT_CAPTURE_TIME, BURST_SORT_BURST_SCORE):
                 self._burst_sort_mode = stored_mode
+        if self._burst_scoped and not self._burst_score_available:
+            # Never silently show a Burst Score order that is secretly just
+            # Capture Time - force the mode itself to Capture Time (not
+            # persisted: this burst's own lack of a score is not the
+            # photographer's general preference), and the combo/warning
+            # below make the "why" explicit rather than leaving Burst Score
+            # selectable-but-meaningless.
+            self._burst_sort_mode = BURST_SORT_CAPTURE_TIME
         if self._burst_scoped:
-            # Apply the persisted sort mode before the dialog ever renders a
+            # Apply the resolved sort mode before the dialog ever renders a
             # frame - MainWindow always hands members in burst_rank order and
             # start_index=0 (the top-ranked image), so a photographer who
             # last chose Capture Time would otherwise see a mismatched
@@ -433,7 +485,19 @@ class LoupeDialog(QDialog):
         self._burst_rank_label = QLabel(self)
         self._burst_best_label = QLabel(self)
         self._burst_score_label = QLabel(self)
+        self._burst_color_source_label = QLabel(self)
+        self._burst_ranking_status_label = QLabel(self)
+        self._burst_sort_warning_label = QLabel(self)
+        self._burst_sort_warning_label.setStyleSheet(f"color: {theme.DARK.reject_fg};")
         if self._burst_scoped:
+            self._burst_color_source_label.setText(f"Color Source: {_strategy_label(self._burst_color_source)}")
+            if self._burst_score_available:
+                self._burst_ranking_status_label.setText("Ranking: Available")
+                self._burst_ranking_status_label.setStyleSheet(f"color: {theme.DARK.keep_fg};")
+            else:
+                self._burst_ranking_status_label.setText("Ranking: Not available")
+                self._burst_ranking_status_label.setStyleSheet(f"color: {theme.DARK.reject_fg};")
+
             self._burst_sort_combo = QComboBox(self)
             self._burst_sort_combo.addItem("Capture Time", BURST_SORT_CAPTURE_TIME)
             self._burst_sort_combo.addItem("Burst Score (highest first)", BURST_SORT_BURST_SCORE)
@@ -442,6 +506,30 @@ class LoupeDialog(QDialog):
             # the burst info block's layout doesn't jump around burst to
             # burst as this dialog is reused for the "Next" navigation.
             self._burst_sort_combo.setEnabled(len(self.image_paths) > 1)
+            if not self._burst_score_available:
+                # burst_rank is only real signal when at least one member of
+                # this burst actually has a score from the active Color
+                # Source - when none do, burst_analysis.analyze_bursts's
+                # tie-break falls back to whatever order reconstruct_bursts
+                # already sorted the members into to detect the burst in
+                # the first place, which is capture-time order (it sorts by
+                # timestamp before grouping - see burst.py). Disabled
+                # (never silently offered) rather than left selectable-but-
+                # meaningless - see this __init__'s own forcing of
+                # _burst_sort_mode to Capture Time above.
+                burst_score_item = self._burst_sort_combo.model().item(1)
+                burst_score_item.setEnabled(False)
+                self._burst_sort_combo.setItemData(
+                    1,
+                    "Burst Score unavailable: this burst has no score from the current Color Source "
+                    f"({_strategy_label(self._burst_color_source)}). Rank this folder with that strategy, "
+                    "or switch Color Source to one that already has.",
+                    Qt.ItemDataRole.ToolTipRole,
+                )
+                self._burst_sort_warning_label.setText(
+                    "Burst Score unavailable for the current Color Source - showing Capture Time"
+                )
+                self._burst_sort_warning_label.setToolTip(self._burst_sort_combo.itemData(1, Qt.ItemDataRole.ToolTipRole))
             index = self._burst_sort_combo.findData(self._burst_sort_mode)
             if index >= 0:
                 self._burst_sort_combo.setCurrentIndex(index)
@@ -555,6 +643,9 @@ class LoupeDialog(QDialog):
             burst_layout.addWidget(self._burst_rank_label)
             burst_layout.addWidget(self._burst_best_label)
             burst_layout.addWidget(self._burst_score_label)
+            burst_layout.addWidget(self._burst_color_source_label)
+            burst_layout.addWidget(self._burst_ranking_status_label)
+            burst_layout.addWidget(self._burst_sort_warning_label)
             bar_layout.addWidget(burst_group, 1, 0, 1, 3, Qt.AlignmentFlag.AlignCenter)
 
         layout = QVBoxLayout(self)
@@ -734,24 +825,35 @@ class LoupeDialog(QDialog):
         self._burst_score_label.setText(f"Score {score * 100:.1f}" if score is not None else "Score -")
 
     def _sort_burst_members(self, mode: str, *, remap_index: bool = False) -> None:
-        """Reorder self.items/self.image_paths using data Burst Analysis
-        already computed - never recomputed here. Capture Time sorts by
-        ImageItem.captured_at (missing timestamps sort first, same as an
-        empty string); Burst Score reuses burst_rank as-is, which
-        `burst_analysis.analyze_bursts` already produced in score-descending
-        order (see that module's own docstring).
+        """Rebuild self.items/self.image_paths from `_burst_members_original`
+        - the fixed, never-mutated list of this burst's members - using
+        data Burst Analysis already computed, never recomputed here.
+        Capture Time sorts by ImageItem.captured_at (missing timestamps
+        sort first, same as an empty string); Burst Score reuses burst_rank
+        as-is, which `burst_analysis.analyze_bursts` already produced in
+        score-descending order (see that module's own docstring).
+
+        Always `sorted()` on the ORIGINAL list, never `self.items.sort()`
+        in place - the previous version resorted whatever was currently
+        displayed, so a second sort by a key with ties (two images sharing
+        one captured_at second, common within a burst) preserved the
+        PREVIOUS sort's leftover order for those ties instead of the true
+        original one. Rebuilding from the fixed original every time makes
+        each mode a pure function of fixed input: picking the same mode
+        twice, with anything selected in between, always reproduces the
+        exact same sequence.
 
         `remap_index` keeps whichever image was showing in view before the
         resort still in view after it - the position within the burst (X of
         N) can change, but the photographer's current frame never jumps.
         """
-        if self.items is None:
+        if self._burst_members_original is None:
             return
         current_path = self._current_path() if remap_index else None
         if mode == BURST_SORT_CAPTURE_TIME:
-            self.items.sort(key=lambda i: i.captured_at or "")
+            self.items = sorted(self._burst_members_original, key=lambda i: i.captured_at or "")
         else:
-            self.items.sort(key=lambda i: i.burst_rank)
+            self.items = sorted(self._burst_members_original, key=lambda i: i.burst_rank)
         self.image_paths = [item.path for item in self.items]
         if remap_index and current_path is not None:
             try:
@@ -763,6 +865,14 @@ class LoupeDialog(QDialog):
         if self._burst_sort_combo is None:
             return
         mode = self._burst_sort_combo.currentData()
+        if mode == BURST_SORT_BURST_SCORE and not self._burst_score_available:
+            # Defensive - the combo item is disabled, so a real click/arrow-
+            # key selection cannot reach here, but never silently accept it
+            # if some other path (a future change, a different Qt style)
+            # ever did: revert instead of ranking by a score that does not
+            # exist for this burst.
+            self._burst_sort_combo.setCurrentIndex(self._burst_sort_combo.findData(BURST_SORT_CAPTURE_TIME))
+            return
         if mode == self._burst_sort_mode:
             return
         self._burst_sort_mode = mode

@@ -56,6 +56,48 @@ def test_import_selected_requires_open_folder(tmp_path) -> None:
     service.close()
 
 
+def test_preview_ground_truth_import_reports_counts_without_writing(tmp_path) -> None:
+    keep_folder = tmp_path / "Keep"
+    keep_folder.mkdir()
+    _make_jpeg(keep_folder / "a.jpg")
+
+    service = ReviewService(db_path=tmp_path / "annotations.sqlite")
+    result = service.preview_ground_truth_import(keep_folder=keep_folder)
+
+    assert result["totals"]["keep"] == 1
+    assert result["totals"]["will_change"] == 1
+    assert result["keep"]["will_change"] == 1
+    assert service.store.review_decision_count() == 0  # preview never writes
+    service.close()
+
+
+def test_apply_ground_truth_import_writes_the_previewed_plan_and_refreshes_state(tmp_path) -> None:
+    from picklikeme.analyzer.annotations import REVIEW_KEEP
+
+    keep_folder = tmp_path / "Keep"
+    keep_folder.mkdir()
+    _make_jpeg(keep_folder / "a.jpg")
+
+    service = ReviewService(db_path=tmp_path / "annotations.sqlite")
+    service.preview_ground_truth_import(keep_folder=keep_folder)
+    result = service.apply_ground_truth_import()
+
+    assert result["updated_keep"] == 1
+    assert result["skipped"] == []
+    assert result["conflicts"] == []
+    assert "state" in result
+    decisions = {row["image_path"]: row["decision"] for row in service.store.review_decisions()}
+    assert decisions[str(keep_folder / "a.jpg")] == REVIEW_KEEP
+    service.close()
+
+
+def test_apply_ground_truth_import_requires_a_preview_first(tmp_path) -> None:
+    service = ReviewService(db_path=tmp_path / "annotations.sqlite")
+    with pytest.raises(ValueError):
+        service.apply_ground_truth_import()
+    service.close()
+
+
 def test_rank_folder_delegates_and_refreshes_session(tmp_path, monkeypatch) -> None:
     folder = tmp_path / "shoot"
     folder.mkdir()
@@ -327,6 +369,31 @@ def test_rank_dialog_returns_selected_values() -> None:
 
     assert dialog.checkpoint_path() == "my_checkpoint.pt"
     assert dialog.crop_birds() is False
+    dialog.close()
+    app.quit()
+
+
+@pytest.mark.skipif(QApplication is None, reason="PySide6 not installed")
+def test_ground_truth_dialog_folders_are_all_optional_and_ok_disabled_until_one_is_set(tmp_path) -> None:
+    from picklikeme.desktop.dialogs.workflow_dialogs import SetUserDecisionsBySubfoldersDialog
+    from PySide6.QtWidgets import QDialogButtonBox
+
+    app = QApplication.instance() or QApplication([])
+    dialog = SetUserDecisionsBySubfoldersDialog()
+
+    ok_button = dialog._buttons.button(QDialogButtonBox.StandardButton.Ok)
+    assert ok_button.isEnabled() is False
+    assert dialog.keep_folder() is None
+    assert dialog.reject_folder() is None
+    assert dialog.neutral_folder() is None
+
+    keep_dir = tmp_path / "Keep"
+    keep_dir.mkdir()
+    dialog._keep_edit.setText(str(keep_dir))
+    dialog._update_ok_enabled()
+
+    assert ok_button.isEnabled() is True
+    assert dialog.keep_folder() == str(keep_dir)
     dialog.close()
     app.quit()
 

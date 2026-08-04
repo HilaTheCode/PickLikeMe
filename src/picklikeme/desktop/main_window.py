@@ -48,6 +48,7 @@ from .dialogs.workflow_dialogs import (
     AutoCropDialog,
     PreferencesDialog,
     RankDialog,
+    SetUserDecisionsBySubfoldersDialog,
     SpeciesLanguageDialog,
 )
 from .models.image_item import ImageItem
@@ -290,6 +291,13 @@ class MainWindow(QMainWindow):
                 fusion = QStyleFactory.create("Fusion")
                 if fusion is not None:
                     app.setStyle(fusion)
+            # A QPalette alongside the stylesheet - QSS alone only reaches
+            # widget types build_stylesheet names explicitly; a QPalette is
+            # inherited by every widget, including QTableWidget/QListWidget/
+            # QTabWidget in dialogs like the Analytics Dashboard that would
+            # otherwise keep rendering with Qt's default light palette even
+            # under a dark stylesheet - see theme.build_qpalette.
+            app.setPalette(theme.build_qpalette(theme.current_palette()))
             app.setStyleSheet(theme.build_stylesheet(theme.current_palette()))
         self._gallery_view.viewport().update()
         if hasattr(self, "_dark_theme_action"):
@@ -418,6 +426,11 @@ class MainWindow(QMainWindow):
             tooltip="Browse past ranking/species-classification experiments and their metrics",
             triggered=self._show_analytics_dashboard,
         )
+        self._ground_truth_action = self._make_action(
+            "Set User Decisions by Subfolders…", icon=SP.SP_DialogApplyButton,
+            tooltip="Bulk-set Keep/Reject/Neutral from folders of already-sorted images, for Ground Truth",
+            triggered=self._set_user_decisions_by_subfolders,
+        )
         self._crop_action = self._make_action(
             "Auto Crop…", icon=SP.SP_FileDialogDetailedView,
             tooltip="Generate Lightroom crop metadata around detected subjects", triggered=self._auto_crop,
@@ -496,6 +509,7 @@ class MainWindow(QMainWindow):
         tools_menu.addAction(self._crop_action)
         tools_menu.addSeparator()
         tools_menu.addAction(self._analytics_dashboard_action)
+        tools_menu.addAction(self._ground_truth_action)
 
         help_menu = menu_bar.addMenu("Help")
         help_menu.addAction(about_action)
@@ -933,20 +947,15 @@ class MainWindow(QMainWindow):
         self.service.set_burst_strategy(self._color_source or DEFAULT_STRATEGY_ID)
         self._refresh_from_state(self.service.load_session())
 
-    def _update_color_source(self, items: list[ImageItem]) -> None:
-        """Recompute the score range the gallery tints card backgrounds
-        against, whenever the visible set or the chosen source changes -
-        see color_source_options(). None (Review Status) needs no range at
-        all; anything else is scaled against the low/high of that strategy's
-        score among only the images actually visible right now, so the
-        gradient always spans the full range of what's on screen instead of
-        being skewed by images a filter has hidden."""
-        if self._color_source is None:
-            self._gallery_view.set_color_source(None, None)
-            return
-        scores = [s for s in (item.score_for(self._color_source) for item in items) if s is not None]
-        score_range = (min(scores), max(scores)) if scores else None
-        self._gallery_view.set_color_source(self._color_source, score_range)
+    def _update_color_source(self, items: list[ImageItem]) -> None:  # noqa: ARG002 - kept for call-site stability
+        """Propagate the chosen Color Source to the gallery so Priority #2
+        of the coloring policy (an undecided image's background, via
+        ImageItem.algorithm_suggestion) uses the right strategy - see
+        ThumbnailCardDelegate._get_background_color's own docstring.
+        `items` is no longer used: algorithm_suggestion is already computed
+        per-item against the current threshold, so there is no separate
+        score range to derive from whichever set is currently visible."""
+        self._gallery_view.set_color_source(self._color_source)
 
     @staticmethod
     def _filter_items(items: list[ImageItem], current_filter: str) -> list[ImageItem]:
@@ -1442,6 +1451,92 @@ class MainWindow(QMainWindow):
         self._active_threads.append(thread)
         thread.finished.connect(lambda: self._active_threads.remove(thread) if thread in self._active_threads else None)
 
+    # -- set user decisions by subfolders (Ground Truth) -------------------------
+
+    def _set_user_decisions_by_subfolders(self) -> None:
+        """Never requires an open folder - unlike every other Tools action,
+        this operates entirely on whatever Keep/Reject/Neutral folders the
+        photographer points at, independent of what is currently open for
+        review (see ground_truth.py's own module docstring)."""
+        dialog = SetUserDecisionsBySubfoldersDialog(parent=self)
+        if dialog.exec() != SetUserDecisionsBySubfoldersDialog.DialogCode.Accepted:
+            return
+        keep_folder = dialog.keep_folder()
+        reject_folder = dialog.reject_folder()
+        neutral_folder = dialog.neutral_folder()
+
+        def _preview_run(on_progress=None, on_stage=None):
+            return self.service.preview_ground_truth_import(
+                keep_folder=keep_folder, reject_folder=reject_folder, neutral_folder=neutral_folder,
+                on_progress=on_progress,
+            )
+
+        def _on_preview_error(message: str) -> None:
+            QMessageBox.warning(
+                self, "PeakPic - Set User Decisions by Subfolders", f"Could not scan the folders:\n{message}",
+            )
+
+        thread = run_with_progress(
+            self, "Scanning Folders", _preview_run,
+            on_success=self._confirm_and_apply_ground_truth_import, on_error=_on_preview_error,
+        )
+        self._active_threads.append(thread)
+        thread.finished.connect(lambda: self._active_threads.remove(thread) if thread in self._active_threads else None)
+
+    def _confirm_and_apply_ground_truth_import(self, preview: dict[str, Any]) -> None:
+        totals = preview["totals"]
+        lines = [
+            f"Keep\t{totals['keep']}",
+            f"Reject\t{totals['reject']}",
+            f"Neutral\t{totals['neutral']}",
+            "",
+            f"Already matching\t{totals['already_matching']}",
+            f"Will change\t{totals['will_change']}",
+        ]
+        if totals["conflicts"]:
+            lines.append(f"Conflicts (found in more than one folder - will be skipped)\t{totals['conflicts']}")
+        if totals["will_change"] == 0:
+            QMessageBox.information(
+                self, "PeakPic - Set User Decisions by Subfolders", "\n".join(lines) + "\n\nNothing to change.",
+            )
+            return
+        choice = QMessageBox.question(
+            self, "PeakPic - Set User Decisions by Subfolders",
+            "\n".join(lines) + f"\n\nApply these {totals['will_change']} change(s)?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if choice != QMessageBox.StandardButton.Yes:
+            self._set_status("Set User Decisions by Subfolders cancelled")
+            return
+
+        def _apply_run(on_progress=None, on_stage=None):
+            return self.service.apply_ground_truth_import()
+
+        def _on_apply_success(result: dict[str, Any]) -> None:
+            self._refresh_from_state(result["state"])
+            summary = (
+                f"Updated Keep: {result['updated_keep']}\n"
+                f"Updated Reject: {result['updated_reject']}\n"
+                f"Updated Neutral: {result['updated_neutral']}\n"
+                f"Skipped: {len(result['skipped'])}\n"
+                f"Conflicts: {len(result['conflicts'])}"
+            )
+            QMessageBox.information(self, "PeakPic - Set User Decisions by Subfolders", summary)
+            total_updated = result["updated_keep"] + result["updated_reject"] + result["updated_neutral"]
+            self._set_status(f"Updated {total_updated} user decision(s)")
+
+        def _on_apply_error(message: str) -> None:
+            QMessageBox.warning(
+                self, "PeakPic - Set User Decisions by Subfolders", f"Could not apply changes:\n{message}",
+            )
+
+        thread = run_with_progress(
+            self, "Applying User Decisions", _apply_run, on_success=_on_apply_success, on_error=_on_apply_error,
+        )
+        self._active_threads.append(thread)
+        thread.finished.connect(lambda: self._active_threads.remove(thread) if thread in self._active_threads else None)
+
     # -- auto crop --------------------------------------------------------------
 
     def _auto_crop(self) -> None:
@@ -1489,7 +1584,7 @@ class MainWindow(QMainWindow):
         the dashboard open while switching back to Review/the Loupe -
         browsing past experiments is a reference task, not a blocking
         workflow step, unlike Organize by Species's own dialog."""
-        dialog = AnalyticsDashboard(parent=self)
+        dialog = AnalyticsDashboard(settings=self._settings, parent=self)
         dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         dialog.show()
 

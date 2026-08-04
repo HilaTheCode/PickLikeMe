@@ -56,17 +56,18 @@ class ThumbnailCardDelegate(QAbstractItemDelegate):
         self._button_font = QFont()
         self._button_font.setPointSize(9)
         self._button_font.setBold(True)
-        # None (the default) means "tint by review status" - see
-        # MainWindow.color_source_options. Otherwise a strategy id whose
-        # score tints the background instead; set via set_color_source.
+        # None (the default) means "no algorithm fallback for Priority #2
+        # of the coloring policy" - see MainWindow.color_source_options and
+        # _get_background_color's own docstring. Otherwise a strategy id -
+        # set via set_color_source, kept in sync with ReviewSession.
+        # burst_strategy by MainWindow._on_color_source_changed, which is
+        # what ImageItem.algorithm_suggestion is itself computed against.
         self._color_source: str | None = None
-        self._score_range: tuple[float, float] | None = None
         # Off by default - see set_show_burst_badge / GalleryView.set_show_burst_badges.
         self._show_burst_badge = False
 
-    def set_color_source(self, strategy_id: str | None, score_range: tuple[float, float] | None) -> None:
+    def set_color_source(self, strategy_id: str | None) -> None:
         self._color_source = strategy_id
-        self._score_range = score_range
 
     def set_show_burst_badge(self, enabled: bool) -> None:
         self._show_burst_badge = enabled
@@ -315,33 +316,36 @@ class ThumbnailCardDelegate(QAbstractItemDelegate):
             painter.drawText(btn_rect, Qt.AlignmentFlag.AlignCenter, STATUS_SYMBOLS[status])
 
     def _get_background_color(self, palette: theme.Palette, item, is_hovered: bool) -> QColor:
-        if self._color_source is not None:
-            return self._score_background_color(palette, item, is_hovered)
+        """The explicit, deterministic coloring policy: the photographer's
+        own review_status always wins - Keep/Reject render in their fixed
+        colors regardless of any algorithm score, exactly as if no Color
+        Source were selected at all. Only once an image has no User
+        Decision (still Neutral) does the currently selected Color Source
+        get a say, and even then as a binary keep/reject call - not a
+        score gradient - via ImageItem.algorithm_suggestion, which is
+        already computed against whichever strategy the Color Source
+        picker currently selects, at the current keep-percent threshold
+        (see ReviewSession.suggestions_for's own docstring). This is why a
+        moved threshold recolors the gallery automatically on the next
+        refresh with no separate logic here: algorithm_suggestion already
+        reflects it.
+
+        "Review Status" as the Color Source (self._color_source is None)
+        has no algorithm to fall back to for Priority #2 - an undecided
+        image simply stays neutral, exactly as it always has.
+        """
         if item.review_status == "keep":
             return QColor(palette.keep_bg)
         if item.review_status == "reject":
             return QColor(palette.reject_bg)
+        if self._color_source is not None:
+            if item.algorithm_suggestion == "keep":
+                return QColor(palette.keep_bg)
+            if item.algorithm_suggestion == "reject":
+                return QColor(palette.reject_bg)
         if is_hovered:
             return QColor(palette.hover_bg)
         return QColor(palette.neutral_bg)
-
-    def _score_background_color(self, palette: theme.Palette, item, is_hovered: bool) -> QColor:
-        """A low-to-high gradient (reject color -> keep color) across
-        `self._score_range`, for scanning a strategy's ranking at a glance
-        without sorting by it. An image that strategy never scored - never
-        ran, or filtered it out - falls back to the plain neutral/hover
-        color, same as an unranked image does in the default coloring."""
-        score = item.score_for(self._color_source)
-        if score is None or self._score_range is None:
-            return QColor(palette.hover_bg) if is_hovered else QColor(palette.neutral_bg)
-        low, high = self._score_range
-        fraction = 0.5 if high - low <= 1e-12 else max(0.0, min(1.0, (score - low) / (high - low)))
-        low_color, high_color = QColor(palette.reject_bg), QColor(palette.keep_bg)
-        return QColor(
-            round(low_color.red() + (high_color.red() - low_color.red()) * fraction),
-            round(low_color.green() + (high_color.green() - low_color.green()) * fraction),
-            round(low_color.blue() + (high_color.blue() - low_color.blue()) * fraction),
-        )
 
     @staticmethod
     def _status_color(palette: theme.Palette, status: str) -> QColor:
