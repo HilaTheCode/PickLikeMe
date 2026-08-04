@@ -571,6 +571,10 @@ class EyePoseV0EyeDetector:
             accepted=accepted,
             head_confidence=detection_confidence,
             head_visible=head_ok,
+            beak=landmarks.get("beak"),
+            head_top=landmarks.get("head_top"),
+            left_shoulder=landmarks.get("left_shoulder"),
+            right_shoulder=landmarks.get("right_shoulder"),
         )
 
     def _predict(self, crop_rgb: np.ndarray) -> tuple[float, dict[str, EyeKeypoint]] | None:

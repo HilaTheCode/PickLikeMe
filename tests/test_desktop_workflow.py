@@ -57,12 +57,13 @@ def test_import_selected_requires_open_folder(tmp_path) -> None:
 
 
 def test_preview_ground_truth_import_reports_counts_without_writing(tmp_path) -> None:
-    keep_folder = tmp_path / "Keep"
-    keep_folder.mkdir()
+    root = tmp_path / "Shoot"
+    keep_folder = root / "Selected"
+    keep_folder.mkdir(parents=True)
     _make_jpeg(keep_folder / "a.jpg")
 
     service = ReviewService(db_path=tmp_path / "annotations.sqlite")
-    result = service.preview_ground_truth_import(keep_folder=keep_folder)
+    result = service.preview_ground_truth_import(root_folder=root, keep_folders=[keep_folder])
 
     assert result["totals"]["keep"] == 1
     assert result["totals"]["will_change"] == 1
@@ -71,15 +72,34 @@ def test_preview_ground_truth_import_reports_counts_without_writing(tmp_path) ->
     service.close()
 
 
+def test_preview_ground_truth_import_infers_neutral_with_no_folder_selection(tmp_path) -> None:
+    """Version 2 workflow: Neutral is never folder-selected - everything
+    under root_folder not inside a selected Keep/Reject subfolder is
+    automatically Neutral."""
+    root = tmp_path / "Shoot"
+    keep_folder = root / "Selected"
+    keep_folder.mkdir(parents=True)
+    _make_jpeg(keep_folder / "a.jpg")
+    _make_jpeg(root / "b.jpg")  # not under any selected folder
+
+    service = ReviewService(db_path=tmp_path / "annotations.sqlite")
+    result = service.preview_ground_truth_import(root_folder=root, keep_folders=[keep_folder])
+
+    assert result["totals"]["keep"] == 1
+    assert result["totals"]["neutral"] == 1
+    service.close()
+
+
 def test_apply_ground_truth_import_writes_the_previewed_plan_and_refreshes_state(tmp_path) -> None:
     from picklikeme.analyzer.annotations import REVIEW_KEEP
 
-    keep_folder = tmp_path / "Keep"
-    keep_folder.mkdir()
+    root = tmp_path / "Shoot"
+    keep_folder = root / "Selected"
+    keep_folder.mkdir(parents=True)
     _make_jpeg(keep_folder / "a.jpg")
 
     service = ReviewService(db_path=tmp_path / "annotations.sqlite")
-    service.preview_ground_truth_import(keep_folder=keep_folder)
+    service.preview_ground_truth_import(root_folder=root, keep_folders=[keep_folder])
     result = service.apply_ground_truth_import()
 
     assert result["updated_keep"] == 1
@@ -374,26 +394,71 @@ def test_rank_dialog_returns_selected_values() -> None:
 
 
 @pytest.mark.skipif(QApplication is None, reason="PySide6 not installed")
-def test_ground_truth_dialog_folders_are_all_optional_and_ok_disabled_until_one_is_set(tmp_path) -> None:
+def test_ground_truth_dialog_shows_root_and_starts_with_empty_keep_reject_lists(tmp_path) -> None:
     from picklikeme.desktop.dialogs.workflow_dialogs import SetUserDecisionsBySubfoldersDialog
-    from PySide6.QtWidgets import QDialogButtonBox
 
     app = QApplication.instance() or QApplication([])
-    dialog = SetUserDecisionsBySubfoldersDialog()
+    root = tmp_path / "Shoot"
+    dialog = SetUserDecisionsBySubfoldersDialog(root_folder=str(root))
 
-    ok_button = dialog._buttons.button(QDialogButtonBox.StandardButton.Ok)
-    assert ok_button.isEnabled() is False
-    assert dialog.keep_folder() is None
-    assert dialog.reject_folder() is None
-    assert dialog.neutral_folder() is None
+    assert dialog.root_folder() == str(root)
+    assert dialog.keep_folders() == []
+    assert dialog.reject_folders() == []
+    dialog.close()
+    app.quit()
 
-    keep_dir = tmp_path / "Keep"
-    keep_dir.mkdir()
-    dialog._keep_edit.setText(str(keep_dir))
-    dialog._update_ok_enabled()
 
-    assert ok_button.isEnabled() is True
-    assert dialog.keep_folder() == str(keep_dir)
+@pytest.mark.skipif(QApplication is None, reason="PySide6 not installed")
+def test_ground_truth_dialog_add_and_remove_multiple_keep_and_reject_folders(tmp_path) -> None:
+    from PySide6.QtWidgets import QListWidgetItem
+
+    from picklikeme.desktop.dialogs.workflow_dialogs import SetUserDecisionsBySubfoldersDialog
+
+    app = QApplication.instance() or QApplication([])
+    root = tmp_path / "Shoot"
+    favorites = root / "Favorites"
+    portfolio = root / "Portfolio"
+    rejected = root / "Rejected"
+    for folder in (favorites, portfolio, rejected):
+        folder.mkdir(parents=True)
+
+    dialog = SetUserDecisionsBySubfoldersDialog(root_folder=str(root))
+
+    dialog._keep_list.addItem(QListWidgetItem(str(favorites)))
+    dialog._keep_list.addItem(QListWidgetItem(str(portfolio)))
+    dialog._reject_list.addItem(QListWidgetItem(str(rejected)))
+
+    assert dialog.keep_folders() == [str(favorites), str(portfolio)]
+    assert dialog.reject_folders() == [str(rejected)]
+
+    dialog._keep_list.item(0).setSelected(True)
+    dialog._remove_selected(dialog._keep_list)
+
+    assert dialog.keep_folders() == [str(portfolio)]
+    dialog.close()
+    app.quit()
+
+
+@pytest.mark.skipif(QApplication is None, reason="PySide6 not installed")
+def test_ground_truth_dialog_add_folder_browses_and_deduplicates(tmp_path, monkeypatch) -> None:
+    from picklikeme.desktop.dialogs import workflow_dialogs as workflow_dialogs_module
+    from picklikeme.desktop.dialogs.workflow_dialogs import SetUserDecisionsBySubfoldersDialog
+
+    app = QApplication.instance() or QApplication([])
+    root = tmp_path / "Shoot"
+    favorites = root / "Favorites"
+    favorites.mkdir(parents=True)
+
+    monkeypatch.setattr(
+        workflow_dialogs_module.QFileDialog, "getExistingDirectory",
+        staticmethod(lambda *a, **k: str(favorites)),
+    )
+
+    dialog = SetUserDecisionsBySubfoldersDialog(root_folder=str(root))
+    dialog._add_folder(dialog._keep_list)  # real Browse… flow, via the monkeypatched file dialog
+    dialog._add_folder(dialog._keep_list)  # picking the same folder again must not duplicate it
+
+    assert dialog.keep_folders() == [str(favorites)]
     dialog.close()
     app.quit()
 

@@ -53,6 +53,41 @@ def test_main_window_can_be_created() -> None:
 
 
 @pytest.mark.skipif(QApplication is None, reason="PySide6 not installed")
+def test_about_dialog_shows_the_actual_running_git_commit_and_version(monkeypatch) -> None:
+    """The concrete, verifiable "am I running the build I think I am" check
+    - reads the real git commit fresh (never a value baked in at process
+    start), so a photographer can compare it against `git rev-parse HEAD`
+    themselves rather than trusting a visual impression of the UI."""
+    import subprocess
+
+    from PySide6.QtWidgets import QMessageBox
+
+    app = QApplication.instance() or QApplication([])
+    state = ApplicationState()
+    settings = DesktopSettings()
+    service = ReviewService(db_path=":memory:")
+    window = MainWindow(state=state, settings=settings, service=service, worker_manager=WorkerManager())
+    window.initialize()
+
+    shown = {}
+    monkeypatch.setattr(
+        QMessageBox, "about",
+        staticmethod(lambda parent, title, text: shown.update(title=title, text=text)),
+    )
+    window._show_about()
+
+    actual_commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"], capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    assert actual_commit in shown["text"]
+    assert "Git commit:" in shown["text"]
+    assert "Application version:" in shown["text"]
+
+    service.close()
+    app.quit()
+
+
+@pytest.mark.skipif(QApplication is None, reason="PySide6 not installed")
 def test_desktop_application_can_initialize_and_open_folder(tmp_path) -> None:
     app = DesktopApplication(db_path=tmp_path / "annotations.sqlite")
     app.initialize()
@@ -86,6 +121,56 @@ def test_main_window_can_apply_review_status(tmp_path) -> None:
 
     assert state.current_selection == [str(image_path.resolve())]
     assert service.session.images[0].review_status == "keep"
+
+    window.close()
+
+
+@pytest.mark.skipif(QApplication is None, reason="PySide6 not installed")
+def test_changing_a_review_decision_never_moves_the_gallery_scroll_position(tmp_path) -> None:
+    """Regression test: a decision change (a single card's Keep/Reject
+    button, or the keyboard/toolbar bulk path - both funnel through
+    apply_review_status) used to jump the gallery straight back to the top
+    every time, because _apply_filter's ImageModel.set_items() always does
+    a full beginResetModel()/endResetModel() - Qt has no way to know "this
+    is the same content, just redecorated" across a full reset, and drops
+    scroll position to 0. Reviewing anything past the first screenful of a
+    large folder was unusable as a result. The fix restores the scrollbar
+    value on the next event-loop turn (the reset's layout recalculation is
+    not necessarily synchronous, so restoring immediately can be clamped
+    against a stale range and silently discarded)."""
+    from PIL import Image
+
+    app = QApplication.instance() or QApplication([])
+    state = ApplicationState()
+    settings = DesktopSettings()
+    service = ReviewService(db_path=tmp_path / "annotations.sqlite")
+    window = MainWindow(state=state, settings=settings, service=service, worker_manager=WorkerManager())
+    window.resize(500, 400)
+    window.show()
+
+    folder = tmp_path / "review"
+    folder.mkdir()
+    paths = []
+    for i in range(80):  # enough rows that the grid genuinely scrolls
+        path = folder / f"img_{i:03d}.jpg"
+        Image.new("RGB", (8, 8), color="blue").save(path, format="JPEG")
+        paths.append(path)
+
+    window.open_folder(str(folder))
+    app.processEvents()
+
+    scrollbar = window._gallery_view.verticalScrollBar()
+    assert scrollbar.maximum() > 0, "the seeded gallery must actually be tall enough to scroll"
+    scrollbar.setValue(scrollbar.maximum() // 2)
+    app.processEvents()
+    scrolled_to = scrollbar.value()
+    assert scrolled_to > 0
+
+    window.apply_review_status("reject", paths=[str(paths[5])])
+    app.processEvents()  # lets the deferred restore (QTimer.singleShot(0, ...)) fire
+
+    assert service.session._image_for(str(paths[5])).review_status == "reject"
+    assert scrollbar.value() == scrolled_to
 
     window.close()
 

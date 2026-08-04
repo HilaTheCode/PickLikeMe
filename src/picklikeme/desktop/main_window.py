@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import QModelIndex, QSize, Qt, QSettings, QThreadPool
+from PySide6.QtCore import QModelIndex, QSize, Qt, QSettings, QThreadPool, QTimer
 from PySide6.QtGui import QAction, QActionGroup, QIcon, QKeySequence, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -1181,7 +1181,32 @@ class MainWindow(QMainWindow):
             self._set_status(f"Marked {Path(paths[0]).name} as {status}")
         else:
             self._set_status(f"Marked {len(paths)} images as {status}")
-        self._refresh_from_state(self.service.load_session())
+        self._refresh_preserving_scroll(self.service.load_session())
+
+    def _refresh_preserving_scroll(self, state: dict[str, Any]) -> None:
+        """Same as `_refresh_from_state`, except the gallery's scroll
+        position survives it. `_apply_filter` (which `_refresh_from_state`
+        always ends up calling) rebuilds the gallery model via
+        `ImageModel.set_items` - a full `beginResetModel`/`endResetModel` -
+        every time, because the filtered/sorted set can genuinely change
+        shape (a filter that excludes on review_status, a sort keyed by
+        it). Qt has no way to know "this is the same content, just
+        redecorated" across a full reset, so it drops the scroll position
+        to 0 - previously true even for the single most common action in
+        the whole app, clicking one card's Keep/Reject button, making
+        reviewing anything past the first screenful of a large folder
+        actively painful (see the regression test for the exact repro).
+
+        The restore is deferred one event-loop turn (`QTimer.singleShot`)
+        rather than applied immediately: the scrollbar's range is not
+        necessarily recomputed synchronously inside `endResetModel()` -
+        setting the value immediately can be clamped against the OLD
+        range and silently discarded once the real layout catches up.
+        """
+        scrollbar = self._gallery_view.verticalScrollBar()
+        saved_scroll = scrollbar.value()
+        self._refresh_from_state(state)
+        QTimer.singleShot(0, lambda: scrollbar.setValue(saved_scroll))
 
     def _on_card_decision(self, path: str, status: str) -> None:
         """A card's own Keep/Reject/Neutral button was clicked directly."""
@@ -1454,20 +1479,26 @@ class MainWindow(QMainWindow):
     # -- set user decisions by subfolders (Ground Truth) -------------------------
 
     def _set_user_decisions_by_subfolders(self) -> None:
-        """Never requires an open folder - unlike every other Tools action,
-        this operates entirely on whatever Keep/Reject/Neutral folders the
-        photographer points at, independent of what is currently open for
-        review (see ground_truth.py's own module docstring)."""
-        dialog = SetUserDecisionsBySubfoldersDialog(parent=self)
+        """Version 2 workflow (see ground_truth.py's own module docstring):
+        Keep/Reject each accept multiple subfolders of the Root Folder;
+        Neutral is inferred automatically for everything else under it.
+        The Root Folder is always the currently open review folder - one
+        walk of it is what makes "everything not in Keep/Reject" a
+        well-defined set at all, so unlike the rest of this method's
+        sibling Tools actions, this one now requires a folder to be open."""
+        if not self.state.current_folder:
+            self._set_status("Open a folder before using Set User Decisions by Subfolders")
+            return
+        dialog = SetUserDecisionsBySubfoldersDialog(root_folder=self.state.current_folder, parent=self)
         if dialog.exec() != SetUserDecisionsBySubfoldersDialog.DialogCode.Accepted:
             return
-        keep_folder = dialog.keep_folder()
-        reject_folder = dialog.reject_folder()
-        neutral_folder = dialog.neutral_folder()
+        root_folder = dialog.root_folder()
+        keep_folders = dialog.keep_folders()
+        reject_folders = dialog.reject_folders()
 
         def _preview_run(on_progress=None, on_stage=None):
             return self.service.preview_ground_truth_import(
-                keep_folder=keep_folder, reject_folder=reject_folder, neutral_folder=neutral_folder,
+                root_folder=root_folder, keep_folders=keep_folders, reject_folders=reject_folders,
                 on_progress=on_progress,
             )
 
@@ -1583,13 +1614,45 @@ class MainWindow(QMainWindow):
         """Non-modal (`.show()`, not `.exec()`) so a photographer can keep
         the dashboard open while switching back to Review/the Loupe -
         browsing past experiments is a reference task, not a blocking
-        workflow step, unlike Organize by Species's own dialog."""
-        dialog = AnalyticsDashboard(settings=self._settings, parent=self)
+        workflow step, unlike Organize by Species's own dialog.
+
+        The live Review context (Root Folder, Color Source, Keep
+        Threshold) is a snapshot of "right now" - a fresh dashboard is
+        constructed every time this is opened (never reused), so it is
+        never more than one click stale."""
+        dialog = AnalyticsDashboard(
+            settings=self._settings,
+            root_folder=self.state.current_folder,
+            color_source=self._color_source,
+            keep_percent=self.service.session.keep_percent,
+            parent=self,
+        )
         dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         dialog.show()
 
     def _show_about(self) -> None:
-        QMessageBox.about(self, "About PeakPic", "PeakPic Desktop\nNative desktop shell powered by the existing backend.")
+        """Answers "am I actually running the build I think I am" without
+        guessing - the exact git commit and installed package version this
+        running process was imported from, read fresh every time this is
+        opened (never cached at startup), so it reflects the actual code
+        currently executing, not whatever was true when the process began.
+        Reuses analytics.environment's resolvers rather than re-implementing
+        "how do I find the git commit" a second time."""
+        from pathlib import Path
+
+        from ..analytics.environment import resolve_application_version, resolve_git_commit
+
+        commit = resolve_git_commit()
+        version = resolve_application_version()
+        module_path = Path(__file__).resolve().parents[1]  # .../src/picklikeme
+        QMessageBox.about(
+            self,
+            "About PeakPic",
+            "PeakPic Desktop\nNative desktop shell powered by the existing backend.\n\n"
+            f"Git commit: {commit or 'unknown (not a git checkout, or git unavailable)'}\n"
+            f"Application version: {version or 'unknown'}\n"
+            f"Running from: {module_path}",
+        )
 
     def _set_status(self, message: str) -> None:
         self.state.status_message = message

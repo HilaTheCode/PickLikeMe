@@ -33,9 +33,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import QSettings, Qt, Signal
-from PySide6.QtGui import QPixmap
+from PySide6.QtCore import QRectF, QSettings, Qt, Signal
+from PySide6.QtGui import QColor, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
+    QButtonGroup,
+    QCheckBox,
     QDialog,
     QDoubleSpinBox,
     QFrame,
@@ -46,6 +48,7 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QLineEdit,
     QPushButton,
+    QRadioButton,
     QSplitter,
     QStackedWidget,
     QTableWidget,
@@ -56,11 +59,13 @@ from PySide6.QtWidgets import (
 )
 
 from ...analyzer.annotations import DEFAULT_ANNOTATIONS_DB, AnnotationStore
+from ...analyzer.contactsheets import EYE_BOX_ACCEPTED, EYE_BOX_REJECTED, OTHER_BOX, SELECTED_BOX
 from ...analytics.agreement import AgreementReport, compare_run_to_user_decisions
 from ...analytics.reports import metric_statistics, run_statistics
 from ...analytics.store import DEFAULT_ANALYTICS_DB, AnalyticsStore
 from ...bird_crop import crop_cache_path
 from ...config import DEFAULT_CROP_CACHE_DIR
+from ...review.thumbnails import detection_boxes_for, eye_keypoints_for
 
 _THUMBNAIL_SIZE = 320
 
@@ -174,6 +179,87 @@ class SummaryCard(QFrame):
         self._value_label.setText(value)
 
 
+class DashboardHeaderPanel(QWidget):
+    """"The dashboard should immediately communicate what dataset is
+    currently being analyzed" (Phase 3's own mandate) - a single, always-
+    visible banner combining the LIVE Review context (Root Folder, Color
+    Source, Keep Threshold - whatever MainWindow currently has set,
+    independent of any experiment selection) with facts about whichever
+    experiment is currently selected (Algorithm, Ground Truth Coverage,
+    Number of Images). Distinct from ExperimentMetadataPanel below it,
+    which is the full per-run detail table - this is the glanceable
+    summary above it, always visible even before any run is selected.
+    """
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self._root_folder: str | None = None
+        self._scope_label_text = "Entire Analytics Database"
+
+        self._context_label = QLabel(self)
+        self._context_label.setWordWrap(True)
+        self._context_label.setStyleSheet("color: palette(mid);")
+
+        self._dataset_card = SummaryCard("Dataset", self)
+        self._algorithm_card = SummaryCard("Algorithm", self)
+        self._color_source_card = SummaryCard("Color Source", self)
+        self._threshold_card = SummaryCard("Keep Threshold", self)
+        self._coverage_card = SummaryCard("Ground Truth Coverage", self)
+        self._image_count_card = SummaryCard("Number of Images", self)
+        cards_row = QHBoxLayout()
+        for card in (
+            self._dataset_card, self._algorithm_card, self._color_source_card,
+            self._threshold_card, self._coverage_card, self._image_count_card,
+        ):
+            cards_row.addWidget(card)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self._context_label)
+        layout.addLayout(cards_row)
+
+    def set_live_context(
+        self, *, root_folder: str | None, color_source: str | None, keep_percent: float | None, scope_label: str,
+    ) -> None:
+        """The part that never depends on which experiment (if any) is
+        selected - called once at dialog construction and again whenever
+        the Scope selector changes, so the header is accurate even before
+        the photographer has clicked an experiment yet."""
+        self._root_folder = root_folder
+        self._scope_label_text = scope_label
+        self._dataset_card.set_value(Path(root_folder).name if root_folder else "(none)")
+        self._color_source_card.set_value(_strategy_label_or_review_status(color_source))
+        self._threshold_card.set_value(f"{keep_percent:.0f}%" if keep_percent is not None else "n/a")
+        self._update_context_label()
+        # An experiment may no longer be selected after a Scope change -
+        # the run-specific cards must not keep showing stale data.
+        self._algorithm_card.set_value("—")
+        self._coverage_card.set_value("—")
+        self._image_count_card.set_value("—")
+
+    def _update_context_label(self) -> None:
+        root = self._root_folder or "(no folder open)"
+        self._context_label.setText(f"Root Folder: {root}      |      Analytics Scope: {self._scope_label_text}")
+
+    def show_run(
+        self, analytics_store: AnalyticsStore, annotation_store: AnnotationStore, run_id: str,
+    ) -> None:
+        run = analytics_store.get_run(run_id) or {}
+        self._algorithm_card.set_value(_friendly_strategy_label(run.get("strategy_id", "")))
+        self._image_count_card.set_value(str(run.get("considered", 0)))
+
+        from ...analytics.agreement import compare_run_to_user_decisions
+
+        report = compare_run_to_user_decisions(analytics_store, annotation_store, run_id)
+        covered = report.compared
+        total = report.compared + report.neutral
+        self._coverage_card.set_value(f"{100 * covered / total:.0f}%" if total else "n/a")
+
+
+def _strategy_label_or_review_status(strategy_id: str | None) -> str:
+    return "Review Status" if strategy_id is None else _friendly_strategy_label(strategy_id)
+
+
 class ExperimentMetadataPanel(QWidget):
     """"The user should immediately know exactly how the experiment was
     produced" - shown above the tabs (not buried inside one of them) so it
@@ -181,18 +267,43 @@ class ExperimentMetadataPanel(QWidget):
     RunSummaryTab's own generic table already dumps every recorded param;
     this shows only the well-known "what produced this" fields, in a fixed
     reading order, and only the ones this particular run actually has (see
-    _METADATA_PARAM_FIELDS)."""
+    _METADATA_PARAM_FIELDS).
+
+    Collapsible, defaulting to collapsed - manual QA on DashboardHeaderPanel
+    found that Device/Images Processed/Experiment Date and the rest of this
+    table's technical, rarely-changing metadata was eating vertical space
+    the analysis tabs need more (Run Summary, User vs Algorithm - the
+    actual "understand the algorithm" content this dashboard exists for).
+    The header panel above already surfaces the frequently-useful subset
+    (Algorithm, Number of Images) as prominent cards; this stays available
+    one click away for the rest, rather than disappearing into a separate
+    dialog - still "above the tabs", just not competing with them for
+    space by default.
+    """
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
+        self._toggle_button = QPushButton("▸ Experiment Details", self)
+        self._toggle_button.setCheckable(True)
+        self._toggle_button.setChecked(False)
+        self._toggle_button.setFlat(True)
+        self._toggle_button.setStyleSheet("text-align: left; border: none; padding: 2px 0;")
+        self._toggle_button.toggled.connect(self._on_toggled)
+
         self._table = QTableWidget(self)
         self._table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self._table.setMaximumHeight(150)
+        self._table.setVisible(False)
         _style_table(self._table)
+
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.addWidget(QLabel("Experiment Metadata", self))
+        layout.addWidget(self._toggle_button)
         layout.addWidget(self._table)
+
+    def _on_toggled(self, expanded: bool) -> None:
+        self._table.setVisible(expanded)
+        self._toggle_button.setText(("▾" if expanded else "▸") + " Experiment Details")
 
     def show_run(self, store: AnalyticsStore, run_id: str) -> None:
         run = store.get_run(run_id) or {}
@@ -535,16 +646,62 @@ class SpeciesAnalysisTab(QWidget):
         self._table.setSortingEnabled(True)
 
 
+# The four processing-stage rectangles "Show Boxes" draws - each its own
+# colour/style so overlapping stages stay visually distinguishable, matching
+# the same palette review_thumbnail's own overlay and the Loupe already use
+# (see analyzer.contactsheets and loupe_dialog.py) rather than inventing a
+# second one. This codebase's DetectionRecord only tracks two subject-box
+# stages - the tight detector box and the margin-grown box that was actually
+# cropped and cached - so "Expanded Crop" and "Final Crop" (Issue 3's own
+# four-way list) are the same rectangle here; see the class docstring's
+# Known Limitations note.
+_DETECTION_BOX_PEN = QPen(QColor(*SELECTED_BOX), 2)
+_EXPANDED_CROP_PEN = QPen(QColor(*OTHER_BOX), 2, Qt.PenStyle.DashLine)
+
+# The six landmarks "Show Landmarks" draws - name, the eye_keypoints_for()
+# dict key holding it, and a colour distinct from every box colour above so
+# boxes and landmarks never get confused when both overlays are on at once.
+_LANDMARK_STYLE: tuple[tuple[str, str, tuple[int, int, int]], ...] = (
+    ("Left Eye", "left", (56, 189, 248)),
+    ("Right Eye", "right", (251, 146, 60)),
+    ("Beak", "beak", (250, 204, 21)),
+    ("Head", "head_top", (226, 232, 240)),
+    ("Left Shoulder", "left_shoulder", (167, 139, 250)),
+    ("Right Shoulder", "right_shoulder", (192, 132, 252)),
+)
+
+
 class ImageInspectorTab(QWidget):
     """For every classified image: original, crop (best-effort - not every
     backend uses one, see docs/Species_Classification_Investigation.md),
-    every recorded metric generically, backend, experiment ID, runtime."""
+    every recorded metric generically, backend, experiment ID, runtime -
+    plus two independent debugging overlays on the Original image (Manual QA
+    Issue 3): "Show Detection / Crop Boxes" and "Show Landmarks", each its
+    own checkbox, each freely combinable with the other.
+
+    Known limitations:
+    - Landmarks (and Eye ROI) are only available for images a Classic Vision
+      run scored with EyePose-v0 specifically - SuperAnimal-Bird locates only
+      the eye, so beak/head/shoulders are never available for it, and
+      neither backend's result is available at all for an image no Classic
+      Vision run ever processed.
+    - "Expanded Crop" and "Final Crop" render as the same rectangle: this
+      codebase's crop pipeline (bird_crop.CropResult/DetectionRecord) only
+      ever records one margin-grown box per image - the region that was both
+      "the crop after expansion" and "the crop actually cached" - it never
+      tracked those as two separate stages to begin with.
+    - A pre-v3 cached eye record (see eyes.cache.EYE_CACHE_VERSION) has no
+      beak/head/shoulder landmarks on disk yet; re-running Classic Vision
+      regenerates it with them.
+    """
 
     def __init__(self, *, crop_cache_dir: Path, parent=None) -> None:
         super().__init__(parent)
         self._crop_cache_dir = crop_cache_dir
         self._store: AnalyticsStore | None = None
         self._run_id: str | None = None
+        self._current_image_path: str | None = None
+        self._current_full_pixmap: QPixmap | None = None
 
         self._image_list = QListWidget(self)
         self._image_list.setAlternatingRowColors(True)
@@ -561,13 +718,29 @@ class ImageInspectorTab(QWidget):
         images_row.addWidget(self._original_label)
         images_row.addWidget(self._crop_label)
 
+        self._show_boxes_checkbox = QCheckBox("Show Detection / Crop Boxes", self)
+        self._show_landmarks_checkbox = QCheckBox("Show Landmarks", self)
+        self._show_boxes_checkbox.toggled.connect(self._refresh_original_display)
+        self._show_landmarks_checkbox.toggled.connect(self._refresh_original_display)
+        overlay_row = QHBoxLayout()
+        overlay_row.addWidget(self._show_boxes_checkbox)
+        overlay_row.addWidget(self._show_landmarks_checkbox)
+        overlay_row.addStretch(1)
+
         self._metrics_table = QTableWidget(self)
         self._metrics_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         _style_table(self._metrics_table)
 
+        self._landmarks_table = QTableWidget(self)
+        self._landmarks_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        _style_table(self._landmarks_table)
+
         detail_column = QVBoxLayout()
         detail_column.addLayout(images_row)
+        detail_column.addLayout(overlay_row)
         detail_column.addWidget(self._metrics_table)
+        detail_column.addWidget(QLabel("Landmarks", self))
+        detail_column.addWidget(self._landmarks_table)
 
         splitter = QSplitter(self)
         list_container = QWidget(self)
@@ -602,9 +775,12 @@ class ImageInspectorTab(QWidget):
         if self._image_list.count():
             self._image_list.setCurrentRow(0)
         else:
+            self._current_image_path = None
+            self._current_full_pixmap = None
             self._original_label.setText("(no images in this selection)")
             self._crop_label.setText("")
             self._metrics_table.setRowCount(0)
+            self._landmarks_table.setRowCount(0)
 
     def _on_image_selected(self, current: QListWidgetItem | None, _previous) -> None:
         if current is None or self._store is None or self._run_id is None:
@@ -612,16 +788,10 @@ class ImageInspectorTab(QWidget):
         image_path = current.data(Qt.ItemDataRole.UserRole)
         run = self._store.get_run(self._run_id) or {}
 
-        original_pixmap = self._load_pixmap(self._original_pixmap_path(image_path))
-        if original_pixmap.isNull():
-            # Most often: this run also moved the file (Organize by Species
-            # relocates every image it classifies) - the path recorded at
-            # classification time no longer points at anything, a known
-            # limitation, not a crash - see docs/BioCLIP_Backend_
-            # Infrastructure_Deliverables.md's "remaining technical debt".
-            self._original_label.setText(f"Original not available\n({Path(image_path).name} may have moved)")
-        else:
-            self._original_label.setPixmap(original_pixmap)
+        self._current_image_path = image_path
+        self._current_full_pixmap = self._load_full_pixmap(self._original_pixmap_path(image_path))
+        self._refresh_original_display()
+
         crop_path = crop_cache_path(self._crop_cache_dir, image_path)
         if crop_path.is_file():
             self._crop_label.setPixmap(self._load_pixmap(crop_path))
@@ -638,6 +808,124 @@ class ImageInspectorTab(QWidget):
             rows.append((name, f"{value:.4f}"))
         _fill_two_column_table(self._metrics_table, rows)
 
+    def _refresh_original_display(self) -> None:
+        """Redraws the Original panel from the already-loaded full-resolution
+        pixmap plus whichever overlay checkboxes are currently checked - runs
+        both on image selection and on every checkbox toggle, without
+        re-reading the image file each time."""
+        image_path = self._current_image_path
+        full_pixmap = self._current_full_pixmap
+        if image_path is None or full_pixmap is None or full_pixmap.isNull():
+            if image_path is not None:
+                self._original_label.setText(f"Original not available\n({Path(image_path).name} may have moved)")
+            self._landmarks_table.setRowCount(0)
+            return
+
+        display = full_pixmap.scaled(
+            _THUMBNAIL_SIZE, _THUMBNAIL_SIZE, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation
+        )
+        show_boxes = self._show_boxes_checkbox.isChecked()
+        show_landmarks = self._show_landmarks_checkbox.isChecked()
+        eye = None
+        if show_boxes or show_landmarks:
+            eye = eye_keypoints_for(image_path, crop_cache_dir=self._crop_cache_dir)
+        if show_boxes:
+            display = self._draw_boxes(display, image_path, eye)
+        if show_landmarks:
+            display = self._draw_landmarks(display, eye)
+            self._fill_landmark_table(eye)
+        else:
+            self._landmarks_table.setRowCount(0)
+        self._original_label.setPixmap(display)
+
+    def _draw_boxes(self, display: QPixmap, image_path: str, eye: dict | None) -> QPixmap:
+        """Detection Box / Expanded Crop / Eye ROI, each its own rectangle -
+        see the class docstring's Known Limitations for why "Expanded Crop"
+        and "Final Crop" are not drawn as two separate boxes here."""
+        boxes = detection_boxes_for(image_path)
+        source_size = (boxes or {}).get("source_size") or (eye or {}).get("source_size")
+        if source_size is None or not source_size[0] or not source_size[1]:
+            return display
+        scale_x = display.width() / source_size[0]
+        scale_y = display.height() / source_size[1]
+
+        def to_display(box) -> QRectF:
+            x1, y1, x2, y2 = box
+            return QRectF(x1 * scale_x, y1 * scale_y, (x2 - x1) * scale_x, (y2 - y1) * scale_y)
+
+        composed = QPixmap(display)
+        painter = QPainter(composed)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        try:
+            if boxes and boxes.get("selected"):
+                painter.setPen(_DETECTION_BOX_PEN)
+                painter.drawRect(to_display(boxes["selected"]["box"]))
+            if boxes and boxes.get("expanded_box"):
+                painter.setPen(_EXPANDED_CROP_PEN)
+                painter.drawRect(to_display(boxes["expanded_box"]))
+            if eye and eye.get("box"):
+                colour = EYE_BOX_ACCEPTED if eye.get("accepted") else EYE_BOX_REJECTED
+                pen = QPen(QColor(*colour), 2)
+                if not eye.get("accepted"):
+                    pen.setStyle(Qt.PenStyle.DashLine)
+                painter.setPen(pen)
+                painter.drawRect(to_display(eye["box"]))
+        finally:
+            painter.end()
+        return composed
+
+    def _draw_landmarks(self, display: QPixmap, eye: dict | None) -> QPixmap:
+        if not eye or not eye.get("source_size"):
+            return display
+        source_size = eye["source_size"]
+        scale_x = display.width() / source_size[0]
+        scale_y = display.height() / source_size[1]
+
+        composed = QPixmap(display)
+        painter = QPainter(composed)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        radius = 3.0
+        try:
+            for name, key, colour in _LANDMARK_STYLE:
+                point = eye.get(key)
+                if not point:
+                    continue
+                x, y = point["x"] * scale_x, point["y"] * scale_y
+                pen = QPen(QColor(*colour), 2)
+                painter.setPen(pen)
+                painter.setBrush(QColor(*colour))
+                painter.drawEllipse(QRectF(x - radius, y - radius, radius * 2, radius * 2))
+                painter.drawText(int(x) + 5, int(y) - 5, f"{name} {point['confidence']:.2f}")
+        finally:
+            painter.end()
+        return composed
+
+    def _fill_landmark_table(self, eye: dict | None) -> None:
+        """Name / Confidence / Position for every landmark that is actually
+        present - "if available" (Issue 3's own wording): a landmark this
+        image's detector never computed (or that no Classic Vision run has
+        recorded at all) simply does not get a row, rather than a fabricated
+        placeholder one."""
+        rows: list[tuple[str, str, str]] = []
+        if eye:
+            for name, key, _colour in _LANDMARK_STYLE:
+                point = eye.get(key)
+                if not point:
+                    continue
+                rows.append((name, f"{point['confidence']:.3f}", f"({point['x']:.1f}, {point['y']:.1f})"))
+        table = self._landmarks_table
+        table.setSortingEnabled(False)
+        table.setRowCount(len(rows))
+        table.setColumnCount(3)
+        table.setHorizontalHeaderLabels(["Landmark", "Confidence", "Position"])
+        for row_index, (name, confidence, position) in enumerate(rows):
+            table.setItem(row_index, 0, QTableWidgetItem(name))
+            table.setItem(row_index, 1, QTableWidgetItem(confidence))
+            table.setItem(row_index, 2, QTableWidgetItem(position))
+        table.resizeColumnsToContents()
+        table.horizontalHeader().setStretchLastSection(True)
+        table.setSortingEnabled(True)
+
     @staticmethod
     def _original_pixmap_path(image_path: str) -> Path | None:
         try:
@@ -647,10 +935,18 @@ class ImageInspectorTab(QWidget):
             return None
 
     @staticmethod
-    def _load_pixmap(path: Path | None) -> QPixmap:
+    def _load_full_pixmap(path: Path | None) -> QPixmap:
+        """Unscaled, so overlay coordinates (in the source frame's own pixel
+        space) can be mapped using a single width/height ratio computed
+        against the ACTUAL displayed size, rather than guessing what
+        `_load_pixmap`'s own KeepAspectRatio scale happened to produce."""
         if path is None or not Path(path).is_file():
             return QPixmap()
-        pixmap = QPixmap(str(path))
+        return QPixmap(str(path))
+
+    @classmethod
+    def _load_pixmap(cls, path: Path | None) -> QPixmap:
+        pixmap = cls._load_full_pixmap(path)
         if pixmap.isNull():
             return pixmap
         return pixmap.scaled(
@@ -673,6 +969,9 @@ class AnalyticsDashboard(QDialog):
         annotations_db: str | Path = DEFAULT_ANNOTATIONS_DB,
         crop_cache_dir: str | Path = DEFAULT_CROP_CACHE_DIR,
         settings: QSettings | None = None,
+        root_folder: str | None = None,
+        color_source: str | None = None,
+        keep_percent: float | None = None,
         parent=None,
     ) -> None:
         super().__init__(parent)
@@ -694,6 +993,37 @@ class AnalyticsDashboard(QDialog):
 
         self._store = AnalyticsStore(analytics_db)
         self._annotation_store = AnnotationStore(annotations_db)
+        # The live Review context this dashboard was opened with - never
+        # re-read afterward (MainWindow constructs a fresh dashboard each
+        # time it is opened, see _show_analytics_dashboard), so these stay
+        # exactly as accurate as "when I clicked Analytics Dashboard".
+        self._root_folder = root_folder
+        self._color_source = color_source
+        self._keep_percent = keep_percent
+
+        # Phase 2 - Analytics Scope: narrows the Experiment Browser to only
+        # runs recorded against the current Root Folder, or shows every run
+        # ever recorded. "Every analytics page must respect this selection"
+        # is satisfied structurally, not by separate logic per tab: every
+        # tab only ever shows data for whichever experiment is SELECTED,
+        # and Scope controls which experiments can be selected at all - see
+        # _refresh_experiment_list.
+        self._scope_current_root_radio = QRadioButton("Current Root Folder", self)
+        self._scope_entire_db_radio = QRadioButton("Entire Analytics Database", self)
+        scope_group = QButtonGroup(self)
+        scope_group.addButton(self._scope_current_root_radio)
+        scope_group.addButton(self._scope_entire_db_radio)
+        if root_folder:
+            self._scope_current_root_radio.setChecked(True)
+        else:
+            self._scope_current_root_radio.setEnabled(False)
+            self._scope_current_root_radio.setToolTip("No folder is currently open in Review")
+            self._scope_entire_db_radio.setChecked(True)
+        self._scope_current_root_radio.toggled.connect(self._on_scope_changed)
+        scope_row = QHBoxLayout()
+        scope_row.addWidget(QLabel("Scope:", self))
+        scope_row.addWidget(self._scope_current_root_radio)
+        scope_row.addWidget(self._scope_entire_db_radio)
 
         self._experiment_search = QLineEdit(self)
         self._experiment_search.setPlaceholderText("Search experiments (folder or algorithm)...")
@@ -707,6 +1037,7 @@ class AnalyticsDashboard(QDialog):
         refresh_button.clicked.connect(self._refresh_experiment_list)
 
         browser_column = QVBoxLayout()
+        browser_column.addLayout(scope_row)
         browser_column.addWidget(QLabel("Experiments (most recent first)", self))
         browser_column.addWidget(self._experiment_search)
         browser_column.addWidget(self._experiment_list)
@@ -714,6 +1045,11 @@ class AnalyticsDashboard(QDialog):
         browser_container = QWidget(self)
         browser_container.setLayout(browser_column)
 
+        self._header_panel = DashboardHeaderPanel(self)
+        self._header_panel.set_live_context(
+            root_folder=root_folder, color_source=color_source, keep_percent=keep_percent,
+            scope_label=self._current_scope_label(),
+        )
         self._metadata_panel = ExperimentMetadataPanel(self)
         self._user_vs_algorithm_tab = UserVsAlgorithmTab(self)
         self._user_vs_algorithm_tab.drillDownRequested.connect(self._on_drill_down)
@@ -761,7 +1097,8 @@ class AnalyticsDashboard(QDialog):
         splitter.setStretchFactor(1, 1)
 
         layout = QVBoxLayout(self)
-        layout.addWidget(splitter)
+        layout.addWidget(self._header_panel)
+        layout.addWidget(splitter, 1)
 
         self._refresh_experiment_list()
         if self._experiment_list.count():
@@ -771,6 +1108,21 @@ class AnalyticsDashboard(QDialog):
         has_experiments = self._experiment_list.count() > 0
         self._detail_stack.setCurrentIndex(0 if has_experiments else 1)
 
+    def _scope_is_current_root(self) -> bool:
+        return self._scope_current_root_radio.isChecked() and bool(self._root_folder)
+
+    def _current_scope_label(self) -> str:
+        if self._scope_is_current_root():
+            return "Current Root Folder"
+        return "Entire Analytics Database"
+
+    def _on_scope_changed(self) -> None:
+        self._header_panel.set_live_context(
+            root_folder=self._root_folder, color_source=self._color_source, keep_percent=self._keep_percent,
+            scope_label=self._current_scope_label(),
+        )
+        self._refresh_experiment_list()
+
     def _refresh_experiment_list(self) -> None:
         # Re-selects whatever run was showing before the rebuild (see
         # refresh_current_run's own docstring) - clicking Refresh after a
@@ -779,9 +1131,17 @@ class AnalyticsDashboard(QDialog):
         previously_selected = self._experiment_list.currentItem()
         previous_run_id = previously_selected.data(Qt.ItemDataRole.UserRole) if previously_selected else None
 
+        # Phase 2 - Analytics Scope: "Current Root Folder" narrows the list
+        # to runs recorded against exactly this folder (resolved, so a
+        # trailing slash or relative-vs-absolute spelling difference never
+        # silently hides a matching run) - every tab downstream only ever
+        # shows whichever run is selected, so narrowing the SELECTABLE set
+        # here is what makes "every analytics page respects this
+        # selection" true everywhere at once, not a per-tab filter.
+        scope_folder = str(Path(self._root_folder).resolve()) if self._scope_is_current_root() else None
         self._experiment_list.clear()
         restore_row = -1
-        for row, run in enumerate(self._store.list_runs()):
+        for row, run in enumerate(self._store.list_runs(folder=scope_folder)):
             label = f"{run['started_at']}  |  {_friendly_strategy_label(run['strategy_id'])}  |  {Path(run['folder']).name}"
             item = QListWidgetItem(label)
             item.setData(Qt.ItemDataRole.UserRole, run["run_id"])
@@ -806,6 +1166,7 @@ class AnalyticsDashboard(QDialog):
         if current is None:
             return
         run_id = current.data(Qt.ItemDataRole.UserRole)
+        self._header_panel.show_run(self._store, self._annotation_store, run_id)
         self._metadata_panel.show_run(self._store, run_id)
         self._user_vs_algorithm_tab.show_run(self._store, self._annotation_store, run_id)
         self._run_summary_tab.show_run(self._store, run_id)

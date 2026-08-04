@@ -23,6 +23,7 @@ from picklikeme.review.thumbnails import (
     _cache_entries,
     _enforce_cache_budget,
     detected_category_for,
+    detection_boxes_for,
     review_preview,
 )
 
@@ -63,6 +64,38 @@ class DetectedCategoryForTests(unittest.TestCase):
             detected_category_for("some/path.jpg")
             _, kwargs = detections.return_value.get.call_args
             self.assertFalse(kwargs.get("allow_detect", True))
+
+
+class DetectionBoxesForTests(unittest.TestCase):
+    """detection_boxes_for: the Image Inspector's "Show Boxes" overlay reads
+    this for its Detection Box / Expanded Crop rectangles (Eye ROI comes
+    from eye_keypoints_for instead - see EyeKeypointsForTests)."""
+
+    def test_includes_the_expanded_crop_box_alongside_the_tight_detection(self):
+        """Regression: the Image Inspector's overlay needs BOTH the tight
+        detection box and the margin-grown crop rectangle actually cached
+        (see DetectionRecord.expanded_box) to draw them as two distinct
+        rectangles, not merged into one - this used to be missing entirely,
+        only `selected`/`others` were exposed."""
+        selected = mock.Mock()
+        selected.as_dict.return_value = {"box": (10.0, 10.0, 20.0, 20.0)}
+        record = mock.Mock(
+            source_size=(100, 100), selected=selected, others=[], expanded_box=(5.0, 5.0, 25.0, 25.0),
+        )
+        with mock.patch("picklikeme.review.thumbnails._detections") as detections:
+            detections.return_value.get.return_value = record
+            result = detection_boxes_for("some/path.jpg")
+
+        self.assertEqual(result["expanded_box"], [5.0, 5.0, 25.0, 25.0])
+        self.assertEqual(result["selected"], {"box": (10.0, 10.0, 20.0, 20.0)})
+
+    def test_no_expanded_box_on_a_full_frame_fallback_is_none_not_a_crash(self):
+        record = mock.Mock(source_size=(100, 100), selected=None, others=[], expanded_box=None)
+        with mock.patch("picklikeme.review.thumbnails._detections") as detections:
+            detections.return_value.get.return_value = record
+            result = detection_boxes_for("some/path.jpg")
+
+        self.assertIsNone(result["expanded_box"])
 
 
 class EyeKeypointsForTests(unittest.TestCase):
@@ -125,6 +158,8 @@ class EyeKeypointsForTests(unittest.TestCase):
             box=(10.0, 20.0, 30.0, 40.0), confidence=0.95,
             left=EyeKeypoint(x=15.0, y=25.0, confidence=0.9),
             right=EyeKeypoint(x=18.0, y=22.0, confidence=0.4),
+            beak=EyeKeypoint(x=20.0, y=30.0, confidence=0.8),
+            head_top=EyeKeypoint(x=20.0, y=10.0, confidence=0.7),
         )
         # Deliberately different from expanded_box, so a test that still used
         # `selected` for the projection would fail this - proving the fix.
@@ -144,6 +179,16 @@ class EyeKeypointsForTests(unittest.TestCase):
         self.assertAlmostEqual(result["left"]["y"], 350.0)
         self.assertAlmostEqual(result["right"]["x"], 436.0)
         self.assertAlmostEqual(result["right"]["y"], 344.0)
+        # The other four landmarks go through the exact same to_frame()
+        # transform as left/right - beak/head_top were supplied here, the
+        # two shoulders were not, and must come back as None rather than a
+        # fabricated (0, 0) point.
+        self.assertAlmostEqual(result["beak"]["x"], 440.0)
+        self.assertAlmostEqual(result["beak"]["y"], 360.0)
+        self.assertAlmostEqual(result["head_top"]["x"], 440.0)
+        self.assertAlmostEqual(result["head_top"]["y"], 320.0)
+        self.assertIsNone(result["left_shoulder"])
+        self.assertIsNone(result["right_shoulder"])
 
     def test_never_runs_the_eye_detector_or_subject_detector_itself(self):
         """Review only ever reads what an earlier Classic Vision run already

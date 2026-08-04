@@ -373,12 +373,43 @@ class TestAcceptRejectGate:
         assert detection.accepted is True  # unaffected - a genuinely separate question, see EyeFilter
         assert detection.confidence == pytest.approx(0.97)
 
+    def test_detect_threads_the_other_four_landmarks_through_instead_of_discarding_them(self, monkeypatch) -> None:
+        """Regression: _predict already decodes all six KPT_NAMES every
+        forward pass, but detect() used to build its returned EyeDetection
+        from only left_eye/right_eye - beak/head_top/left_shoulder/
+        right_shoulder were computed and then silently dropped, discovered
+        while wiring the Image Inspector's landmark overlay (Issue 3)."""
+        detector = _stub_detector(min_confidence=0.5, max_head_distance_ratio=1.5, min_head_confidence=0.5)
+        landmarks = _landmarks(
+            left=(48.0, 35.0, 0.95), right=(52.0, 36.0, 0.40),
+            beak=(50.0, 60.0, 0.95), head_top=(50.0, 20.0, 0.95),
+            left_shoulder=(15.0, 45.0, 0.6), right_shoulder=(85.0, 45.0, 0.6),
+        )
+        monkeypatch.setattr(detector, "_predict", lambda crop: (0.9, landmarks))
+
+        detection = detector.detect(np.zeros((100, 100, 3), dtype=np.uint8))
+
+        assert (detection.beak.x, detection.beak.y, detection.beak.confidence) == pytest.approx((50.0, 60.0, 0.95))
+        assert (detection.head_top.x, detection.head_top.y, detection.head_top.confidence) == pytest.approx(
+            (50.0, 20.0, 0.95)
+        )
+        assert (detection.left_shoulder.x, detection.left_shoulder.y, detection.left_shoulder.confidence) == pytest.approx(
+            (15.0, 45.0, 0.6)
+        )
+        assert (detection.right_shoulder.x, detection.right_shoulder.y, detection.right_shoulder.confidence) == pytest.approx(
+            (85.0, 45.0, 0.6)
+        )
+
     def test_an_empty_crop_is_declined_rather_than_crashing(self) -> None:
         detector = EyePoseV0EyeDetector.__new__(EyePoseV0EyeDetector)
         detection = detector.detect(np.zeros((0, 0, 3), dtype=np.uint8))
         assert detection.accepted is False
         assert detection.head_visible is False
         assert detector.detect(None).accepted is False
+        assert detection.beak is None
+        assert detection.head_top is None
+        assert detection.left_shoulder is None
+        assert detection.right_shoulder is None
 
     def test_no_detection_at_all_is_declined_rather_than_crashing(self, monkeypatch) -> None:
         """_predict returning None (a degenerate all-zero model output - see

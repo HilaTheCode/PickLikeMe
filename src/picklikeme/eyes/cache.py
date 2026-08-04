@@ -35,7 +35,10 @@ logger = logging.getLogger(__name__)
 # already apply to their own sidecars.
 # v2 (EyePose Investigation Phase 1, Part 2): added head_confidence, the
 # independent "is a real head present" signal - see eyepose_v0.head_visible.
-EYE_CACHE_VERSION = 2
+# v3 (Image Inspector landmark overlay): added beak/head_top/left_shoulder/
+# right_shoulder - the rest of EyePose-v0's own six-landmark set, previously
+# computed but discarded before EyeDetection ever returned them.
+EYE_CACHE_VERSION = 3
 EYE_SUFFIX = ".eye.json"
 
 
@@ -65,6 +68,13 @@ class EyeRecord:
     # eyes.detector.EyeDetection.head_confidence's own docstring. None for a
     # backend (or an older cached row) that doesn't have one.
     head_confidence: float | None = None
+    # The rest of EyePose-v0's six-landmark set - see
+    # eyes.detector.EyeDetection's own fields of the same names. None for a
+    # backend (or a pre-v3 cached row) that doesn't have them.
+    beak: EyeKeypoint | None = None
+    head_top: EyeKeypoint | None = None
+    left_shoulder: EyeKeypoint | None = None
+    right_shoulder: EyeKeypoint | None = None
 
 
 def save_eye_detection(
@@ -90,6 +100,10 @@ def save_eye_detection(
         "left": _keypoint_to_dict(detection.left),
         "right": _keypoint_to_dict(detection.right),
         "head_confidence": detection.head_confidence,
+        "beak": _keypoint_to_dict(detection.beak),
+        "head_top": _keypoint_to_dict(detection.head_top),
+        "left_shoulder": _keypoint_to_dict(detection.left_shoulder),
+        "right_shoulder": _keypoint_to_dict(detection.right_shoulder),
     }
     try:
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -128,6 +142,10 @@ def read_eye_detection(cache_dir: str | Path, source_path: str | Path) -> EyeRec
         left=_keypoint_from_dict(payload.get("left")),
         right=_keypoint_from_dict(payload.get("right")),
         head_confidence=float(head_confidence) if head_confidence is not None else None,
+        beak=_keypoint_from_dict(payload.get("beak")),
+        head_top=_keypoint_from_dict(payload.get("head_top")),
+        left_shoulder=_keypoint_from_dict(payload.get("left_shoulder")),
+        right_shoulder=_keypoint_from_dict(payload.get("right_shoulder")),
     )
 
 

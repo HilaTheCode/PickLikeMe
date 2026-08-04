@@ -279,6 +279,12 @@ def detection_boxes_for(image_path: str) -> dict | None:
         "source_size": record.source_size,
         "selected": record.selected.as_dict() if record.selected is not None else None,
         "others": [box.as_dict() for box in record.others],
+        # The crop's own rectangle (tight detection box grown by
+        # CropParams.margin_frac - see DetectionRecord.expanded_box's own
+        # docstring) - the region that was actually cropped and cached, as
+        # opposed to `selected`, the raw detector box before the margin was
+        # applied. None on a full-frame fallback, same as `selected`.
+        "expanded_box": list(record.expanded_box) if record.expanded_box else None,
     }
 
 
@@ -353,4 +359,13 @@ def eye_keypoints_for(image_path: str, *, crop_cache_dir: str | Path | None = No
         "box": (x1, y1, x2, y2),
         "left": keypoint_dict(eye.left),
         "right": keypoint_dict(eye.right),
+        # The rest of EyePose-v0's landmark set, mapped through the same
+        # to_frame() transform as left/right - None for any record (older
+        # cache version, or a backend like SuperAnimal-Bird that never
+        # computed them) that doesn't have them. See eyes.cache.EyeRecord's
+        # own fields of the same names.
+        "beak": keypoint_dict(eye.beak),
+        "head_top": keypoint_dict(eye.head_top),
+        "left_shoulder": keypoint_dict(eye.left_shoulder),
+        "right_shoulder": keypoint_dict(eye.right_shoulder),
     }

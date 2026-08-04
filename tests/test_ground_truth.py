@@ -1,9 +1,9 @@
-"""ground_truth.build_plan/apply_plan - "Set User Decisions by Subfolders",
-the bulk Ground-Truth-seeding workflow. Not an import: only
-review_decisions rows change, matched by content identity (see
-identity.py), never by path alone - a photographer's Keep/Reject/Neutral
-folders may hold copies or renames of images tracked elsewhere under a
-completely different path.
+"""ground_truth.build_plan/apply_plan - "Set User Decisions by Subfolders"
+Version 2: Keep and Reject each accept MULTIPLE subfolders; Neutral is
+never folder-selected - every image under the Root Folder not inside a
+selected Keep/Reject subfolder becomes Neutral automatically. Not an
+import: only review_decisions rows change, matched by content identity
+(see identity.py), never by path alone.
 """
 
 from __future__ import annotations
@@ -29,177 +29,199 @@ def _write(path: Path, content: bytes) -> Path:
     return path
 
 
-def test_build_plan_counts_keep_folder_images_as_will_change_when_undecided(tmp_path, store) -> None:
-    keep_folder = tmp_path / "Keep"
-    _write(keep_folder / "a.jpg", b"image a")
-    _write(keep_folder / "b.jpg", b"image b")
+def test_images_under_a_keep_subfolder_become_keep(tmp_path, store) -> None:
+    root = tmp_path / "Shoot"
+    _write(root / "Selected" / "a.jpg", b"a")
+    _write(root / "b.jpg", b"b")  # not under any Keep/Reject folder -> Neutral
 
-    plan = build_plan(store, keep_folder=keep_folder)
-
-    assert len(plan.keep.paths) == 2
-    assert plan.keep.will_change == 2
-    assert plan.keep.already_matching == 0
-    assert plan.reject.paths == []
-    assert plan.neutral.paths == []
-    assert plan.totals() == {
-        "keep": 2, "reject": 0, "neutral": 0, "already_matching": 0, "will_change": 2, "conflicts": 0,
-    }
-
-
-def test_build_plan_recurses_into_subfolders(tmp_path, store) -> None:
-    keep_folder = tmp_path / "Keep"
-    _write(keep_folder / "a.jpg", b"a")
-    _write(keep_folder / "2026-08-01" / "b.jpg", b"b")
-    _write(keep_folder / "2026-08-01" / "burst1" / "c.jpg", b"c")
-
-    plan = build_plan(store, keep_folder=keep_folder)
-
-    assert len(plan.keep.paths) == 3
-
-
-def test_build_plan_ignores_non_image_files(tmp_path, store) -> None:
-    keep_folder = tmp_path / "Keep"
-    _write(keep_folder / "a.jpg", b"a")
-    _write(keep_folder / "notes.txt", b"not an image")
-    _write(keep_folder / "Thumbs.db", b"not an image")
-
-    plan = build_plan(store, keep_folder=keep_folder)
+    plan = build_plan(store, root_folder=root, keep_folders=[root / "Selected"])
 
     assert [Path(p).name for p in plan.keep.paths] == ["a.jpg"]
+    assert [Path(p).name for p in plan.neutral.paths] == ["b.jpg"]
+    assert plan.reject.paths == []
 
 
-def test_build_plan_recognises_an_already_matching_decision(tmp_path, store) -> None:
-    keep_folder = tmp_path / "Keep"
-    path = _write(keep_folder / "a.jpg", b"a")
-    store.set_review_decision(path, REVIEW_KEEP)
-
-    plan = build_plan(store, keep_folder=keep_folder)
-
-    assert plan.keep.already_matching == 1
-    assert plan.keep.will_change == 0
-
-
-def test_build_plan_recognises_a_decision_that_will_change(tmp_path, store) -> None:
-    keep_folder = tmp_path / "Keep"
-    path = _write(keep_folder / "a.jpg", b"a")
-    store.set_review_decision(path, REVIEW_REJECT)  # currently Reject, folder says Keep
-
-    plan = build_plan(store, keep_folder=keep_folder)
-
-    assert plan.keep.will_change == 1
-    assert plan.keep.already_matching == 0
-
-
-def test_neutral_folder_targets_clearing_the_decision(tmp_path, store) -> None:
-    neutral_folder = tmp_path / "Neutral"
-    already_neutral = _write(neutral_folder / "a.jpg", b"a")
-    has_a_decision = _write(neutral_folder / "b.jpg", b"b")
-    store.set_review_decision(has_a_decision, REVIEW_KEEP)
-
-    plan = build_plan(store, neutral_folder=neutral_folder)
-
-    assert plan.neutral.already_matching == 1  # a.jpg: never decided = already Neutral
-    assert plan.neutral.will_change == 1  # b.jpg: has a Keep decision, must be cleared
-
-
-def test_all_three_folders_together(tmp_path, store) -> None:
-    keep = _write(tmp_path / "Keep" / "a.jpg", b"a")
-    reject = _write(tmp_path / "Reject" / "b.jpg", b"b")
-    neutral = _write(tmp_path / "Neutral" / "c.jpg", b"c")
+def test_multiple_keep_subfolders_all_contribute(tmp_path, store) -> None:
+    root = tmp_path / "Shoot"
+    _write(root / "Favorites" / "a.jpg", b"a")
+    _write(root / "Portfolio" / "b.jpg", b"b")
+    _write(root / "Print" / "c.jpg", b"c")
 
     plan = build_plan(
-        store, keep_folder=keep.parent, reject_folder=reject.parent, neutral_folder=neutral.parent,
+        store, root_folder=root,
+        keep_folders=[root / "Favorites", root / "Portfolio", root / "Print"],
     )
 
-    # c.jpg (Neutral folder) was never decided, so it is already Neutral -
-    # only a.jpg (Keep) and b.jpg (Reject) actually change anything.
-    assert plan.totals() == {
-        "keep": 1, "reject": 1, "neutral": 1, "already_matching": 1, "will_change": 2, "conflicts": 0,
-    }
+    assert {Path(p).name for p in plan.keep.paths} == {"a.jpg", "b.jpg", "c.jpg"}
 
 
-def test_folders_are_all_optional(tmp_path, store) -> None:
-    plan = build_plan(store)
-    assert plan.totals() == {
-        "keep": 0, "reject": 0, "neutral": 0, "already_matching": 0, "will_change": 0, "conflicts": 0,
-    }
+def test_multiple_reject_subfolders_all_contribute(tmp_path, store) -> None:
+    root = tmp_path / "Shoot"
+    _write(root / "Rejected" / "a.jpg", b"a")
+    _write(root / "Trash" / "b.jpg", b"b")
+    _write(root / "Delete" / "c.jpg", b"c")
+
+    plan = build_plan(
+        store, root_folder=root,
+        reject_folders=[root / "Rejected", root / "Trash", root / "Delete"],
+    )
+
+    assert {Path(p).name for p in plan.reject.paths} == {"a.jpg", "b.jpg", "c.jpg"}
 
 
-def test_missing_folder_raises_file_not_found(tmp_path, store) -> None:
-    with pytest.raises(FileNotFoundError):
-        build_plan(store, keep_folder=tmp_path / "does-not-exist")
+def test_neutral_is_never_folder_selected_and_covers_everything_else(tmp_path, store) -> None:
+    root = tmp_path / "Shoot"
+    _write(root / "Selected" / "a.jpg", b"a")
+    _write(root / "Rejected" / "b.jpg", b"b")
+    _write(root / "c.jpg", b"c")  # directly under root
+    _write(root / "misc" / "d.jpg", b"d")  # an unrelated subfolder
+
+    plan = build_plan(
+        store, root_folder=root, keep_folders=[root / "Selected"], reject_folders=[root / "Rejected"],
+    )
+
+    assert {Path(p).name for p in plan.neutral.paths} == {"c.jpg", "d.jpg"}
 
 
-def test_the_same_image_under_two_folders_is_a_conflict_not_applied_to_either(tmp_path, store) -> None:
-    """Matched by content identity, not path - a copy of the same bytes
-    under both Keep and Reject is genuinely ambiguous and must never be
-    silently resolved one way."""
-    keep_folder = tmp_path / "Keep"
-    reject_folder = tmp_path / "Reject"
-    _write(keep_folder / "a.jpg", b"identical bytes")
-    _write(reject_folder / "a_copy.jpg", b"identical bytes")  # same content, different name/location
+def test_no_folders_selected_makes_everything_neutral(tmp_path, store) -> None:
+    root = tmp_path / "Shoot"
+    _write(root / "a.jpg", b"a")
+    _write(root / "sub" / "b.jpg", b"b")
 
-    plan = build_plan(store, keep_folder=keep_folder, reject_folder=reject_folder)
+    plan = build_plan(store, root_folder=root)
+
+    assert {Path(p).name for p in plan.neutral.paths} == {"a.jpg", "b.jpg"}
+    assert plan.keep.paths == []
+    assert plan.reject.paths == []
+
+
+def test_a_folder_selected_for_both_keep_and_reject_is_a_conflict(tmp_path, store) -> None:
+    root = tmp_path / "Shoot"
+    overlap = root / "Ambiguous"
+    _write(overlap / "a.jpg", b"a")
+
+    plan = build_plan(store, root_folder=root, keep_folders=[overlap], reject_folders=[overlap])
 
     assert plan.keep.paths == []
     assert plan.reject.paths == []
-    assert len(plan.conflicts) == 2
-    assert plan.totals()["conflicts"] == 2
+    assert plan.neutral.paths == []
+    assert [Path(p).name for p in plan.conflicts] == ["a.jpg"]
+
+
+def test_a_reject_folder_nested_inside_a_keep_folder_conflicts_only_the_overlap(tmp_path, store) -> None:
+    root = tmp_path / "Shoot"
+    keep_folder = root / "Selected"
+    nested_reject = keep_folder / "SecondLook_Reject"
+    _write(keep_folder / "a.jpg", b"a")  # only under Keep
+    _write(nested_reject / "b.jpg", b"b")  # under both -> conflict
+
+    plan = build_plan(store, root_folder=root, keep_folders=[keep_folder], reject_folders=[nested_reject])
+
+    assert [Path(p).name for p in plan.keep.paths] == ["a.jpg"]
+    assert [Path(p).name for p in plan.conflicts] == ["b.jpg"]
+
+
+def test_a_keep_folder_outside_the_root_folder_raises(tmp_path, store) -> None:
+    root = tmp_path / "Shoot"
+    root.mkdir()
+    outside = tmp_path / "Elsewhere"
+    outside.mkdir()
+
+    with pytest.raises(ValueError, match="not the Root Folder or a subfolder"):
+        build_plan(store, root_folder=root, keep_folders=[outside])
+
+
+def test_a_missing_root_folder_raises_file_not_found(tmp_path, store) -> None:
+    with pytest.raises(FileNotFoundError):
+        build_plan(store, root_folder=tmp_path / "does-not-exist")
+
+
+def test_a_missing_keep_folder_raises_file_not_found(tmp_path, store) -> None:
+    root = tmp_path / "Shoot"
+    root.mkdir()
+    with pytest.raises(FileNotFoundError):
+        build_plan(store, root_folder=root, keep_folders=[root / "NoSuchFolder"])
+
+
+def test_ignores_non_image_files(tmp_path, store) -> None:
+    root = tmp_path / "Shoot"
+    _write(root / "a.jpg", b"a")
+    _write(root / "notes.txt", b"not an image")
+
+    plan = build_plan(store, root_folder=root)
+
+    assert [Path(p).name for p in plan.neutral.paths] == ["a.jpg"]
+
+
+def test_already_matching_vs_will_change(tmp_path, store) -> None:
+    root = tmp_path / "Shoot"
+    keep_path = _write(root / "Selected" / "a.jpg", b"a")
+    reject_path = _write(root / "Rejected" / "b.jpg", b"b")
+    neutral_path = _write(root / "c.jpg", b"c")
+    store.set_review_decision(keep_path, REVIEW_KEEP)  # already matches
+    store.set_review_decision(reject_path, REVIEW_KEEP)  # will change to reject
+    store.set_review_decision(neutral_path, REVIEW_KEEP)  # will change to neutral (cleared)
+
+    plan = build_plan(store, root_folder=root, keep_folders=[root / "Selected"], reject_folders=[root / "Rejected"])
+
+    assert plan.keep.already_matching == 1 and plan.keep.will_change == 0
+    assert plan.reject.already_matching == 0 and plan.reject.will_change == 1
+    assert plan.neutral.already_matching == 0 and plan.neutral.will_change == 1
 
 
 def test_an_empty_file_is_skipped_not_a_crash(tmp_path, store) -> None:
-    keep_folder = tmp_path / "Keep"
-    _write(keep_folder / "empty.jpg", b"")  # image_identity raises IdentityUnavailable for empty files
-    _write(keep_folder / "a.jpg", b"a")
+    root = tmp_path / "Shoot"
+    _write(root / "Selected" / "empty.jpg", b"")  # image_identity raises for empty files
+    _write(root / "Selected" / "a.jpg", b"a")
 
-    plan = build_plan(store, keep_folder=keep_folder)
+    plan = build_plan(store, root_folder=root, keep_folders=[root / "Selected"])
 
-    assert len(plan.keep.paths) == 1
-    assert plan.keep.skipped == [str(keep_folder / "empty.jpg")]
+    assert [Path(p).name for p in plan.keep.paths] == ["a.jpg"]
+    assert [Path(p).name for p in plan.keep.skipped] == ["empty.jpg"]
 
 
 def test_apply_plan_writes_keep_reject_and_clears_neutral(tmp_path, store) -> None:
-    keep = _write(tmp_path / "Keep" / "a.jpg", b"a")
-    reject = _write(tmp_path / "Reject" / "b.jpg", b"b")
-    neutral_target = _write(tmp_path / "Neutral" / "c.jpg", b"c")
-    store.set_review_decision(neutral_target, REVIEW_KEEP)  # must be cleared
+    root = tmp_path / "Shoot"
+    keep_path = _write(root / "Selected" / "a.jpg", b"a")
+    reject_path = _write(root / "Rejected" / "b.jpg", b"b")
+    neutral_path = _write(root / "c.jpg", b"c")
+    store.set_review_decision(neutral_path, REVIEW_KEEP)  # must be cleared
 
-    plan = build_plan(
-        store, keep_folder=keep.parent, reject_folder=reject.parent, neutral_folder=neutral_target.parent,
-    )
+    plan = build_plan(store, root_folder=root, keep_folders=[root / "Selected"], reject_folders=[root / "Rejected"])
     result = apply_plan(store, plan)
 
     assert result == {
         "updated_keep": 1, "updated_reject": 1, "updated_neutral": 1, "skipped": [], "conflicts": [],
     }
     decisions = {row["image_path"]: row["decision"] for row in store.review_decisions()}
-    assert decisions[str(keep)] == REVIEW_KEEP
-    assert decisions[str(reject)] == REVIEW_REJECT
-    assert str(neutral_target) not in decisions  # cleared, not merely set to something else
+    assert decisions[str(keep_path)] == REVIEW_KEEP
+    assert decisions[str(reject_path)] == REVIEW_REJECT
+    assert str(neutral_path) not in decisions  # cleared, not merely set to something else
 
 
 def test_apply_plan_never_touches_conflicting_images(tmp_path, store) -> None:
-    keep_folder = tmp_path / "Keep"
-    reject_folder = tmp_path / "Reject"
-    _write(keep_folder / "a.jpg", b"identical bytes")
-    _write(reject_folder / "a_copy.jpg", b"identical bytes")
+    root = tmp_path / "Shoot"
+    overlap = root / "Ambiguous"
+    _write(overlap / "a.jpg", b"a")
 
-    plan = build_plan(store, keep_folder=keep_folder, reject_folder=reject_folder)
+    plan = build_plan(store, root_folder=root, keep_folders=[overlap], reject_folders=[overlap])
     result = apply_plan(store, plan)
 
     assert result["updated_keep"] == 0
     assert result["updated_reject"] == 0
-    assert len(result["conflicts"]) == 2
+    assert result["updated_neutral"] == 0
+    assert len(result["conflicts"]) == 1
     assert store.review_decision_count() == 0
 
 
 def test_apply_plan_is_idempotent_for_already_matching_images(tmp_path, store) -> None:
-    keep = _write(tmp_path / "Keep" / "a.jpg", b"a")
-    store.set_review_decision(keep, REVIEW_KEEP)
+    root = tmp_path / "Shoot"
+    keep_path = _write(root / "Selected" / "a.jpg", b"a")
+    store.set_review_decision(keep_path, REVIEW_KEEP)
 
-    plan = build_plan(store, keep_folder=keep.parent)
+    plan = build_plan(store, root_folder=root, keep_folders=[root / "Selected"])
     result = apply_plan(store, plan)
 
     assert result["updated_keep"] == 1
     decisions = {row["image_path"]: row["decision"] for row in store.review_decisions()}
-    assert decisions[str(keep)] == REVIEW_KEEP
+    assert decisions[str(keep_path)] == REVIEW_KEEP

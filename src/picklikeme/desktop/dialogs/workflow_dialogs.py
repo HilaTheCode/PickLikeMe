@@ -15,9 +15,12 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QPushButton,
     QRadioButton,
     QVBoxLayout,
+    QWidget,
 )
 
 from ...config import DEFAULT_CHECKPOINT_PATH
@@ -424,89 +427,113 @@ class AutoCropDialog(QDialog):
 
 
 class SetUserDecisionsBySubfoldersDialog(QDialog):
-    """"Set User Decisions by Subfolders..." - collects the three (all
-    optional) folder paths only. Never touches AnnotationStore itself - see
-    ground_truth.py's own docstring; the actual preview/confirm/apply
-    sequence runs afterward, in MainWindow, exactly like every other
-    workflow dialog here only collects parameters and lets the caller run
-    the operation (with a progress bar, since walking+hashing thousands of
-    images is not instant)."""
+    """"Set User Decisions by Subfolders..." - Version 2: Keep and Reject
+    each accept MULTIPLE subfolders of the Root Folder (a photographer's
+    own organisation is rarely a single folder - "Selected", "Favorites",
+    "Portfolio" might all mean Keep). Neutral is never folder-selected here
+    at all - see ground_truth.py's own module docstring for why one walk of
+    the Root Folder is enough to infer it automatically.
 
-    def __init__(self, *, parent=None) -> None:
+    Collects parameters only, exactly like every other workflow dialog
+    here - the actual preview/confirm/apply sequence runs afterward, in
+    MainWindow, with a progress bar (walking+hashing thousands of images is
+    not instant)."""
+
+    def __init__(self, *, root_folder: str, parent=None) -> None:
         super().__init__(parent)
         self.setWindowTitle("Set User Decisions by Subfolders")
-        self.setMinimumWidth(480)
+        self.setMinimumWidth(520)
+        self._root_folder = root_folder
 
         intro = QLabel(
-            "Recursively scans each folder below and sets the User Decision for every "
-            "image found in it - Keep, Reject, or back to Neutral. Images are matched by "
-            "content, not just their path, so a copy or a rename still matches. Nothing is "
-            "copied or moved; only the decision changes. All three folders are optional.",
+            "Scans the Root Folder below once and sets the User Decision for every image "
+            "found - Keep or Reject for anything inside a folder selected below, Neutral "
+            "automatically for everything else (no folder to pick for it). Images are "
+            "matched by content, not just their path, so a copy or a rename still matches. "
+            "Nothing is copied or moved - only the decision changes.",
             self,
         )
         intro.setWordWrap(True)
 
-        self._keep_edit = QLineEdit(self)
-        self._keep_edit.setReadOnly(True)
-        self._keep_edit.setPlaceholderText("(not set)")
-        self._reject_edit = QLineEdit(self)
-        self._reject_edit.setReadOnly(True)
-        self._reject_edit.setPlaceholderText("(not set)")
-        self._neutral_edit = QLineEdit(self)
-        self._neutral_edit.setReadOnly(True)
-        self._neutral_edit.setPlaceholderText("(not set)")
+        root_row = QHBoxLayout()
+        root_row.addWidget(QLabel("Root Folder:", self))
+        root_label = QLabel(root_folder, self)
+        root_label.setWordWrap(True)
+        root_row.addWidget(root_label, 1)
 
-        form = QFormLayout()
-        form.addRow("Keep Folder:", self._browse_row(self._keep_edit, self._browse_keep))
-        form.addRow("Reject Folder:", self._browse_row(self._reject_edit, self._browse_reject))
-        form.addRow("Neutral Folder:", self._browse_row(self._neutral_edit, self._browse_neutral))
+        self._keep_list, keep_group = self._folder_list_group("Keep Folders")
+        self._reject_list, reject_group = self._folder_list_group("Reject Folders")
+        lists_row = QHBoxLayout()
+        lists_row.addWidget(keep_group)
+        lists_row.addWidget(reject_group)
+
+        neutral_note = QLabel(
+            "Neutral: every remaining image under the Root Folder that is not inside a "
+            "Keep or Reject folder above - inferred automatically, nothing to select.",
+            self,
+        )
+        neutral_note.setWordWrap(True)
+        neutral_note.setStyleSheet("color: palette(mid);")
 
         self._buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel, self)
         self._buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Preview…")
         self._buttons.accepted.connect(self.accept)
         self._buttons.rejected.connect(self.reject)
-        self._update_ok_enabled()
 
         layout = QVBoxLayout(self)
         layout.addWidget(intro)
-        layout.addLayout(form)
+        layout.addLayout(root_row)
+        layout.addLayout(lists_row)
+        layout.addWidget(neutral_note)
         layout.addWidget(self._buttons)
 
+    def _folder_list_group(self, title: str) -> tuple[QListWidget, QWidget]:
+        list_widget = QListWidget(self)
+        list_widget.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
+
+        add_button = QPushButton("Add Folder…", self)
+        add_button.clicked.connect(lambda: self._add_folder(list_widget))
+        remove_button = QPushButton("Remove Selected", self)
+        remove_button.clicked.connect(lambda: self._remove_selected(list_widget))
+        buttons_row = QHBoxLayout()
+        buttons_row.addWidget(add_button)
+        buttons_row.addWidget(remove_button)
+
+        group = QWidget(self)
+        group_layout = QVBoxLayout(group)
+        group_layout.setContentsMargins(0, 0, 0, 0)
+        group_layout.addWidget(QLabel(title, self))
+        group_layout.addWidget(list_widget)
+        group_layout.addLayout(buttons_row)
+        return list_widget, group
+
+    def _add_folder(self, list_widget: QListWidget) -> None:
+        path = QFileDialog.getExistingDirectory(self, "Choose a folder", self._root_folder)
+        if not path:
+            return
+        existing = {list_widget.item(row).text() for row in range(list_widget.count())}
+        if path not in existing:
+            item = QListWidgetItem(path)
+            item.setToolTip(path)
+            list_widget.addItem(item)
+
     @staticmethod
-    def _browse_row(edit: QLineEdit, on_browse) -> QHBoxLayout:
-        row = QHBoxLayout()
-        row.addWidget(edit, 1)
-        button = QPushButton("Browse…")
-        button.clicked.connect(on_browse)
-        row.addWidget(button)
-        return row
+    def _remove_selected(list_widget: QListWidget) -> None:
+        for item in list_widget.selectedItems():
+            list_widget.takeItem(list_widget.row(item))
 
-    def _browse_keep(self) -> None:
-        self._browse_into(self._keep_edit)
+    @staticmethod
+    def _folders(list_widget: QListWidget) -> list[str]:
+        return [list_widget.item(row).text() for row in range(list_widget.count())]
 
-    def _browse_reject(self) -> None:
-        self._browse_into(self._reject_edit)
+    def root_folder(self) -> str:
+        return self._root_folder
 
-    def _browse_neutral(self) -> None:
-        self._browse_into(self._neutral_edit)
+    def keep_folders(self) -> list[str]:
+        return self._folders(self._keep_list)
 
-    def _browse_into(self, edit: QLineEdit) -> None:
-        start_dir = edit.text() or ""
-        path = QFileDialog.getExistingDirectory(self, "Choose a folder", start_dir)
-        if path:
-            edit.setText(path)
-            edit.setToolTip(path)
-        self._update_ok_enabled()
-
-    def _update_ok_enabled(self) -> None:
-        any_folder = bool(self._keep_edit.text() or self._reject_edit.text() or self._neutral_edit.text())
-        self._buttons.button(QDialogButtonBox.StandardButton.Ok).setEnabled(any_folder)
-
-    def keep_folder(self) -> str | None:
-        return self._keep_edit.text() or None
-
-    def reject_folder(self) -> str | None:
-        return self._reject_edit.text() or None
+    def reject_folders(self) -> list[str]:
+        return self._folders(self._reject_list)
 
     def neutral_folder(self) -> str | None:
         return self._neutral_edit.text() or None

@@ -11,9 +11,11 @@ from pathlib import Path
 import pytest
 
 try:
+    from PySide6.QtGui import QPixmap
     from PySide6.QtWidgets import QApplication
 except ImportError:  # pragma: no cover
     QApplication = None
+    QPixmap = None
 
 from picklikeme.analytics.store import AnalyticsStore
 
@@ -179,6 +181,42 @@ def test_experiment_metadata_panel_shows_algorithm_and_recorded_params(tmp_path:
     assert rows["Images Processed"] == "3"
     assert rows["Species Count"] == "55"
     assert rows["Experiment Duration"] == "4.2s"
+
+    dialog.close()
+
+
+@pytest.mark.skipif(QApplication is None, reason="PySide6 not installed")
+def test_experiment_metadata_panel_starts_collapsed_and_toggles(tmp_path: Path) -> None:
+    """Manual QA finding: Device/Images Processed/Experiment Date and the
+    rest of this table's rarely-changing technical metadata was eating
+    vertical space the analysis tabs need more - now collapsible, default
+    collapsed, one click to expand. Populating the table (show_run) must
+    still work while collapsed - the data is queried by other code/tests
+    regardless of visibility."""
+    from picklikeme.desktop.dialogs.analytics_dashboard import AnalyticsDashboard
+
+    _seed(tmp_path / "analytics.db")
+    app = QApplication.instance() or QApplication([])
+    dialog = AnalyticsDashboard(analytics_db=tmp_path / "analytics.db")
+    dialog._experiment_list.setCurrentRow(0)
+    app.processEvents()
+
+    # isHidden() (the explicit per-widget flag), not isVisible() (which
+    # also depends on the whole ancestor chain being shown on screen - the
+    # dialog in this test never is, so isVisible() would read False either
+    # way and could not distinguish the two states).
+    panel = dialog._metadata_panel
+    assert panel._table.isHidden() is True
+    assert panel._toggle_button.isChecked() is False
+    assert panel._table.rowCount() > 0  # still populated even while collapsed
+
+    panel._toggle_button.setChecked(True)
+    assert panel._table.isHidden() is False
+    assert "▾" in panel._toggle_button.text()
+
+    panel._toggle_button.setChecked(False)
+    assert panel._table.isHidden() is True
+    assert "▸" in panel._toggle_button.text()
 
     dialog.close()
 
@@ -392,3 +430,275 @@ def test_refresh_current_run_reflects_a_review_decision_made_after_the_dashboard
 
     assert dialog._user_vs_algorithm_tab._coverage_label.text().startswith("4 image(s) compared")
     dialog.close()
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 - Analytics Scope, Phase 3 - Dashboard header panel
+# ---------------------------------------------------------------------------
+
+
+def _seed_two_folders(db_path: Path, root_a: Path, root_b: Path) -> None:
+    """Two runs recorded against genuinely DIFFERENT root folders - the
+    scenario the "Current Root Folder" scope actually needs to prove it
+    filters correctly (the original _seed fixture's two runs share one
+    folder, which cannot distinguish "filtered" from "showing everything")."""
+    with AnalyticsStore(db_path) as store:
+        store.insert_run(
+            "run-a", folder=str(root_a), strategy_id="ai-model", started_at="2026-08-04T21:00:00",
+            considered=4, accepted=3, device="cuda", params={},
+            reject_counts={}, image_metrics={str(root_a / "x.jpg"): {"score": 0.9}},
+        )
+        store.insert_run(
+            "run-b", folder=str(root_b), strategy_id="classic-vision", started_at="2026-08-04T20:00:00",
+            considered=2, accepted=1, device="cpu", params={},
+            reject_counts={}, image_metrics={str(root_b / "y.jpg"): {"score": 0.5}},
+        )
+
+
+@pytest.mark.skipif(QApplication is None, reason="PySide6 not installed")
+def test_scope_defaults_to_current_root_folder_when_a_folder_is_open(tmp_path: Path) -> None:
+    from PySide6.QtCore import Qt
+
+    from picklikeme.desktop.dialogs.analytics_dashboard import AnalyticsDashboard
+
+    root_a = tmp_path / "ShootA"
+    root_b = tmp_path / "ShootB"
+    _seed_two_folders(tmp_path / "analytics.db", root_a, root_b)
+    app = QApplication.instance() or QApplication([])
+
+    dialog = AnalyticsDashboard(analytics_db=tmp_path / "analytics.db", root_folder=str(root_a))
+
+    assert dialog._scope_current_root_radio.isChecked() is True
+    assert dialog._experiment_list.count() == 1
+    assert "run-a" == dialog._experiment_list.item(0).data(Qt.ItemDataRole.UserRole)
+    dialog.close()
+
+
+@pytest.mark.skipif(QApplication is None, reason="PySide6 not installed")
+def test_scope_defaults_to_entire_database_with_no_folder_open(tmp_path: Path) -> None:
+    from picklikeme.desktop.dialogs.analytics_dashboard import AnalyticsDashboard
+
+    root_a = tmp_path / "ShootA"
+    root_b = tmp_path / "ShootB"
+    _seed_two_folders(tmp_path / "analytics.db", root_a, root_b)
+    app = QApplication.instance() or QApplication([])
+
+    dialog = AnalyticsDashboard(analytics_db=tmp_path / "analytics.db", root_folder=None)
+
+    assert dialog._scope_entire_db_radio.isChecked() is True
+    assert dialog._scope_current_root_radio.isEnabled() is False
+    assert dialog._experiment_list.count() == 2
+    dialog.close()
+
+
+@pytest.mark.skipif(QApplication is None, reason="PySide6 not installed")
+def test_switching_scope_to_entire_database_shows_every_run(tmp_path: Path) -> None:
+    from picklikeme.desktop.dialogs.analytics_dashboard import AnalyticsDashboard
+
+    root_a = tmp_path / "ShootA"
+    root_b = tmp_path / "ShootB"
+    _seed_two_folders(tmp_path / "analytics.db", root_a, root_b)
+    app = QApplication.instance() or QApplication([])
+
+    dialog = AnalyticsDashboard(analytics_db=tmp_path / "analytics.db", root_folder=str(root_a))
+    assert dialog._experiment_list.count() == 1
+
+    dialog._scope_entire_db_radio.setChecked(True)
+
+    assert dialog._experiment_list.count() == 2
+    dialog.close()
+
+
+@pytest.mark.skipif(QApplication is None, reason="PySide6 not installed")
+def test_header_panel_shows_live_context_before_any_selection(tmp_path: Path) -> None:
+    from picklikeme.desktop.dialogs.analytics_dashboard import AnalyticsDashboard
+
+    root_a = tmp_path / "ShootA"
+    app = QApplication.instance() or QApplication([])
+    dialog = AnalyticsDashboard(
+        analytics_db=tmp_path / "empty.db", root_folder=str(root_a), color_source="classic-vision", keep_percent=30.0,
+    )
+
+    assert str(root_a) in dialog._header_panel._context_label.text()
+    assert "Current Root Folder" in dialog._header_panel._context_label.text()
+    assert dialog._header_panel._dataset_card._value_label.text() == "ShootA"
+    assert dialog._header_panel._threshold_card._value_label.text() == "30%"
+    assert "Classic" in dialog._header_panel._color_source_card._value_label.text()
+    assert dialog._header_panel._algorithm_card._value_label.text() == "—"
+    dialog.close()
+
+
+@pytest.mark.skipif(QApplication is None, reason="PySide6 not installed")
+def test_header_panel_updates_when_an_experiment_is_selected(tmp_path: Path) -> None:
+    from picklikeme.desktop.dialogs.analytics_dashboard import AnalyticsDashboard
+
+    root_a = tmp_path / "ShootA"
+    root_b = tmp_path / "ShootB"
+    _seed_two_folders(tmp_path / "analytics.db", root_a, root_b)
+    app = QApplication.instance() or QApplication([])
+
+    dialog = AnalyticsDashboard(analytics_db=tmp_path / "analytics.db", root_folder=str(root_a))
+    app.processEvents()
+
+    assert dialog._header_panel._algorithm_card._value_label.text() == "AI"
+    assert dialog._header_panel._image_count_card._value_label.text() == "4"
+    dialog.close()
+
+
+@pytest.mark.skipif(QApplication is None, reason="PySide6 not installed")
+def test_header_panel_resets_run_specific_fields_when_scope_changes(tmp_path: Path) -> None:
+    from picklikeme.desktop.dialogs.analytics_dashboard import AnalyticsDashboard
+
+    root_a = tmp_path / "ShootA"
+    root_b = tmp_path / "ShootB"
+    _seed_two_folders(tmp_path / "analytics.db", root_a, root_b)
+    app = QApplication.instance() or QApplication([])
+
+    dialog = AnalyticsDashboard(analytics_db=tmp_path / "analytics.db", root_folder=str(root_a))
+    assert dialog._header_panel._algorithm_card._value_label.text() == "AI"
+
+    dialog._scope_entire_db_radio.setChecked(True)
+
+    # A run is still selected (the first one in the now-larger list), so
+    # the run-specific cards get repopulated rather than staying stale -
+    # not asserting a specific value here, just that this doesn't crash
+    # and the scope label itself updated.
+    assert "Entire Analytics Database" in dialog._header_panel._context_label.text()
+    dialog.close()
+
+
+# ---------------------------------------------------------------------------
+# ImageInspectorTab's overlay checkboxes (Manual QA Issue 3): "Show
+# Detection / Crop Boxes" and "Show Landmarks", independently toggleable,
+# neither one running the detector itself - they only ever read what an
+# earlier Classic Vision run already cached (detection_boxes_for /
+# eye_keypoints_for), the same read-only rule the Gallery/Loupe overlays
+# already follow.
+# ---------------------------------------------------------------------------
+
+
+def _make_inspector_tab(tmp_path: Path, monkeypatch):
+    from unittest import mock
+
+    from picklikeme.desktop.dialogs import analytics_dashboard as dashboard_module
+
+    tab = dashboard_module.ImageInspectorTab(crop_cache_dir=tmp_path / "crops")
+    base_pixmap = QPixmap(200, 150)
+    base_pixmap.fill()
+    monkeypatch.setattr(tab, "_load_full_pixmap", lambda path: base_pixmap)
+
+    store = mock.Mock()
+    store.image_metrics.return_value = {}
+    store.get_run.return_value = {"strategy_id": "classic-vision"}
+    tab.show_paths(store, "run-1", ["some/a.jpg"])
+    return tab, dashboard_module
+
+
+@pytest.mark.skipif(QApplication is None, reason="PySide6 not installed")
+def test_neither_overlay_checkbox_reads_the_cache_when_both_are_off(tmp_path: Path, monkeypatch) -> None:
+    from unittest import mock
+
+    app = QApplication.instance() or QApplication([])
+    tab, dashboard_module = _make_inspector_tab(tmp_path, monkeypatch)
+    boxes_spy = mock.Mock(return_value=None)
+    eye_spy = mock.Mock(return_value=None)
+    monkeypatch.setattr(dashboard_module, "detection_boxes_for", boxes_spy)
+    monkeypatch.setattr(dashboard_module, "eye_keypoints_for", eye_spy)
+
+    tab._refresh_original_display()
+
+    boxes_spy.assert_not_called()
+    eye_spy.assert_not_called()
+    assert tab._landmarks_table.rowCount() == 0
+    tab.close()
+
+
+@pytest.mark.skipif(QApplication is None, reason="PySide6 not installed")
+def test_show_boxes_checkbox_draws_independently_of_landmarks(tmp_path: Path, monkeypatch) -> None:
+    from unittest import mock
+
+    app = QApplication.instance() or QApplication([])
+    tab, dashboard_module = _make_inspector_tab(tmp_path, monkeypatch)
+    boxes_spy = mock.Mock(return_value={
+        "source_size": (200, 150),
+        "selected": {"box": (10.0, 10.0, 50.0, 50.0)},
+        "expanded_box": [0.0, 0.0, 60.0, 60.0],
+    })
+    eye_spy = mock.Mock(return_value=None)
+    monkeypatch.setattr(dashboard_module, "detection_boxes_for", boxes_spy)
+    monkeypatch.setattr(dashboard_module, "eye_keypoints_for", eye_spy)
+
+    tab._show_boxes_checkbox.setChecked(True)
+
+    boxes_spy.assert_called_once_with("some/a.jpg")
+    eye_spy.assert_called_once()  # boxes overlay also wants the eye ROI, if any
+    assert not tab._original_label.pixmap().isNull()
+    assert tab._landmarks_table.rowCount() == 0  # landmarks checkbox is still off
+    tab.close()
+
+
+@pytest.mark.skipif(QApplication is None, reason="PySide6 not installed")
+def test_show_landmarks_checkbox_populates_only_the_landmarks_that_are_present(tmp_path: Path, monkeypatch) -> None:
+    """"if available" (Issue 3's own wording): Left Eye and Beak were
+    supplied, Right Eye/Head/both shoulders were not - only the two present
+    ones get a row, never a fabricated placeholder for the rest."""
+    from unittest import mock
+
+    app = QApplication.instance() or QApplication([])
+    tab, dashboard_module = _make_inspector_tab(tmp_path, monkeypatch)
+    eye_spy = mock.Mock(return_value={
+        "source_size": (200, 150),
+        "accepted": True,
+        "left": {"x": 20.0, "y": 30.0, "confidence": 0.91},
+        "right": None,
+        "beak": {"x": 25.0, "y": 60.0, "confidence": 0.82},
+        "head_top": None,
+        "left_shoulder": None,
+        "right_shoulder": None,
+    })
+    boxes_spy = mock.Mock(return_value=None)
+    monkeypatch.setattr(dashboard_module, "detection_boxes_for", boxes_spy)
+    monkeypatch.setattr(dashboard_module, "eye_keypoints_for", eye_spy)
+
+    tab._show_landmarks_checkbox.setChecked(True)
+
+    boxes_spy.assert_not_called()  # landmarks-only: never touches the box cache
+    eye_spy.assert_called_once_with("some/a.jpg", crop_cache_dir=tab._crop_cache_dir)
+    assert tab._landmarks_table.rowCount() == 2
+    names = {tab._landmarks_table.item(row, 0).text() for row in range(tab._landmarks_table.rowCount())}
+    assert names == {"Left Eye", "Beak"}
+
+    # Turning it back off clears the table rather than leaving stale rows.
+    tab._show_landmarks_checkbox.setChecked(False)
+    assert tab._landmarks_table.rowCount() == 0
+    tab.close()
+
+
+@pytest.mark.skipif(QApplication is None, reason="PySide6 not installed")
+def test_both_overlay_checkboxes_can_be_on_at_once(tmp_path: Path, monkeypatch) -> None:
+    from unittest import mock
+
+    app = QApplication.instance() or QApplication([])
+    tab, dashboard_module = _make_inspector_tab(tmp_path, monkeypatch)
+    boxes_spy = mock.Mock(return_value={
+        "source_size": (200, 150), "selected": {"box": (10.0, 10.0, 50.0, 50.0)}, "expanded_box": None,
+    })
+    eye_spy = mock.Mock(return_value={
+        "source_size": (200, 150), "accepted": False,
+        "left": {"x": 20.0, "y": 30.0, "confidence": 0.91}, "right": None,
+        "beak": None, "head_top": None, "left_shoulder": None, "right_shoulder": None,
+    })
+    monkeypatch.setattr(dashboard_module, "detection_boxes_for", boxes_spy)
+    monkeypatch.setattr(dashboard_module, "eye_keypoints_for", eye_spy)
+
+    tab._show_boxes_checkbox.setChecked(True)
+    tab._show_landmarks_checkbox.setChecked(True)
+
+    # Each checkbox's own toggle triggers its own redraw (boxes_spy is
+    # therefore called once per toggle while "Show Boxes" stays checked) -
+    # the point here is that both overlays are independently active
+    # together, not a call-count contract.
+    boxes_spy.assert_called_with("some/a.jpg")
+    assert tab._landmarks_table.rowCount() == 1
+    assert not tab._original_label.pixmap().isNull()
+    tab.close()

@@ -3,7 +3,8 @@ MainWindow flow: open the dialog, scan the folders (preview), confirm, and
 apply. `ground_truth.build_plan`/`apply_plan` themselves are tested in
 isolation in test_ground_truth.py; this file covers only the desktop layer
 on top: the confirmation prompt, the progress-bar-backed background run,
-and the result summary/state refresh.
+the result summary/state refresh, and the Root-Folder requirement Version 2
+of this workflow introduced.
 """
 
 from __future__ import annotations
@@ -75,7 +76,8 @@ def _use_synchronous_run_with_progress(monkeypatch) -> None:
 def test_confirm_and_apply_writes_decisions_and_refreshes_state(app, tmp_path, monkeypatch) -> None:
     from picklikeme.analyzer.annotations import REVIEW_KEEP
 
-    keep_folder = tmp_path / "Keep"
+    root = tmp_path / "Shoot"
+    keep_folder = root / "Selected"
     _make_jpeg(keep_folder / "a.jpg")
 
     window, service = _window(tmp_path)
@@ -87,7 +89,7 @@ def test_confirm_and_apply_writes_decisions_and_refreshes_state(app, tmp_path, m
             QMessageBox, "information", staticmethod(lambda *a, **k: info_calls.append(a) or QMessageBox.StandardButton.Ok)
         )
 
-        preview = service.preview_ground_truth_import(keep_folder=keep_folder)
+        preview = service.preview_ground_truth_import(root_folder=root, keep_folders=[keep_folder])
         window._confirm_and_apply_ground_truth_import(preview)
 
         decisions = {row["image_path"]: row["decision"] for row in service.store.review_decisions()}
@@ -99,7 +101,8 @@ def test_confirm_and_apply_writes_decisions_and_refreshes_state(app, tmp_path, m
 
 
 def test_declining_the_confirmation_writes_nothing(app, tmp_path, monkeypatch) -> None:
-    keep_folder = tmp_path / "Keep"
+    root = tmp_path / "Shoot"
+    keep_folder = root / "Selected"
     _make_jpeg(keep_folder / "a.jpg")
 
     window, service = _window(tmp_path)
@@ -107,7 +110,7 @@ def test_declining_the_confirmation_writes_nothing(app, tmp_path, monkeypatch) -
         _use_synchronous_run_with_progress(monkeypatch)
         monkeypatch.setattr(QMessageBox, "question", staticmethod(lambda *a, **k: QMessageBox.StandardButton.No))
 
-        preview = service.preview_ground_truth_import(keep_folder=keep_folder)
+        preview = service.preview_ground_truth_import(root_folder=root, keep_folders=[keep_folder])
         window._confirm_and_apply_ground_truth_import(preview)
 
         assert service.store.review_decision_count() == 0
@@ -119,7 +122,8 @@ def test_declining_the_confirmation_writes_nothing(app, tmp_path, monkeypatch) -
 def test_nothing_to_change_shows_information_without_asking_to_confirm(app, tmp_path, monkeypatch) -> None:
     from picklikeme.analyzer.annotations import REVIEW_KEEP
 
-    keep_folder = tmp_path / "Keep"
+    root = tmp_path / "Shoot"
+    keep_folder = root / "Selected"
     path = keep_folder / "a.jpg"
     _make_jpeg(path)
 
@@ -137,7 +141,7 @@ def test_nothing_to_change_shows_information_without_asking_to_confirm(app, tmp_
             QMessageBox, "information", staticmethod(lambda *a, **k: info_calls.append(a) or QMessageBox.StandardButton.Ok)
         )
 
-        preview = service.preview_ground_truth_import(keep_folder=keep_folder)
+        preview = service.preview_ground_truth_import(root_folder=root, keep_folders=[keep_folder])
         window._confirm_and_apply_ground_truth_import(preview)
 
         assert question_calls == []  # nothing to change - never asks to confirm
@@ -147,37 +151,65 @@ def test_nothing_to_change_shows_information_without_asking_to_confirm(app, tmp_
         service.close()
 
 
-def test_ground_truth_menu_action_exists_and_works_without_an_open_folder(app, tmp_path, monkeypatch) -> None:
-    """Unlike every other Tools action, this one must not require
-    self.state.current_folder - it operates entirely on the folders chosen
-    inside its own dialog."""
+def test_ground_truth_action_requires_an_open_folder(app, tmp_path, monkeypatch) -> None:
+    """Version 2 requirement: unlike the original design, this now needs a
+    Root Folder to walk (so "everything not in Keep/Reject" is well
+    defined) - the currently open review folder. No folder open must
+    refuse cleanly, never open the dialog."""
     from picklikeme.desktop.dialogs.workflow_dialogs import SetUserDecisionsBySubfoldersDialog
-
-    keep_folder = tmp_path / "Keep"
-    _make_jpeg(keep_folder / "a.jpg")
 
     window, service = _window(tmp_path)
     try:
         assert window.state.current_folder is None
 
+        opened = []
+        monkeypatch.setattr(
+            SetUserDecisionsBySubfoldersDialog, "__init__",
+            lambda self, **kwargs: opened.append(kwargs) or None,
+        )
+
+        window._set_user_decisions_by_subfolders()
+
+        assert opened == []  # the dialog was never constructed
+    finally:
+        window.close()
+        service.close()
+
+
+def test_ground_truth_action_passes_the_open_folder_as_root(app, tmp_path, monkeypatch) -> None:
+    """The Root Folder the dialog receives, and that preview walks, is
+    always whatever is currently open for review - never a separately
+    chosen folder, since Version 2 dropped the "independent of what's
+    open" design entirely (see ground_truth.py's own module docstring)."""
+    from picklikeme.desktop.dialogs.workflow_dialogs import SetUserDecisionsBySubfoldersDialog
+
+    root = tmp_path / "Shoot"
+    keep_folder = root / "Selected"
+    _make_jpeg(keep_folder / "a.jpg")
+
+    window, service = _window(tmp_path)
+    try:
+        window.state.current_folder = str(root)
+
         class _FakeDialog:
             DialogCode = SetUserDecisionsBySubfoldersDialog.DialogCode
 
-            def __init__(self, **kwargs):
-                pass
+            def __init__(self, *, root_folder, **kwargs):
+                captured_root_folder.append(root_folder)
 
             def exec(self):
                 return self.DialogCode.Accepted
 
-            def keep_folder(self):
-                return str(keep_folder)
+            def root_folder(self):
+                return str(root)
 
-            def reject_folder(self):
-                return None
+            def keep_folders(self):
+                return [str(keep_folder)]
 
-            def neutral_folder(self):
-                return None
+            def reject_folders(self):
+                return []
 
+        captured_root_folder: list[str] = []
         import picklikeme.desktop.main_window as main_window_module
 
         _use_synchronous_run_with_progress(monkeypatch)
@@ -187,6 +219,7 @@ def test_ground_truth_menu_action_exists_and_works_without_an_open_folder(app, t
 
         window._set_user_decisions_by_subfolders()
 
+        assert captured_root_folder == [str(root)]
         assert service.store.review_decision_count() == 1
     finally:
         window.close()

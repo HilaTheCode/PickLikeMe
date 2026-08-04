@@ -131,6 +131,19 @@ class EyeDetection:
     # reason (LOW_HEAD_CONFIDENCE). Defaults to True (never rejects) so a
     # backend that leaves `head_confidence` at None is never affected.
     head_visible: bool = True
+    # The other four of EyePose-v0's own six-landmark set (see
+    # eyepose_v0.KPT_NAMES) - computed on every forward pass alongside
+    # left/right eye, previously discarded before detect() ever returned
+    # them (found while building the Image Inspector's landmark overlay:
+    # the data already existed, nothing read it). None for a backend that
+    # does not predict body landmarks at all (SuperAnimal-Bird only ever
+    # locates the eye) - never fabricated, matching left/right's own
+    # "populated whenever the detector ran at all" contract for whichever
+    # backend actually computes it.
+    beak: EyeKeypoint | None = None
+    head_top: EyeKeypoint | None = None
+    left_shoulder: EyeKeypoint | None = None
+    right_shoulder: EyeKeypoint | None = None
 
 
 class EyeDetector(Protocol):

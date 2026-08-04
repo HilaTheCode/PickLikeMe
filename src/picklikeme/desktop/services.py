@@ -194,22 +194,24 @@ class ReviewService:
     def preview_ground_truth_import(
         self,
         *,
-        keep_folder: str | Path | None = None,
-        reject_folder: str | Path | None = None,
-        neutral_folder: str | Path | None = None,
+        root_folder: str | Path,
+        keep_folders: list[str | Path] = (),
+        reject_folders: list[str | Path] = (),
         on_progress: Callable[[int, int], None] | None = None,
     ) -> dict[str, Any]:
-        """"Set User Decisions by Subfolders" - step 1. Walks whichever
-        folders were given (all optional) and reports counts only; nothing
-        is written yet. See ground_truth.py's own module docstring - this
-        is never an import, only `review_decisions` rows are ever touched,
-        and only once `apply_ground_truth_import` is called with this exact
-        plan still cached."""
+        """"Set User Decisions by Subfolders" - step 1. Walks `root_folder`
+        once and reports counts only; nothing is written yet. See
+        ground_truth.py's own module docstring - this is never an import,
+        only `review_decisions` rows are ever touched, and only once
+        `apply_ground_truth_import` is called with this exact plan still
+        cached. Neutral is never folder-selected - every image under
+        `root_folder` not inside a Keep/Reject subfolder becomes Neutral
+        automatically."""
         from ..ground_truth import build_plan
 
         plan = build_plan(
-            self.store, keep_folder=keep_folder, reject_folder=reject_folder,
-            neutral_folder=neutral_folder, on_progress=on_progress,
+            self.store, root_folder=root_folder, keep_folders=list(keep_folders),
+            reject_folders=list(reject_folders), on_progress=on_progress,
         )
         self._ground_truth_plan = plan
         return {
