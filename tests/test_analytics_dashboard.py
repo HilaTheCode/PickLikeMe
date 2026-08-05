@@ -875,6 +875,63 @@ def test_clicking_a_confusion_matrix_cell_pins_the_drill_down(tmp_path: Path) ->
 
 
 @pytest.mark.skipif(QApplication is None, reason="PySide6 not installed")
+def test_advanced_filters_narrow_user_vs_algorithm_live_with_no_apply_button(tmp_path: Path) -> None:
+    """Phase C's own requirement: "changing filters should immediately
+    update KPIs ... Confusion Matrix ... Run Summary" - Advanced Filters
+    alone (no drill-down, no Apply button) must narrow every tab as soon
+    as a control changes."""
+    from picklikeme.desktop.dialogs.analytics_dashboard import AnalyticsDashboard
+
+    _seed_agreement_scenario(tmp_path)
+    app = QApplication.instance() or QApplication([])
+    dialog = AnalyticsDashboard(species_db=tmp_path / "species.db", analytics_db=tmp_path / "analytics.db", annotations_db=tmp_path / "annotations.sqlite")
+    dialog._experiment_list.setCurrentRow(0)
+    app.processEvents()
+
+    assert dialog._run_summary_tab._images_processed_card._value_label.text() == "4"
+
+    dialog._advanced_filters_panel._user_decision_combo.setCurrentText("Reject")
+    app.processEvents()
+
+    # b.jpg and c.jpg are the only User Reject images (see _seed_agreement_scenario).
+    assert dialog._run_summary_tab._images_processed_card._value_label.text() == "2"
+    assert dialog._user_vs_algorithm_tab._user_reject_card._value_label.text() == "2"
+
+    dialog._advanced_filters_panel.reset()
+    app.processEvents()
+    assert dialog._run_summary_tab._images_processed_card._value_label.text() == "4"
+
+    dialog.close()
+
+
+@pytest.mark.skipif(QApplication is None, reason="PySide6 not installed")
+def test_drill_down_and_advanced_filters_combine_with_and(tmp_path: Path) -> None:
+    """A pinned drill-down and a manually-set Advanced Filters criterion
+    must narrow together (AND), never have one silently override the
+    other - the same two-source pattern the Review Window's simple Filter
+    combo + Advanced Filters already establishes."""
+    from picklikeme.desktop.dialogs.analytics_dashboard import AnalyticsDashboard
+
+    _seed_agreement_scenario(tmp_path)
+    app = QApplication.instance() or QApplication([])
+    dialog = AnalyticsDashboard(species_db=tmp_path / "species.db", analytics_db=tmp_path / "analytics.db", annotations_db=tmp_path / "annotations.sqlite")
+    dialog._experiment_list.setCurrentRow(0)
+    app.processEvents()
+
+    # Drill down to User Reject (b.jpg, c.jpg), then further narrow to
+    # Algorithm Keep (b.jpg only - c.jpg is Algorithm Reject).
+    dialog._user_vs_algorithm_tab._user_reject_card.clicked.emit()
+    app.processEvents()
+    assert {Path(p).name for p in dialog._drill_down_paths} == {"b.jpg", "c.jpg"}
+
+    dialog._advanced_filters_panel._algorithm_decision_combo.setCurrentText("Keep")
+    app.processEvents()
+
+    assert dialog._run_summary_tab._images_processed_card._value_label.text() == "1"
+    dialog.close()
+
+
+@pytest.mark.skipif(QApplication is None, reason="PySide6 not installed")
 def test_refresh_current_run_reflects_a_review_decision_made_after_the_dashboard_opened(tmp_path: Path) -> None:
     """The explicit Part 3 requirement: after Set User Decisions by
     Subfolders changes review_status, Agreement/Confusion Matrix/Precision/
