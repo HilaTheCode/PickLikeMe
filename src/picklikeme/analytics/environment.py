@@ -15,6 +15,7 @@ throughout `species.experiment`.
 from __future__ import annotations
 
 import logging
+import platform
 import subprocess
 
 logger = logging.getLogger(__name__)
@@ -39,6 +40,32 @@ def resolve_git_commit() -> str | None:
     except (OSError, subprocess.SubprocessError):
         pass
     return None
+
+
+def resolve_git_commit_timestamp() -> str | None:
+    """The current commit's own author date, ISO 8601 - the honest proxy
+    for "Build Timestamp" this project actually has (Manual QA Phase 13's
+    About dialog): there is no separate packaging/build step that stamps
+    its own time, so the commit that produced the code currently running
+    is the truthful answer to "when was this built" - never fabricated as
+    "now" or left silently blank. None for a packaged/non-git install, same
+    as `resolve_git_commit`.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "log", "-1", "--format=%cI"], capture_output=True, text=True, timeout=5, check=False,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip() or None
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return None
+
+
+def resolve_python_version() -> str:
+    """The interpreter actually running this process - e.g. "3.11.8", never
+    the full `sys.version` banner (compiler/build info nobody asked for)."""
+    return platform.python_version()
 
 
 def resolve_gpu_name(torch_module) -> str | None:

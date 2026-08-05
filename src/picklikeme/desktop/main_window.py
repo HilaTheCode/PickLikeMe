@@ -240,6 +240,14 @@ class MainWindow(QMainWindow):
         self._cutoff_spin.setSuffix("%")
         self._cutoff_spin.setValue(KEEP_PERCENT_PRESETS[0])
         self._cutoff_spin.setEnabled(False)
+        # Manual QA Phase 11: "Threshold changes should immediately recolor
+        # the gallery." Deliberately separate from _apply_cutoff (the
+        # "Apply Cutoff" action, which bulk-writes review_status with its
+        # own conflict-confirmation dialog) - this only moves
+        # ReviewSession.keep_percent, which set_keep_percent's own docstring
+        # already guarantees "never changes anyone's review_status", so a
+        # live preview here is always safe to fire on every value change.
+        self._cutoff_spin.valueChanged.connect(self._on_cutoff_preview_changed)
 
         self._sort_combo = QComboBox(self)
         for field, label in sort_options():
@@ -454,6 +462,7 @@ class MainWindow(QMainWindow):
             empty_label="No recent folders yet",
             clear_label="Clear Recent Folders",
             limit=DEFAULT_RECENT_ITEMS_LIMIT,
+            is_valid=lambda path: Path(path).is_dir(),
         )
         file_menu.addSeparator()
         file_menu.addAction(self._import_action)
@@ -851,7 +860,13 @@ class MainWindow(QMainWindow):
         self._update_status_counts(state.get("counts", {}))
 
     def _open_folder_dialog(self) -> None:
-        folder = QFileDialog.getExistingDirectory(self, "Open Folder", str(Path.home()))
+        # Manual QA Issue 2: must always start from the last folder actually
+        # opened via Open Folder - never Desktop/Documents/the project
+        # folder/an output folder. _default_folder_for_dialog() already
+        # existed and reads exactly that (falling back to home only the
+        # very first time this app has ever opened a folder); it just
+        # wasn't wired up here yet.
+        folder = QFileDialog.getExistingDirectory(self, "Open Folder", self._default_folder_for_dialog())
         if folder:
             self.open_folder(folder)
 
@@ -945,7 +960,20 @@ class MainWindow(QMainWindow):
         # Status" (None) is not a ranking strategy, so that case falls back
         # to the AI model, same as burst_strategy's own default.
         self.service.set_burst_strategy(self._color_source or DEFAULT_STRATEGY_ID)
-        self._refresh_from_state(self.service.load_session())
+        # Scroll-preserving (see _refresh_preserving_scroll's own docstring,
+        # Manual QA Issue 1): switching Color Source recolors the whole
+        # gallery through the same full model reset a decision change does,
+        # so it must not jump the scroll position back to the top either.
+        self._refresh_preserving_scroll(self.service.load_session())
+
+    def _on_cutoff_preview_changed(self, percent: float) -> None:
+        """Manual QA Phase 11: moving the Keep Threshold spinner recolors
+        the gallery immediately - a pure display preview via
+        ReviewSession.set_keep_percent (never touches review_status), not
+        the explicit, confirmed "Apply Cutoff" action below."""
+        if not self.state.current_folder:
+            return
+        self._refresh_preserving_scroll(self.service.set_keep_percent(percent))
 
     def _update_color_source(self, items: list[ImageItem]) -> None:  # noqa: ARG002 - kept for call-site stability
         """Propagate the chosen Color Source to the gallery so Priority #2
@@ -1084,7 +1112,7 @@ class MainWindow(QMainWindow):
             return
         percent = self._cutoff_spin.value()
         state = self.service.set_keep_percent(percent)
-        self._refresh_from_state(state)
+        self._refresh_preserving_scroll(state)
 
         keep_to_reject = 0
         reject_to_keep = 0
@@ -1632,25 +1660,37 @@ class MainWindow(QMainWindow):
 
     def _show_about(self) -> None:
         """Answers "am I actually running the build I think I am" without
-        guessing - the exact git commit and installed package version this
-        running process was imported from, read fresh every time this is
-        opened (never cached at startup), so it reflects the actual code
-        currently executing, not whatever was true when the process began.
-        Reuses analytics.environment's resolvers rather than re-implementing
-        "how do I find the git commit" a second time."""
+        guessing - the exact git commit (and its own commit date, the
+        honest proxy this project has for a "build timestamp" - see
+        resolve_git_commit_timestamp's own docstring), installed package
+        version, interpreter version, and source path this running process
+        was imported from - read fresh every time this is opened (never
+        cached at startup), so it reflects the actual code currently
+        executing, not whatever was true when the process began. Reuses
+        analytics.environment's resolvers rather than re-implementing "how
+        do I find the git commit" a second time (Manual QA Phase 13)."""
         from pathlib import Path
 
-        from ..analytics.environment import resolve_application_version, resolve_git_commit
+        from ..analytics.environment import (
+            resolve_application_version,
+            resolve_git_commit,
+            resolve_git_commit_timestamp,
+            resolve_python_version,
+        )
 
         commit = resolve_git_commit()
+        commit_timestamp = resolve_git_commit_timestamp()
         version = resolve_application_version()
+        python_version = resolve_python_version()
         module_path = Path(__file__).resolve().parents[1]  # .../src/picklikeme
         QMessageBox.about(
             self,
             "About PeakPic",
             "PeakPic Desktop\nNative desktop shell powered by the existing backend.\n\n"
-            f"Git commit: {commit or 'unknown (not a git checkout, or git unavailable)'}\n"
             f"Application version: {version or 'unknown'}\n"
+            f"Git commit: {commit or 'unknown (not a git checkout, or git unavailable)'}\n"
+            f"Build timestamp (commit date): {commit_timestamp or 'unknown'}\n"
+            f"Python version: {python_version}\n"
             f"Running from: {module_path}",
         )
 

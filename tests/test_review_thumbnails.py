@@ -212,6 +212,58 @@ class EyeKeypointsForTests(unittest.TestCase):
                 self.assertFalse(kwargs.get("allow_detect", True))
 
 
+class EyeKeypointsInCropForTests(unittest.TestCase):
+    """eye_keypoints_in_crop_for: the Manual QA Issue 3 fix - landmarks in
+    the crop's own pixel space, no full-frame transform, so the Image
+    Inspector can draw them on the much-larger cached crop instead of the
+    full photo (where the head is a small fraction of the frame and every
+    landmark overlaps)."""
+
+    def test_no_cached_eye_record_means_no_overlay(self):
+        with mock.patch("picklikeme.eyes.cache.read_eye_detection", return_value=None):
+            self.assertIsNone(thumbnails_module.eye_keypoints_in_crop_for("some/path.jpg"))
+
+    def test_returns_keypoints_untransformed_in_the_crops_own_pixel_space(self):
+        """Deliberately does NOT need detection_boxes_for/_detections at
+        all, unlike eye_keypoints_for - there is no full-frame rectangle to
+        map against, since nothing here leaves the crop's own coordinate
+        space."""
+        from picklikeme.eyes.cache import EyeRecord
+        from picklikeme.eyes.detector import EyeKeypoint
+
+        record = EyeRecord(
+            detector_id="fake", subject_crop_size=(120, 90), accepted=True,
+            box=(10.0, 20.0, 30.0, 40.0), confidence=0.95,
+            left=EyeKeypoint(x=15.0, y=25.0, confidence=0.9),
+            right=EyeKeypoint(x=18.0, y=22.0, confidence=0.4),
+            beak=EyeKeypoint(x=20.0, y=60.0, confidence=0.8),
+            head_top=EyeKeypoint(x=20.0, y=10.0, confidence=0.7),
+        )
+        with mock.patch("picklikeme.eyes.cache.read_eye_detection", return_value=record):
+            result = thumbnails_module.eye_keypoints_in_crop_for("some/path.jpg")
+
+        self.assertEqual(result["source_size"], (120, 90))
+        self.assertTrue(result["accepted"])
+        self.assertAlmostEqual(result["confidence"], 0.95)
+        self.assertEqual(result["box"], (10.0, 20.0, 30.0, 40.0))  # untouched, no rescale
+        self.assertEqual((result["left"]["x"], result["left"]["y"]), (15.0, 25.0))
+        self.assertEqual((result["right"]["x"], result["right"]["y"]), (18.0, 22.0))
+        self.assertEqual((result["beak"]["x"], result["beak"]["y"]), (20.0, 60.0))
+        self.assertEqual((result["head_top"]["x"], result["head_top"]["y"]), (20.0, 10.0))
+        self.assertIsNone(result["left_shoulder"])
+        self.assertIsNone(result["right_shoulder"])
+
+    def test_a_degenerate_crop_size_yields_no_overlay_rather_than_a_div_by_zero(self):
+        from picklikeme.eyes.cache import EyeRecord
+
+        record = EyeRecord(
+            detector_id="fake", subject_crop_size=(0, 0), accepted=True,
+            box=(0.0, 0.0, 1.0, 1.0), confidence=0.5, left=None, right=None,
+        )
+        with mock.patch("picklikeme.eyes.cache.read_eye_detection", return_value=record):
+            self.assertIsNone(thumbnails_module.eye_keypoints_in_crop_for("some/path.jpg"))
+
+
 def _write_fake_cache_file(cache_dir: Path, name: str, size_bytes: int, age_seconds: float) -> Path:
     """A file inside the cache's own sharded layout (cache_dir/xx/name.jpg),
     with a controlled size and mtime - the two things LRU eviction reads,

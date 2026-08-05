@@ -39,6 +39,7 @@ class RecentItemsMenu:
         empty_label: str = "Nothing recent yet",
         clear_label: str = "Clear",
         limit: int = DEFAULT_RECENT_ITEMS_LIMIT,
+        is_valid: Callable[[str], bool] | None = None,
     ) -> None:
         self._menu = menu
         self._settings = settings
@@ -47,6 +48,15 @@ class RecentItemsMenu:
         self._empty_label = empty_label
         self._clear_label = clear_label
         self._limit = limit
+        # Self-healing (Manual QA Issue 1): an entry that no longer passes
+        # this check is dropped the next time reload() runs, not just
+        # refused on click - so a folder that has since been deleted, or a
+        # leftover from a version of this feature that once (incorrectly)
+        # remembered something other than an explicit Open Folder choice,
+        # ages out of the persisted list on its own rather than
+        # accumulating forever. None means "everything persisted is valid",
+        # matching every use before this parameter existed.
+        self._is_valid = is_valid
         self._items: list[str] = []
         self._actions: list[QAction] = []
         self._menu.setToolTipsVisible(True)
@@ -56,13 +66,18 @@ class RecentItemsMenu:
         return list(self._items)
 
     def reload(self) -> None:
-        """Re-read from QSettings, discarding any in-memory state."""
+        """Re-read from QSettings, discarding any in-memory state. Entries
+        that fail `is_valid` (if one was given) are pruned and the trimmed
+        list is written straight back - so an invalid entry disappears for
+        good on the next launch, not just from this one in-memory reload."""
         raw = self._settings.value(self._settings_key, [])
         if isinstance(raw, str):
             raw = [raw]
         items = [item for item in raw if isinstance(item, str) and item]
+        if self._is_valid is not None:
+            items = [item for item in items if self._is_valid(item)]
         self._items = list(dict.fromkeys(items))[: self._limit]
-        self._rebuild()
+        self._persist()
 
     def remember(self, item: str) -> None:
         """Move `item` to the front (inserting it if new), trim to the

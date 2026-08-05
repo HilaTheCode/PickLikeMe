@@ -82,6 +82,14 @@ def test_about_dialog_shows_the_actual_running_git_commit_and_version(monkeypatc
     assert actual_commit in shown["text"]
     assert "Git commit:" in shown["text"]
     assert "Application version:" in shown["text"]
+    # Manual QA Phase 13: Build Timestamp, Python Version, Source Path -
+    # the two fields the About dialog was previously missing.
+    import platform
+
+    assert "Build timestamp" in shown["text"]
+    assert "Python version:" in shown["text"]
+    assert platform.python_version() in shown["text"]
+    assert "Running from:" in shown["text"]
 
     service.close()
     app.quit()
@@ -172,6 +180,158 @@ def test_changing_a_review_decision_never_moves_the_gallery_scroll_position(tmp_
     assert service.session._image_for(str(paths[5])).review_status == "reject"
     assert scrollbar.value() == scrolled_to
 
+    window.close()
+
+
+@pytest.mark.skipif(QApplication is None, reason="PySide6 not installed")
+def test_moving_the_keep_threshold_spinner_immediately_recolors_without_moving_scroll(tmp_path) -> None:
+    """Manual QA Phase 11: "Threshold changes should immediately recolor
+    the gallery." Moving the Keep Threshold spinner must update
+    ReviewSession.keep_percent right away (so ImageItem.algorithm_suggestion
+    - and therefore Priority #2 of the coloring policy - reflects it on the
+    very next paint) without requiring the separate, confirmed "Apply
+    Cutoff" action, and without moving the gallery scroll position -
+    exactly the same scroll-preserving refresh Issue 1 already established
+    for a decision change."""
+    from PIL import Image
+
+    app = QApplication.instance() or QApplication([])
+    state = ApplicationState()
+    settings = DesktopSettings()
+    service = ReviewService(db_path=tmp_path / "annotations.sqlite")
+    window = MainWindow(state=state, settings=settings, service=service, worker_manager=WorkerManager())
+    window.resize(500, 400)
+    window.show()
+
+    folder = tmp_path / "review"
+    folder.mkdir()
+    for i in range(80):
+        Image.new("RGB", (8, 8), color="blue").save(folder / f"img_{i:03d}.jpg", format="JPEG")
+
+    window.open_folder(str(folder))
+    app.processEvents()
+
+    scrollbar = window._gallery_view.verticalScrollBar()
+    assert scrollbar.maximum() > 0
+    scrollbar.setValue(scrollbar.maximum() // 2)
+    app.processEvents()
+    scrolled_to = scrollbar.value()
+
+    assert service.session.keep_percent != 42.0
+    window._cutoff_spin.setValue(42.0)  # triggers _on_cutoff_preview_changed
+    app.processEvents()
+
+    assert service.session.keep_percent == 42.0
+    assert scrollbar.value() == scrolled_to
+
+    window.close()
+
+
+@pytest.mark.skipif(QApplication is None, reason="PySide6 not installed")
+def test_moving_the_keep_threshold_spinner_before_a_folder_is_open_does_not_crash(tmp_path) -> None:
+    app = QApplication.instance() or QApplication([])
+    state = ApplicationState()
+    settings = DesktopSettings()
+    service = ReviewService(db_path=tmp_path / "annotations.sqlite")
+    window = MainWindow(state=state, settings=settings, service=service, worker_manager=WorkerManager())
+
+    window._cutoff_spin.setValue(20.0)  # must not raise - no folder open yet
+
+    window.close()
+
+
+@pytest.mark.skipif(QApplication is None, reason="PySide6 not installed")
+def test_changing_color_source_never_moves_the_gallery_scroll_position(tmp_path) -> None:
+    """Same Issue-1 scroll-preservation guarantee, extended to switching
+    Color Source (Phase 11): recoloring the gallery this way also goes
+    through a full ImageModel reset, so it must not jump scroll either."""
+    from PIL import Image
+
+    app = QApplication.instance() or QApplication([])
+    state = ApplicationState()
+    settings = DesktopSettings()
+    service = ReviewService(db_path=tmp_path / "annotations.sqlite")
+    window = MainWindow(state=state, settings=settings, service=service, worker_manager=WorkerManager())
+    window.resize(500, 400)
+    window.show()
+
+    folder = tmp_path / "review"
+    folder.mkdir()
+    for i in range(80):
+        Image.new("RGB", (8, 8), color="blue").save(folder / f"img_{i:03d}.jpg", format="JPEG")
+
+    window.open_folder(str(folder))
+    app.processEvents()
+
+    scrollbar = window._gallery_view.verticalScrollBar()
+    assert scrollbar.maximum() > 0
+    scrollbar.setValue(scrollbar.maximum() // 2)
+    app.processEvents()
+    scrolled_to = scrollbar.value()
+
+    classic_index = window._color_combo.findData("classic-vision")
+    assert classic_index >= 0
+    window._color_combo.setCurrentIndex(classic_index)
+    app.processEvents()
+
+    assert scrollbar.value() == scrolled_to
+
+    window.close()
+
+
+@pytest.mark.skipif(QApplication is None, reason="PySide6 not installed")
+def test_open_folder_dialog_starts_at_the_last_opened_folder_not_home(tmp_path, monkeypatch) -> None:
+    """Manual QA Issue 2: Open Folder must never default to Desktop/
+    Documents/the project folder - it must reopen wherever Open Folder was
+    last actually used, via _default_folder_for_dialog(), which already
+    existed and read the right QSettings key but was never wired into the
+    dialog call itself."""
+    from unittest import mock
+
+    from picklikeme.desktop import main_window as main_window_module
+
+    app = QApplication.instance() or QApplication([])
+    state = ApplicationState()
+    settings = DesktopSettings()
+    service = ReviewService(db_path=tmp_path / "annotations.sqlite")
+    window = MainWindow(state=state, settings=settings, service=service, worker_manager=WorkerManager())
+
+    last_folder = tmp_path / "previously_opened"
+    last_folder.mkdir()
+    window._settings.setValue("last_opened_folder", str(last_folder))
+
+    with mock.patch.object(
+        main_window_module.QFileDialog, "getExistingDirectory", return_value=""
+    ) as dialog_spy:
+        window._open_folder_dialog()
+
+    dialog_spy.assert_called_once_with(window, "Open Folder", str(last_folder))
+    window.close()
+
+
+@pytest.mark.skipif(QApplication is None, reason="PySide6 not installed")
+def test_open_folder_dialog_falls_back_to_home_before_any_folder_was_ever_opened(tmp_path) -> None:
+    from unittest import mock
+
+    from picklikeme.desktop import main_window as main_window_module
+
+    app = QApplication.instance() or QApplication([])
+    state = ApplicationState()
+    settings = DesktopSettings()
+    service = ReviewService(db_path=tmp_path / "annotations.sqlite")
+    window = MainWindow(state=state, settings=settings, service=service, worker_manager=WorkerManager())
+    # window._settings is the real, process-wide QSettings (see
+    # MainWindow.__init__) - shared with every other test in this file, so
+    # a prior test's "last_opened_folder" would otherwise leak in here.
+    # Remove it explicitly to simulate "before any folder was ever opened".
+    window._settings.remove("last_opened_folder")
+
+    with mock.patch.object(
+        main_window_module.QFileDialog, "getExistingDirectory", return_value=""
+    ) as dialog_spy:
+        window._open_folder_dialog()
+
+    dialog_spy.assert_called_once_with(window, "Open Folder", str(Path.home()))
     window.close()
 
 

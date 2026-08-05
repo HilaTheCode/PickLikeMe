@@ -369,3 +369,47 @@ def eye_keypoints_for(image_path: str, *, crop_cache_dir: str | Path | None = No
         "left_shoulder": keypoint_dict(eye.left_shoulder),
         "right_shoulder": keypoint_dict(eye.right_shoulder),
     }
+
+
+def eye_keypoints_in_crop_for(image_path: str, *, crop_cache_dir: str | Path | None = None) -> dict | None:
+    """The same eye-detector result as `eye_keypoints_for`, left in the
+    subject CROP's own pixel space instead of rescaled onto the full frame.
+
+    Manual QA Issue 3: landmarks drawn on the full photo overlap and become
+    unreadable, because the head - the only part of the frame any of them
+    sit near - is a small fraction of it. The cached crop file
+    (`bird_crop.crop_cache_path`) already IS that region at a much larger
+    effective zoom, and every field on `eyes.detector.EyeDetection` is
+    already recorded in that exact crop's own coordinate space (see its own
+    docstring) - so this needs no transform at all, unlike
+    `eye_keypoints_for`'s `to_frame()`. Returned shape matches
+    `eye_keypoints_for` exactly except `source_size` is the crop's own
+    (width, height) rather than the full frame's, so a caller can reuse one
+    scale-to-display calculation for either.
+    """
+    from ..eyes.cache import read_eye_detection
+
+    eye = read_eye_detection(crop_cache_dir or DEFAULT_CROP_CACHE_DIR, image_path)
+    if eye is None:
+        return None
+    crop_width, crop_height = eye.subject_crop_size
+    if crop_width <= 0 or crop_height <= 0:
+        return None
+
+    def keypoint_dict(keypoint) -> dict | None:
+        if keypoint is None:
+            return None
+        return {"x": keypoint.x, "y": keypoint.y, "confidence": keypoint.confidence}
+
+    return {
+        "source_size": (crop_width, crop_height),
+        "accepted": eye.accepted,
+        "confidence": eye.confidence,
+        "box": tuple(eye.box),
+        "left": keypoint_dict(eye.left),
+        "right": keypoint_dict(eye.right),
+        "beak": keypoint_dict(eye.beak),
+        "head_top": keypoint_dict(eye.head_top),
+        "left_shoulder": keypoint_dict(eye.left_shoulder),
+        "right_shoulder": keypoint_dict(eye.right_shoulder),
+    }

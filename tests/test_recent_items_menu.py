@@ -24,7 +24,7 @@ from picklikeme.desktop.widgets.recent_items import DEFAULT_RECENT_ITEMS_LIMIT, 
 pytestmark = pytest.mark.skipif(QApplication is None, reason="PySide6 not installed")
 
 
-def make_menu(tmp_path, *, settings_key="recent_folders", limit=DEFAULT_RECENT_ITEMS_LIMIT, on_select=None):
+def make_menu(tmp_path, *, settings_key="recent_folders", limit=DEFAULT_RECENT_ITEMS_LIMIT, on_select=None, is_valid=None):
     """A menu backed by a throwaway INI file, so tests never touch the real
     app's QSettings (registry on Windows) and never see state left over from
     other tests or runs."""
@@ -40,6 +40,7 @@ def make_menu(tmp_path, *, settings_key="recent_folders", limit=DEFAULT_RECENT_I
         empty_label="No recent folders yet",
         clear_label="Clear Recent Folders",
         limit=limit,
+        is_valid=is_valid,
     )
     return recent, menu, settings, selected
 
@@ -194,3 +195,56 @@ def test_the_class_is_generic_enough_for_a_differently_keyed_list(tmp_path):
 
     assert projects.items() == ["project-a.peakpic"]
     assert folders.items() == []  # independent keys, no cross-talk
+
+
+# ---------------------------------------------------------------------------
+# Self-healing (Manual QA Issue 1): a persisted entry that fails `is_valid`
+# disappears on reload, and stays gone - it is pruned from QSettings itself,
+# not just filtered out of this one in-memory view.
+# ---------------------------------------------------------------------------
+
+
+def test_an_invalid_persisted_entry_is_pruned_on_reload(tmp_path):
+    real_dir = tmp_path / "real_folder"
+    real_dir.mkdir()
+    recent, _menu, settings, _selected = make_menu(tmp_path, is_valid=lambda p: Path(p).is_dir())
+    # Simulate a leftover entry from before this validation existed, or a
+    # folder that has since been deleted/renamed - written directly to
+    # QSettings, bypassing remember() entirely, the same way stale state
+    # from an older app version would already be sitting there.
+    settings.setValue("recent_folders", [str(real_dir), str(tmp_path / "vanished_folder")])
+
+    recent.reload()
+
+    assert recent.items() == [str(real_dir)]
+
+
+def test_the_pruned_list_is_what_gets_persisted_back(tmp_path):
+    """The prune must be written back to QSettings immediately, not just
+    held in memory - otherwise the invalid entry would keep reappearing on
+    every future reload (e.g. every app launch)."""
+    real_dir = tmp_path / "real_folder"
+    real_dir.mkdir()
+    settings = QSettings(str(tmp_path / "settings.ini"), QSettings.IniFormat)
+    settings.setValue("recent_folders", [str(real_dir), str(tmp_path / "vanished_folder")])
+    QApplication.instance() or QApplication([])
+    menu = QMenu()
+    RecentItemsMenu(
+        menu, settings, settings_key="recent_folders", on_select=lambda item: None,
+        is_valid=lambda p: Path(p).is_dir(),
+    )
+
+    persisted = settings.value("recent_folders")
+    assert persisted == [str(real_dir)]
+
+
+def test_no_is_valid_means_every_persisted_entry_is_kept(tmp_path):
+    """Every use of this class before is_valid existed must behave exactly
+    as before when the parameter is omitted - it defaults to None, which
+    means "nothing gets pruned"."""
+    recent, _menu, settings, _selected = make_menu(tmp_path)
+    settings.setValue("recent_folders", [str(tmp_path / "does_not_exist")])
+
+    recent.reload()
+
+    assert recent.items() == [str(tmp_path / "does_not_exist")]
