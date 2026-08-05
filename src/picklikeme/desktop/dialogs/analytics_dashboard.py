@@ -1463,7 +1463,7 @@ class AnalyticsDashboard(QDialog):
             paths = None
 
         self._user_vs_algorithm_tab.show_run(self._store, self._annotation_store, run_id, paths=paths)
-        self._run_summary_tab.show_run(self._store, run_id, paths=paths)
+        self._run_summary_tab.show_run(self._store, run_id, records=filtered_records)
         self._species_analysis_tab.show_run(self._store, run_id, records=filtered_records)
         self._burst_analytics_tab.show_run(self._store, run_id, paths=paths)
 

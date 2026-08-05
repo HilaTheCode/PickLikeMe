@@ -197,7 +197,7 @@ def test_clicking_a_species_row_pins_every_tab_to_that_species(tmp_path: Path) -
     app.processEvents()
 
     assert dialog._drill_down_paths == [str(a)]
-    assert dialog._run_summary_tab._images_processed_card._value_label.text() == "1"
+    assert dialog._run_summary_tab._images_processed_card._value_label.text() == "1"  # Considered = len(records)
     dialog.close()
 
 
