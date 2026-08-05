@@ -13,3 +13,11 @@ matplotlib
 pyarrow
 tqdm
 PyYAML
+
+# EyePose-v0 (an optional Classic Vision eye-detector backend - see
+# picklikeme.eyes.eyepose_v0's module docstring) needs onnxruntime. Not
+# listed unconditionally above since CPU vs GPU is a real choice, not a
+# default - pick exactly one:
+#   pip install onnxruntime               # any machine (CPU)
+#   pip install onnxruntime-gpu==1.28.0    # NVIDIA/CUDA machines - matches the cu130 torch build above
+# (same two choices as pyproject.toml's eyepose-cpu/eyepose-gpu extras)

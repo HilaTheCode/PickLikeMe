@@ -43,7 +43,33 @@ than one virtualenv and only one is active), since `-m` only needs the
 *interpreter you run it with* to have the package installed, not `PATH`. Both
 forms run the identical code.
 
-### 2. Build a manifest from a Select/Reject folder pair
+### 2. Install ExifTool (required for metadata and DNG crop embedding)
+
+PickLikeMe uses ExifTool for metadata extraction and for embedding Lightroom crop metadata into DNG files.
+
+macOS (Homebrew):
+
+```bash
+brew install exiftool
+```
+
+If Homebrew installs it outside your shell PATH, make sure one of these locations is available:
+
+- Apple Silicon: `/opt/homebrew/bin/exiftool`
+- Intel: `/usr/local/bin/exiftool`
+
+You can verify it with:
+
+```bash
+which exiftool
+exiftool -ver
+```
+
+Windows:
+
+- Install ExifTool and ensure `exiftool.exe` is on your `PATH`, or pass `--exiftool-path` to the relevant command.
+
+### 3. Build a manifest from a Select/Reject folder pair
 
 ```bash
 python -m picklikeme.ingest.cli build-manifest --select-root "C:\\path\\to\\select" --reject-root "C:\\path\\to\\reject" --manifest-path data/manifest.parquet
@@ -53,7 +79,7 @@ python -m picklikeme.ingest.cli build-manifest --select-root "C:\\path\\to\\sele
 the single source of truth for labels and burst membership; there is no
 separate labels CSV to keep in sync with it.
 
-### 3. Create the frozen evaluation split (once)
+### 4. Create the frozen evaluation split (once)
 
 ```bash
 python -m picklikeme.split --manifest data/manifest.parquet --output data/split.csv
@@ -63,7 +89,7 @@ The split is assigned per burst (never per image) and is frozen: every model
 version trains and evaluates against the same split so results are comparable.
 The command refuses to overwrite an existing split unless `--force` is given.
 
-### 4. Train the model
+### 5. Train the model
 
 ```bash
 python -m picklikeme.train --epochs 20 --select-root "C:\\path\\to\\select" --reject-root "C:\\path\\to\\reject" --manifest data/manifest.parquet --split data/split.csv
@@ -188,6 +214,22 @@ python -m picklikeme.train --epochs 20 --select-root "..." --reject-root "..."
 If `--crop-birds` is on but the cache is empty, training prints a warning and
 falls back to full frames — so build the cache first, or pass
 `--no-crop-birds` intentionally.
+
+**This crop cache is the Vision Cache** — the shared image source for every
+Computer Vision consumer (training, Classic Vision's eye detectors, its
+sharpness metrics, and any future vision module), not a training-only
+optimization. It stores each crop at its **own original resolution** by
+default (`--max-side`, unset = unlimited) as **JPEG** (`--image-format`,
+`--jpeg-quality`, default q98 — near-lossless, ~3× smaller than PNG). A
+consumer that genuinely needs a smaller input (training's own data loader)
+resizes at load time instead of the cache pre-shrinking everything for it —
+see `docs/vision_cache.md` for the full investigation, the real disk-size
+measurements behind these defaults, and how this differs from the separate,
+UI-only Preview Cache. Changing any cache-affecting parameter (resolution,
+format, quality) on an existing cache directory is refused
+(`SystemExit: ... pass --force to rebuild`) rather than silently mixing
+old and new data — pass `--force` (CLI) or `force_preprocess=True`
+(`rank.rank_folder`/`ClassicVisionStrategy.rank_folder`) to rebuild.
 
 #### How preprocessing spends its time
 
@@ -350,6 +392,276 @@ writing `crops_sheet_*.png`, `fallback_sheet_*.png`, and `report.txt` into
 `inspection/`. Detected-vs-fallback is re-derived by running the detector
 read-only on the sampled crops, since preprocessing doesn't record per-image
 outcomes.
+
+### Analysis modules (AI Model, Classic Vision)
+
+Ranking is pluggable. A **ranking strategy** is an *analysis module*: it reads
+a folder's images and writes scores. Everything downstream —
+`analyzer.io.load_ranking`, the review gallery, the AI-suggestion cutoff — is
+strategy-agnostic, so adding a module touches none of it.
+
+**Analysis and Organize are independent.** An analysis module never moves a
+file, never consults whether a folder has been organized, and never refuses to
+run because of workflow state. Every module can be run on a folder that has
+never been organized, one already arranged into `_Selected`/`_Rejected`, one
+already ranked by another module, one already ranked by itself, or one never
+ranked at all. In the organized case it analyses the images *inside*
+`_Selected` and `_Rejected` too — an image does not stop being an image once
+it has been filed, and RAW vs JPEG makes no difference either. Organize is a
+separate, optional operation that may *consume* analysis metadata but is never
+a prerequisite for producing it.
+
+**Each module owns its own scores file**, so results coexist instead of
+overwriting each other:
+
+```
+<folder>/.picklikeme/
+    ranking.csv                    # AI Model (keeps the original name)
+    ranking-classic-vision.csv     # Classic Vision
+    classic_vision_filters.json    # why Classic Vision skipped what it skipped
+```
+
+The review session discovers whatever files are present rather than asking the
+registry, so a folder scored by a module that has since been removed still
+displays its numbers. Both the Gallery card and the Loupe show every module's
+score independently, and the Sort menu offers one entry per module — all
+generated from the registry, so a future module (Burst Analysis, Species
+Analysis) appears in the UI without any UI code changing.
+
+Three ship today, selectable from the Desktop app's **Rank** menu (the
+toolbar button itself still runs the default):
+
+| Strategy | What it is |
+| --- | --- |
+| **AI Model** (default) | The trained preference model — `picklikeme.rank`, exactly as before. |
+| **Classic Vision Ranking (EyePose-v0, recommended)** | Deterministic. No model checkpoint fine-tuning, no learning. Eye localisation: EyePose-v0. |
+| **Classic Vision Ranking (SuperAnimal)** | The same deterministic scoring, eye localisation: SuperAnimal-Bird. |
+
+**Classic Vision is a framework of interchangeable eye-localisation
+backends, not a single algorithm.** Filtering, scoring, the crop cache, the
+eye cache, the Gallery/Loupe overlay and every diagnostic below are
+completely blind to which backend produced an eye location — they only ever
+consume `eyes.detector.EyeDetection` (a box, a confidence, left/right
+keypoints, an accept/reject flag). Each backend is its **own** ranking
+strategy with its own `strategy_id`, so both can be run on the same folder
+and their results coexist for direct comparison, exactly like the AI Model
+and Classic Vision already coexist:
+
+```
+<folder>/.picklikeme/
+    ranking-classic-vision-eyepose-v0.csv   # EyePose-v0's own scores
+    ranking-classic-vision.csv              # SuperAnimal's own scores (legacy filename, unchanged)
+    classic-vision-eyepose-v0_filters.json  # + matching filter/metrics reports per backend
+    classic_vision_filters.json
+```
+
+Adding a fourth backend later (a future fine-tuned model, a head-pose
+pipeline, …) is implementing `eyes.detector.EyeDetector` and registering it
+in `eyes.build_eye_detector` plus one subclass in `ranking/classic.py` — no
+other code changes, per `ranking.classic`'s own module docstring.
+
+Both backends run the same two phases:
+
+*Phase 1 — filtering.* An image is excluded from scoring, with an explicit
+reason, when it has no detected subject (`NO_SUBJECT`), no locatable eye
+(`NO_VISIBLE_EYE`), or a subject no eye detector covers
+(`UNSUPPORTED_SUBJECT`). Filtered images get **no score at all** rather than a
+zero — they appear in the review gallery as Unranked and Neutral, which is the
+honest presentation, and the per-image reasons are written to a
+backend-specific `*_filters.json`.
+
+*Phase 2 — scoring.* Three independent metrics, identical across backends,
+each normalised across the run and combined as a weighted sum (defaults
+50 / 30 / 20):
+
+- **Eye sharpness** — focus measured inside the detected eye box alone
+- **Subject sharpness** — focus across the whole subject crop
+- **Subject size** — subject box area ÷ full frame area
+
+Weights and the accept/reject thresholds are set in an **Algorithm
+Parameters** dialog before each run, with *Reset to Defaults* — generated
+from each backend's own parameter declarations (they differ: see below), so
+adding a parameter later needs no UI code. Any weight values are valid
+(50/30/20 and 5/3/2 mean the same thing); they are normalised, not validated.
+
+#### EyePose-v0 (recommended)
+
+[`synthet/eye-pose-v0`](https://huggingface.co/synthet/eye-pose-v0) — a
+YOLO11n-pose checkpoint (MIT licence) fine-tuned on CUB-200-2011 for six
+bird head/body landmarks: `beak`, `left_eye`, `right_eye`, `head_top`,
+`left_shoulder`, `right_shoulder`.
+
+**Running a `.pt` YOLO checkpoint normally means depending on the
+`ultralytics` package, which is AGPL-3.0** — the same license this project
+already avoided once (see SuperAnimal-Bird below). The resolution:
+`picklikeme/eyes/eyepose_v0.py` downloads the published checkpoint and
+converts it to **ONNX once**, on first use, caching the result in
+`cache/eye_models/`; every run after that uses `onnxruntime` (MIT) only.
+`ultralytics` is an **optional, one-time setup dependency**
+(`pip install picklikeme[eyepose-export]`, or just `pip install ultralytics`),
+never a runtime one — nothing reachable from a normal ranking run imports it.
+The ONNX export was verified byte-for-byte identical to the original
+checkpoint's own forward pass before shipping — see
+`docs/eyepose_v0_validation.md`.
+
+`onnxruntime` itself is a separate choice, not bundled with the base
+install (a GPU-only wheel has no business being forced on a CPU-only
+machine, or vice versa) — pick exactly one:
+
+```
+pip install picklikeme[eyepose-cpu]   # any machine
+pip install picklikeme[eyepose-gpu]   # NVIDIA/CUDA machines
+```
+
+Either way, `device="cuda"` is requested automatically whenever CUDA is
+available (`picklikeme.platform.resolve_torch_device`); with the CPU-only
+package installed this request is silently ignored and CPU is used, no
+error. `EyePoseV0EyeDetector` prints a short "EyePose runtime" banner at
+construction naming the execution provider, device, and ONNX Runtime
+version actually in use — see `picklikeme/eyes/runtime_providers.py` for
+how CUDA's native library discovery is kept isolated from EyePose itself
+(sourced from torch's own already-mandatory CUDA build, not a second,
+duplicated one).
+
+Its accept/reject gate mirrors SuperAnimal-Bird's own two-gate shape without
+reusing its arithmetic (the two landmark schemas differ too much for that to
+mean the same thing): a confidence threshold, then an **anatomical
+plausibility check** — the eye must sit close to the `beak`↔`head_top` line,
+relative to head size, catching a landmark that confidently lands somewhere
+that isn't actually a head. Unlike SuperAnimal-Bird's thresholds (tuned
+against a hand-adjudicated sample of this project's own archive), EyePose-v0's
+defaults are reasonable starting points pending the same treatment — see
+`docs/eyepose_v0_validation.md` for a real, if small, comparison against
+SuperAnimal-Bird and what it does and doesn't establish.
+
+#### SuperAnimal-Bird
+
+[SuperAnimal-Bird](https://huggingface.co/DeepLabCut/DeepLabCutModelZoo-SuperAnimal-Bird)
+from the DeepLabCut Model Zoo (Ye et al., *Nature Communications* 2024) — the
+only free, actively maintained, bird-specific pretrained model with `left_eye`
+and `right_eye` keypoints. Its published architecture is a `timm` `resnet50_gn`
+backbone plus two transposed-convolution heads, all of which this project
+already depends on, so `picklikeme/eyes/superanimal_bird.py` rebuilds it in
+~40 lines and loads the published weights **without taking on DeepLabCut as a
+dependency**. The ~103 MB checkpoint downloads once into `cache/eye_models/`;
+everything after that is fully local, like the COCO detector's weights.
+
+**How accurate is it?** Measured on 30 crops drawn with a fixed seed from this
+archive, stratified 15/15 by your own Selected/Rejected verdict, birds only,
+with each one adjudicated by eye against a 6× zoom of the predicted eye box:
+
+| | count |
+| --- | --- |
+| box lands on a real eye | 14 / 30 |
+| box on nape, wing or background | 7 / 30 |
+| head too small/blurred to judge | 8 / 30 |
+| correctly filtered (no eye visible) | 1 / 30 |
+
+The useful result is the **separation**: every correct detection scored ≥ 0.89,
+while six of the seven errors scored below 0.80. Hence the default minimum eye
+confidence of **0.80**, which lifts precision from 67% to 93% while keeping
+every correct detection. On a 500-crop sample it keeps 71% of Selected images
+against 53% of Rejected ones — it discards rejects faster than keepers.
+
+Known limitations, all observed in that sample:
+
+- **Birds only.** On a mammal the model returns a confident, wrong answer (a
+  tiger's "eyes" on its ear at 0.67/0.90), so non-birds are reported as
+  `UNSUPPORTED_SUBJECT` rather than silently mis-scored.
+- **Group scenes are outside its contract.** It is a top-down *single-animal*
+  pose model, but `bird_crop` crops flocks to the whole group; its output on
+  such a crop is arbitrary and its confidence does not reliably drop.
+- **Upstream misdetections pass through.** `supports()` trusts the COCO class
+  the subject detector recorded — a fruit bat detected as a bird still reaches
+  the eye model.
+- **One eye is enough** (side-profile is the norm), but taking the more
+  confident of the two occasionally picks the worse-localised one.
+
+Both backends reuse the same crop cache the AI path builds, so on an
+already-ranked folder each adds only its own eye pass plus cheap OpenCV
+arithmetic — neither re-decodes a RAW or re-runs subject detection.
+
+#### Debug mode and coordinate-transform validation
+
+`ClassicVisionStrategy.rank_folder`'s `debug_dir` parameter (off by default,
+not exposed in the desktop UI — a development/troubleshooting aid, not a
+photographer-facing feature) writes one combined debug image per processed
+candidate: the crop, the eye box, both eye keypoints, confidence values, and
+the eye box's coordinates in both crop space and projected onto the full
+frame. Backend-agnostic — drawn only from `EyeDetection`, so it needs no
+per-backend code.
+
+For validating a backend's coordinate math end to end on real photos —
+original image → bird crop → the exact tensor the model saw → raw output →
+eye overlay on the crop → eye overlay projected back onto the original —
+`picklikeme.eyes.inspect_eyepose` is a read-only CLI tool, the same shape as
+`picklikeme.inspect_crops`:
+
+```bash
+python -m picklikeme.eyes.inspect_eyepose --input-folder "D:\Photos\sample"
+```
+
+**Detector Boxes** (Gallery toolbar / View menu, synced into the Loupe) draws
+the subject box(es) any module's preprocessing recorded, plus — once Classic
+Vision has run — the eye it measured: solid magenta when accepted, dashed
+magenta when detected but distrusted (`EyeDetection.accepted`). Both are shown
+regardless of the filtering verdict, on purpose — a *rejected* image's raw eye
+guess is exactly what you need to see to judge whether `NO_VISIBLE_EYE` was
+the right call. This overlay is read-only: it never re-runs a detector, only
+draws what an earlier run already recorded, so a folder ranked only by the AI
+model shows subject boxes but no eye until Classic Vision has run on it too.
+Box outlines (both the subject box and the eye box, Gallery and Loupe alike)
+are drawn at ~5× their original thickness — this overlay is PeakPic's primary
+tool for judging a detector's output, so it needs to read at a glance; colors
+are unchanged.
+
+**Color Source** (Gallery toolbar) picks which strategy's score tints a card's
+background — "Review Status" (green/red/neutral by your own Keep/Reject/
+Neutral decision, the default) or any registered module's own score as a
+low-to-high gradient across whatever is currently visible. Since AI Model and
+Classic Vision can rank the same folder in opposite orders, this makes it
+explicit, at all times, which one's opinion the colors on screen represent —
+generated from the same registry as the Rank/Sort menus, so a future module
+is colorable the moment it is runnable, with no UI change.
+
+### Burst Analysis (Collapse Bursts)
+
+Burst Analysis is a processing layer that runs **after** ranking, not a third
+ranking strategy — it never looks at a pixel and produces no score of its
+own:
+
+```
+Image → Ranking Strategy → Score → Burst Analysis → Burst Ranking → Review UI
+```
+
+It is handed nothing but each image's path, capture timestamp and score, so
+it works identically whichever strategy (AI Model, Classic Vision, or
+whatever ships next) produced that score, and never needs to change when a
+new one is added. Burst *identification* reuses `picklikeme.burst`'s existing
+capture-time-gap clustering as-is — frames within 2 seconds of the previous
+one are the same burst; an image with no readable capture time is its own
+singleton burst rather than being guessed into one. Burst *ranking* is this
+feature's own addition: within one burst, members are ordered by score
+(an unscored member sorts last, never mistaken for a score of zero), giving
+every image:
+
+- `burst_id` — which burst it belongs to
+- `burst_size` — how many images are in that burst
+- `burst_rank` — 1-based position within its own burst, best first
+- `burst_best` — true for exactly the top-ranked member
+
+Which strategy's score drives `burst_rank` follows the Gallery's own Color
+Source selector (falling back to the AI model for "Review Status", which
+isn't a ranking strategy) — one selector, one unambiguous meaning across the
+whole app.
+
+The Gallery's **Collapse Bursts** toggle (View menu / toolbar, off by
+default — the Gallery is otherwise completely unchanged) shows only each
+burst's `burst_best` image, with a small "+N" badge for any burst that has
+other members. Opening a collapsed card opens the Loupe scoped to that
+burst's own members in `burst_rank` order, so you flip through a burst's
+frames best-first with the same Keep/Reject/Neutral workflow, rather than the
+whole gallery's order.
 
 ### Auto-crop for photo editors (Lightroom)
 

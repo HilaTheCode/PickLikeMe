@@ -19,11 +19,35 @@ dependencies = [
   "matplotlib",
   "pyarrow",
   "tqdm",
-  "PyYAML"
+  "PyYAML",
+  "open_clip_torch"
 ]
+
+[project.optional-dependencies]
+# Only needed once, ever: converting eye-pose-v0's published .pt checkpoint
+# to the ONNX graph picklikeme.eyes.eyepose_v0 actually runs against. NOT a
+# runtime dependency - the `ultralytics` package (AGPL-3.0) is imported only
+# inside that one-time conversion step, never by anything reachable from a
+# normal ranking run once eye_pose_v0.onnx is cached. See
+# eyes/eyepose_v0.py's module docstring for the full rationale.
+eyepose-export = ["ultralytics"]
+# EyePose-v0's actual runtime dependency (see eyes/eyepose_v0.py's module
+# docstring's "CPU vs GPU onnxruntime") - deliberately NOT in the base
+# `dependencies` above, since forcing onnxruntime-gpu's ~240MB CUDA wheel
+# onto a CPU-only contributor's machine (or vice versa, a CPU-only
+# onnxruntime onto a GPU machine that could use CUDA) is exactly the kind
+# of thing an optional extra exists to avoid. Pick exactly one:
+#   pip install picklikeme[eyepose-cpu]   # any machine
+#   pip install picklikeme[eyepose-gpu]   # NVIDIA/CUDA machines
+eyepose-cpu = ["onnxruntime"]
+# Pinned (not >=) because onnxruntime-gpu's CUDA/cuDNN version requirement
+# changes across releases - see eyes/runtime_providers.py's module
+# docstring for how this is matched against torch's own CUDA build.
+eyepose-gpu = ["onnxruntime-gpu==1.28.0"]
 
 [project.scripts]
 picklikeme = "picklikeme.ingest.cli:main"
+peakpic-desktop = "picklikeme.desktop.app:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

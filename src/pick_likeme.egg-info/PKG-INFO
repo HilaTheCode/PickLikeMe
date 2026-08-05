@@ -14,3 +14,4 @@ Requires-Dist: timm>=1.0.20
 Requires-Dist: matplotlib
 Requires-Dist: pyarrow
 Requires-Dist: tqdm
+Requires-Dist: PyYAML

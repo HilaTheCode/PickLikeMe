@@ -415,7 +415,7 @@ signal about the detector's behaviour, not an artefact of different counting.
 
 | | |
 | --- | --- |
-| Location | `<project>/annotations/false_negatives.db` (`--annotations-db` to move) |
+| Location | `<project>/annotations/review.db` (`--annotations-db` to move; renamed from `false_negatives.db` — an existing database is migrated automatically the first time it's opened, no action needed) |
 | Why there | Outside every output directory — those are per-run and get replaced; a knowledge base must outlive them |
 | Tables | `annotations_v2`, `annotation_categories_v2`, `categories`, `identity_cache`, `unmigrated_v1`, `schema_info` |
 | Per record | `image_hash` (identity), filename, original path, capture datetime if readable, timestamps, the three fields, plus any pre-redesign categories / cause / notes |

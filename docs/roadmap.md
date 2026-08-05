@@ -9,6 +9,13 @@ This roadmap improves the system scientifically: **each version changes exactly 
 major component** so that every improvement can be measured in isolation against the
 previous version.
 
+> This roadmap covers the **AI Model** strategy only. **Classic Vision Ranking** - a
+> separate, deterministic, non-learned strategy (subject/eye detection + sharpness/size
+> metrics, no training) - ships alongside it and is versioned independently; see
+> README.md's "Analysis modules (AI Model, Classic Vision)" section. It is intentionally
+> absent from the V1-V9 sequence below, since it never changes "one major component" of
+> this model - it is not a version of it.
+
 ## Rules
 
 1. One major change per version. Never combine two improvements.

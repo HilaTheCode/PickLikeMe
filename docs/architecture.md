@@ -1,5 +1,7 @@
 # Pick Like Me architecture
 
+> **Scope note:** everything below is about the *learned* ranking strategy ("AI Model"). PeakPic also ships a second, independent, non-learned strategy - **Classic Vision Ranking** (`src/picklikeme/ranking/classic.py`) - a deterministic pipeline of subject/eye detection plus three sharpness/size metrics, with no training and no checkpoint. Classic Vision is itself a framework of interchangeable eye-localisation backends (currently EyePose-v0 and SuperAnimal-Bird, each its own selectable strategy with its own coexisting results) rather than one fixed algorithm - see `src/picklikeme/eyes/detector.py`'s module docstring for that backend boundary. It exists alongside the AI Model rather than instead of it: see README.md's "Analysis modules (AI Model, Classic Vision)" section for what it does and why. The "Classical handcrafted feature engineering" rejection below is about the *main*, learned architecture only - it does not apply to Classic Vision, which is deliberately hand-crafted and deterministic by design (a debuggable baseline/cross-check, not a competitor to the learned model).
+
 ## Problem framing
 
 This project is not an objective image-quality ranking problem. It is a personal preference modeling problem: given a RAW wildlife image or burst, predict whether I would keep it.
