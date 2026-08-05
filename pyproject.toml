@@ -20,7 +20,15 @@ dependencies = [
   "pyarrow",
   "tqdm",
   "PyYAML",
-  "open_clip_torch"
+  "open_clip_torch",
+  # The PeakPic desktop GUI shell (src/picklikeme/desktop/) - imported
+  # directly by desktop/app.py and every dialog/view under desktop/.
+  # Previously installed only by accident (already present in whichever
+  # venv happened to be active) and never declared here, so a clean
+  # `pip install -r requirements.txt && pip install -e .` on a fresh
+  # machine could not launch `peakpic-desktop`/`python -m picklikeme.desktop`
+  # at all - see docs/Developer_Onboarding_Mac.md.
+  "PySide6"
 ]
 
 [project.optional-dependencies]

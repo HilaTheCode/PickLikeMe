@@ -13,6 +13,12 @@ matplotlib
 pyarrow
 tqdm
 PyYAML
+open_clip_torch
+
+# The PeakPic desktop GUI shell (src/picklikeme/desktop/) - required to run
+# `peakpic-desktop` / `python -m picklikeme.desktop`. Previously undeclared
+# here (see docs/Developer_Onboarding_Mac.md).
+PySide6
 
 # EyePose-v0 (an optional Classic Vision eye-detector backend - see
 # picklikeme.eyes.eyepose_v0's module docstring) needs onnxruntime. Not
