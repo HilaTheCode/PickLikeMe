@@ -54,6 +54,12 @@ dist/
 *.rw2
 *.dng
 
+# ...except documentation illustration screenshots (app UI screenshots
+# embedded in docs/*.md guides, e.g. docs/Safari_Operational_Guide_Mac.md) -
+# these are small, committed-on-purpose assets, unlike the working
+# photography images the patterns above exist to keep out of git.
+!docs/images/**
+
 # AI models
 *.pt
 *.pth
