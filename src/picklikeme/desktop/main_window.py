@@ -37,6 +37,8 @@ from .core.caching import CacheManager
 from .core.events import EventBus
 from .core.jobs import JobManager, JobSpec, run_in_background as _real_run_in_background
 from .core.thumbnail_loader import ThumbnailLoadTask, ThumbnailReadySignal
+from .filtering import FilterableRecord, apply_filters
+from .widgets.advanced_filters_panel import AdvancedFiltersPanel
 from .widgets.recent_items import DEFAULT_RECENT_ITEMS_LIMIT, RecentItemsMenu
 
 run_in_background = _real_run_in_background
@@ -173,6 +175,13 @@ class MainWindow(QMainWindow):
         self._initialized = False
         self._settings = QSettings("PeakPic", "PeakPicDesktop")
         self._all_items: list[ImageItem] = []
+        # Best-effort per-path species lookup for Advanced Filters' Species
+        # control (see _refresh_species_cache) - keyed by path, value is a
+        # species.classifier.SpeciesPrediction or None once that path has
+        # been checked and nothing was on record for it. Absence of the key
+        # itself (as opposed to a stored None) means "not looked up yet" -
+        # the incremental-lookup marker _refresh_species_cache relies on.
+        self._species_by_path: dict[str, Any] = {}
         self._current_filter = "all"
         self._sort_field = "score"  # matches ReviewSession.load()'s own default ordering
         self._sort_ascending = False
@@ -228,6 +237,16 @@ class MainWindow(QMainWindow):
         self._filter_combo = QComboBox(self)
         self._filter_combo.addItems([FILTER_LABELS[f] for f in FILTERS])
         self._filter_combo.currentIndexChanged.connect(self._on_filter_changed)
+
+        # Product Direction: "the highest priority is now to move the
+        # advanced filtering capabilities into the Review Window" - narrows
+        # the same gallery model the simple Filter combo above and Collapse
+        # Bursts already narrow (see _apply_filter), through the one shared
+        # filtering.py engine (desktop/filtering.py's own docstring: "the
+        # same engine should drive Main Review Window / Analytics Dashboard
+        # / Loupe navigation").
+        self._advanced_filters_panel = AdvancedFiltersPanel(self)
+        self._advanced_filters_panel.criteriaChanged.connect(self._apply_filter)
 
         self._cutoff_combo = QComboBox(self)
         for preset in KEEP_PERCENT_PRESETS:
@@ -324,6 +343,7 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(self._central_widget)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
+        layout.addWidget(self._advanced_filters_panel)
         layout.addWidget(self._gallery_view)
         return layout
 
@@ -738,6 +758,10 @@ class MainWindow(QMainWindow):
         self._recent_folders_menu.remember(folder_path)
         self.state.current_folder = result.get("input_folder") or self.state.current_folder
         self.state.image_count = result.get("counts", {}).get("total", 0)
+        # A genuinely new folder - species lookups keyed by the old folder's
+        # paths are no longer useful and would otherwise accumulate forever
+        # across however many folders a session opens.
+        self._species_by_path = {}
         self._refresh_from_state(result)
 
         # The gallery now has real data - scores, ranks, thumbnails, review
@@ -856,8 +880,100 @@ class MainWindow(QMainWindow):
             )
             for image in state.get("images", [])
         ]
+        self._refresh_species_cache(self._all_items)
+        self._refresh_advanced_filter_options()
         self._apply_filter()
         self._update_status_counts(state.get("counts", {}))
+
+    def _refresh_species_cache(self, items: list[ImageItem]) -> None:
+        """Best-effort per-path species lookup for Advanced Filters'
+        Species control - mirrors AnalyticsDashboard's ImageExplorerTab.
+        _populate_candidates, except with no single run/classifier_id to
+        scope to (Organize by Species is a separate, file-moving-only
+        workflow not tied to ReviewSession) - so this asks SpeciesCache for
+        "the most recent prediction from any classifier" (get_any) instead.
+
+        Incremental: only paths not already a key in self._species_by_path
+        are queried, so _refresh_from_state's frequent re-invocation (every
+        color-source change, every cutoff-preview tick) costs nothing once
+        a folder's images have all been looked up once. _start_open_folder
+        resets the dict when a genuinely new folder is opened.
+        """
+        missing = [item.path for item in items if item.path and item.path not in self._species_by_path]
+        if not missing:
+            return
+        try:
+            from ..species.cache import DEFAULT_SPECIES_DB, SpeciesCache
+
+            cache = SpeciesCache(DEFAULT_SPECIES_DB)
+            try:
+                for path in missing:
+                    self._species_by_path[path] = cache.get_any(path)
+            finally:
+                cache.close()
+        except Exception:  # noqa: BLE001 - species lookup is best-effort, must never block Review
+            for path in missing:
+                self._species_by_path.setdefault(path, None)
+
+    def _build_filterable_records(self) -> list[FilterableRecord]:
+        """Adapts the Review Window's own live `ImageItem` list into the
+        shared filtering engine's generic shape - see filtering.py's own
+        docstring for why this adapter, rather than a data-model
+        unification, is what "one shared engine" means here."""
+        strategy_id = self._color_source or DEFAULT_STRATEGY_ID
+        records: list[FilterableRecord] = []
+        for item in self._all_items:
+            metrics = item.metrics.get(strategy_id) or {}
+            if not metrics:
+                # The current Color Source strategy (e.g. the AI model)
+                # never produces these detailed per-metric measurements
+                # (only Classic Vision/EyePose do) - fall back to whichever
+                # strategy's metrics ARE present rather than showing
+                # everything as unmeasured.
+                metrics = next((m for m in item.metrics.values() if m), {})
+            reject_reason = item.filter_reasons.get(strategy_id) or next(
+                iter(item.filter_reasons.values()), None
+            )
+            prediction = self._species_by_path.get(item.path)
+            records.append(
+                FilterableRecord(
+                    path=item.path,
+                    folder=str(Path(item.path).parent) if item.path else "",
+                    filename=item.display_name,
+                    user_decision=item.review_status,
+                    algorithm_decision=item.algorithm_suggestion,
+                    reject_reason=reject_reason,
+                    species=prediction.species if prediction is not None else None,
+                    species_confidence=prediction.confidence if prediction is not None else None,
+                    score=item.score,
+                    eye_confidence=metrics.get("eye_confidence"),
+                    head_confidence=metrics.get("head_confidence"),
+                    subject_size=metrics.get("subject_size"),
+                    eye_sharpness=metrics.get("eye_sharpness"),
+                    subject_sharpness=metrics.get("subject_sharpness"),
+                    burst_id=item.burst_id,
+                    burst_size=item.burst_size,
+                    burst_rank=item.burst_rank,
+                    burst_best=item.burst_best,
+                )
+            )
+        return records
+
+    def _refresh_advanced_filter_options(self) -> None:
+        """Keeps the panel's Folder/Species/Reject Reason/Burst Rank combos
+        in sync with whatever is actually in the currently open folder -
+        called whenever self._all_items is rebuilt."""
+        folders = sorted({str(Path(item.path).parent) for item in self._all_items if item.path})
+        species = sorted({
+            prediction.species
+            for prediction in self._species_by_path.values()
+            if prediction is not None and prediction.species
+        })
+        reject_reasons = [(code, REJECT_REASON_LABELS.get(code, code)) for code in REJECT_REASON_LABELS]
+        max_burst_size = max((item.burst_size for item in self._all_items), default=1)
+        self._advanced_filters_panel.set_available_options(
+            folders=folders, species=species, reject_reasons=reject_reasons, max_burst_size=max_burst_size,
+        )
 
     def _open_folder_dialog(self) -> None:
         # Manual QA Issue 2: must always start from the last folder actually
@@ -946,6 +1062,19 @@ class MainWindow(QMainWindow):
         filtered = self._filter_items(self._all_items, self._current_filter)
         if self._collapse_bursts:
             filtered = [item for item in filtered if item.burst_best]
+        criteria = self._advanced_filters_panel.criteria
+        if criteria.is_active():
+            # AND the Advanced Filters panel's own narrowing on top of the
+            # simple Filter combo + Collapse Bursts above - both routes
+            # into the one gallery model, exactly as the product direction
+            # asks ("filtering must affect the main image grid ... support
+            # multiple simultaneous filters"). Records are only built from
+            # what's already survived the cheaper filters, not the full
+            # folder, since apply_filters() only needs to see candidates.
+            by_path = {item.path: item for item in filtered}
+            records = [r for r in self._build_filterable_records() if r.path in by_path]
+            matching_paths = {r.path for r in apply_filters(records, criteria)}
+            filtered = [item for item in filtered if item.path in matching_paths]
         filtered = self._sort_items(filtered)
         self._gallery_model.set_items(filtered)
         self._update_color_source(filtered)
@@ -1081,6 +1210,8 @@ class MainWindow(QMainWindow):
         if self._current_filter != "all":
             label = FILTER_LABELS.get(self._current_filter, self._current_filter.capitalize())
             return f"No images match the '{label}' filter"
+        if self._advanced_filters_panel.criteria.is_active():
+            return "No images match the current Advanced Filters"
         return ""
 
     def _filtered_paths(self) -> list[str]:

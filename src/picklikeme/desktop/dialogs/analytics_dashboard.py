@@ -6,9 +6,9 @@ disagree with the photographer", "what should improve next". User vs
 Algorithm (see UserVsAlgorithmTab) is the primary page for that reason -
 agreement with the photographer, not the score itself, is the actual
 measure of success - shown first, ahead of Run Summary, Species Analysis
-and Image Explorer. Implemented as one master-detail dialog - an
-Experiment Browser (a list) on the left, and the four detail views as tabs
-on the right that redraw for whichever experiment is currently selected.
+and Burst Analytics. Implemented as one master-detail dialog - an
+Experiment Browser (a list) on the left, and the detail views as tabs on
+the right that redraw for whichever experiment is currently selected.
 
 Deliberately reads only `AnalyticsStore`'s already-generic accessors
 (`list_runs`, `get_run`, `category_counts`, `summary_metrics`,
@@ -21,28 +21,32 @@ underlie both, see analytics/store.py's own docstring. This is what "avoid
 hardcoded backend names" (Part 7) means applied to the dashboard itself,
 not just to the classifier registry.
 
-The Image Explorer's per-image detail panel lists whatever
-`store.image_metrics(run_id, image_path)` returns as generic rows, rather
-than a fixed "top1_confidence, top2_confidence, ..." layout - so EyePose
-metrics (eye_confidence, head_confidence, ...) recorded by a future run
-appear here with no UI change, per the explicit "design accordingly"
-instruction.
+Product Direction (the "NEW PRODUCT DIRECTION" pivot): this dashboard no
+longer contains its own per-image browser/investigation tool
+(ImageExplorerTab - Original/Crop panels, Visual Debug overlays, Score
+Explanation - was removed entirely). "The Analytics Dashboard should
+remain responsible only for: statistics, analytics, trends, confusion
+matrices, run summaries, species analytics, burst analytics. It should NOT
+become another image browser." Per-image investigation now belongs to the
+Review Window (Advanced Filters + the main grid) and the Loupe (per-image
+debugging) - see AnalyticsDashboard's own class docstring for how
+Advanced Filters and drill-downs still let a photographer narrow WHICH
+images every table/chart here reflects, without ever showing the images
+themselves.
 """
 
 from __future__ import annotations
 
+import statistics
 from pathlib import Path
 
-from PySide6.QtCore import QRectF, QSettings, Qt, Signal
-from PySide6.QtGui import QColor, QPainter, QPen, QPixmap
+from PySide6.QtCore import QSettings, Qt, Signal
 from PySide6.QtWidgets import (
     QButtonGroup,
-    QCheckBox,
     QComboBox,
     QDialog,
     QDoubleSpinBox,
     QFrame,
-    QGridLayout,
     QHBoxLayout,
     QHeaderView,
     QLabel,
@@ -51,7 +55,6 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QPushButton,
     QRadioButton,
-    QScrollArea,
     QSplitter,
     QStackedWidget,
     QTableWidget,
@@ -62,7 +65,6 @@ from PySide6.QtWidgets import (
 )
 
 from ...analyzer.annotations import DEFAULT_ANNOTATIONS_DB, AnnotationStore
-from ...analyzer.contactsheets import EYE_BOX_ACCEPTED, EYE_BOX_REJECTED, OTHER_BOX, SELECTED_BOX
 from ...analytics.agreement import (
     AgreementReport,
     algorithm_decisions_for_run,
@@ -70,21 +72,13 @@ from ...analytics.agreement import (
     user_decisions_for_paths,
 )
 from ...analytics.reports import metric_statistics, run_statistics
-from ...analytics.score_explanation import explain_score
 from ...analytics.store import DEFAULT_ANALYTICS_DB, AnalyticsStore
-from ...bird_crop import crop_cache_path
 from ...burst_analysis import BurstInfo, ScoredImage, analyze_bursts
-from ...config import DEFAULT_CROP_CACHE_DIR
 from ...ranking.classic import read_filter_report
 from ...ranking.filters import REJECT_REASON_LABELS
-from ...review.thumbnails import detection_boxes_for, eye_keypoints_for, eye_keypoints_in_crop_for
-
-_THUMBNAIL_SIZE = 320
-# Manual QA Issue 3: the Original/Crop panels in ImageExplorerTab
-# specifically (every other tab's thumbnails stay at _THUMBNAIL_SIZE) - the
-# landmark overlay was unreadable at 320px, so both panels render
-# significantly larger there.
-_INSPECTOR_IMAGE_SIZE = 460
+from ...species.classifier import UNKNOWN_SPECIES
+from ..filtering import FilterableRecord, apply_filters
+from ..widgets.advanced_filters_panel import AdvancedFiltersPanel
 
 # run_id/folder/started_at (etc.) are not "algorithm identity" facts a
 # photographer reads the Experiment Metadata panel to answer "what produced
@@ -377,6 +371,28 @@ _METRIC_LABELS: dict[str, str] = {
 }
 
 
+def _metric_statistics_for_paths(
+    store: AnalyticsStore, run_id: str, metric_name: str, paths: list[str]
+) -> dict | None:
+    """The same mean/median/min/max/count shape as
+    `analytics.reports.metric_statistics`, computed only over `paths` -
+    Advanced Filters' equivalent for RunSummaryTab, which otherwise reads
+    that whole-run SQL aggregate directly. Built from `store.image_metrics`
+    per path (already used for exactly this purpose elsewhere in this
+    module, e.g. BurstAnalyticsTab/ImageExplorerTab) rather than a new
+    path-scoped query on AnalyticsStore itself."""
+    values = [v for path in paths if (v := store.image_metrics(run_id, path).get(metric_name)) is not None]
+    if not values:
+        return None
+    return {
+        "mean": round(statistics.fmean(values), 4),
+        "median": round(statistics.median(values), 4),
+        "min": round(min(values), 4),
+        "max": round(max(values), 4),
+        "count": len(values),
+    }
+
+
 class UserVsAlgorithmTab(QWidget):
     """The primary dashboard page (see this module's own Phase 2 mandate):
     not "how good is the score", but "how well does the algorithm agree
@@ -410,6 +426,7 @@ class UserVsAlgorithmTab(QWidget):
         self._annotation_store: AnnotationStore | None = None
         self._run_id: str | None = None
         self._report: AgreementReport | None = None
+        self._paths: list[str] | None = None
 
         self._threshold_spin = QDoubleSpinBox(self)
         self._threshold_spin.setRange(0.0, 100.0)
@@ -474,10 +491,20 @@ class UserVsAlgorithmTab(QWidget):
         layout.addWidget(self._metrics_table)
         layout.addWidget(self._coverage_label)
 
-    def show_run(self, analytics_store: AnalyticsStore, annotation_store: AnnotationStore, run_id: str) -> None:
+    def show_run(
+        self, analytics_store: AnalyticsStore, annotation_store: AnnotationStore, run_id: str,
+        *, paths: list[str] | None = None,
+    ) -> None:
+        """`paths=None` (the default) reports on every image this run
+        scored. Otherwise (Advanced Filters active) every card, the
+        confusion matrix, and precision/recall/F1 are scoped to exactly
+        `paths` - see `compare_run_to_user_decisions`'s own docstring for
+        why the Keep/Reject cut itself never changes, only what is
+        reported."""
         self._analytics_store = analytics_store
         self._annotation_store = annotation_store
         self._run_id = run_id
+        self._paths = paths
 
         run = analytics_store.get_run(run_id) or {}
         considered = run.get("considered") or 0
@@ -499,7 +526,8 @@ class UserVsAlgorithmTab(QWidget):
         if self._analytics_store is None or self._annotation_store is None or self._run_id is None:
             return
         report = compare_run_to_user_decisions(
-            self._analytics_store, self._annotation_store, self._run_id, keep_percent=keep_percent,
+            self._analytics_store, self._annotation_store, self._run_id,
+            keep_percent=keep_percent, paths=self._paths,
         )
         self._report = report
 
@@ -624,30 +652,73 @@ class RunSummaryTab(QWidget):
         layout.addWidget(QLabel("Full Run Detail", self))
         layout.addWidget(self._table)
 
-    def show_run(self, store: AnalyticsStore, run_id: str) -> None:
-        stats = run_statistics(store, run_id)
+    def show_run(self, store: AnalyticsStore, run_id: str, *, records: list[FilterableRecord] | None = None) -> None:
+        """`records=None` (the default) reports on the whole run, exactly
+        as before Advanced Filters existed - the whole-run SQL aggregates
+        (`run_statistics`, `metric_statistics`) this tab otherwise reads
+        directly. Otherwise every card/table is recomputed from `records`
+        (already narrowed to the active filters/drill-down) instead:
+        Considered is simply `len(records)`; Accepted/Rejected come from
+        each record's own `algorithm_decision` (already computed once, in
+        `_build_run_records`, from the run's FULL ranking - see
+        `algorithm_decisions_for_run`'s own docstring for why that must
+        never be re-derived from just the filtered subset). Per-metric
+        statistics still read `store.image_metrics` per path
+        (`_metric_statistics_for_paths`) rather than each record's own
+        fixed field set, since a run can record metrics (e.g.
+        top1_confidence, inference_seconds) FilterableRecord has no field
+        for at all.
+
+        Known limitation: Accepted/Rejected has no meaning for a filtered
+        SPECIES-classification run (`algorithm_decision` is a ranking-run
+        concept only - species runs report "accepted" as "successfully
+        classified, not Unknown" instead, a fact `run_statistics` already
+        captures correctly for the UNFILTERED case but that this tab has no
+        per-image equivalent for once filtered) - it reads 0/0 rather than
+        a wrong number in that case, never a fabricated guess.
+        """
         run = store.get_run(run_id) or {}
         summary = store.summary_metrics(run_id)
+        # Which metrics EXIST at all is a run-wide fact (what this
+        # strategy records), independent of which images are filtered in.
+        metric_names = store.metric_names(run_id)
 
-        considered = stats.get("considered", 0)
-        accepted = stats.get("accepted", 0)
-        rejected = stats.get("rejected", 0)
+        if records is None:
+            stats = run_statistics(store, run_id)
+            considered = stats.get("considered", 0)
+            accepted = stats.get("accepted", 0)
+            rejected = stats.get("rejected", 0)
+            stat_fn = lambda name: metric_statistics(store, run_id, name)  # noqa: E731
+            folder, strategy_id = stats.get("folder", ""), stats.get("strategy_id", "")
+            started_at, device = stats.get("started_at", ""), stats.get("device") or "n/a"
+            params = stats.get("params", {})
+        else:
+            considered = len(records)
+            accepted = sum(1 for r in records if r.algorithm_decision == "keep")
+            rejected = considered - accepted
+            paths = [r.path for r in records]
+            stat_fn = lambda name: _metric_statistics_for_paths(store, run_id, name, paths)  # noqa: E731
+            folder, strategy_id = run.get("folder", ""), run.get("strategy_id", "")
+            started_at, device = run.get("started_at", ""), run.get("device") or "n/a"
+            params = dict(run.get("params") or {})
+
+        all_metric_stats = {name: stat_fn(name) for name in metric_names}
+
         self._images_processed_card.set_value(str(considered))
         self._accepted_card.set_value(str(accepted))
         self._rejected_card.set_value(str(rejected))
         self._acceptance_card.set_value(f"{100.0 * accepted / considered:.1f}%" if considered else "n/a")
-        score_stats = metric_statistics(store, run_id, "score")
+        score_stats = all_metric_stats.get("score") or stat_fn("score") or {}
         self._score_card.set_value(f"{score_stats['mean']:.4f}" if score_stats else "n/a")
 
         def _fmt(value: float | None) -> str:
             return f"{value:.4f}" if value is not None else "n/a"
 
-        score_stats = score_stats or {}
-        eye_confidence_stats = metric_statistics(store, run_id, "eye_confidence") or {}
-        head_confidence_stats = metric_statistics(store, run_id, "head_confidence") or {}
-        eye_sharpness_stats = metric_statistics(store, run_id, "eye_sharpness") or {}
-        subject_sharpness_stats = metric_statistics(store, run_id, "subject_sharpness") or {}
-        subject_size_stats = metric_statistics(store, run_id, "subject_size") or {}
+        eye_confidence_stats = all_metric_stats.get("eye_confidence") or {}
+        head_confidence_stats = all_metric_stats.get("head_confidence") or {}
+        eye_sharpness_stats = all_metric_stats.get("eye_sharpness") or {}
+        subject_sharpness_stats = all_metric_stats.get("subject_sharpness") or {}
+        subject_size_stats = all_metric_stats.get("subject_size") or {}
         runtime_seconds = summary.get("runtime_seconds")
         average_runtime = runtime_seconds / considered if runtime_seconds is not None and considered else None
 
@@ -665,12 +736,11 @@ class RunSummaryTab(QWidget):
         ])
 
         self._metric_stats_table.setSortingEnabled(False)
-        metric_names = store.metric_names(run_id)
         self._metric_stats_table.setRowCount(len(metric_names))
         self._metric_stats_table.setColumnCount(5)
         self._metric_stats_table.setHorizontalHeaderLabels(["Metric", "Mean", "Median", "Min", "Max"])
         for row_index, name in enumerate(metric_names):
-            metric_stats = metric_statistics(store, run_id, name) or {}
+            metric_stats = all_metric_stats.get(name) or {}
             self._metric_stats_table.setItem(row_index, 0, QTableWidgetItem(_METRIC_LABELS.get(name, name)))
             for col_index, key in enumerate(("mean", "median", "min", "max"), start=1):
                 value = metric_stats.get(key)
@@ -683,23 +753,24 @@ class RunSummaryTab(QWidget):
 
         rows: list[tuple[str, str]] = [
             ("Experiment ID", run_id),
-            ("Folder", stats.get("folder", "")),
-            ("Backend / Strategy", stats.get("strategy_id", "")),
-            ("Started at", stats.get("started_at", "")),
-            ("Device", stats.get("device") or "n/a"),
+            ("Folder", folder),
+            ("Backend / Strategy", strategy_id),
+            ("Started at", started_at),
+            ("Device", device),
             ("Considered", str(considered)),
             ("Accepted", str(accepted)),
             ("Rejected", str(rejected)),
         ]
         for name, value in sorted(summary.items()):
             rows.append((f"Runtime: {name}", f"{value:.4f}" if isinstance(value, float) else str(value)))
-        for name, value in sorted(stats.get("metric_means", {}).items()):
-            rows.append((f"Mean {name}", f"{value:.4f}"))
+        for name in metric_names:
+            metric_stats = all_metric_stats.get(name)
+            if metric_stats:
+                rows.append((f"Mean {name}", f"{metric_stats['mean']:.4f}"))
         # The full experiment record (model id/version, species list hash,
         # GPU, thresholds, ...) lives in params for a species run - see
         # species.experiment.ExperimentMetadata.to_dict(). Shown generically
         # so a ranking run's differently-shaped params render just as well.
-        params = stats.get("params", {})
         for key, value in sorted(params.items()):
             if isinstance(value, dict):
                 for sub_key, sub_value in sorted(value.items()):
@@ -757,20 +828,43 @@ class SpeciesAnalysisTab(QWidget):
         layout.addWidget(QLabel("Full Distribution (click a row to filter the Image Explorer)", self))
         layout.addWidget(self._table)
 
-    def show_run(self, store: AnalyticsStore, run_id: str) -> None:
+    def show_run(self, store: AnalyticsStore, run_id: str, *, records: list[FilterableRecord] | None = None) -> None:
+        """`records=None` (the default) reports on the whole run, from the
+        same whole-run `category_counts` SQL aggregate as before Advanced
+        Filters existed. Otherwise (Advanced Filters active) the
+        distribution is recomputed from each filtered record's own
+        `species`/`reject_reason` field instead - `category_counts` is a
+        run-wide total with no per-image breakdown to filter (see this
+        module's own docstring), unlike `FilterableRecord`, which already
+        carries one classification per image."""
         run = store.get_run(run_id) or {}
-        considered = run.get("considered", 0) or 0
-        accepted = run.get("accepted", 0) or 0
-        counts = store.category_counts(run_id)
-        summary = store.summary_metrics(run_id)
 
-        unknown_rate = summary.get("unknown_rate")
+        if records is None:
+            considered = run.get("considered", 0) or 0
+            accepted = run.get("accepted", 0) or 0
+            counts = store.category_counts(run_id)
+            unknown_rate = store.summary_metrics(run_id).get("unknown_rate")
+            confidence_stats = metric_statistics(store, run_id, "top1_confidence")
+            confidence_mean = confidence_stats["mean"] if confidence_stats else None
+        else:
+            considered = len(records)
+            accepted = sum(1 for r in records if r.algorithm_decision == "keep")
+            counts = {}
+            for r in records:
+                category = r.species
+                if category is None and r.reject_reason:
+                    category = REJECT_REASON_LABELS.get(r.reject_reason, r.reject_reason)
+                if category:
+                    counts[category] = counts.get(category, 0) + 1
+            unknown = sum(1 for r in records if r.species == UNKNOWN_SPECIES)
+            unknown_rate = unknown / considered if considered else None
+            confidences = [r.species_confidence for r in records if r.species_confidence is not None]
+            confidence_mean = statistics.fmean(confidences) if confidences else None
+
         label_text = f"{len(counts)} distinct outcome(s) across {considered} image(s)"
         self._label.setText(label_text)
         self._unknown_rate_card.set_value(f"{unknown_rate:.1%}" if unknown_rate is not None else "n/a")
-
-        confidence_stats = metric_statistics(store, run_id, "top1_confidence")
-        self._confidence_card.set_value(f"{confidence_stats['mean']:.4f}" if confidence_stats else "n/a")
+        self._confidence_card.set_value(f"{confidence_mean:.4f}" if confidence_mean is not None else "n/a")
 
         ranked = sorted(counts.items(), key=lambda kv: -kv[1])
         _fill_ranked_table(self._top5_table, ranked[:5], considered)
@@ -781,7 +875,7 @@ class SpeciesAnalysisTab(QWidget):
         # the run itself) - shown first so the table reads as a complete
         # outcome breakdown, not only the rejected/categorized slice. Not
         # clickable (see _on_row_clicked) - it is not a species/category
-        # name the Image Explorer's species filter could ever match.
+        # name the Review Window's Species filter could ever match.
         rows = [("Accepted", accepted)] + ranked
         _fill_ranked_table(self._table, rows, considered)
 
@@ -886,16 +980,31 @@ class BurstAnalyticsTab(QWidget):
         layout.addWidget(QLabel("Every Image", self))
         layout.addWidget(self._table)
 
-    def show_run(self, store: AnalyticsStore, run_id: str) -> None:
+    def show_run(self, store: AnalyticsStore, run_id: str, *, paths: list[str] | None = None) -> None:
+        """`paths=None` (the default) reports on every image this run
+        scored. Burst membership/rank/winner is always computed from the
+        run's FULL image set (never just `paths`) - narrowing the INPUT
+        would silently redefine "which image won this burst" whenever a
+        filter happens to exclude the actual winner, the same principle
+        `algorithm_decisions_for_run`'s own docstring explains for Algorithm
+        Decision. `paths`, when given, only narrows which of the already-
+        computed bursts/images are actually reported."""
         self._store = store
         self._run_id = run_id
-        paths = store.image_paths(run_id)
-        burst_by_path = _compute_burst_map(store, self._annotation_store, run_id, paths)
+        all_paths = store.image_paths(run_id)
+        burst_by_path = _compute_burst_map(store, self._annotation_store, run_id, all_paths)
+        display_paths = list(paths) if paths is not None else all_paths
+        allowed = set(display_paths)
+        filtered_burst_by_path = {p: info for p, info in burst_by_path.items() if p in allowed}
 
-        burst_ids = {info.burst_id for info in burst_by_path.values()}
-        sizes = [info.burst_size for info in burst_by_path.values() if info.burst_rank == 1]
-        singleton_images = sum(1 for info in burst_by_path.values() if info.burst_size == 1)
-        multi_image_bursts = sum(1 for size in sizes if size > 1)
+        burst_ids = {info.burst_id for info in filtered_burst_by_path.values()}
+        # One BurstInfo per distinct burst actually represented in the
+        # filtered set - any member works, since burst_size is a fixed fact
+        # about the whole burst, not just its (possibly filtered-out) winner.
+        distinct_bursts = {info.burst_id: info for info in filtered_burst_by_path.values()}.values()
+        sizes = [info.burst_size for info in distinct_bursts]
+        singleton_images = sum(1 for info in filtered_burst_by_path.values() if info.burst_size == 1)
+        multi_image_bursts = sum(1 for info in distinct_bursts if info.burst_size > 1)
 
         self._burst_count_card.set_value(str(len(burst_ids)))
         self._average_size_card.set_value(f"{sum(sizes) / len(sizes):.2f}" if sizes else "n/a")
@@ -919,11 +1028,11 @@ class BurstAnalyticsTab(QWidget):
         self._size_distribution_table.setSortingEnabled(True)
 
         self._table.setSortingEnabled(False)
-        self._table.setRowCount(len(paths))
+        self._table.setRowCount(len(display_paths))
         self._table.setColumnCount(4)
         self._table.setHorizontalHeaderLabels(["Image", "Burst Size", "Burst Rank", "Burst Winner"])
-        for row_index, path in enumerate(paths):
-            info = burst_by_path.get(path)
+        for row_index, path in enumerate(display_paths):
+            info = filtered_burst_by_path.get(path)
             self._table.setItem(row_index, 0, QTableWidgetItem(Path(path).name))
             self._table.setItem(row_index, 1, QTableWidgetItem(str(info.burst_size) if info else "n/a"))
             self._table.setItem(row_index, 2, QTableWidgetItem(str(info.burst_rank) if info else "n/a"))
@@ -933,786 +1042,134 @@ class BurstAnalyticsTab(QWidget):
         self._table.setSortingEnabled(True)
 
 
-# ---------------------------------------------------------------------------
-# Visual Debug (Phase 5): every processing-stage rectangle/marker the Image
-# Explorer can draw, each its own checkbox and its own colour/style, never
-# merged into another stage's rectangle - see ImageExplorerTab's own
-# docstring for which stages share a colour family and why, and its Known
-# Limitations for the two pairs this codebase's own data model cannot tell
-# apart (Detection Boxes vs its own Selected/Candidate breakdown; Expanded
-# Crop vs Final Crop).
-# ---------------------------------------------------------------------------
-
-# The BOX family - drawn on the Original (a full-frame concept).
-_UNION_DETECTION_PEN = QPen(QColor(148, 163, 184), 2, Qt.PenStyle.DotLine)
-_CANDIDATE_DETECTION_PEN = QPen(QColor(*OTHER_BOX), 2, Qt.PenStyle.DashLine)
-_SELECTED_DETECTION_PEN = QPen(QColor(*SELECTED_BOX), 2)
-_REJECTED_DETECTION_PEN = QPen(QColor(*EYE_BOX_REJECTED), 2, Qt.PenStyle.DashDotLine)
-_EXPANDED_CROP_PEN = QPen(QColor(59, 130, 246), 2, Qt.PenStyle.DashLine)
-_FINAL_CROP_PEN = QPen(QColor(59, 130, 246), 2, Qt.PenStyle.DotLine)
-_HEAD_BOX_PEN = QPen(QColor(249, 115, 22), 2)
-
-# The LANDMARK family - drawn on the Crop when one is cached, else falls
-# back to the Original (see Manual QA Issue 3). Name, the
-# eye_keypoints_for()/eye_keypoints_in_crop_for() dict key holding it, and a
-# colour distinct from every box colour above so boxes and landmarks never
-# get confused when both overlay families are on at once.
-_LANDMARK_STYLE: tuple[tuple[str, str, tuple[int, int, int]], ...] = (
-    ("Left Eye", "left", (56, 189, 248)),
-    ("Right Eye", "right", (251, 146, 60)),
-    ("Beak", "beak", (250, 204, 21)),
-    ("Head", "head_top", (226, 232, 240)),
-    ("Left Shoulder", "left_shoulder", (167, 139, 250)),
-    ("Right Shoulder", "right_shoulder", (192, 132, 252)),
-)
-# Only these four (never the shoulders - a body/torso landmark, not a head
-# one) contribute to the approximate "Head Box" overlay.
-_HEAD_BOX_LANDMARK_KEYS: tuple[str, ...] = ("left", "right", "beak", "head_top")
-
-# Every independent overlay checkbox Visual Debug supports (key, label) -
-# key doubles as the dict key in the checked-state map and the preset sets
-# below. Order here is the order checkboxes render in the grid.
-_OVERLAY_CHECKBOX_DEFS: tuple[tuple[str, str], ...] = (
-    ("detection_boxes", "Detection Boxes"),
-    ("candidate_detections", "Candidate Detection Boxes"),
-    ("selected_detection", "Selected Detection"),
-    ("rejected_detections", "Rejected Detections"),
-    ("expanded_crop", "Expanded Crop"),
-    ("final_crop", "Final Crop"),
-    ("eye_roi", "Eye ROI"),
-    ("head_box", "Head Box"),
-    ("landmarks", "Landmarks"),
-    ("landmark_labels", "Landmark Labels"),
-    ("confidence_values", "Confidence Values"),
-)
-_ALL_OVERLAY_KEYS = frozenset(key for key, _label in _OVERLAY_CHECKBOX_DEFS)
-_BOX_FAMILY_KEYS = frozenset({
-    "detection_boxes", "candidate_detections", "selected_detection", "rejected_detections",
-    "expanded_crop", "final_crop", "eye_roi",
-})
-_LANDMARK_FAMILY_KEYS = frozenset({"head_box", "landmarks", "landmark_labels", "confidence_values"})
-
-# Preset -> exact checked-set. "Custom" has no fixed set - it means "keep
-# whatever is currently checked" - see _on_overlay_checkbox_toggled.
-_OVERLAY_PRESETS: dict[str, frozenset[str]] = {
-    "Detection": frozenset({"detection_boxes", "candidate_detections", "selected_detection", "rejected_detections"}),
-    "Crop": frozenset({"expanded_crop", "final_crop"}),
-    "EyePose": frozenset({"eye_roi", "head_box", "landmarks", "landmark_labels", "confidence_values"}),
-    "Everything": frozenset(_ALL_OVERLAY_KEYS),
-}
-_PRESET_NAMES: tuple[str, ...] = ("Detection", "Crop", "EyePose", "Everything", "Custom")
-
-
-class ImageExplorerTab(QWidget):
-    """Phase 4/5/6 - the primary investigation tool: search/filter over
-    whichever run (or drill-down subset) is currently shown, full per-image
-    detail (Original, Crop, Ground Truth, Algorithm Decision, User Decision,
-    generic metrics, Score Explanation), and Visual Debug - every ranking-
-    pipeline processing stage as its own independently-toggleable overlay,
-    with presets for the common combinations. Respects the dashboard's
-    Analytics Scope structurally, the same way every other tab does: it only
-    ever shows images from whichever experiment Scope allowed to be
-    SELECTED (see AnalyticsDashboard's own docstring) - there is no separate
-    scope check to duplicate here.
-
-    Two independent overlay families, restated from Manual QA Issue 3's own
-    fix: the BOX family (_BOX_FAMILY_KEYS - detection/crop/eye-ROI
-    rectangles, full-frame concepts) draws on the Original; the LANDMARK
-    family (_LANDMARK_FAMILY_KEYS - markers, labels, head box) draws on the
-    Crop when one is cached (the head fills most of the frame there, not a
-    small fraction of it) with a fallback to the Original otherwise.
-
-    Known limitations:
-    - Landmarks (and Eye ROI, Head Box, Rejected Detections) are only
-      available for images a Classic Vision run scored with EyePose-v0
-      specifically - SuperAnimal-Bird locates only the eye, so
-      beak/head/shoulders are never available for it.
-    - "Expanded Crop" and "Final Crop" render as the same rectangle, and
-      "Detection Boxes" (every detected box, selected and candidates alike,
-      in one neutral style) necessarily overlaps "Selected Detection" +
-      "Candidate Detection Boxes" (the same boxes, split into two more
-      specific toggles) - this codebase's DetectionRecord only ever tracked
-      one margin-grown crop rectangle and one selected/others split, never a
-      four-way or three-way breakdown, so exposing all of Phase 5's named
-      checkboxes means some of them necessarily draw the same underlying
-      rectangle a differently-scoped checkbox also draws.
-    - "Reject Reason" filtering (and the images it would surface) depends on
-      `.picklikeme/classic_vision_filters.json` still existing next to the
-      run's own folder - AnalyticsStore itself only ever persisted AGGREGATE
-      reject-reason counts, never a per-image reason. That sidecar is
-      overwritten by every new Classic Vision run for the same folder, so
-      inspecting an OLDER historical run's filtered-out images only works
-      until a newer run against the same folder replaces it.
-    - "Species Prediction" and "Burst Rank" are both best-effort: species
-      comes from `species.cache.SpeciesCache`, keyed by this run's own
-      strategy_id as classifier_id (empty for a ranking run, which never
-      wrote to that cache); burst rank is recomputed locally from each
-      image's own EXIF capture time and this run's own score, not read from
-      any persisted burst table (none exists - see burst_analysis.py's own
-      docstring on why burst ranking is never persisted).
-    - "Algorithm Decision"/"Conflict Type" always use this run's own default
-      keep-percent threshold (accepted/considered ratio), independent of any
-      threshold adjustment made in the User vs Algorithm tab - the two do
-      not live-sync.
-    - A pre-v3 cached eye record (see eyes.cache.EYE_CACHE_VERSION) has no
-      beak/head/shoulder landmarks on disk yet; re-running Classic Vision
-      regenerates it with them.
-    """
-
-    def __init__(
-        self, *, crop_cache_dir: Path, annotation_store: AnnotationStore,
-        species_db: str | Path | None = None, parent=None,
-    ) -> None:
-        super().__init__(parent)
-        self._crop_cache_dir = crop_cache_dir
-        self._annotation_store = annotation_store
-        # Injectable so a test never touches the real project-wide species
-        # cache (cache/species.db) just by populating the image list - the
-        # same isolation crop_cache_dir/annotation_store already get from
-        # their own callers. None (the default, used by AnalyticsDashboard)
-        # means "the real one" - species.cache.SpeciesCache's own default.
-        self._species_db = species_db
-        self._store: AnalyticsStore | None = None
-        self._run_id: str | None = None
-
-        self._all_paths: list[str] = []
-        self._algo_decision_by_path: dict[str, str] = {}
-        self._user_decision_by_path: dict[str, str] = {}
-        self._reject_reason_by_path: dict[str, str | None] = {}
-        self._species_by_path: dict[str, str] = {}
-        self._burst_by_path: dict[str, BurstInfo] = {}
-
-        self._current_image_path: str | None = None
-        self._current_full_pixmap: QPixmap | None = None
-        self._current_crop_full_pixmap: QPixmap | None = None
-
-        # ---- Filter bar (Phase 4) ------------------------------------
-        self._search_edit = QLineEdit(self)
-        self._search_edit.setPlaceholderText("Search filename...")
-        self._search_edit.textChanged.connect(self._apply_filters)
-
-        self._folder_combo = QComboBox(self)
-        self._species_combo = QComboBox(self)
-        self._burst_combo = QComboBox(self)
-        self._burst_combo.addItems(["All", "Burst Winners", "Burst Losers"])
-        self._reject_reason_combo = QComboBox(self)
-        self._conflict_combo = QComboBox(self)
-        self._conflict_combo.addItems(["All", "Agree", "False Positive", "False Negative", "N/A"])
-        self._user_decision_combo = QComboBox(self)
-        self._user_decision_combo.addItems(["All", "Keep", "Reject", "Neutral"])
-        self._algo_decision_combo = QComboBox(self)
-        self._algo_decision_combo.addItems(["All", "Keep", "Reject"])
-        for combo in (
-            self._folder_combo, self._species_combo, self._burst_combo, self._reject_reason_combo,
-            self._conflict_combo, self._user_decision_combo, self._algo_decision_combo,
-        ):
-            combo.currentIndexChanged.connect(self._apply_filters)
-
-        self._score_min_spin = QDoubleSpinBox(self)
-        self._score_max_spin = QDoubleSpinBox(self)
-        for spin in (self._score_min_spin, self._score_max_spin):
-            spin.setDecimals(4)
-            spin.setRange(-1000.0, 1000.0)
-            spin.valueChanged.connect(self._apply_filters)
-
-        filter_grid = QGridLayout()
-        filter_grid.addWidget(self._search_edit, 0, 0, 1, 4)
-        for row, (label, widget) in enumerate((
-            ("Folder", self._folder_combo), ("Species", self._species_combo),
-            ("Burst", self._burst_combo), ("Reject Reason", self._reject_reason_combo),
-            ("Conflict Type", self._conflict_combo), ("User Decision", self._user_decision_combo),
-            ("Algorithm Decision", self._algo_decision_combo),
-        ), start=1):
-            filter_grid.addWidget(QLabel(label, self), row, 0)
-            filter_grid.addWidget(widget, row, 1)
-        score_row = filter_grid.rowCount()
-        filter_grid.addWidget(QLabel("Score range", self), score_row, 0)
-        score_range_row = QHBoxLayout()
-        score_range_row.addWidget(self._score_min_spin)
-        score_range_row.addWidget(QLabel("to", self))
-        score_range_row.addWidget(self._score_max_spin)
-        filter_grid.addLayout(score_range_row, score_row, 1)
-
-        self._image_list = QListWidget(self)
-        self._image_list.setAlternatingRowColors(True)
-        self._image_list.currentItemChanged.connect(self._on_image_selected)
-
-        list_container = QWidget(self)
-        list_layout = QVBoxLayout(list_container)
-        list_layout.addWidget(QLabel("Filters", self))
-        list_layout.addLayout(filter_grid)
-        list_layout.addWidget(QLabel("Images", self))
-        list_layout.addWidget(self._image_list, 1)
-
-        # ---- Original / Crop panels (Manual QA Issue 3) ----------------
-        self._original_label = QLabel("Original", self)
-        self._original_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._original_label.setMinimumSize(_INSPECTOR_IMAGE_SIZE, _INSPECTOR_IMAGE_SIZE)
-        self._crop_label = QLabel("Crop", self)
-        self._crop_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._crop_label.setMinimumSize(_INSPECTOR_IMAGE_SIZE, _INSPECTOR_IMAGE_SIZE)
-        images_row = QHBoxLayout()
-        images_row.addWidget(self._original_label)
-        images_row.addWidget(self._crop_label)
-
-        # ---- Visual Debug overlay presets + checkboxes (Phase 5) -------
-        self._overlay_preset_combo = QComboBox(self)
-        self._overlay_preset_combo.addItems(_PRESET_NAMES)
-        self._overlay_preset_combo.setCurrentText("Custom")
-        self._overlay_preset_combo.currentTextChanged.connect(self._on_overlay_preset_changed)
-        preset_row = QHBoxLayout()
-        preset_row.addWidget(QLabel("Overlay preset:", self))
-        preset_row.addWidget(self._overlay_preset_combo)
-        preset_row.addStretch(1)
-
-        self._overlay_checkboxes: dict[str, QCheckBox] = {}
-        overlay_grid = QGridLayout()
-        for index, (key, label) in enumerate(_OVERLAY_CHECKBOX_DEFS):
-            checkbox = QCheckBox(label, self)
-            checkbox.toggled.connect(self._on_overlay_checkbox_toggled)
-            self._overlay_checkboxes[key] = checkbox
-            overlay_grid.addWidget(checkbox, index // 3, index % 3)
-
-        self._metrics_table = QTableWidget(self)
-        self._metrics_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        _style_table(self._metrics_table)
-
-        # ---- Score Explanation (Phase 6) --------------------------------
-        self._score_explanation_summary_label = QLabel(self)
-        self._score_explanation_summary_label.setStyleSheet("font-weight: 600;")
-        self._score_table = QTableWidget(self)
-        self._score_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        _style_table(self._score_table)
-
-        self._landmarks_table = QTableWidget(self)
-        self._landmarks_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        _style_table(self._landmarks_table)
-
-        detail_column = QVBoxLayout()
-        detail_column.addLayout(images_row)
-        detail_column.addLayout(preset_row)
-        detail_column.addLayout(overlay_grid)
-        detail_column.addWidget(QLabel("Details (Metrics / Ground Truth / Decisions)", self))
-        detail_column.addWidget(self._metrics_table)
-        detail_column.addWidget(QLabel("Score Explanation", self))
-        detail_column.addWidget(self._score_explanation_summary_label)
-        detail_column.addWidget(self._score_table)
-        detail_column.addWidget(QLabel("Landmarks", self))
-        detail_column.addWidget(self._landmarks_table)
-
-        # The detail column is tall (large images + preset grid + three
-        # tables) - a scroll area keeps it usable on anything smaller than a
-        # maximized window, matching Phase 12's own "responsive layouts"
-        # requirement rather than fighting it later.
-        detail_content = QWidget(self)
-        detail_content.setLayout(detail_column)
-        detail_scroll = QScrollArea(self)
-        detail_scroll.setWidgetResizable(True)
-        detail_scroll.setWidget(detail_content)
-
-        splitter = QSplitter(self)
-        splitter.addWidget(list_container)
-        splitter.addWidget(detail_scroll)
-        splitter.setStretchFactor(1, 1)
-
-        layout = QVBoxLayout(self)
-        layout.addWidget(splitter)
-
-    # ---- Populating the candidate set -----------------------------------
-
-    def show_run(self, store: AnalyticsStore, run_id: str) -> None:
-        self._store = store
-        self._run_id = run_id
-        self._populate_candidates(store.image_paths(run_id), include_filtered=True)
-
-    def show_paths(self, store: AnalyticsStore, run_id: str, paths: list[str]) -> None:
-        """Populate the image list from exactly `paths`, not every image
-        this run recorded - the drill-down target for User vs Algorithm's
-        confusion-matrix cells and KPI cards ("show me only the false
-        positives"), and for any other future caller that wants a filtered
-        view rather than the whole run. Unlike `show_run`, never extended
-        with filtered-out images from the run's own sidecar - a drill-down
-        caller asked for an EXACT set."""
-        self._store = store
-        self._run_id = run_id
-        self._populate_candidates(list(paths), include_filtered=False)
-
-    def _populate_candidates(self, scored_paths: list[str], *, include_filtered: bool) -> None:
-        assert self._store is not None and self._run_id is not None  # noqa: S101 - only called from show_run/show_paths
-        run = self._store.get_run(self._run_id) or {}
-        folder = run.get("folder")
-        strategy_id = run.get("strategy_id", "")
-
-        self._reject_reason_by_path = {path: None for path in scored_paths}
-        filtered_paths: list[str] = []
-        if include_filtered and folder:
-            try:
-                report = read_filter_report(folder, strategy_id)
-                for path, reason in (report.get("images") or {}).items():
-                    if path not in self._reject_reason_by_path:
-                        filtered_paths.append(path)
-                    self._reject_reason_by_path[path] = reason
-            except Exception:  # noqa: BLE001 - best-effort; see class docstring's Known Limitations
-                pass
-        self._all_paths = list(scored_paths) + filtered_paths
-
-        try:
-            self._algo_decision_by_path = algorithm_decisions_for_run(self._store, self._run_id)
-        except Exception:  # noqa: BLE001 - filtering must never crash the dashboard
-            self._algo_decision_by_path = {}
-        try:
-            self._user_decision_by_path = user_decisions_for_paths(self._annotation_store, self._all_paths)
-        except Exception:  # noqa: BLE001
-            self._user_decision_by_path = {}
-
-        self._species_by_path = {}
-        try:
-            from ...species.cache import DEFAULT_SPECIES_DB, SpeciesCache
-
-            cache = SpeciesCache(self._species_db if self._species_db is not None else DEFAULT_SPECIES_DB)
-            try:
-                for path in self._all_paths:
-                    prediction = cache.get(path, strategy_id)
-                    if prediction is not None and prediction.species:
-                        self._species_by_path[path] = prediction.species
-            finally:
-                cache.close()
-        except Exception:  # noqa: BLE001 - species prediction is best-effort (see Known Limitations)
-            pass
-
-        self._burst_by_path = _compute_burst_map(self._store, self._annotation_store, self._run_id, self._all_paths)
-
-        self._refresh_filter_options()
-        self._apply_filters()
-
-    def _refresh_filter_options(self) -> None:
-        def _reset_combo(combo: QComboBox, options: list[str]) -> None:
-            combo.blockSignals(True)
-            combo.clear()
-            combo.addItems(options)
-            combo.blockSignals(False)
-
-        folders = sorted({str(Path(path).parent) for path in self._all_paths})
-        _reset_combo(self._folder_combo, ["All Folders"] + folders)
-
-        species = sorted({name for name in self._species_by_path.values() if name})
-        _reset_combo(self._species_combo, ["All Species"] + species)
-
-        reasons = sorted({reason for reason in self._reject_reason_by_path.values() if reason})
-        _reset_combo(self._reject_reason_combo, ["All"] + [REJECT_REASON_LABELS.get(r, r) for r in reasons])
-
-        scores = []
-        if self._store is not None and self._run_id is not None:
-            scores = [
-                value for path in self._all_paths
-                if (value := self._store.image_metrics(self._run_id, path).get("score")) is not None
-            ]
-        low, high = (min(scores), max(scores)) if scores else (0.0, 1.0)
-        for spin, value in ((self._score_min_spin, low), (self._score_max_spin, high)):
-            spin.blockSignals(True)
-            spin.setRange(min(low, -1000.0), max(high, 1000.0))
-            spin.setValue(value)
-            spin.blockSignals(False)
-
-    def _conflict_type(self, path: str) -> str:
-        algo_status = self._algo_decision_by_path.get(path)
-        user_status = self._user_decision_by_path.get(path)
-        if algo_status is None or user_status is None or user_status == "neutral":
-            return "N/A"
-        if algo_status == user_status:
-            return "Agree"
-        return "False Positive" if algo_status == "keep" else "False Negative"
-
-    def _apply_filters(self) -> None:
-        """Every filter combines with every other (AND), matching Phase 4's
-        own "allow combining multiple filters" requirement - a candidate
-        image must clear all of them, not just one."""
-        search = self._search_edit.text().strip().lower()
-        folder_choice = self._folder_combo.currentText()
-        species_choice = self._species_combo.currentText()
-        burst_choice = self._burst_combo.currentText()
-        score_min, score_max = self._score_min_spin.value(), self._score_max_spin.value()
-        reason_choice = self._reject_reason_combo.currentText()
-        conflict_choice = self._conflict_combo.currentText()
-        user_choice = self._user_decision_combo.currentText()
-        algo_choice = self._algo_decision_combo.currentText()
-        previous_path = self._current_image_path
-
-        visible: list[str] = []
-        for path in self._all_paths:
-            if search and search not in Path(path).name.lower():
-                continue
-            if folder_choice not in ("", "All Folders") and str(Path(path).parent) != folder_choice:
-                continue
-            if species_choice not in ("", "All Species") and self._species_by_path.get(path) != species_choice:
-                continue
-            burst = self._burst_by_path.get(path)
-            if burst_choice == "Burst Winners" and not (burst and burst.burst_best):
-                continue
-            if burst_choice == "Burst Losers" and not (burst and not burst.burst_best):
-                continue
-            score = None
-            if self._store is not None and self._run_id is not None:
-                score = self._store.image_metrics(self._run_id, path).get("score")
-            if score is not None and not (score_min <= score <= score_max):
-                continue
-            if reason_choice != "All":
-                reason = self._reject_reason_by_path.get(path)
-                reason_label = REJECT_REASON_LABELS.get(reason, reason) if reason else None
-                if reason_label != reason_choice:
-                    continue
-            if algo_choice != "All" and (self._algo_decision_by_path.get(path) or "").capitalize() != algo_choice:
-                continue
-            if user_choice != "All" and (self._user_decision_by_path.get(path) or "").capitalize() != user_choice:
-                continue
-            if conflict_choice != "All" and self._conflict_type(path) != conflict_choice:
-                continue
-            visible.append(path)
-
-        self._image_list.blockSignals(True)
-        self._image_list.clear()
-        restore_row = -1
-        for row, path in enumerate(visible):
-            item = QListWidgetItem(Path(path).name)
-            item.setData(Qt.ItemDataRole.UserRole, path)
-            self._image_list.addItem(item)
-            if path == previous_path:
-                restore_row = row
-        self._image_list.blockSignals(False)
-
-        if visible:
-            self._image_list.setCurrentRow(restore_row if restore_row >= 0 else 0)  # triggers _on_image_selected
-        else:
-            self._current_image_path = None
-            self._current_full_pixmap = None
-            self._current_crop_full_pixmap = None
-            self._original_label.setText("(no images match the current filters)")
-            self._crop_label.setText("")
-            self._metrics_table.setRowCount(0)
-            self._landmarks_table.setRowCount(0)
-            self._score_table.setRowCount(0)
-            self._score_explanation_summary_label.setText("")
-
-    # ---- Per-image detail --------------------------------------------
-
-    def _on_image_selected(self, current: QListWidgetItem | None, _previous) -> None:
-        if current is None or self._store is None or self._run_id is None:
-            return
-        image_path = current.data(Qt.ItemDataRole.UserRole)
-        run = self._store.get_run(self._run_id) or {}
-
-        self._current_image_path = image_path
-        self._current_full_pixmap = self._load_full_pixmap(self._original_pixmap_path(image_path))
-        crop_path = crop_cache_path(self._crop_cache_dir, image_path)
-        self._current_crop_full_pixmap = self._load_full_pixmap(crop_path) if crop_path.is_file() else None
-        self._refresh_overlays()
-
-        metrics = self._store.image_metrics(self._run_id, image_path)
-        user_status = self._user_decision_by_path.get(image_path)
-        algo_status = self._algo_decision_by_path.get(image_path)
-        rows = [
-            ("Image", image_path),
-            ("Experiment ID", self._run_id),
-            ("Backend", run.get("strategy_id", "")),
-            # Ground Truth and User Decision render from the same underlying
-            # review-decision record - this app has no separate ground-truth
-            # store distinct from a manual review decision (see the class
-            # docstring's Known Limitations) - shown as two rows anyway since
-            # Phase 4 lists them as two distinct display fields.
-            ("Ground Truth", (user_status or "not reviewed").capitalize()),
-            ("User Decision", (user_status or "not reviewed").capitalize()),
-            ("Algorithm Decision", (algo_status or "n/a").capitalize()),
-        ]
-        species = self._species_by_path.get(image_path)
-        if species:
-            rows.append(("Species Prediction", species))
-        burst = self._burst_by_path.get(image_path)
-        if burst:
-            winner = " (winner)" if burst.burst_best else ""
-            rows.append(("Burst Rank", f"{burst.burst_rank} of {burst.burst_size}{winner}"))
-        for name, value in sorted(metrics.items()):
-            rows.append((name, f"{value:.4f}"))
-        _fill_two_column_table(self._metrics_table, rows)
-
-        self._fill_score_explanation(image_path)
-
-    def _fill_score_explanation(self, image_path: str) -> None:
-        table = self._score_table
-        try:
-            explanation = explain_score(self._store, self._run_id, image_path)
-        except Exception:  # noqa: BLE001 - must never crash the dashboard
-            explanation = None
-
-        table.setSortingEnabled(False)
-        table.setColumnCount(6)
-        table.setHorizontalHeaderLabels(
-            ["Metric", "Raw Value", "Normalized Value", "Weight", "Contribution", "Running Total"]
-        )
-        if explanation is None or not explanation.rows:
-            table.setRowCount(0)
-            self._score_explanation_summary_label.setText(
-                "No per-metric breakdown recorded for this run/image "
-                "(e.g. an AI-model or species-classification run)."
-            )
-            table.setSortingEnabled(True)
-            return
-
-        table.setRowCount(len(explanation.rows))
-        for row_index, row in enumerate(explanation.rows):
-            values = (
-                row.label, f"{row.raw_value:.4f}", f"{row.normalized_value:.4f}",
-                f"{row.weight:.3f}", f"{row.contribution:.4f}", f"{row.running_total:.4f}",
-            )
-            for col_index, value in enumerate(values):
-                table.setItem(row_index, col_index, QTableWidgetItem(value))
-        table.resizeColumnsToContents()
-        table.horizontalHeader().setStretchLastSection(True)
-        table.setSortingEnabled(True)
-
-        final = explanation.final_score
-        summary = f"Final Score: {final:.4f}" if final is not None else "Final Score: n/a"
-        if explanation.recomputed_score is not None:
-            summary += f"   (recomputed from breakdown: {explanation.recomputed_score:.4f})"
-        self._score_explanation_summary_label.setText(summary)
-
-    # ---- Visual Debug (Phase 5) ------------------------------------------
-
-    def _on_overlay_preset_changed(self, name: str) -> None:
-        preset_keys = _OVERLAY_PRESETS.get(name)
-        if preset_keys is not None:  # not "Custom" - Custom keeps whatever is already checked
-            for key, checkbox in self._overlay_checkboxes.items():
-                checkbox.blockSignals(True)
-                checkbox.setChecked(key in preset_keys)
-                checkbox.blockSignals(False)
-        self._refresh_overlays()
-
-    def _on_overlay_checkbox_toggled(self, _checked: bool) -> None:
-        current_keys = frozenset(key for key, cb in self._overlay_checkboxes.items() if cb.isChecked())
-        matching_preset = next((name for name, keys in _OVERLAY_PRESETS.items() if keys == current_keys), "Custom")
-        self._overlay_preset_combo.blockSignals(True)
-        self._overlay_preset_combo.setCurrentText(matching_preset)
-        self._overlay_preset_combo.blockSignals(False)
-        self._refresh_overlays()
-
-    def _refresh_overlays(self) -> None:
-        """Redraws both the Original and Crop panels from their already-
-        loaded full-resolution pixmaps plus whichever overlay checkboxes are
-        currently checked - runs on image selection and on every checkbox/
-        preset change, without re-reading either image file each time.
-
-        The BOX family draws on the Original; the LANDMARK family draws on
-        the Crop when one is cached, else falls back to the Original - see
-        the class docstring.
-        """
-        image_path = self._current_image_path
-        original_pixmap = self._current_full_pixmap
-        if image_path is None or original_pixmap is None or original_pixmap.isNull():
-            if image_path is not None:
-                self._original_label.setText(f"Original not available\n({Path(image_path).name} may have moved)")
-            self._crop_label.setText("")
-            self._landmarks_table.setRowCount(0)
-            return
-
-        checked = {key: cb.isChecked() for key, cb in self._overlay_checkboxes.items()}
-        original_display = original_pixmap.scaled(
-            _INSPECTOR_IMAGE_SIZE, _INSPECTOR_IMAGE_SIZE,
-            Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation,
-        )
-        crop_pixmap = self._current_crop_full_pixmap
-        crop_display = (
-            crop_pixmap.scaled(
-                _INSPECTOR_IMAGE_SIZE, _INSPECTOR_IMAGE_SIZE,
-                Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation,
-            )
-            if crop_pixmap is not None and not crop_pixmap.isNull()
-            else None
-        )
-
-        if any(checked[key] for key in _BOX_FAMILY_KEYS):
-            boxes = detection_boxes_for(image_path)
-            eye_full = eye_keypoints_for(image_path, crop_cache_dir=self._crop_cache_dir)
-            original_display = self._draw_box_family(original_display, boxes, eye_full, checked)
-
-        if any(checked[key] for key in _LANDMARK_FAMILY_KEYS):
-            if crop_display is not None:
-                eye_crop = eye_keypoints_in_crop_for(image_path, crop_cache_dir=self._crop_cache_dir)
-                crop_display = self._draw_landmark_family(crop_display, eye_crop, checked)
-                self._fill_landmark_table(eye_crop)
-                # "Keep optional overlay on the original image if useful"
-                # (Issue 3's own wording): markers only, never the text that
-                # made the original unreadable in the first place - the crop
-                # above is the detailed view.
-                eye_full = eye_keypoints_for(image_path, crop_cache_dir=self._crop_cache_dir)
-                context_only = {**checked, "landmark_labels": False, "confidence_values": False}
-                original_display = self._draw_landmark_family(original_display, eye_full, context_only)
-            else:
-                eye_full = eye_keypoints_for(image_path, crop_cache_dir=self._crop_cache_dir)
-                original_display = self._draw_landmark_family(original_display, eye_full, checked)
-                self._fill_landmark_table(eye_full)
-        else:
-            self._landmarks_table.setRowCount(0)
-
-        self._original_label.setPixmap(original_display)
-        if crop_display is not None:
-            self._crop_label.setPixmap(crop_display)
-        else:
-            self._crop_label.setText("No crop cached for this image\n(this backend may classify the full frame)")
-
-    def _draw_box_family(
-        self, display: QPixmap, boxes: dict | None, eye: dict | None, checked: dict[str, bool]
-    ) -> QPixmap:
-        source_size = (boxes or {}).get("source_size") or (eye or {}).get("source_size")
-        if source_size is None or not source_size[0] or not source_size[1]:
-            return display
-        scale_x = display.width() / source_size[0]
-        scale_y = display.height() / source_size[1]
-
-        def to_display(box) -> QRectF:
-            x1, y1, x2, y2 = box
-            return QRectF(x1 * scale_x, y1 * scale_y, (x2 - x1) * scale_x, (y2 - y1) * scale_y)
-
-        composed = QPixmap(display)
-        painter = QPainter(composed)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        try:
-            if checked["detection_boxes"] and boxes:
-                painter.setPen(_UNION_DETECTION_PEN)
-                for box in ([boxes["selected"]] if boxes.get("selected") else []) + list(boxes.get("others") or []):
-                    painter.drawRect(to_display(box["box"]))
-            if checked["candidate_detections"] and boxes:
-                painter.setPen(_CANDIDATE_DETECTION_PEN)
-                for box in boxes.get("others") or []:
-                    painter.drawRect(to_display(box["box"]))
-            if checked["selected_detection"] and boxes and boxes.get("selected"):
-                painter.setPen(_SELECTED_DETECTION_PEN)
-                painter.drawRect(to_display(boxes["selected"]["box"]))
-            if checked["rejected_detections"] and eye and eye.get("box") and not eye.get("accepted"):
-                painter.setPen(_REJECTED_DETECTION_PEN)
-                painter.drawRect(to_display(eye["box"]))
-            if checked["expanded_crop"] and boxes and boxes.get("expanded_box"):
-                painter.setPen(_EXPANDED_CROP_PEN)
-                painter.drawRect(to_display(boxes["expanded_box"]))
-            if checked["final_crop"] and boxes and boxes.get("expanded_box"):
-                painter.setPen(_FINAL_CROP_PEN)
-                painter.drawRect(to_display(boxes["expanded_box"]))
-            if checked["eye_roi"] and eye and eye.get("box"):
-                colour = EYE_BOX_ACCEPTED if eye.get("accepted") else EYE_BOX_REJECTED
-                pen = QPen(QColor(*colour), 2)
-                if not eye.get("accepted"):
-                    pen.setStyle(Qt.PenStyle.DashLine)
-                painter.setPen(pen)
-                painter.drawRect(to_display(eye["box"]))
-        finally:
-            painter.end()
-        return composed
-
-    def _draw_landmark_family(self, display: QPixmap, eye: dict | None, checked: dict[str, bool]) -> QPixmap:
-        if not eye or not eye.get("source_size"):
-            return display
-        source_size = eye["source_size"]
-        scale_x = display.width() / source_size[0]
-        scale_y = display.height() / source_size[1]
-
-        composed = QPixmap(display)
-        painter = QPainter(composed)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        radius = 4.0
-        try:
-            if checked["head_box"]:
-                points = [eye.get(key) for key in _HEAD_BOX_LANDMARK_KEYS]
-                points = [point for point in points if point]
-                if points:
-                    xs = [point["x"] * scale_x for point in points]
-                    ys = [point["y"] * scale_y for point in points]
-                    painter.setPen(_HEAD_BOX_PEN)
-                    painter.drawRect(QRectF(min(xs), min(ys), max(xs) - min(xs), max(ys) - min(ys)))
-            if checked["landmarks"]:
-                for name, key, colour in _LANDMARK_STYLE:
-                    point = eye.get(key)
-                    if not point:
-                        continue
-                    x, y = point["x"] * scale_x, point["y"] * scale_y
-                    painter.setPen(QPen(QColor(*colour), 2))
-                    painter.setBrush(QColor(*colour))
-                    painter.drawEllipse(QRectF(x - radius, y - radius, radius * 2, radius * 2))
-                    label_parts = []
-                    if checked["landmark_labels"]:
-                        label_parts.append(name)
-                    if checked["confidence_values"]:
-                        label_parts.append(f"{point['confidence']:.2f}")
-                    if label_parts:
-                        painter.drawText(int(x) + 6, int(y) - 6, " ".join(label_parts))
-        finally:
-            painter.end()
-        return composed
-
-    def _fill_landmark_table(self, eye: dict | None) -> None:
-        """Name / Confidence / Pixel Coordinates / Normalized Coordinates for
-        every landmark that is actually present - "if available" (Manual QA
-        Issue 3's own wording): a landmark this image's detector never
-        computed simply does not get a row, rather than a fabricated
-        placeholder one."""
-        rows: list[tuple[str, str, str, str]] = []
-        source_size = (eye or {}).get("source_size")
-        if eye and source_size and source_size[0] and source_size[1]:
-            width, height = source_size
-            for name, key, _colour in _LANDMARK_STYLE:
-                point = eye.get(key)
-                if not point:
-                    continue
-                rows.append((
-                    name, f"{point['confidence']:.3f}",
-                    f"({point['x']:.1f}, {point['y']:.1f})",
-                    f"({point['x'] / width:.3f}, {point['y'] / height:.3f})",
-                ))
-        table = self._landmarks_table
-        table.setSortingEnabled(False)
-        table.setRowCount(len(rows))
-        table.setColumnCount(4)
-        table.setHorizontalHeaderLabels(["Landmark", "Confidence", "Pixel Coordinates", "Normalized Coordinates"])
-        for row_index, values in enumerate(rows):
-            for col_index, value in enumerate(values):
-                table.setItem(row_index, col_index, QTableWidgetItem(value))
-        table.resizeColumnsToContents()
-        table.horizontalHeader().setStretchLastSection(True)
-        table.setSortingEnabled(True)
-
-    @staticmethod
-    def _original_pixmap_path(image_path: str) -> Path | None:
-        try:
-            from ...review.thumbnails import review_preview
-            return review_preview(image_path)
-        except Exception:  # noqa: BLE001 - a missing/unreadable source image must not crash the dashboard
-            return None
-
-    @staticmethod
-    def _load_full_pixmap(path: Path | None) -> QPixmap:
-        """Unscaled, so overlay coordinates (in the source frame's own pixel
-        space) can be mapped using a single width/height ratio computed
-        against the ACTUAL displayed size - both Original and Crop are
-        loaded this way and scaled down in `_refresh_overlays` right before
-        display, rather than guessing what a pre-scaled pixmap's own
-        KeepAspectRatio scale happened to produce."""
-        if path is None or not Path(path).is_file():
-            return QPixmap()
-        return QPixmap(str(path))
-
-
 _GEOMETRY_SETTINGS_KEY = "analytics/dashboard_geometry"
 
 
+def _build_run_records(
+    store: AnalyticsStore, annotation_store: AnnotationStore, run_id: str,
+    *, species_db: str | Path | None = None,
+) -> list[FilterableRecord]:
+    """Every image this run touched, adapted into the shared filtering
+    engine's generic shape (see desktop/filtering.py) - the Analytics
+    Dashboard's own equivalent of MainWindow._build_filterable_records.
+    Product Direction Phase B: "use the same engine everywhere" - this is
+    the ONE place a run's images become FilterableRecords, reused by
+    Advanced Filters, the Species-row drill-down, and (indirectly, via
+    _apply_filters_to_tabs) every detail tab.
+
+    Replaces the per-path lookups the now-removed ImageExplorerTab's own
+    `_populate_candidates` used to build purely for its own filter bar
+    (algorithm/user decision, species, burst, reject reason) - same
+    best-effort sources, same Known Limitations (species/burst are
+    recomputed, never a persisted per-image fact; reject reasons depend on
+    `.picklikeme/classic_vision_filters.json` still existing next to the
+    run's own folder).
+    """
+    run = store.get_run(run_id) or {}
+    folder = run.get("folder")
+    strategy_id = run.get("strategy_id", "")
+
+    scored_paths = store.image_paths(run_id)
+    reject_reason_by_path: dict[str, str | None] = {path: None for path in scored_paths}
+    filtered_paths: list[str] = []
+    if folder:
+        try:
+            report = read_filter_report(folder, strategy_id)
+            for path, reason in (report.get("images") or {}).items():
+                if path not in reject_reason_by_path:
+                    filtered_paths.append(path)
+                reject_reason_by_path[path] = reason
+        except Exception:  # noqa: BLE001 - best-effort; see this function's own docstring
+            pass
+    all_paths = list(scored_paths) + filtered_paths
+
+    try:
+        algo_decision_by_path = algorithm_decisions_for_run(store, run_id)
+    except Exception:  # noqa: BLE001 - filtering must never crash the dashboard
+        algo_decision_by_path = {}
+    try:
+        user_decision_by_path = user_decisions_for_paths(annotation_store, all_paths)
+    except Exception:  # noqa: BLE001
+        user_decision_by_path = {}
+
+    species_by_path: dict[str, object] = {}
+    try:
+        from ...species.cache import DEFAULT_SPECIES_DB, SpeciesCache
+
+        cache = SpeciesCache(species_db if species_db is not None else DEFAULT_SPECIES_DB)
+        try:
+            for path in all_paths:
+                prediction = cache.get(path, strategy_id)
+                if prediction is not None:
+                    species_by_path[path] = prediction
+        finally:
+            cache.close()
+    except Exception:  # noqa: BLE001 - species prediction is best-effort
+        pass
+
+    burst_by_path = _compute_burst_map(store, annotation_store, run_id, all_paths)
+
+    records: list[FilterableRecord] = []
+    for path in all_paths:
+        metrics = store.image_metrics(run_id, path)
+        prediction = species_by_path.get(path)
+        burst = burst_by_path.get(path)
+        records.append(FilterableRecord(
+            path=path,
+            folder=str(Path(path).parent),
+            filename=Path(path).name,
+            user_decision=user_decision_by_path.get(path, "neutral"),
+            algorithm_decision=algo_decision_by_path.get(path),
+            reject_reason=reject_reason_by_path.get(path),
+            species=prediction.species if prediction is not None else None,
+            species_confidence=prediction.confidence if prediction is not None else None,
+            score=metrics.get("score"),
+            eye_confidence=metrics.get("eye_confidence"),
+            head_confidence=metrics.get("head_confidence"),
+            subject_size=metrics.get("subject_size"),
+            eye_sharpness=metrics.get("eye_sharpness"),
+            subject_sharpness=metrics.get("subject_sharpness"),
+            burst_id=burst.burst_id if burst else None,
+            burst_size=burst.burst_size if burst else 1,
+            burst_rank=burst.burst_rank if burst else 1,
+            burst_best=burst.burst_best if burst else True,
+        ))
+    return records
+
+
 class AnalyticsDashboard(QDialog):
-    """The Experiment Browser (left) plus an Experiment Metadata header and
-    User vs Algorithm / Run Summary / Species Analysis / Burst Analytics /
-    Image Explorer (right, as tabs) - the priority order specified for this
-    phase."""
+    """The Experiment Browser (left) plus an Experiment Metadata header,
+    Advanced Filters, and User vs Algorithm / Run Summary / Species
+    Analysis / Burst Analytics (right, as tabs) - the priority order
+    specified for this phase.
+
+    Product Direction (the "NEW PRODUCT DIRECTION" pivot): "the Dashboard
+    should no longer contain Image Explorer functionality... it should
+    support the same filtering engine [as the Review Window]. Changing
+    filters should immediately update: KPIs, Statistics, Tables, Charts,
+    Confusion Matrix, Species Analytics, Burst Analytics, Run Summary."
+    ImageExplorerTab (its own per-image browser, Original/Crop panels,
+    Visual Debug overlays, and Score Explanation table) was removed
+    entirely - browsing/investigating one image now belongs to the Review
+    Window (Advanced Filters + the main grid) and the Loupe (per-image
+    debugging), never a second image browser living inside the Dashboard.
+
+    Every detail tab's own `show_run` takes an optional `paths`/`records`
+    filter argument, always computed here from `self._all_run_records`
+    (see `_build_run_records`) narrowed by `self._advanced_filters_panel`
+    AND `self._drill_down_paths` together (`_apply_filters_to_tabs`) -
+    exactly the two-source AND pattern the Review Window's own simple
+    Filter combo + Advanced Filters already establishes, so a KPI/matrix-
+    cell/species-row click (a "drill-down", pinned until explicitly
+    cleared) and a manually-set Advanced Filters criterion can combine
+    rather than fight each other.
+    """
 
     def __init__(
         self,
         *,
         analytics_db: str | Path = DEFAULT_ANALYTICS_DB,
         annotations_db: str | Path = DEFAULT_ANNOTATIONS_DB,
-        crop_cache_dir: str | Path = DEFAULT_CROP_CACHE_DIR,
         species_db: str | Path | None = None,
         settings: QSettings | None = None,
         root_folder: str | None = None,
@@ -1739,6 +1196,10 @@ class AnalyticsDashboard(QDialog):
 
         self._store = AnalyticsStore(analytics_db)
         self._annotation_store = AnnotationStore(annotations_db)
+        # Injectable so a test never touches the real project-wide species
+        # cache (cache/species.db) just by selecting an experiment - see
+        # _build_run_records. None (the default) means "the real one".
+        self._species_db = species_db
         # The live Review context this dashboard was opened with - never
         # re-read afterward (MainWindow constructs a fresh dashboard each
         # time it is opened, see _show_analytics_dashboard), so these stay
@@ -1746,6 +1207,19 @@ class AnalyticsDashboard(QDialog):
         self._root_folder = root_folder
         self._color_source = color_source
         self._keep_percent = keep_percent
+        # Every image the currently-selected run touched, as FilterableRecords
+        # (see _build_run_records) - rebuilt once per experiment selection,
+        # never per filter change (_apply_filters_to_tabs only re-filters
+        # this already-built list, the same "compute once, filter repeatedly"
+        # pattern MainWindow's own Advanced Filters wiring uses).
+        self._all_run_records: list[FilterableRecord] = []
+        self._current_run_id: str | None = None
+        # A KPI card / confusion-matrix cell / species-row click pins the
+        # detail tabs to exactly that path list until explicitly cleared
+        # (see _set_drill_down) - ANDed with Advanced Filters, never
+        # replacing it, so a photographer can narrow a drill-down further
+        # ("false positives" + "Score > 0.8") without losing either.
+        self._drill_down_paths: list[str] | None = None
 
         # Phase 2 - Analytics Scope: narrows the Experiment Browser to only
         # runs recorded against the current Root Folder, or shows every run
@@ -1797,16 +1271,28 @@ class AnalyticsDashboard(QDialog):
             scope_label=self._current_scope_label(),
         )
         self._metadata_panel = ExperimentMetadataPanel(self)
+
+        # Phase B/C - the same shared filtering engine the Review Window
+        # uses (desktop/filtering.py), populated from _all_run_records
+        # rather than ImageItem - see _refresh_advanced_filter_options.
+        self._advanced_filters_panel = AdvancedFiltersPanel(self)
+        self._advanced_filters_panel.criteriaChanged.connect(self._apply_filters_to_tabs)
+
+        self._drill_down_label = QLabel(self)
+        self._drill_down_label.setStyleSheet("color: palette(mid);")
+        self._clear_drill_down_button = QPushButton("Clear", self)
+        self._clear_drill_down_button.setVisible(False)
+        self._clear_drill_down_button.clicked.connect(self._clear_drill_down)
+        drill_down_row = QHBoxLayout()
+        drill_down_row.addWidget(self._drill_down_label, 1)
+        drill_down_row.addWidget(self._clear_drill_down_button)
+
         self._user_vs_algorithm_tab = UserVsAlgorithmTab(self)
         self._user_vs_algorithm_tab.drillDownRequested.connect(self._on_drill_down)
         self._run_summary_tab = RunSummaryTab(self)
         self._species_analysis_tab = SpeciesAnalysisTab(self)
         self._species_analysis_tab.speciesDrillDownRequested.connect(self._on_species_drill_down)
         self._burst_analytics_tab = BurstAnalyticsTab(annotation_store=self._annotation_store, parent=self)
-        self._image_explorer_tab = ImageExplorerTab(
-            crop_cache_dir=Path(crop_cache_dir), annotation_store=self._annotation_store,
-            species_db=species_db, parent=self,
-        )
 
         self._tabs = QTabWidget(self)
         # User vs Algorithm first - "the primary dashboard page" (see this
@@ -1816,10 +1302,11 @@ class AnalyticsDashboard(QDialog):
         self._tabs.addTab(self._run_summary_tab, "Run Summary")
         self._tabs.addTab(self._species_analysis_tab, "Species Analysis")
         self._tabs.addTab(self._burst_analytics_tab, "Burst Analytics")
-        self._tabs.addTab(self._image_explorer_tab, "Image Explorer")
 
         detail_column = QVBoxLayout()
         detail_column.addWidget(self._metadata_panel)
+        detail_column.addWidget(self._advanced_filters_panel)
+        detail_column.addLayout(drill_down_row)
         detail_column.addWidget(self._tabs, 1)
         detail_with_metadata = QWidget(self)
         detail_with_metadata.setLayout(detail_column)
@@ -1918,48 +1405,105 @@ class AnalyticsDashboard(QDialog):
         if current is None:
             return
         run_id = current.data(Qt.ItemDataRole.UserRole)
+        # A genuinely different run's own path list makes any pinned
+        # drill-down meaningless (re-selecting the SAME run, e.g. via
+        # refresh_current_run, must NOT lose it - that is exactly the
+        # "still looking at the same thing after a refresh" case).
+        if run_id != self._current_run_id:
+            self._clear_drill_down(refresh=False)
+        self._current_run_id = run_id
+
         self._header_panel.show_run(self._store, self._annotation_store, run_id)
         self._metadata_panel.show_run(self._store, run_id)
-        self._user_vs_algorithm_tab.show_run(self._store, self._annotation_store, run_id)
-        self._run_summary_tab.show_run(self._store, run_id)
-        self._species_analysis_tab.show_run(self._store, run_id)
-        self._burst_analytics_tab.show_run(self._store, run_id)
-        self._image_explorer_tab.show_run(self._store, run_id)
+        self._all_run_records = _build_run_records(
+            self._store, self._annotation_store, run_id, species_db=self._species_db,
+        )
+        self._refresh_advanced_filter_options()
+        self._apply_filters_to_tabs()
+
+    def _refresh_advanced_filter_options(self) -> None:
+        """Keeps the panel's Folder/Species/Reject Reason/Burst Rank combos
+        in sync with whichever run is currently selected - mirrors
+        MainWindow's own _refresh_advanced_filter_options exactly."""
+        records = self._all_run_records
+        folders = sorted({r.folder for r in records if r.folder})
+        species = sorted({r.species for r in records if r.species})
+        reject_codes = sorted({r.reject_reason for r in records if r.reject_reason})
+        reject_reasons = [(code, REJECT_REASON_LABELS.get(code, code)) for code in reject_codes]
+        max_burst_size = max((r.burst_size for r in records), default=1)
+        self._advanced_filters_panel.set_available_options(
+            folders=folders, species=species, reject_reasons=reject_reasons, max_burst_size=max_burst_size,
+        )
+
+    def _apply_filters_to_tabs(self) -> None:
+        """The single choke point every detail tab's data flows through -
+        Advanced Filters' own criteria AND whichever drill-down is
+        currently pinned (see the class docstring), applied to
+        self._all_run_records, and the resulting path/record subset handed
+        to every tab. Runs on: an experiment being selected, any Advanced
+        Filters control changing (criteriaChanged), and any drill-down
+        being set or cleared - the same "no Apply button, the grid updates
+        immediately" requirement the Review Window's own Advanced Filters
+        satisfies."""
+        if self._current_run_id is None:
+            return
+        run_id = self._current_run_id
+        records = self._all_run_records
+        if self._drill_down_paths is not None:
+            allowed = set(self._drill_down_paths)
+            records = [r for r in records if r.path in allowed]
+
+        criteria = self._advanced_filters_panel.criteria
+        active = criteria.is_active() or self._drill_down_paths is not None
+        if active:
+            filtered_records = apply_filters(records, criteria)
+            paths: list[str] | None = [r.path for r in filtered_records]
+        else:
+            filtered_records = None
+            paths = None
+
+        self._user_vs_algorithm_tab.show_run(self._store, self._annotation_store, run_id, paths=paths)
+        self._run_summary_tab.show_run(self._store, run_id, paths=paths)
+        self._species_analysis_tab.show_run(self._store, run_id, records=filtered_records)
+        self._burst_analytics_tab.show_run(self._store, run_id, paths=paths)
 
     def _on_drill_down(self, paths: list, label: str) -> None:
-        """A User vs Algorithm confusion-matrix cell was clicked - filter
-        the Image Explorer to exactly those images and switch to it, so
+        """A User vs Algorithm confusion-matrix cell or KPI card was
+        clicked - pin every detail tab to exactly those images, so
         "drilling down into every category" (see the Phase 2 mandate)
-        actually shows the photographer the images, not just a count."""
-        run_id = self._user_vs_algorithm_tab._run_id
-        if run_id is None:
-            return
-        self._image_explorer_tab.show_paths(self._store, run_id, paths)
-        self._tabs.setCurrentWidget(self._image_explorer_tab)
-        self._image_explorer_tab.setToolTip(f"Filtered: {label} ({len(paths)} image(s))")
+        actually shows the photographer the images behind a number, not
+        just the count itself."""
+        self._set_drill_down(paths, label)
 
     def _on_species_drill_down(self, species: str) -> None:
-        """Species Analysis's distribution table (Phase 9) - filters the
-        Image Explorer to every image this run recorded under exactly that
-        species/category, via its own species filter combo, rather than a
-        separate paths-based drill-down: the Explorer already has every
-        image for this run loaded (show_run, not show_paths), so narrowing
-        it in place preserves every OTHER filter the photographer may
-        already have set."""
-        current = self._experiment_list.currentItem()
-        run_id = current.data(Qt.ItemDataRole.UserRole) if current else None
-        if run_id is None:
-            return
-        self._tabs.setCurrentWidget(self._image_explorer_tab)
-        if self._image_explorer_tab._run_id != run_id:
-            self._image_explorer_tab.show_run(self._store, run_id)
-        self._image_explorer_tab._species_combo.setCurrentText(species)
+        """Species Analysis's distribution table (Phase 9) - pins every
+        detail tab to every image this run recorded under exactly that
+        species/category. Computed from self._all_run_records (already
+        built for the currently-selected run), the same source Advanced
+        Filters' own Species control reads."""
+        matching = [r.path for r in self._all_run_records if r.species == species]
+        self._set_drill_down(matching, f"Species: {species}")
+
+    def _set_drill_down(self, paths: list[str], label: str) -> None:
+        self._drill_down_paths = list(paths)
+        self._drill_down_label.setText(f"Showing: {label} ({len(paths)} image(s))")
+        self._clear_drill_down_button.setVisible(True)
+        self._apply_filters_to_tabs()
+
+    def _clear_drill_down(self, *, refresh: bool = True) -> None:
+        self._drill_down_paths = None
+        self._drill_down_label.setText("")
+        self._clear_drill_down_button.setVisible(False)
+        if refresh:
+            self._apply_filters_to_tabs()
 
     def refresh_current_run(self) -> None:
         """Re-runs whichever experiment is currently selected through every
         tab again - the explicit "immediately refresh Agreement/Confusion
         Matrix/Precision/Recall/F1" requirement after a Ground Truth import
-        changes review decisions out from under an already-open dashboard."""
+        changes review decisions out from under an already-open dashboard.
+        Advanced Filters and any pinned drill-down survive this (see
+        _on_experiment_selected) - only the underlying data is recomputed."""
         self._on_experiment_selected(self._experiment_list.currentItem(), None)
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt override

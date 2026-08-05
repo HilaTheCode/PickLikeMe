@@ -40,13 +40,26 @@ REJECT = REVIEW_REJECT
 
 def algorithm_decisions_for_run(
     store: AnalyticsStore, run_id: str, *, keep_percent: float | None = None, metric_name: str = "score",
+    paths: list[str] | None = None,
 ) -> dict[str, str]:
     """image_path -> "keep"/"reject" for every image this run recorded
     `metric_name` for - ranked by that metric, split at `keep_percent`
     (top `keep_percent`% is "keep"). `keep_percent=None` (the default)
     uses the run's own recorded accepted/considered ratio - what the
     algorithm's own accept/reject split for this run actually was, rather
-    than an arbitrary guess."""
+    than an arbitrary guess.
+
+    `paths=None` (the default) returns every scored image. Otherwise the
+    RESULT is narrowed to `paths` after the cut is computed - never before:
+    the cut (and therefore what "keep" means for any one image) is always
+    the top `keep_percent`% of the run's OWN full ranking, so a photographer
+    narrowing the Analytics Dashboard with Advanced Filters (e.g. to one
+    species) sees the same Algorithm Decision for an image whether or not a
+    filter happens to be active. Ranking only that species' own images
+    against each other would silently redefine "keep" per-filter, which
+    would make an image's own Algorithm Decision change depending on what
+    else was on screen - never desired.
+    """
     run = store.get_run(run_id)
     if run is None:
         return {}
@@ -58,7 +71,11 @@ def algorithm_decisions_for_run(
     scored = [(path, value) for path, value in scored if value is not None]
     scored.sort(key=lambda pair: pair[1], reverse=True)
     cut = round(len(scored) * keep_percent / 100.0)
-    return {path: (KEEP if index < cut else REJECT) for index, (path, _value) in enumerate(scored)}
+    decisions = {path: (KEEP if index < cut else REJECT) for index, (path, _value) in enumerate(scored)}
+    if paths is not None:
+        allowed = set(paths)
+        decisions = {path: status for path, status in decisions.items() if path in allowed}
+    return decisions
 
 
 NEUTRAL = "neutral"
@@ -147,6 +164,7 @@ def compare_run_to_user_decisions(
     *,
     keep_percent: float | None = None,
     metric_name: str = "score",
+    paths: list[str] | None = None,
 ) -> AgreementReport:
     """The full User vs Algorithm report for one run. Treats Keep as the
     positive class and the photographer's own decision as ground truth -
@@ -154,8 +172,15 @@ def compare_run_to_user_decisions(
     photographer also keep"; recall is "of what the photographer kept, how
     much did the algorithm also suggest keeping" - the exact same framing
     `ReviewSession.agreement_stats()` already uses, so the two can never
-    disagree about what these words mean."""
-    algo_decisions = algorithm_decisions_for_run(analytics_store, run_id, keep_percent=keep_percent, metric_name=metric_name)
+    disagree about what these words mean.
+
+    `paths=None` (the default) reports on every image this run scored - see
+    `algorithm_decisions_for_run`'s own docstring for what `paths` narrows
+    to and, just as importantly, what it deliberately does NOT change
+    (the meaning of "keep" itself)."""
+    algo_decisions = algorithm_decisions_for_run(
+        analytics_store, run_id, keep_percent=keep_percent, metric_name=metric_name, paths=paths,
+    )
     user_decisions = user_decisions_for_paths(annotation_store, list(algo_decisions))
 
     report = AgreementReport()

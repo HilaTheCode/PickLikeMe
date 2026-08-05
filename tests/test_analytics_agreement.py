@@ -78,6 +78,25 @@ def test_algorithm_decisions_for_an_unknown_run_is_empty(tmp_path, analytics_sto
     assert algorithm_decisions_for_run(analytics_store, "nope") == {}
 
 
+def test_algorithm_decisions_paths_narrows_the_result_without_changing_the_cut(tmp_path, analytics_store) -> None:
+    """Product Direction (Analytics Dashboard filtering): scoping to a path
+    subset must never redefine what "keep" means for an image - the cut
+    stays the top keep_percent% of the FULL run, only the reported set
+    narrows. img_1 is "keep" here (top 2 of 4) exactly as it is unfiltered,
+    even though restricted to only the bottom three images."""
+    scores = {f"img_{i}.jpg": 1.0 - i * 0.1 for i in range(4)}  # img_0 highest, img_3 lowest
+    run_id = _seed_run(analytics_store, tmp_path, considered=4, accepted=2, scores=scores)
+
+    decisions = algorithm_decisions_for_run(
+        analytics_store, run_id, paths=["img_1.jpg", "img_2.jpg", "img_3.jpg"],
+    )
+
+    assert set(decisions) == {"img_1.jpg", "img_2.jpg", "img_3.jpg"}
+    assert decisions["img_1.jpg"] == "keep"
+    assert decisions["img_2.jpg"] == "reject"
+    assert decisions["img_3.jpg"] == "reject"
+
+
 def test_user_decisions_distinguishes_neutral_from_unmatched(tmp_path, annotation_store) -> None:
     kept = _write(tmp_path / "a.jpg", b"a")
     rejected = _write(tmp_path / "b.jpg", b"b")
@@ -138,6 +157,24 @@ def test_compare_run_to_user_decisions_disagreement_shows_up_as_false_positive_a
     assert report.precision == 0.0
     assert report.recall == 0.0
     assert report.override_rate == 100.0
+
+
+def test_compare_run_to_user_decisions_paths_scopes_the_report(tmp_path, analytics_store, annotation_store) -> None:
+    """Analytics Dashboard Advanced Filters: narrowing to `paths` narrows
+    every KPI/confusion-matrix count to just that subset, matching-run
+    context (the algorithm's own accepted ratio) unchanged."""
+    a = _write(tmp_path / "a.jpg", b"a")
+    b = _write(tmp_path / "b.jpg", b"b")
+    annotation_store.set_review_decision(a, REVIEW_REJECT)  # false positive
+    annotation_store.set_review_decision(b, REVIEW_KEEP)  # false negative
+    run_id = _seed_run(analytics_store, tmp_path, considered=2, accepted=1, scores={str(a): 0.9, str(b): 0.1})
+
+    report = compare_run_to_user_decisions(analytics_store, annotation_store, run_id, paths=[str(a)])
+
+    assert report.compared == 1
+    assert report.algo_keep_user_reject == 1
+    assert report.algo_reject_user_keep == 0
+    assert report.pairs == [(str(a), "reject", "keep")]
 
 
 def test_neutral_and_unmatched_images_are_excluded_from_comparison_but_counted(

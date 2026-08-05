@@ -73,7 +73,7 @@ def test_selecting_an_experiment_populates_all_three_tabs(tmp_path: Path) -> Non
 
     assert dialog._run_summary_tab._table.rowCount() > 0
     assert dialog._species_analysis_tab._table.rowCount() == 4  # Accepted, Kingfisher, Osprey, Unknown
-    assert dialog._image_explorer_tab._image_list.count() == 2  # a.jpg, b.jpg
+    assert dialog._user_vs_algorithm_tab._run_id == "run-1"
 
     dialog.close()
 
@@ -155,12 +155,39 @@ def test_top_5_predictions_table_shows_at_most_five_highest_count_rows(tmp_path:
 
 
 @pytest.mark.skipif(QApplication is None, reason="PySide6 not installed")
-def test_clicking_a_species_row_filters_the_image_explorer(tmp_path: Path) -> None:
+def test_clicking_a_species_row_pins_every_tab_to_that_species(tmp_path: Path) -> None:
+    """Species Analysis's distribution table drill-down no longer opens a
+    separate Image Explorer (removed - see analytics_dashboard.py's own
+    Product Direction docstring); it pins the shared drill-down scope
+    instead, which every detail tab (here: Run Summary's own card) reads
+    through _apply_filters_to_tabs. Needs real per-image SpeciesCache
+    predictions - species DRILL-DOWN is always best-effort, per-image data
+    (never derived from the whole-run `category_counts` aggregate the
+    UNFILTERED table itself reads, which is why `reject_counts` is ALSO
+    seeded below: the two are genuinely separate sources - see this
+    module's own docstring)."""
+    from picklikeme.species.cache import SpeciesCache
+    from picklikeme.species.classifier import SpeciesPrediction
     from picklikeme.desktop.dialogs.analytics_dashboard import AnalyticsDashboard
 
-    _seed(tmp_path / "analytics.db")
+    shoot = tmp_path / "shoot"
+    a, b = shoot / "a.jpg", shoot / "b.jpg"
+    _make_jpeg(a, color="red")
+    _make_jpeg(b, color="green")
+    with AnalyticsStore(tmp_path / "analytics.db") as store:
+        store.insert_run(
+            "run-1", folder=str(shoot), strategy_id="bioclip2", started_at="t",
+            considered=2, accepted=2, device="cpu", params={},
+            reject_counts={"Kingfisher": 1, "Osprey": 1},  # the whole-run aggregate the UNFILTERED table reads
+            image_metrics={str(a): {"top1_confidence": 0.9}, str(b): {"top1_confidence": 0.4}},
+        )
+    species_db = tmp_path / "species.db"
+    with SpeciesCache(species_db) as cache:
+        cache.store(a, SpeciesPrediction(species="Kingfisher", confidence=0.9, classifier_id="bioclip2"))
+        cache.store(b, SpeciesPrediction(species="Osprey", confidence=0.4, classifier_id="bioclip2"))
+
     app = QApplication.instance() or QApplication([])
-    dialog = AnalyticsDashboard(species_db=tmp_path / "species.db", analytics_db=tmp_path / "analytics.db", annotations_db=tmp_path / "annotations.sqlite")
+    dialog = AnalyticsDashboard(species_db=species_db, analytics_db=tmp_path / "analytics.db", annotations_db=tmp_path / "annotations.sqlite")
     dialog._experiment_list.setCurrentRow(0)
     app.processEvents()
 
@@ -169,8 +196,8 @@ def test_clicking_a_species_row_filters_the_image_explorer(tmp_path: Path) -> No
     table.cellClicked.emit(row, 0)
     app.processEvents()
 
-    assert dialog._tabs.currentWidget() is dialog._image_explorer_tab
-    assert dialog._image_explorer_tab._species_combo.currentText() in ("Kingfisher", "All Species")
+    assert dialog._drill_down_paths == [str(a)]
+    assert dialog._run_summary_tab._images_processed_card._value_label.text() == "1"
     dialog.close()
 
 
@@ -281,9 +308,12 @@ def test_burst_analytics_per_image_table_shows_size_rank_and_winner(tmp_path: Pa
 
 
 @pytest.mark.skipif(QApplication is None, reason="PySide6 not installed")
-def test_image_explorer_burst_filter_agrees_with_burst_analytics_tab(tmp_path: Path) -> None:
-    """Both read through the same _compute_burst_map - a winner in one tab
-    must be a winner in the other."""
+def test_advanced_filters_burst_winners_agrees_with_burst_analytics_tab(tmp_path: Path) -> None:
+    """Both Advanced Filters' own Burst control and BurstAnalyticsTab read
+    through the same _compute_burst_map (via _build_run_records) - a
+    winner in one must be a winner in the other, and narrowing to Burst
+    Winners must narrow every OTHER tab too (Phase C: "changing filters
+    should immediately update ... Burst Analytics, Run Summary")."""
     from picklikeme.desktop.dialogs.analytics_dashboard import AnalyticsDashboard
 
     _make_burst_images(tmp_path)
@@ -292,13 +322,17 @@ def test_image_explorer_burst_filter_agrees_with_burst_analytics_tab(tmp_path: P
     dialog._experiment_list.setCurrentRow(0)
     app.processEvents()
 
-    explorer = dialog._image_explorer_tab
-    explorer._burst_combo.setCurrentText("Burst Winners")
-    winner_names = {explorer._image_list.item(r).text() for r in range(explorer._image_list.count())}
-    assert winner_names == {"a.jpg", "c.jpg"}
+    dialog._advanced_filters_panel._burst_combo.setCurrentText("Winners")
+    app.processEvents()
 
-    explorer._burst_combo.setCurrentText("Burst Losers")
-    loser_names = {explorer._image_list.item(r).text() for r in range(explorer._image_list.count())}
+    burst_table = dialog._burst_analytics_tab._table
+    winner_names = {burst_table.item(r, 0).text() for r in range(burst_table.rowCount())}
+    assert winner_names == {"a.jpg", "c.jpg"}
+    assert dialog._run_summary_tab._images_processed_card._value_label.text() == "2"
+
+    dialog._advanced_filters_panel._burst_combo.setCurrentText("Losers")
+    app.processEvents()
+    loser_names = {burst_table.item(r, 0).text() for r in range(burst_table.rowCount())}
     assert loser_names == {"b.jpg"}
     dialog.close()
 
@@ -315,26 +349,24 @@ def test_dashboard_with_no_experiments_does_not_crash(tmp_path: Path) -> None:
 
 
 @pytest.mark.skipif(QApplication is None, reason="PySide6 not installed")
-def test_image_inspector_never_crashes_on_a_missing_source_file(tmp_path: Path) -> None:
+def test_dashboard_never_crashes_when_a_run_recorded_a_missing_source_file(tmp_path: Path) -> None:
     """The exact real-world case found during validation: a recorded image
     path that no longer exists (Organize by Species moved the file after
-    recording it) must degrade to a clear message, never a crash or a
-    silently blank widget."""
+    recording it) must never crash record-building or any detail tab -
+    per-image display of a missing file is now the Loupe's concern, not
+    the Dashboard's (see this module's own Product Direction docstring),
+    but _build_run_records/_apply_filters_to_tabs must still degrade
+    gracefully rather than raising."""
     from picklikeme.desktop.dialogs.analytics_dashboard import AnalyticsDashboard
 
-    _seed(tmp_path / "analytics.db")
+    _seed(tmp_path / "analytics.db")  # "a.jpg"/"b.jpg" - relative paths that never existed on disk
     app = QApplication.instance() or QApplication([])
     dialog = AnalyticsDashboard(species_db=tmp_path / "species.db", analytics_db=tmp_path / "analytics.db", annotations_db=tmp_path / "annotations.sqlite")
 
-    dialog._tabs.setCurrentIndex(2)
     dialog._experiment_list.setCurrentRow(0)
     app.processEvents()
-    dialog._image_explorer_tab._image_list.setCurrentRow(0)
-    app.processEvents()
 
-    assert dialog._image_explorer_tab._original_label.pixmap() is None or \
-        dialog._image_explorer_tab._original_label.pixmap().isNull() or \
-        dialog._image_explorer_tab._original_label.text() != ""
+    assert dialog._run_summary_tab._table.rowCount() > 0
     dialog.close()
 
 
@@ -675,9 +707,7 @@ def test_user_keep_card_is_clickable(tmp_path: Path) -> None:
     dialog._user_vs_algorithm_tab._user_keep_card.clicked.emit()
     app.processEvents()
 
-    assert dialog._tabs.currentWidget() is dialog._image_explorer_tab
-    assert dialog._image_explorer_tab._image_list.count() == 1
-    assert dialog._image_explorer_tab._image_list.item(0).text() == "a.jpg"
+    assert [Path(p).name for p in dialog._drill_down_paths] == ["a.jpg"]
     dialog.close()
 
 
@@ -694,7 +724,7 @@ def test_user_reject_card_is_clickable(tmp_path: Path) -> None:
     dialog._user_vs_algorithm_tab._user_reject_card.clicked.emit()
     app.processEvents()
 
-    names = {dialog._image_explorer_tab._image_list.item(row).text() for row in range(dialog._image_explorer_tab._image_list.count())}
+    names = {Path(p).name for p in dialog._drill_down_paths}
     assert names == {"b.jpg", "c.jpg"}
     dialog.close()
 
@@ -712,7 +742,7 @@ def test_algorithm_keep_card_is_clickable(tmp_path: Path) -> None:
     dialog._user_vs_algorithm_tab._algo_keep_card.clicked.emit()
     app.processEvents()
 
-    names = {dialog._image_explorer_tab._image_list.item(row).text() for row in range(dialog._image_explorer_tab._image_list.count())}
+    names = {Path(p).name for p in dialog._drill_down_paths}
     assert names == {"a.jpg", "b.jpg"}
     dialog.close()
 
@@ -732,8 +762,7 @@ def test_algorithm_reject_card_is_clickable(tmp_path: Path) -> None:
 
     # d.jpg is Algorithm Reject too, but was never reviewed (Neutral) - not
     # in report.pairs at all, so it correctly never appears here.
-    assert dialog._image_explorer_tab._image_list.count() == 1
-    assert dialog._image_explorer_tab._image_list.item(0).text() == "c.jpg"
+    assert [Path(p).name for p in dialog._drill_down_paths] == ["c.jpg"]
     dialog.close()
 
 
@@ -750,7 +779,7 @@ def test_agreement_card_is_clickable(tmp_path: Path) -> None:
     dialog._user_vs_algorithm_tab._agree_card.clicked.emit()
     app.processEvents()
 
-    names = {dialog._image_explorer_tab._image_list.item(row).text() for row in range(dialog._image_explorer_tab._image_list.count())}
+    names = {Path(p).name for p in dialog._drill_down_paths}
     assert names == {"a.jpg", "c.jpg"}
     dialog.close()
 
@@ -768,8 +797,7 @@ def test_disagreement_card_is_clickable(tmp_path: Path) -> None:
     dialog._user_vs_algorithm_tab._disagree_card.clicked.emit()
     app.processEvents()
 
-    assert dialog._image_explorer_tab._image_list.count() == 1
-    assert dialog._image_explorer_tab._image_list.item(0).text() == "b.jpg"
+    assert [Path(p).name for p in dialog._drill_down_paths] == ["b.jpg"]
     dialog.close()
 
 
@@ -819,7 +847,7 @@ def test_a_non_clickable_summary_card_never_emits_clicked(tmp_path: Path) -> Non
 
 
 @pytest.mark.skipif(QApplication is None, reason="PySide6 not installed")
-def test_clicking_a_confusion_matrix_cell_filters_the_image_inspector(tmp_path: Path) -> None:
+def test_clicking_a_confusion_matrix_cell_pins_the_drill_down(tmp_path: Path) -> None:
     from picklikeme.desktop.dialogs.analytics_dashboard import AnalyticsDashboard
 
     _seed_agreement_scenario(tmp_path)
@@ -832,9 +860,16 @@ def test_clicking_a_confusion_matrix_cell_filters_the_image_inspector(tmp_path: 
     dialog._user_vs_algorithm_tab._matrix_table.cellClicked.emit(1, 0)
     app.processEvents()
 
-    assert dialog._tabs.currentWidget() is dialog._image_explorer_tab
-    assert dialog._image_explorer_tab._image_list.count() == 1
-    assert dialog._image_explorer_tab._image_list.item(0).text() == "b.jpg"
+    assert [Path(p).name for p in dialog._drill_down_paths] == ["b.jpg"]
+    # isHidden() (the explicit per-widget flag), not isVisible() - the
+    # dialog in this test is never actually shown on screen, so isVisible()
+    # would read False either way regardless of setVisible()'s own state.
+    assert dialog._clear_drill_down_button.isHidden() is False
+
+    dialog._clear_drill_down_button.click()
+    app.processEvents()
+    assert dialog._drill_down_paths is None
+    assert dialog._clear_drill_down_button.isHidden() is True
 
     dialog.close()
 
@@ -1005,514 +1040,3 @@ def test_header_panel_resets_run_specific_fields_when_scope_changes(tmp_path: Pa
     dialog.close()
 
 
-# ---------------------------------------------------------------------------
-# ImageExplorerTab (Phase 4/5/6) - Visual Debug's overlay checkboxes/presets,
-# neither one running the detector itself - they only ever read what an
-# earlier Classic Vision run already cached (detection_boxes_for /
-# eye_keypoints_for), the same read-only rule the Gallery/Loupe overlays
-# already follow.
-# ---------------------------------------------------------------------------
-
-
-def _make_explorer_tab(tmp_path: Path, monkeypatch):
-    from unittest import mock
-
-    from picklikeme.desktop.dialogs import analytics_dashboard as dashboard_module
-
-    annotation_store = mock.Mock()
-    annotation_store.review_decisions.return_value = []
-    annotation_store.capture_timestamp_of.return_value = None
-    tab = dashboard_module.ImageExplorerTab(
-        crop_cache_dir=tmp_path / "crops", annotation_store=annotation_store,
-        species_db=tmp_path / "species.db",
-    )
-    base_pixmap = QPixmap(200, 150)
-    base_pixmap.fill()
-    monkeypatch.setattr(tab, "_load_full_pixmap", lambda path: base_pixmap)
-
-    store = mock.Mock()
-    store.image_metrics.return_value = {}
-    store.get_run.return_value = {"strategy_id": "classic-vision"}
-    store.image_paths.return_value = []
-    tab.show_paths(store, "run-1", ["some/a.jpg"])
-    return tab, dashboard_module
-
-
-@pytest.mark.skipif(QApplication is None, reason="PySide6 not installed")
-def test_no_overlay_checkbox_reads_the_cache_when_none_are_checked(tmp_path: Path, monkeypatch) -> None:
-    from unittest import mock
-
-    app = QApplication.instance() or QApplication([])
-    tab, dashboard_module = _make_explorer_tab(tmp_path, monkeypatch)
-    boxes_spy = mock.Mock(return_value=None)
-    eye_spy = mock.Mock(return_value=None)
-    monkeypatch.setattr(dashboard_module, "detection_boxes_for", boxes_spy)
-    monkeypatch.setattr(dashboard_module, "eye_keypoints_for", eye_spy)
-
-    tab._refresh_overlays()
-
-    boxes_spy.assert_not_called()
-    eye_spy.assert_not_called()
-    assert tab._landmarks_table.rowCount() == 0
-    tab.close()
-
-
-@pytest.mark.skipif(QApplication is None, reason="PySide6 not installed")
-def test_selected_detection_checkbox_draws_independently_of_landmarks(tmp_path: Path, monkeypatch) -> None:
-    from unittest import mock
-
-    app = QApplication.instance() or QApplication([])
-    tab, dashboard_module = _make_explorer_tab(tmp_path, monkeypatch)
-    boxes_spy = mock.Mock(return_value={
-        "source_size": (200, 150),
-        "selected": {"box": (10.0, 10.0, 50.0, 50.0)},
-        "expanded_box": [0.0, 0.0, 60.0, 60.0],
-        "others": [],
-    })
-    eye_spy = mock.Mock(return_value=None)
-    monkeypatch.setattr(dashboard_module, "detection_boxes_for", boxes_spy)
-    monkeypatch.setattr(dashboard_module, "eye_keypoints_for", eye_spy)
-
-    tab._overlay_checkboxes["selected_detection"].setChecked(True)
-
-    boxes_spy.assert_called_once_with("some/a.jpg")
-    eye_spy.assert_called_once()  # the box family also wants the eye ROI, if any
-    assert not tab._original_label.pixmap().isNull()
-    assert tab._landmarks_table.rowCount() == 0  # no landmark-family checkbox is on
-    assert tab._overlay_preset_combo.currentText() == "Custom"
-    tab.close()
-
-
-@pytest.mark.skipif(QApplication is None, reason="PySide6 not installed")
-def test_landmarks_checkbox_populates_only_the_landmarks_that_are_present(tmp_path: Path, monkeypatch) -> None:
-    """"if available" (Issue 3's own wording): Left Eye and Beak were
-    supplied, Right Eye/Head/both shoulders were not - only the two present
-    ones get a row, never a fabricated placeholder for the rest."""
-    from unittest import mock
-
-    app = QApplication.instance() or QApplication([])
-    tab, dashboard_module = _make_explorer_tab(tmp_path, monkeypatch)
-    eye_spy = mock.Mock(return_value={
-        "source_size": (200, 150),
-        "accepted": True,
-        "left": {"x": 20.0, "y": 30.0, "confidence": 0.91},
-        "right": None,
-        "beak": {"x": 25.0, "y": 60.0, "confidence": 0.82},
-        "head_top": None,
-        "left_shoulder": None,
-        "right_shoulder": None,
-    })
-    boxes_spy = mock.Mock(return_value=None)
-    monkeypatch.setattr(dashboard_module, "detection_boxes_for", boxes_spy)
-    monkeypatch.setattr(dashboard_module, "eye_keypoints_for", eye_spy)
-
-    tab._overlay_checkboxes["landmarks"].setChecked(True)
-
-    boxes_spy.assert_not_called()  # landmarks-only: never touches the box cache
-    eye_spy.assert_called_once_with("some/a.jpg", crop_cache_dir=tab._crop_cache_dir)
-    assert tab._landmarks_table.rowCount() == 2
-    names = {tab._landmarks_table.item(row, 0).text() for row in range(tab._landmarks_table.rowCount())}
-    assert names == {"Left Eye", "Beak"}
-    # 4 columns now: Landmark / Confidence / Pixel Coordinates / Normalized
-    # Coordinates (Phase 5's own requirement).
-    assert tab._landmarks_table.columnCount() == 4
-    row = next(r for r in range(tab._landmarks_table.rowCount()) if tab._landmarks_table.item(r, 0).text() == "Left Eye")
-    assert tab._landmarks_table.item(row, 3).text() == f"({20.0 / 200:.3f}, {30.0 / 150:.3f})"
-
-    # Turning it back off clears the table rather than leaving stale rows.
-    tab._overlay_checkboxes["landmarks"].setChecked(False)
-    assert tab._landmarks_table.rowCount() == 0
-    tab.close()
-
-
-@pytest.mark.skipif(QApplication is None, reason="PySide6 not installed")
-def test_box_family_and_landmark_family_checkboxes_are_independent(tmp_path: Path, monkeypatch) -> None:
-    from unittest import mock
-
-    app = QApplication.instance() or QApplication([])
-    tab, dashboard_module = _make_explorer_tab(tmp_path, monkeypatch)
-    boxes_spy = mock.Mock(return_value={
-        "source_size": (200, 150), "selected": {"box": (10.0, 10.0, 50.0, 50.0)}, "expanded_box": None, "others": [],
-    })
-    eye_spy = mock.Mock(return_value={
-        "source_size": (200, 150), "accepted": False,
-        "left": {"x": 20.0, "y": 30.0, "confidence": 0.91}, "right": None,
-        "beak": None, "head_top": None, "left_shoulder": None, "right_shoulder": None,
-    })
-    monkeypatch.setattr(dashboard_module, "detection_boxes_for", boxes_spy)
-    monkeypatch.setattr(dashboard_module, "eye_keypoints_for", eye_spy)
-
-    tab._overlay_checkboxes["selected_detection"].setChecked(True)
-    tab._overlay_checkboxes["landmarks"].setChecked(True)
-
-    boxes_spy.assert_called_with("some/a.jpg")
-    assert tab._landmarks_table.rowCount() == 1
-    assert not tab._original_label.pixmap().isNull()
-    tab.close()
-
-
-@pytest.mark.skipif(QApplication is None, reason="PySide6 not installed")
-def test_rejected_detections_checkbox_only_draws_when_the_eye_was_rejected(tmp_path: Path, monkeypatch) -> None:
-    from unittest import mock
-
-    app = QApplication.instance() or QApplication([])
-    tab, dashboard_module = _make_explorer_tab(tmp_path, monkeypatch)
-    monkeypatch.setattr(dashboard_module, "detection_boxes_for", mock.Mock(return_value=None))
-    accepted_eye = {"source_size": (200, 150), "accepted": True, "box": (1.0, 1.0, 5.0, 5.0)}
-    monkeypatch.setattr(dashboard_module, "eye_keypoints_for", mock.Mock(return_value=accepted_eye))
-
-    tab._overlay_checkboxes["rejected_detections"].setChecked(True)
-    accepted_pixmap = tab._original_label.pixmap()
-
-    tab._overlay_checkboxes["rejected_detections"].setChecked(False)
-    rejected_eye = {**accepted_eye, "accepted": False}
-    monkeypatch.setattr(dashboard_module, "eye_keypoints_for", mock.Mock(return_value=rejected_eye))
-    tab._overlay_checkboxes["rejected_detections"].setChecked(True)
-    rejected_pixmap = tab._original_label.pixmap()
-
-    # Can't easily assert on drawn pixels without a real render target, but
-    # both paths must at least produce a real (non-null) pixmap - the
-    # meaningful behavioural coverage (accepted eyes drawing nothing extra)
-    # lives in the pure box_family drawing logic itself.
-    assert not accepted_pixmap.isNull()
-    assert not rejected_pixmap.isNull()
-    tab.close()
-
-
-# ---------------------------------------------------------------------------
-# Visual Debug presets (Phase 5): Detection / Crop / EyePose / Everything /
-# Custom - a preset sets the exact checked set; manually toggling any
-# checkbox afterward switches the combo to "Custom".
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.skipif(QApplication is None, reason="PySide6 not installed")
-def test_detection_preset_checks_exactly_the_detection_stage_boxes(tmp_path: Path, monkeypatch) -> None:
-    tab, dashboard_module = _make_explorer_tab(tmp_path, monkeypatch)
-
-    tab._overlay_preset_combo.setCurrentText("Detection")
-
-    checked = {key for key, cb in tab._overlay_checkboxes.items() if cb.isChecked()}
-    assert checked == dashboard_module._OVERLAY_PRESETS["Detection"]
-    tab.close()
-
-
-@pytest.mark.skipif(QApplication is None, reason="PySide6 not installed")
-def test_everything_preset_checks_every_checkbox(tmp_path: Path, monkeypatch) -> None:
-    tab, dashboard_module = _make_explorer_tab(tmp_path, monkeypatch)
-
-    tab._overlay_preset_combo.setCurrentText("Everything")
-
-    assert all(cb.isChecked() for cb in tab._overlay_checkboxes.values())
-    tab.close()
-
-
-@pytest.mark.skipif(QApplication is None, reason="PySide6 not installed")
-def test_manually_toggling_a_checkbox_after_a_preset_switches_to_custom(tmp_path: Path, monkeypatch) -> None:
-    tab, _dashboard_module = _make_explorer_tab(tmp_path, monkeypatch)
-    tab._overlay_preset_combo.setCurrentText("Crop")
-    assert tab._overlay_preset_combo.currentText() == "Crop"
-
-    tab._overlay_checkboxes["eye_roi"].setChecked(True)
-
-    assert tab._overlay_preset_combo.currentText() == "Custom"
-    tab.close()
-
-
-@pytest.mark.skipif(QApplication is None, reason="PySide6 not installed")
-def test_checking_exactly_a_presets_own_set_by_hand_is_recognised_as_that_preset(tmp_path: Path, monkeypatch) -> None:
-    tab, dashboard_module = _make_explorer_tab(tmp_path, monkeypatch)
-
-    for key in dashboard_module._OVERLAY_PRESETS["Crop"]:
-        tab._overlay_checkboxes[key].setChecked(True)
-
-    assert tab._overlay_preset_combo.currentText() == "Crop"
-    tab.close()
-
-
-# ---------------------------------------------------------------------------
-# Manual QA Issue 3: landmarks must draw on the CROP (where the head fills
-# most of the frame) rather than the full photo, whenever a crop is cached
-# for the image - with a fallback to the Original when it is not.
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.skipif(QApplication is None, reason="PySide6 not installed")
-def test_landmarks_draw_on_the_crop_when_one_is_cached(tmp_path: Path, monkeypatch) -> None:
-    from unittest import mock
-
-    from picklikeme.bird_crop import crop_cache_path
-    from picklikeme.desktop.dialogs import analytics_dashboard as dashboard_module
-
-    app = QApplication.instance() or QApplication([])
-    crop_dir = tmp_path / "crops"
-    annotation_store = mock.Mock()
-    annotation_store.review_decisions.return_value = []
-    annotation_store.capture_timestamp_of.return_value = None
-    tab = dashboard_module.ImageExplorerTab(
-        crop_cache_dir=crop_dir, annotation_store=annotation_store, species_db=tmp_path / "species.db",
-    )
-    base_pixmap = QPixmap(200, 150)
-    base_pixmap.fill()
-    monkeypatch.setattr(tab, "_load_full_pixmap", lambda path: base_pixmap)
-
-    image_path = "some/a.jpg"
-    # Only existence is checked (Path.is_file()) - the bytes are never
-    # decoded, since _load_full_pixmap is mocked above.
-    crop_path = crop_cache_path(crop_dir, image_path)
-    crop_path.parent.mkdir(parents=True, exist_ok=True)
-    crop_path.write_bytes(b"fake crop bytes")
-
-    crop_eye_spy = mock.Mock(return_value={
-        "source_size": (80, 60), "accepted": True,
-        "left": {"x": 20.0, "y": 30.0, "confidence": 0.9}, "right": None,
-        "beak": None, "head_top": None, "left_shoulder": None, "right_shoulder": None,
-    })
-    full_eye_spy = mock.Mock(return_value=None)
-    monkeypatch.setattr(dashboard_module, "eye_keypoints_in_crop_for", crop_eye_spy)
-    monkeypatch.setattr(dashboard_module, "eye_keypoints_for", full_eye_spy)
-
-    store = mock.Mock()
-    store.image_metrics.return_value = {}
-    store.get_run.return_value = {"strategy_id": "classic-vision"}
-    store.image_paths.return_value = []
-    tab.show_paths(store, "run-1", [image_path])
-
-    tab._overlay_checkboxes["landmarks"].setChecked(True)
-
-    crop_eye_spy.assert_called_with(image_path, crop_cache_dir=crop_dir)
-    # The Original still gets a (context-only) pass too - "keep optional
-    # overlay on the original image if useful" - via the ordinary
-    # full-frame function.
-    full_eye_spy.assert_called_with(image_path, crop_cache_dir=crop_dir)
-    assert tab._landmarks_table.rowCount() == 1
-    assert tab._landmarks_table.item(0, 0).text() == "Left Eye"
-    assert not tab._crop_label.pixmap().isNull()
-    tab.close()
-
-
-@pytest.mark.skipif(QApplication is None, reason="PySide6 not installed")
-def test_landmarks_fall_back_to_the_original_when_no_crop_is_cached(tmp_path: Path, monkeypatch) -> None:
-    """No file at all exists at the computed crop cache path for this
-    image - crop_path.is_file() is False, so landmarks fall back onto the
-    Original instead of showing nothing."""
-    from unittest import mock
-
-    app = QApplication.instance() or QApplication([])
-    tab, dashboard_module = _make_explorer_tab(tmp_path, monkeypatch)
-    eye_spy = mock.Mock(return_value={
-        "source_size": (200, 150), "accepted": True,
-        "left": {"x": 20.0, "y": 30.0, "confidence": 0.9}, "right": None,
-        "beak": None, "head_top": None, "left_shoulder": None, "right_shoulder": None,
-    })
-    monkeypatch.setattr(dashboard_module, "eye_keypoints_for", eye_spy)
-    crop_eye_spy = mock.Mock()
-    monkeypatch.setattr(dashboard_module, "eye_keypoints_in_crop_for", crop_eye_spy)
-
-    tab._overlay_checkboxes["landmarks"].setChecked(True)
-
-    crop_eye_spy.assert_not_called()  # never called at all - there is no crop to draw it on
-    eye_spy.assert_called_with("some/a.jpg", crop_cache_dir=tab._crop_cache_dir)
-    assert tab._landmarks_table.rowCount() == 1
-    assert "No crop cached" in tab._crop_label.text()
-    tab.close()
-
-
-@pytest.mark.skipif(QApplication is None, reason="PySide6 not installed")
-def test_explorer_images_render_significantly_larger_than_other_tabs(tmp_path: Path, monkeypatch) -> None:
-    """Manual QA Issue 3: "make both the original image and the crop
-    significantly larger" - pins the actual size relationship rather than a
-    specific number, so this stays meaningful if _THUMBNAIL_SIZE itself
-    ever changes."""
-    from picklikeme.desktop.dialogs import analytics_dashboard as dashboard_module
-
-    assert dashboard_module._INSPECTOR_IMAGE_SIZE > dashboard_module._THUMBNAIL_SIZE
-
-    tab, _dashboard_module = _make_explorer_tab(tmp_path, monkeypatch)
-    assert tab._original_label.minimumSize().width() == dashboard_module._INSPECTOR_IMAGE_SIZE
-    assert tab._crop_label.minimumSize().width() == dashboard_module._INSPECTOR_IMAGE_SIZE
-    tab.close()
-
-
-# ---------------------------------------------------------------------------
-# Phase 4 - filtering: every filter combines with every other (AND). Uses
-# show_run (not show_paths) against a real, small AnalyticsStore so the
-# reject-reason/score-range/folder filters exercise real data rather than
-# reimplementing the same logic in mocks.
-# ---------------------------------------------------------------------------
-
-
-def _make_explorer_tab_with_real_run(tmp_path: Path, monkeypatch):
-    from unittest import mock
-
-    from picklikeme.analytics.store import AnalyticsStore
-    from picklikeme.desktop.dialogs import analytics_dashboard as dashboard_module
-
-    store = AnalyticsStore(tmp_path / "analytics.db")
-    store.insert_run(
-        "run-1", folder=str(tmp_path / "shoot"), strategy_id="classic-vision-eyepose", started_at="t",
-        considered=3, accepted=2, device="cpu",
-        params={"weights": {"eye_sharpness_weight": 1.0, "subject_sharpness_weight": 0.0, "subject_size_weight": 0.0}},
-        reject_counts={},
-        image_metrics={
-            str(tmp_path / "shoot" / "a.jpg"): {"eye_sharpness": 1.0, "subject_sharpness": 1.0, "subject_size": 0.1, "score": 0.9},
-            str(tmp_path / "shoot" / "b.jpg"): {"eye_sharpness": 5.0, "subject_sharpness": 1.0, "subject_size": 0.1, "score": 0.5},
-            str(tmp_path / "other" / "c.jpg"): {"eye_sharpness": 10.0, "subject_sharpness": 1.0, "subject_size": 0.1, "score": 0.1},
-        },
-    )
-    annotation_store = mock.Mock()
-    annotation_store.review_decisions.return_value = []
-    annotation_store.capture_timestamp_of.return_value = None
-    tab = dashboard_module.ImageExplorerTab(
-        crop_cache_dir=tmp_path / "crops", annotation_store=annotation_store, species_db=tmp_path / "species.db",
-    )
-    monkeypatch.setattr(tab, "_load_full_pixmap", lambda path: QPixmap())
-    tab.show_run(store, "run-1")
-    return tab, store
-
-
-@pytest.mark.skipif(QApplication is None, reason="PySide6 not installed")
-def test_show_run_lists_every_scored_image(tmp_path: Path, monkeypatch) -> None:
-    app = QApplication.instance() or QApplication([])
-    tab, _store = _make_explorer_tab_with_real_run(tmp_path, monkeypatch)
-    assert tab._image_list.count() == 3
-    tab.close()
-
-
-@pytest.mark.skipif(QApplication is None, reason="PySide6 not installed")
-def test_folder_filter_narrows_to_exactly_that_folder(tmp_path: Path, monkeypatch) -> None:
-    app = QApplication.instance() or QApplication([])
-    tab, _store = _make_explorer_tab_with_real_run(tmp_path, monkeypatch)
-
-    tab._folder_combo.setCurrentText(str(tmp_path / "shoot"))
-
-    names = {tab._image_list.item(row).text() for row in range(tab._image_list.count())}
-    assert names == {"a.jpg", "b.jpg"}
-    tab.close()
-
-
-@pytest.mark.skipif(QApplication is None, reason="PySide6 not installed")
-def test_search_and_folder_filters_combine(tmp_path: Path, monkeypatch) -> None:
-    """AND, not OR - narrowing by folder AND then by a filename search that
-    only one of the folder's own images matches."""
-    app = QApplication.instance() or QApplication([])
-    tab, _store = _make_explorer_tab_with_real_run(tmp_path, monkeypatch)
-
-    tab._folder_combo.setCurrentText(str(tmp_path / "shoot"))
-    tab._search_edit.setText("a.jpg")
-
-    assert tab._image_list.count() == 1
-    assert tab._image_list.item(0).text() == "a.jpg"
-    tab.close()
-
-
-@pytest.mark.skipif(QApplication is None, reason="PySide6 not installed")
-def test_score_range_filter_narrows_by_the_runs_own_recorded_score(tmp_path: Path, monkeypatch) -> None:
-    app = QApplication.instance() or QApplication([])
-    tab, _store = _make_explorer_tab_with_real_run(tmp_path, monkeypatch)
-
-    tab._score_min_spin.setValue(0.4)
-    tab._score_max_spin.setValue(1.0)
-
-    names = {tab._image_list.item(row).text() for row in range(tab._image_list.count())}
-    assert names == {"a.jpg", "b.jpg"}  # c.jpg's score (0.1) falls below the min
-    tab.close()
-
-
-@pytest.mark.skipif(QApplication is None, reason="PySide6 not installed")
-def test_clearing_a_filter_restores_the_full_candidate_list(tmp_path: Path, monkeypatch) -> None:
-    app = QApplication.instance() or QApplication([])
-    tab, _store = _make_explorer_tab_with_real_run(tmp_path, monkeypatch)
-
-    tab._folder_combo.setCurrentText(str(tmp_path / "shoot"))
-    assert tab._image_list.count() == 2
-
-    tab._folder_combo.setCurrentText("All Folders")
-    assert tab._image_list.count() == 3
-    tab.close()
-
-
-@pytest.mark.skipif(QApplication is None, reason="PySide6 not installed")
-def test_show_paths_never_extends_the_exact_drill_down_set(tmp_path: Path, monkeypatch) -> None:
-    """Unlike show_run, show_paths (the drill-down entry point) must show
-    EXACTLY the given paths - never widened with other filtered-out images
-    from the same run's folder sidecar."""
-    from unittest import mock
-
-    from picklikeme.desktop.dialogs import analytics_dashboard as dashboard_module
-
-    app = QApplication.instance() or QApplication([])
-    annotation_store = mock.Mock()
-    annotation_store.review_decisions.return_value = []
-    annotation_store.capture_timestamp_of.return_value = None
-    tab = dashboard_module.ImageExplorerTab(
-        crop_cache_dir=tmp_path / "crops", annotation_store=annotation_store, species_db=tmp_path / "species.db",
-    )
-    monkeypatch.setattr(tab, "_load_full_pixmap", lambda path: QPixmap())
-    store = mock.Mock()
-    store.image_metrics.return_value = {}
-    store.get_run.return_value = {"strategy_id": "classic-vision", "folder": str(tmp_path)}
-
-    tab.show_paths(store, "run-1", ["some/a.jpg"])
-
-    assert tab._image_list.count() == 1
-    assert tab._image_list.item(0).text() == "a.jpg"
-    tab.close()
-
-
-# ---------------------------------------------------------------------------
-# Phase 4 - detail rows: Ground Truth / Algorithm Decision / User Decision.
-# Phase 6 - Score Explanation.
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.skipif(QApplication is None, reason="PySide6 not installed")
-def test_detail_table_shows_ground_truth_and_decision_rows(tmp_path: Path, monkeypatch) -> None:
-    app = QApplication.instance() or QApplication([])
-    tab, _store = _make_explorer_tab_with_real_run(tmp_path, monkeypatch)
-
-    fields = {tab._metrics_table.item(row, 0).text() for row in range(tab._metrics_table.rowCount())}
-    assert {"Ground Truth", "User Decision", "Algorithm Decision"} <= fields
-    tab.close()
-
-
-@pytest.mark.skipif(QApplication is None, reason="PySide6 not installed")
-def test_score_explanation_table_shows_the_per_metric_breakdown(tmp_path: Path, monkeypatch) -> None:
-    app = QApplication.instance() or QApplication([])
-    tab, _store = _make_explorer_tab_with_real_run(tmp_path, monkeypatch)
-    tab._image_list.setCurrentRow(0)  # a.jpg
-
-    assert tab._score_table.rowCount() == 3  # eye_sharpness, subject_sharpness, subject_size
-    labels = {tab._score_table.item(row, 0).text() for row in range(tab._score_table.rowCount())}
-    assert "Eye sharpness" in labels
-    assert "Final Score" in tab._score_explanation_summary_label.text()
-    tab.close()
-
-
-@pytest.mark.skipif(QApplication is None, reason="PySide6 not installed")
-def test_score_explanation_is_empty_for_a_run_with_no_weighted_metrics(tmp_path: Path, monkeypatch) -> None:
-    from unittest import mock
-
-    from picklikeme.analytics.store import AnalyticsStore
-    from picklikeme.desktop.dialogs import analytics_dashboard as dashboard_module
-
-    app = QApplication.instance() or QApplication([])
-    store = AnalyticsStore(tmp_path / "analytics.db")
-    store.insert_run(
-        "run-ai", folder=str(tmp_path / "shoot"), strategy_id="ai-model", started_at="t",
-        considered=1, accepted=1, device="cuda", params={}, reject_counts={},
-        image_metrics={str(tmp_path / "shoot" / "a.jpg"): {"score": 0.5}},
-    )
-    annotation_store = mock.Mock()
-    annotation_store.review_decisions.return_value = []
-    annotation_store.capture_timestamp_of.return_value = None
-    tab = dashboard_module.ImageExplorerTab(
-        crop_cache_dir=tmp_path / "crops", annotation_store=annotation_store, species_db=tmp_path / "species.db",
-    )
-    monkeypatch.setattr(tab, "_load_full_pixmap", lambda path: QPixmap())
-
-    tab.show_run(store, "run-ai")
-
-    assert tab._score_table.rowCount() == 0
-    assert "No per-metric breakdown" in tab._score_explanation_summary_label.text()
-    tab.close()

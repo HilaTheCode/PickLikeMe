@@ -215,6 +215,31 @@ class SpeciesCache:
             species=row["species"], confidence=row["confidence"], classifier_id=row["classifier_id"]
         )
 
+    def get_any(self, image_path: str | Path) -> SpeciesPrediction | None:
+        """The most recent prediction for this exact file from ANY
+        classifier, or None if nothing is on record for it at all.
+
+        For a best-effort caller with no single classifier_id of its own to
+        ask for - the Review Window's Advanced Filters panel, which shows
+        species purely as a convenience filter over whatever `Organize by
+        Species` has already classified in this project, unlike
+        AnalyticsStore-backed callers (e.g. AnalyticsDashboard's
+        ImageExplorerTab) that always know one specific run's own
+        strategy_id/classifier_id to scope `get()` to."""
+        digest = self._identity(image_path)
+        if digest is None:
+            return None
+        row = self._conn.execute(
+            "SELECT species, confidence, classifier_id FROM species_cache "
+            "WHERE image_hash = ? ORDER BY created_at DESC LIMIT 1",
+            (digest,),
+        ).fetchone()
+        if row is None:
+            return None
+        return SpeciesPrediction(
+            species=row["species"], confidence=row["confidence"], classifier_id=row["classifier_id"]
+        )
+
     def store(self, image_path: str | Path, prediction: SpeciesPrediction) -> None:
         """Writes (or replaces) this exact (image, classifier) pair's
         cached prediction - never touches any other classifier's row for
