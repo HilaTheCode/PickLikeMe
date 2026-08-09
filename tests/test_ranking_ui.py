@@ -66,7 +66,7 @@ def test_editing_a_field_is_reflected_in_the_returned_parameters(app) -> None:
     dialog.close()
 
 
-def test_reset_to_defaults_restores_50_30_20(app) -> None:
+def test_reset_to_defaults_restores_70_10_20(app) -> None:
     dialog = _dialog()
     for name in dialog._spins:
         dialog._spins[name].setValue(1.0)
@@ -75,8 +75,8 @@ def test_reset_to_defaults_restores_50_30_20(app) -> None:
     assert dialog.parameters() == ClassicVisionParams()
     assert dialog.parameters().normalized_weights() == pytest.approx(
         {
-            "eye_sharpness_weight": 0.5,
-            "subject_sharpness_weight": 0.3,
+            "eye_sharpness_weight": 0.7,
+            "subject_sharpness_weight": 0.1,
             "subject_size_weight": 0.2,
         }
     )
@@ -181,7 +181,9 @@ def test_the_toolbar_rank_button_is_a_split_button_with_a_dropdown(app, tmp_path
     )
     try:
         window.initialize()
-        button = window.findChild(QToolBar, "main_toolbar").widgetForAction(window._rank_action)
+        # Rank lives on the toolbar's second row (main_toolbar_2) - see the
+        # top-toolbar layout fix's two-row split in _build_tool_bar.
+        button = window.findChild(QToolBar, "main_toolbar_2").widgetForAction(window._rank_action)
         assert isinstance(button, QToolButton)
         assert button.popupMode() == QToolButton.ToolButtonPopupMode.MenuButtonPopup
 

@@ -190,7 +190,7 @@ def _scoring_weight_specs() -> tuple[ParamSpec, ...]:
         ParamSpec(
             name="eye_sharpness_weight",
             label="Eye sharpness",
-            default=50.0,
+            default=70.0,
             minimum=0.0,
             maximum=1000.0,
             group=GROUP_WEIGHTS,
@@ -199,7 +199,7 @@ def _scoring_weight_specs() -> tuple[ParamSpec, ...]:
         ParamSpec(
             name="subject_sharpness_weight",
             label="Subject sharpness",
-            default=30.0,
+            default=10.0,
             minimum=0.0,
             maximum=1000.0,
             group=GROUP_WEIGHTS,
@@ -289,8 +289,8 @@ class ClassicVisionParams(WeightedParams):
     eye detector, so both backends mean exactly the same thing by them.
     """
 
-    eye_sharpness_weight: float = 50.0
-    subject_sharpness_weight: float = 30.0
+    eye_sharpness_weight: float = 70.0
+    subject_sharpness_weight: float = 10.0
     subject_size_weight: float = 20.0
     min_eye_confidence: float = DEFAULT_MIN_CONFIDENCE
     max_eye_disagreement: float = DEFAULT_MAX_EYE_DISAGREEMENT
@@ -362,8 +362,8 @@ class ClassicVisionEyePoseParams(WeightedParams):
     is a different, later finding that does carry one.
     """
 
-    eye_sharpness_weight: float = 50.0
-    subject_sharpness_weight: float = 30.0
+    eye_sharpness_weight: float = 70.0
+    subject_sharpness_weight: float = 10.0
     subject_size_weight: float = 20.0
     eye_confidence_threshold: float = EYEPOSE_DEFAULT_MIN_CONFIDENCE
     max_head_distance_ratio: float = EYEPOSE_DEFAULT_MAX_HEAD_DISTANCE_RATIO

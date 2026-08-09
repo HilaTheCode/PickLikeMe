@@ -682,100 +682,84 @@ def test_loupe_dialog_save_jpeg(tmp_path, monkeypatch) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Loupe burst sort mode + burst info display
+# Loupe burst navigation order + burst info display
+#
+# Burst ORDER is decided entirely by MainWindow (see BURST_SORT_* and the
+# View menu's "Burst Order" submenu in main_window.py, and test_burst_ui.py's
+# own coverage of that decision) before a LoupeDialog is ever constructed -
+# the Loupe itself just navigates exactly the `items`/`image_paths` it was
+# handed, in that exact order, with no sort control and no re-sorting. These
+# tests exercise LoupeDialog directly (as this file already does throughout)
+# to prove that half of the contract: given an already-ordered burst, does
+# it display/navigate/report on it correctly, without ever reordering it
+# itself.
 # ---------------------------------------------------------------------------
 
 
-def _make_burst_items(folder) -> list:
-    """Three members of one burst: burst_rank order (score-descending, what
+def _make_burst_items(folder, *, order: tuple[str, str, str] = ("a", "b", "c")) -> list:
+    """Three members of one burst: burst_rank (score-descending, what
     burst_analysis.analyze_bursts already produces) deliberately disagrees
-    with captured_at order, so a test can tell the two sort modes apart."""
+    with captured_at order, so a test can tell whichever order it was
+    actually given apart from the other. `order` controls the order the
+    returned list itself is in - the Loupe navigates exactly that list, so
+    callers pass the sequence they want to verify is preserved."""
     from picklikeme.desktop.models.image_item import ImageItem
 
-    paths = [folder / f"{name}.jpg" for name in ("a", "b", "c")]
-    for path in paths:
-        _make_jpeg(path)
-    return [
-        ImageItem(
-            path=str(paths[0]), file_name="a.jpg", captured_at="2026-01-01T10:00:02",
+    by_name = {
+        "a": ImageItem(
+            path=str(folder / "a.jpg"), file_name="a.jpg", captured_at="2026-01-01T10:00:02",
             burst_id="burst-0018", burst_size=3, burst_rank=2, burst_best=False,
             ranking_results={"ai-model": {"score": 0.700, "rank": 2}},
         ),
-        ImageItem(
-            path=str(paths[1]), file_name="b.jpg", captured_at="2026-01-01T10:00:00",
+        "b": ImageItem(
+            path=str(folder / "b.jpg"), file_name="b.jpg", captured_at="2026-01-01T10:00:00",
             burst_id="burst-0018", burst_size=3, burst_rank=1, burst_best=True,
             ranking_results={"ai-model": {"score": 0.948, "rank": 1}},
         ),
-        ImageItem(
-            path=str(paths[2]), file_name="c.jpg", captured_at="2026-01-01T10:00:01",
+        "c": ImageItem(
+            path=str(folder / "c.jpg"), file_name="c.jpg", captured_at="2026-01-01T10:00:01",
             burst_id="burst-0018", burst_size=3, burst_rank=3, burst_best=False,
             ranking_results={"ai-model": {"score": 0.512, "rank": 3}},
         ),
-    ]
+    }
+    for name in ("a", "b", "c"):
+        _make_jpeg(folder / f"{name}.jpg")
+    return [by_name[name] for name in order]
 
 
 @pytest.mark.skipif(QApplication is None, reason="PySide6 not installed")
-def test_loupe_burst_defaults_to_score_order_matching_burst_rank(tmp_path) -> None:
-    """Burst Analysis's burst_rank is already score-descending (see
-    burst_analysis.py's own docstring) - the actual current default
-    Loupe navigation order, which the new toggle must not silently change
-    the default of."""
-    from picklikeme.desktop.dialogs.loupe_dialog import BURST_SORT_BURST_SCORE, LoupeDialog
+def test_loupe_navigates_burst_members_in_exactly_the_order_it_was_given(tmp_path) -> None:
+    """The core contract: whatever order the caller (MainWindow) sorted the
+    burst into - Score order, Capture Time order, or anything else - the
+    Loupe uses it verbatim. Checked against two different orderings of the
+    SAME three members to prove the Loupe has no sort preference of its own
+    baked in; there is also no sort combo to switch between them."""
+    from picklikeme.desktop.dialogs.loupe_dialog import LoupeDialog
 
     app = QApplication.instance() or QApplication([])
-    folder = tmp_path / "shoot"
-    folder.mkdir()
-    items = _make_burst_items(folder)
-
     service = ReviewService(db_path=tmp_path / "annotations.sqlite")
-    service.open_folder(folder)
 
+    score_order_folder = tmp_path / "score_order"
+    score_order_folder.mkdir()
+    score_items = _make_burst_items(score_order_folder, order=("b", "a", "c"))  # burst_rank order
     dialog = LoupeDialog(
-        service=service, image_paths=[i.path for i in items], items=list(items),
+        service=service, image_paths=[i.path for i in score_items], items=list(score_items),
         start_index=0, burst_scoped=True,
     )
-
-    assert dialog._burst_sort_mode == BURST_SORT_BURST_SCORE
     assert [i.file_name for i in dialog.items] == ["b.jpg", "a.jpg", "c.jpg"]
-    assert dialog._burst_sort_combo.currentData() == BURST_SORT_BURST_SCORE
-
+    assert not hasattr(dialog, "_burst_sort_combo")
     dialog.close()
-    service.close()
-    app.quit()
 
-
-@pytest.mark.skipif(QApplication is None, reason="PySide6 not installed")
-def test_loupe_burst_sort_by_capture_time_reorders_with_no_recomputation(tmp_path) -> None:
-    """Switching the combo to Capture Time re-sorts using ImageItem.
-    captured_at alone - no rescoring, no calls back into the service for
-    new data."""
-    from picklikeme.desktop.dialogs.loupe_dialog import BURST_SORT_CAPTURE_TIME, LoupeDialog
-
-    app = QApplication.instance() or QApplication([])
-    folder = tmp_path / "shoot"
-    folder.mkdir()
-    items = _make_burst_items(folder)
-
-    service = ReviewService(db_path=tmp_path / "annotations.sqlite")
-    service.open_folder(folder)
-
-    dialog = LoupeDialog(
-        service=service, image_paths=[i.path for i in items], items=list(items),
+    capture_time_folder = tmp_path / "capture_time_order"
+    capture_time_folder.mkdir()
+    capture_items = _make_burst_items(capture_time_folder, order=("a", "b", "c"))  # captured_at order
+    dialog2 = LoupeDialog(
+        service=service, image_paths=[i.path for i in capture_items], items=list(capture_items),
         start_index=0, burst_scoped=True,
     )
-    # start_index=0 was given against the unsorted [a, b, c] list, so the
-    # image actually in view is "a.jpg" - the initial burst-score sort
-    # (applied in __init__) must have kept it in view across the reorder.
-    assert dialog.items[dialog.index].file_name == "a.jpg"
+    assert [i.file_name for i in dialog2.items] == ["a.jpg", "b.jpg", "c.jpg"]
+    dialog2.close()
 
-    index = dialog._burst_sort_combo.findData(BURST_SORT_CAPTURE_TIME)
-    dialog._burst_sort_combo.setCurrentIndex(index)
-
-    assert [i.file_name for i in dialog.items] == ["b.jpg", "c.jpg", "a.jpg"]
-    # The same image ("a.jpg") is still the one in view after reordering.
-    assert dialog.items[dialog.index].file_name == "a.jpg"
-
-    dialog.close()
     service.close()
     app.quit()
 
@@ -787,7 +771,9 @@ def test_loupe_burst_info_labels_show_id_rank_best_and_score(tmp_path) -> None:
     app = QApplication.instance() or QApplication([])
     folder = tmp_path / "shoot"
     folder.mkdir()
-    items = _make_burst_items(folder)
+    # Handed in already in burst-score order (b, a, c) - MainWindow's own
+    # job (see test_burst_ui.py), not the Loupe's.
+    items = _make_burst_items(folder, order=("b", "a", "c"))
 
     service = ReviewService(db_path=tmp_path / "annotations.sqlite")
     service.open_folder(folder)
@@ -796,12 +782,8 @@ def test_loupe_burst_info_labels_show_id_rank_best_and_score(tmp_path) -> None:
         service=service, image_paths=[i.path for i in items], items=list(items),
         start_index=0, burst_scoped=True,
     )
-    # Sort applied in __init__ leaves "a.jpg" (rank #2) in view - jump to
-    # position 0 explicitly to check the top-ranked member's own labels.
-    dialog.index = 0
-    dialog._update_info_labels()
 
-    # Sorted to burst-score order -> position 0 is "b.jpg", rank #1 of 3, best, score 0.948.
+    # Position 0 is "b.jpg", rank #1 of 3, best, score 0.948.
     assert dialog._burst_id_label.text() == "Burst 18"
     assert dialog._burst_rank_label.text() == "Burst Rank #1 of 3"
     assert dialog._burst_best_label.text() == "Best Image: Yes"
@@ -819,9 +801,10 @@ def test_loupe_burst_info_labels_show_id_rank_best_and_score(tmp_path) -> None:
 @pytest.mark.skipif(QApplication is None, reason="PySide6 not installed")
 def test_loupe_non_burst_session_shows_no_burst_sort_ui(tmp_path) -> None:
     """A Loupe session opened outside Collapse Bursts (burst_scoped=False,
-    the default) must not grow the new sort combo or burst info row - every
-    ImageItem still carries burst_id/burst_rank ("a burst of one"), so this
-    only works if the UI keys off the explicit flag, not inferred data."""
+    the default) must not grow any burst info row - every ImageItem still
+    carries burst_id/burst_rank ("a burst of one"), so this only works if
+    the UI keys off the explicit flag, not inferred data. There is no sort
+    combo at all any more, burst-scoped or not."""
     from picklikeme.desktop.dialogs.loupe_dialog import LoupeDialog
 
     app = QApplication.instance() or QApplication([])
@@ -835,57 +818,10 @@ def test_loupe_non_burst_session_shows_no_burst_sort_ui(tmp_path) -> None:
 
     dialog = LoupeDialog(service=service, image_paths=[str(path_a)], start_index=0)
 
-    assert dialog._burst_sort_combo is None
+    assert not hasattr(dialog, "_burst_sort_combo")
     assert dialog._burst_id_label.text() == ""
 
     dialog.close()
-    service.close()
-    app.quit()
-
-
-@pytest.mark.skipif(QApplication is None, reason="PySide6 not installed")
-def test_loupe_burst_sort_mode_is_remembered_via_qsettings(tmp_path) -> None:
-    from PySide6.QtCore import QSettings
-
-    from picklikeme.desktop.dialogs.loupe_dialog import (
-        BURST_SORT_CAPTURE_TIME,
-        BURST_SORT_SETTINGS_KEY,
-        LoupeDialog,
-    )
-
-    app = QApplication.instance() or QApplication([])
-    folder = tmp_path / "shoot"
-    folder.mkdir()
-    items = _make_burst_items(folder)
-
-    service = ReviewService(db_path=tmp_path / "annotations.sqlite")
-    service.open_folder(folder)
-
-    settings_path = str(tmp_path / "settings.ini")
-    settings = QSettings(settings_path, QSettings.Format.IniFormat)
-
-    dialog = LoupeDialog(
-        service=service, image_paths=[i.path for i in items], items=list(items),
-        start_index=0, burst_scoped=True, settings=settings,
-    )
-    index = dialog._burst_sort_combo.findData(BURST_SORT_CAPTURE_TIME)
-    dialog._burst_sort_combo.setCurrentIndex(index)
-    dialog.close()
-    settings.sync()
-
-    assert settings.value(BURST_SORT_SETTINGS_KEY) == BURST_SORT_CAPTURE_TIME
-
-    # A fresh dialog reading the same settings file restores the mode and
-    # opens already sorted by capture time, with no further user action.
-    settings_reloaded = QSettings(settings_path, QSettings.Format.IniFormat)
-    dialog2 = LoupeDialog(
-        service=service, image_paths=[i.path for i in items], items=list(items),
-        start_index=0, burst_scoped=True, settings=settings_reloaded,
-    )
-    assert dialog2._burst_sort_mode == BURST_SORT_CAPTURE_TIME
-    assert [i.file_name for i in dialog2.items] == ["b.jpg", "c.jpg", "a.jpg"]
-
-    dialog2.close()
     service.close()
     app.quit()
 

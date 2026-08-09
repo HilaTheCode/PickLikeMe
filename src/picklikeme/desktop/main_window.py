@@ -102,6 +102,29 @@ FILTER_LABELS = {
     "filtered": "Filtered (Skipped by an analysis module)",
 }
 KEEP_PERCENT_PRESETS = (5.0, 10.0, 20.0, 25.0, 35.0)
+# Bump whenever _build_tool_bar's toolbar/row structure changes - passed to
+# QMainWindow.save/restoreState() so a stale QSettings blob saved under an
+# older toolbar arrangement (e.g. the pre-fix single-row toolbar) is
+# recognized as a version mismatch and ignored rather than silently
+# reapplied over the newly-built layout on every launch.
+TOOLBAR_STATE_VERSION = 1
+# Burst member order for a burst-scoped Loupe session (opened from a
+# collapsed burst card - see _open_loupe_for_item). Owned entirely by the
+# Main Grid, not the Loupe: the Loupe used to carry its own Capture Time /
+# Burst Score toggle and re-sort itself on every change, which is what
+# caused the repeated Capture-Time/Score synchronization bugs (one sort mode
+# silently breaking the other, or a mode change not actually reordering
+# navigation). The Loupe now only ever receives an already-ordered member
+# list and walks it - see LoupeDialog's own module docstring. Burst Score
+# reuses burst_rank as-is (already score-descending - see
+# burst_analysis.py's own docstring); Capture Time re-sorts by
+# ImageItem.captured_at. Persisted via QSettings under
+# BURST_SORT_SETTINGS_KEY so the photographer only picks it once - same key
+# the old Loupe-level toggle used, so an existing preference carries over.
+BURST_SORT_CAPTURE_TIME = "capture_time"
+BURST_SORT_BURST_SCORE = "burst_score"
+BURST_SORT_SETTINGS_KEY = "review/burst_sort_mode"
+DEFAULT_BURST_SORT_MODE = BURST_SORT_BURST_SCORE
 # Sorting by any analysis module's score, plus the two intrinsic file
 # properties. A module's field is "score:<strategy_id>"; the bare "score" is
 # kept as the default because it is what the window opens on and what
@@ -190,6 +213,16 @@ class MainWindow(QMainWindow):
         # Bursts" View menu action - when true, the gallery shows only each
         # burst's top-ranked (burst_best) image instead of every member.
         self._collapse_bursts = False
+        # The Main Grid's own Burst Order preference - see BURST_SORT_*
+        # above and the "Burst Order" View menu submenu built in
+        # _build_menu_bar. Read once at startup; _set_burst_sort_mode keeps
+        # both this attribute and QSettings in sync from then on.
+        stored_burst_sort_mode = self._settings.value(BURST_SORT_SETTINGS_KEY, DEFAULT_BURST_SORT_MODE)
+        self._burst_sort_mode = (
+            stored_burst_sort_mode
+            if stored_burst_sort_mode in (BURST_SORT_CAPTURE_TIME, BURST_SORT_BURST_SCORE)
+            else DEFAULT_BURST_SORT_MODE
+        )
         # None (the default) means "tint by review status" - see
         # color_source_options(). Anything else is a strategy id whose score
         # tints the background instead.
@@ -237,6 +270,7 @@ class MainWindow(QMainWindow):
         self._filter_combo = QComboBox(self)
         self._filter_combo.addItems([FILTER_LABELS[f] for f in FILTERS])
         self._filter_combo.currentIndexChanged.connect(self._on_filter_changed)
+        self._make_toolbar_combo_compact(self._filter_combo, min_chars=14, max_width=165)
 
         # Product Direction: "the highest priority is now to move the
         # advanced filtering capabilities into the Review Window" - narrows
@@ -253,6 +287,7 @@ class MainWindow(QMainWindow):
             self._cutoff_combo.addItem(f"{preset:g}%", preset)
         self._cutoff_combo.addItem("Custom…", None)
         self._cutoff_combo.currentIndexChanged.connect(self._on_cutoff_preset_changed)
+        self._make_toolbar_combo_compact(self._cutoff_combo, min_chars=8, max_width=100)
 
         self._cutoff_spin = QDoubleSpinBox(self)
         self._cutoff_spin.setRange(0.0, 100.0)
@@ -273,6 +308,7 @@ class MainWindow(QMainWindow):
             self._sort_combo.addItem(label, field)
         self._sort_combo.setCurrentIndex(max(0, self._sort_combo.findData(self._sort_field)))
         self._sort_combo.currentIndexChanged.connect(self._on_sort_field_changed)
+        self._make_toolbar_combo_compact(self._sort_combo, min_chars=14, max_width=160)
 
         self._sort_direction_btn = QPushButton(self)
         self._sort_direction_btn.setCheckable(True)
@@ -284,12 +320,41 @@ class MainWindow(QMainWindow):
         for source, label in color_source_options():
             self._color_combo.addItem(label, source)
         self._color_combo.currentIndexChanged.connect(self._on_color_source_changed)
+        self._make_toolbar_combo_compact(self._color_combo, min_chars=13, max_width=150)
 
         self._build_ui()
 
+    @staticmethod
+    def _make_toolbar_combo_compact(combo: QComboBox, *, min_chars: int, max_width: int) -> None:
+        """Cap a toolbar combo box's width instead of letting it grow to fit
+        its longest item (e.g. Filter's "Filtered (Skipped by an analysis
+        module)" or Sort/Color's "<strategy display name> Score", which can
+        run to 50+ characters for a ranking strategy with a long name). Left
+        at Qt's default AdjustToContentsOnFirstShow, the combo box sizes
+        itself to that longest label, which on a MacBook-width window was
+        pushing the Color and Collapse Bursts controls off the visible
+        toolbar (see top-toolbar layout fix).
+
+        minimumContentsLength sets a floor so the box never gets so narrow
+        the selected value is unreadable; maximumWidth caps how far it can
+        grow. The dropdown popup itself is unaffected and still shows each
+        item at full width - only the closed box's current-value display is
+        constrained, so a tooltip mirrors the full text for when it elides.
+        """
+        combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        combo.setMinimumContentsLength(min_chars)
+        combo.setMaximumWidth(max_width)
+        combo.currentTextChanged.connect(combo.setToolTip)
+        combo.setToolTip(combo.currentText())
+
     def _build_ui(self) -> None:
         self.setWindowTitle("PeakPic Desktop")
-        self.resize(1200, 800)
+        # Wide enough that both toolbar rows show every control (Color,
+        # Collapse Bursts included) without Qt's overflow ">>" chevron on a
+        # first launch with no saved window/geometry yet - see the top
+        # toolbar's own two-row split in _build_tool_bar. A user's own
+        # resize is remembered afterwards via _save_state/_restore_state.
+        self.resize(1520, 820)
         self.setDockOptions(self.dockOptions() | self.DockOption.AnimatedDocks)
         self._apply_theme(self._settings.value("theme", theme.DEFAULT_THEME))
         self.setCentralWidget(self._central_widget)
@@ -524,10 +589,35 @@ class MainWindow(QMainWindow):
         self._collapse_bursts_action = QAction("Collapse Bursts", self, checkable=True)
         self._collapse_bursts_action.setToolTip(
             "Show only the top-ranked image of each burst; open one to flip through its "
-            "burst mates in rank order"
+            "burst mates in the order set by Burst Order below"
         )
         self._collapse_bursts_action.toggled.connect(self._on_toggle_collapse_bursts)
         view_menu.addAction(self._collapse_bursts_action)
+
+        # The Main Grid's own Burst Order choice - the ONLY place burst
+        # member order is decided (see BURST_SORT_* above). The Loupe
+        # receives whichever order this produces and just navigates it;
+        # changing it here requires closing and reopening the Loupe to take
+        # effect, by design - see _open_loupe_for_item.
+        burst_order_menu = view_menu.addMenu("Burst Order")
+        burst_order_menu.setToolTip(
+            "Order burst members are navigated in when the Loupe is opened from a collapsed "
+            "burst card. Change here, then reopen the Loupe to see the new order."
+        )
+        burst_order_group = QActionGroup(self)
+        burst_order_group.setExclusive(True)
+        self._burst_order_capture_time_action = QAction("Capture Time", self, checkable=True)
+        self._burst_order_score_action = QAction("Score (highest first)", self, checkable=True)
+        burst_order_group.addAction(self._burst_order_capture_time_action)
+        burst_order_group.addAction(self._burst_order_score_action)
+        burst_order_menu.addAction(self._burst_order_capture_time_action)
+        burst_order_menu.addAction(self._burst_order_score_action)
+        self._burst_order_capture_time_action.setChecked(self._burst_sort_mode == BURST_SORT_CAPTURE_TIME)
+        self._burst_order_score_action.setChecked(self._burst_sort_mode == BURST_SORT_BURST_SCORE)
+        self._burst_order_capture_time_action.triggered.connect(
+            lambda: self._set_burst_sort_mode(BURST_SORT_CAPTURE_TIME)
+        )
+        self._burst_order_score_action.triggered.connect(lambda: self._set_burst_sort_mode(BURST_SORT_BURST_SCORE))
 
         tools_menu = menu_bar.addMenu("Tools")
         tools_menu.addMenu(self._rank_menu)
@@ -545,17 +635,32 @@ class MainWindow(QMainWindow):
 
     def _build_tool_bar(self) -> None:
         """Groups mirror the workflow: Open -> Review decisions/Loupe ->
-        AI ranking/cutoff -> Organize/Import/Species/Crop -> Preferences."""
+        AI ranking/cutoff -> Organize/Import/Species/Crop -> Preferences.
+
+        Two rows, split at that same workflow boundary (row 1 ends after
+        Collapse Bursts; row 2 starts at AI Ranking). Even with the Filter/
+        Sort/Color combo boxes capped to a compact width (see
+        _make_toolbar_combo_compact), everything through Collapse Bursts
+        plus AI ranking/cutoff plus Organize/Import/Species/Crop plus
+        Settings is simply too many controls for one row on a MacBook-width
+        window - Filter/Sort/Color/Collapse Bursts are the controls a
+        photographer reaches for on every image, so they stay on row 1 and
+        are what row 1's width is budgeted for; the coarser, one-off actions
+        (ranking a whole folder, importing, organizing, Settings) move to
+        row 2."""
         toolbar = QToolBar("Main", self)
         toolbar.setObjectName("main_toolbar")
         toolbar.setMovable(False)
         toolbar.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
         toolbar.setIconSize(QSize(20, 20))
+        toolbar.setContentsMargins(2, 2, 2, 2)
+        if toolbar.layout() is not None:
+            toolbar.layout().setSpacing(2)
 
         toolbar.addAction(self._open_action)
         toolbar.addSeparator()
 
-        toolbar.addWidget(QLabel(" Filter: "))
+        toolbar.addWidget(QLabel("Filter:"))
         toolbar.addWidget(self._filter_combo)
         toolbar.addSeparator()
 
@@ -566,16 +671,27 @@ class MainWindow(QMainWindow):
         toolbar.addAction(self._loupe_action)
         toolbar.addSeparator()
 
-        toolbar.addWidget(QLabel(" Sort: "))
+        toolbar.addWidget(QLabel("Sort:"))
         toolbar.addWidget(self._sort_combo)
         toolbar.addWidget(self._sort_direction_btn)
-        toolbar.addWidget(QLabel(" Color: "))
+        toolbar.addWidget(QLabel("Color:"))
         toolbar.addWidget(self._color_combo)
         toolbar.addAction(self._detector_boxes_action)
         toolbar.addAction(self._collapse_bursts_action)
-        toolbar.addSeparator()
 
-        toolbar.addAction(self._rank_action)
+        self.addToolBar(Qt.ToolBarArea.TopToolBarArea, toolbar)
+        self.addToolBarBreak(Qt.ToolBarArea.TopToolBarArea)
+
+        toolbar2 = QToolBar("Main (Ranking & Organize)", self)
+        toolbar2.setObjectName("main_toolbar_2")
+        toolbar2.setMovable(False)
+        toolbar2.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        toolbar2.setIconSize(QSize(20, 20))
+        toolbar2.setContentsMargins(2, 2, 2, 2)
+        if toolbar2.layout() is not None:
+            toolbar2.layout().setSpacing(2)
+
+        toolbar2.addAction(self._rank_action)
         # MenuButtonPopup, not InstantPopup: the button's own half still runs
         # the default strategy on a single click (see _build_actions), and only
         # the arrow opens the list of the others.
@@ -587,24 +703,24 @@ class MainWindow(QMainWindow):
         # that arrangement - it only reports an explicitly-set menu - so it is
         # a misleading thing to assert on; the style option's HasMenu feature
         # is what actually decides whether the arrow is drawn.
-        rank_button = toolbar.widgetForAction(self._rank_action)
+        rank_button = toolbar2.widgetForAction(self._rank_action)
         if isinstance(rank_button, QToolButton):
             rank_button.setPopupMode(QToolButton.ToolButtonPopupMode.MenuButtonPopup)
-        toolbar.addWidget(QLabel(" AI cutoff: "))
-        toolbar.addWidget(self._cutoff_combo)
-        toolbar.addWidget(self._cutoff_spin)
-        toolbar.addAction(self._apply_cutoff_action)
-        toolbar.addSeparator()
+        toolbar2.addWidget(QLabel("AI cutoff:"))
+        toolbar2.addWidget(self._cutoff_combo)
+        toolbar2.addWidget(self._cutoff_spin)
+        toolbar2.addAction(self._apply_cutoff_action)
+        toolbar2.addSeparator()
 
-        toolbar.addAction(self._organize_action)
-        toolbar.addAction(self._import_action)
-        toolbar.addAction(self._species_action)
-        toolbar.addAction(self._crop_action)
-        toolbar.addSeparator()
+        toolbar2.addAction(self._organize_action)
+        toolbar2.addAction(self._import_action)
+        toolbar2.addAction(self._species_action)
+        toolbar2.addAction(self._crop_action)
+        toolbar2.addSeparator()
 
-        toolbar.addAction(self._settings_action)
+        toolbar2.addAction(self._settings_action)
 
-        self.addToolBar(Qt.ToolBarArea.TopToolBarArea, toolbar)
+        self.addToolBar(Qt.ToolBarArea.TopToolBarArea, toolbar2)
 
     def _build_status_bar(self) -> None:
         status_bar = QStatusBar(self)
@@ -639,11 +755,11 @@ class MainWindow(QMainWindow):
             self.restoreGeometry(geometry)
         state = self._settings.value("window/state")
         if state is not None:
-            self.restoreState(state)
+            self.restoreState(state, TOOLBAR_STATE_VERSION)
 
     def _save_state(self) -> None:
         self._settings.setValue("window/geometry", self.saveGeometry())
-        self._settings.setValue("window/state", self.saveState())
+        self._settings.setValue("window/state", self.saveState(TOOLBAR_STATE_VERSION))
 
     def initialize(self) -> None:
         self._initialized = True
@@ -1052,6 +1168,15 @@ class MainWindow(QMainWindow):
         self._gallery_view.set_show_burst_badges(checked)
         self._apply_filter()
 
+    def _set_burst_sort_mode(self, mode: str) -> None:
+        """The Burst Order View-menu choice - see BURST_SORT_* and
+        _open_loupe_for_item, the only place this value is read. Persisted
+        immediately, same as every other QSettings-backed preference in this
+        window (e.g. _set_theme), so it survives a restart without the
+        photographer needing to touch it twice."""
+        self._burst_sort_mode = mode
+        self._settings.setValue(BURST_SORT_SETTINGS_KEY, mode)
+
     # -- filtering ------------------------------------------------------------
 
     def _on_filter_changed(self, index: int) -> None:
@@ -1388,22 +1513,60 @@ class MainWindow(QMainWindow):
 
         In Collapse Bursts mode a visible card is one burst's burst_best
         image standing in for the whole group, so opening it instead scopes
-        the Loupe to that burst's own members, ordered by burst_rank - "the
-        existing review workflow while allowing navigation through the
-        burst members" the feature asks for. Pulled from `self._all_items`,
-        not the collapsed, filtered gallery model: the other members are
-        deliberately not in that model's rows at all.
+        the Loupe to that burst's own members, ordered by the Main Grid's
+        own Burst Order setting (self._burst_sort_mode - see the View menu's
+        "Burst Order" submenu and BURST_SORT_* above) - "the existing review
+        workflow while allowing navigation through the burst members" the
+        feature asks for. Pulled from `self._all_items`, not the collapsed,
+        filtered gallery model: the other members are deliberately not in
+        that model's rows at all.
+
+        The Loupe itself never re-sorts - it receives exactly this order and
+        walks it (see LoupeDialog's own module docstring). This is the fix
+        for the repeated Capture-Time/Score synchronization bugs: there is
+        now exactly one place a burst's member order is decided, not two
+        that could disagree or desync.
         """
         if self._collapse_bursts and item is not None and item.burst_id is not None:
-            members = sorted(
-                (i for i in self._all_items if i.burst_id == item.burst_id),
-                key=lambda i: i.burst_rank,
-            )
+            unsorted_members = [i for i in self._all_items if i.burst_id == item.burst_id]
+            mode = self._burst_sort_mode
+            if mode == BURST_SORT_BURST_SCORE and not self._burst_score_available(unsorted_members):
+                # Never silently show a Burst Score order that is secretly
+                # just Capture Time (burst_rank degenerates to capture order
+                # when no member has been scored by the active Color Source
+                # - see burst_analysis.py) - fall back for THIS burst only,
+                # without touching the photographer's saved preference.
+                mode = BURST_SORT_CAPTURE_TIME
+                self._set_status(
+                    "Burst Score unavailable for the current Color Source - opening Loupe in Capture Time order"
+                )
+            members = self._sort_burst_members(unsorted_members, mode)
             self._open_loupe(items=members, start_row=0, burst_scoped=True)
             return
         items = self._gallery_model.items()
         start_row = items.index(item) if item is not None and item in items else 0
         self._open_loupe(items=items, start_row=start_row)
+
+    @staticmethod
+    def _sort_burst_members(members: list[ImageItem], mode: str) -> list[ImageItem]:
+        """Always derives from the given list via `sorted()` (never mutates
+        it in place) - so this is a pure function of (members, mode) with no
+        hidden state, the exact property that made the old Loupe-side
+        version's "sort fresh from an immutable original every time" fix
+        work: picking the same mode twice always reproduces the same
+        sequence, regardless of what was requested in between."""
+        if mode == BURST_SORT_CAPTURE_TIME:
+            return sorted(members, key=lambda i: i.captured_at or "")
+        return sorted(members, key=lambda i: i.burst_rank)
+
+    def _burst_score_available(self, members: list[ImageItem]) -> bool:
+        """Whether the active Color Source (ReviewSession.burst_strategy)
+        has actually scored at least one member of this specific burst - see
+        _sort_burst_members's caller. When it hasn't, burst_rank carries no
+        real signal (analyze_bursts's tie-break falls back to capture
+        order), so Burst Score would silently coincide with Capture Time."""
+        strategy_id = getattr(self.service.session, "burst_strategy", None)
+        return strategy_id is not None and any(item.score_for(strategy_id) is not None for item in members)
 
     def _open_loupe(self, *, items: list[ImageItem], start_row: int, burst_scoped: bool = False) -> None:
         if not items:
@@ -1413,8 +1576,7 @@ class MainWindow(QMainWindow):
         start_row = max(0, min(start_row, len(paths) - 1))
         dialog = LoupeDialog(
             service=self.service, image_paths=paths, items=items, start_index=start_row,
-            show_boxes=self._show_detector_boxes, burst_scoped=burst_scoped,
-            settings=self._settings if burst_scoped else None, parent=self,
+            show_boxes=self._show_detector_boxes, burst_scoped=burst_scoped, parent=self,
         )
         dialog.exec()
         self._refresh_from_state(self.service.load_session())

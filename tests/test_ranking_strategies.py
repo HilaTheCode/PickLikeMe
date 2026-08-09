@@ -172,12 +172,12 @@ def test_listing_strategies_does_not_import_torch() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_default_weights_are_50_30_20() -> None:
+def test_default_weights_are_70_10_20() -> None:
     weights = ClassicVisionParams().normalized_weights()
     assert weights == pytest.approx(
         {
-            "eye_sharpness_weight": 0.5,
-            "subject_sharpness_weight": 0.3,
+            "eye_sharpness_weight": 0.7,
+            "subject_sharpness_weight": 0.1,
             "subject_size_weight": 0.2,
         }
     )

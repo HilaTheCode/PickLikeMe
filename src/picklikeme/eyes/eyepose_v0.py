@@ -173,13 +173,13 @@ PAD_VALUE = 114
 
 # A starting default, not an empirically validated one - see the module
 # docstring's "Accept/reject gate" section.
-DEFAULT_MIN_CONFIDENCE = 0.5
+DEFAULT_MIN_CONFIDENCE = 0.8
 # Gates head_visible() - see the module docstring's "Accept/reject gate"
-# section, question 1. 0.5 sits with a wide margin below every real head
-# observed in the EyePose Investigation Phase 1 sample (0.82-0.92) and a
-# wide margin above the one confirmed no-head case (0.026) - informed by
-# that data, not exhaustively validated by it (10 images).
-DEFAULT_MIN_HEAD_CONFIDENCE = 0.5
+# section, question 1. Sits with a margin below every real head observed in
+# the EyePose Investigation Phase 1 sample (0.82-0.92) and a wide margin
+# above the one confirmed no-head case (0.026) - informed by that data, not
+# exhaustively validated by it (10 images).
+DEFAULT_MIN_HEAD_CONFIDENCE = 0.8
 # Matches SuperAnimal-Bird's own default: the two backends' eye boxes should
 # be comparably sized for a fair side-by-side comparison, and 0.08 is not
 # tied to anything model-specific - see eyes.detector.derive_eye_box.

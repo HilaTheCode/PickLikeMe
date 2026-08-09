@@ -122,8 +122,17 @@ def test_opening_a_card_normally_scopes_the_loupe_to_the_visible_gallery(app, tm
 def test_opening_a_collapsed_card_scopes_the_loupe_to_its_burst_in_rank_order(app, tmp_path, monkeypatch) -> None:
     """The reported requirement: selecting a burst opens the Loupe scoped to
     that burst's own members, ordered by burst_rank - not the whole
-    collapsed gallery, and not left/right-file order."""
+    collapsed gallery, and not left/right-file order.
+
+    Uses items scored by the default burst_strategy (ai-model), not the
+    plain _burst_items() fixture - with no score behind burst_rank at all,
+    _burst_score_available correctly falls back to Capture Time (see
+    test_an_unscored_burst_shows_the_no_effect_warning_... below), which
+    would make this specific test's own rank-order assertion wrong for a
+    reason unrelated to what it actually checks.
+    """
     from picklikeme.desktop import main_window as main_window_module
+    from picklikeme.desktop.models.image_item import ImageItem
 
     captured = {}
 
@@ -138,7 +147,24 @@ def test_opening_a_collapsed_card_scopes_the_loupe_to_its_burst_in_rank_order(ap
 
     window, service = _window(tmp_path)
     try:
-        window._all_items = _burst_items()
+        window._all_items = [
+            ImageItem(
+                path="/x/a.nef", file_name="a.nef", burst_id="b1", burst_size=3, burst_rank=2, burst_best=False,
+                ranking_results={"ai-model": {"score": 0.60, "rank": 2}},
+            ),
+            ImageItem(
+                path="/x/b.nef", file_name="b.nef", burst_id="b1", burst_size=3, burst_rank=1, burst_best=True,
+                ranking_results={"ai-model": {"score": 0.90, "rank": 1}},
+            ),
+            ImageItem(
+                path="/x/c.nef", file_name="c.nef", burst_id="b1", burst_size=3, burst_rank=3, burst_best=False,
+                ranking_results={"ai-model": {"score": 0.30, "rank": 3}},
+            ),
+            ImageItem(
+                path="/x/d.nef", file_name="d.nef", burst_id="b2", burst_size=1, burst_rank=1, burst_best=True,
+                ranking_results={"ai-model": {"score": 0.50, "rank": 1}},
+            ),
+        ]
         window._on_toggle_collapse_bursts(True)
 
         # Only b.nef (burst_best of "b1") is a visible row now.
@@ -182,37 +208,28 @@ def test_opening_a_collapsed_singleton_burst_shows_only_itself(app, tmp_path, mo
         service.close()
 
 
-def test_burst_sort_toggle_actually_changes_loupe_navigation_order(app, tmp_path, monkeypatch) -> None:
-    """Regression test for a reported bug: the Loupe's Capture Time / Burst
-    Score combo appeared and Burst Rank displayed, but switching between
-    the two modes never actually changed which image Next/Prev (or any
-    other navigation) visited - the Loupe always stayed in capture-time
-    order.
-
-    Exercises the REAL LoupeDialog (a thin exec()-stubbing subclass, not a
-    captured-kwargs stand-in like the other tests in this file), constructed
-    through the REAL MainWindow._open_loupe_for_item code path, against a
-    burst whose burst_rank order and captured_at order genuinely disagree -
-    per the report's own instruction to validate with a burst where the two
-    orderings differ.
-    """
-    from PIL import Image
+def _isolate_settings(monkeypatch, tmp_path):
+    """An isolated, file-backed QSettings - MainWindow always constructs its
+    own QSettings("PeakPic", "PeakPicDesktop") internally (see __init__),
+    which would otherwise read/write the real OS-level app settings during a
+    test run."""
+    from PySide6.QtCore import QSettings
 
     from picklikeme.desktop import main_window as main_window_module
-    from picklikeme.desktop.dialogs.loupe_dialog import BURST_SORT_CAPTURE_TIME, LoupeDialog
-    from picklikeme.desktop.models.image_item import ImageItem
-
-    # An isolated, file-backed QSettings - MainWindow always constructs its
-    # own QSettings("PeakPic", "PeakPicDesktop") internally (see __init__),
-    # which would otherwise read/write the real OS-level app settings
-    # during a test run.
-    from PySide6.QtCore import QSettings
 
     settings_path = str(tmp_path / "settings.ini")
     monkeypatch.setattr(
         main_window_module, "QSettings",
         lambda *a, **k: QSettings(settings_path, QSettings.Format.IniFormat),
     )
+
+
+def _spy_loupe_dialog(monkeypatch):
+    """Patches MainWindow's LoupeDialog with a thin exec()-stubbing subclass
+    of the REAL class (not a captured-kwargs stand-in), returning the dict
+    the next _open_loupe_for_item call will populate under "dialog"."""
+    from picklikeme.desktop import main_window as main_window_module
+    from picklikeme.desktop.dialogs.loupe_dialog import LoupeDialog
 
     captured = {}
 
@@ -224,168 +241,153 @@ def test_burst_sort_toggle_actually_changes_loupe_navigation_order(app, tmp_path
             return QDialog.DialogCode.Accepted
 
     monkeypatch.setattr(main_window_module, "LoupeDialog", _SpyLoupeDialog)
+    return captured
 
+
+def _scored_disagreeing_burst(tmp_path):
+    """Three members of one burst whose burst_rank order (b, a, c - score-
+    descending) and captured_at order (a, b, c) genuinely disagree, and
+    which HAVE been scored by the default burst_strategy (ai-model) - so
+    Burst Score is real signal, not a silent Capture Time fallback (see
+    test_an_unscored_burst_falls_back_to_capture_time_and_sequences_coincide
+    below for that case)."""
+    from PIL import Image
+
+    from picklikeme.desktop.models.image_item import ImageItem
+
+    for name in ("a.jpg", "b.jpg", "c.jpg"):
+        Image.new("RGB", (16, 16), color="blue").save(tmp_path / name, format="JPEG")
+    return [
+        ImageItem(
+            path=str(tmp_path / "a.jpg"), file_name="a.jpg", burst_id="b1", burst_size=3,
+            burst_rank=2, burst_best=False, captured_at="2024-01-01T10:00:00",
+            ranking_results={"ai-model": {"score": 0.60, "rank": 2}},
+        ),
+        ImageItem(
+            path=str(tmp_path / "b.jpg"), file_name="b.jpg", burst_id="b1", burst_size=3,
+            burst_rank=1, burst_best=True, captured_at="2024-01-01T10:00:01",
+            ranking_results={"ai-model": {"score": 0.90, "rank": 1}},
+        ),
+        ImageItem(
+            path=str(tmp_path / "c.jpg"), file_name="c.jpg", burst_id="b1", burst_size=3,
+            burst_rank=3, burst_best=False, captured_at="2024-01-01T10:00:02",
+            ranking_results={"ai-model": {"score": 0.30, "rank": 3}},
+        ),
+    ]
+
+
+def test_burst_order_is_decided_by_the_main_grid_before_the_loupe_ever_opens(app, tmp_path, monkeypatch) -> None:
+    """The architectural fix for a string of reported bugs where fixing
+    Capture Time sorting broke Score sorting or vice versa, or a mode change
+    inside the Loupe silently had no effect: there is now exactly ONE place
+    burst order is decided - MainWindow._burst_sort_mode (set via the View
+    menu's "Burst Order" submenu) - and the Loupe receives an already-
+    ordered list it never re-sorts. Changing the mode only affects the NEXT
+    Loupe session, not one already open - verified by opening twice.
+
+    Goes through the real open_folder -> ReviewSession -> _refresh_from_state
+    pipeline (like _real_burst_folder-based tests below), not a hand-built
+    `window._all_items` - `_open_loupe` calls `_refresh_from_state(service.
+    load_session())` once the (stubbed) dialog returns, which would silently
+    wipe out a hand-assigned `_all_items` that the real session never knew
+    about, and this test specifically needs a SECOND _open_loupe_for_item
+    call after the first one closes.
+    """
+    from picklikeme.desktop.main_window import BURST_SORT_BURST_SCORE, BURST_SORT_CAPTURE_TIME
+    from picklikeme.sidecar import AI_STRATEGY_ID
+
+    _isolate_settings(monkeypatch, tmp_path)
+    folder = _real_burst_folder(tmp_path, filenames_in_capture_order=["DSC_0001.jpg", "DSC_0002.jpg", "DSC_0003.jpg"])
     window, service = _window(tmp_path)
     try:
-        for name in ("a.jpg", "b.jpg", "c.jpg"):
-            Image.new("RGB", (16, 16), color="blue").save(tmp_path / name, format="JPEG")
+        service.open_folder(folder)
+        scores = {"DSC_0001.jpg": 0.60, "DSC_0002.jpg": 0.90, "DSC_0003.jpg": 0.30}
+        captured_at = {
+            "DSC_0001.jpg": "2024-01-01T10:00:00",
+            "DSC_0002.jpg": "2024-01-01T10:00:01",
+            "DSC_0003.jpg": "2024-01-01T10:00:02",
+        }
+        for fname, score in scores.items():
+            image = service.session._image_for(str(folder / fname))
+            image.captured_at = captured_at[fname]
+            image.ranking_results[AI_STRATEGY_ID] = {"score": score, "rank": None}
 
-        # ranking_results matches burst_rank (rank #1 = highest score) - a
-        # burst with burst_rank set but NO actual score behind it is exactly
-        # the "unavailable" case _burst_score_available now detects (see
-        # test_an_unscored_burst_shows_the_no_effect_warning_and_both_
-        # sequences_coincide below); this test is specifically about a
-        # burst that HAS been scored.
-        window._all_items = [
-            ImageItem(
-                path=str(tmp_path / "a.jpg"), file_name="a.jpg", burst_id="b1", burst_size=3,
-                burst_rank=2, burst_best=False, captured_at="2024-01-01T10:00:00",
-                ranking_results={"ai-model": {"score": 0.60, "rank": 2}},
-            ),
-            ImageItem(
-                path=str(tmp_path / "b.jpg"), file_name="b.jpg", burst_id="b1", burst_size=3,
-                burst_rank=1, burst_best=True, captured_at="2024-01-01T10:00:01",
-                ranking_results={"ai-model": {"score": 0.90, "rank": 1}},
-            ),
-            ImageItem(
-                path=str(tmp_path / "c.jpg"), file_name="c.jpg", burst_id="b1", burst_size=3,
-                burst_rank=3, burst_best=False, captured_at="2024-01-01T10:00:02",
-                ranking_results={"ai-model": {"score": 0.30, "rank": 3}},
-            ),
-        ]
+        window.state.current_folder = str(folder)
+        window._refresh_from_state(service.load_session())
         window._on_toggle_collapse_bursts(True)
         (visible,) = window._gallery_model.items()
-        window._open_loupe_for_item(visible)
 
-        dialog = captured["dialog"]
-        # Default mode is Burst Score - matches burst_rank order (b, a, c),
-        # NOT capture-time order (a, b, c).
-        assert dialog.image_paths == [str(tmp_path / n) for n in ("b.jpg", "a.jpg", "c.jpg")]
-        assert dialog._current_path() == str(tmp_path / "b.jpg")
-
-        combo_index = dialog._burst_sort_combo.findData(BURST_SORT_CAPTURE_TIME)
-        dialog._burst_sort_combo.setCurrentIndex(combo_index)
-
-        # The reorder itself.
-        assert dialog.image_paths == [str(tmp_path / n) for n in ("a.jpg", "b.jpg", "c.jpg")]
-        # Navigation (Next/Prev, the same code path wheel/keyboard use) must
-        # walk the NEW order, not the order the dialog was first opened
-        # with - this is the actual bug: only image_paths/labels updated.
+        # Default mode is Burst Score - matches score-descending order
+        # (0002, 0001, 0003), NOT capture-time order (0001, 0002, 0003).
+        assert window._burst_sort_mode == BURST_SORT_BURST_SCORE
+        dialog = _open_burst_loupe(window, monkeypatch)
+        assert [Path(p).name for p in dialog.image_paths] == ["DSC_0002.jpg", "DSC_0001.jpg", "DSC_0003.jpg"]
+        # No sort control in the Loupe at all - see the module docstring.
+        assert not hasattr(dialog, "_burst_sort_combo")
+        # Navigation (the same path wheel/keyboard use) walks the order the
+        # dialog was opened with.
         dialog.index = 0
-        assert dialog._current_path() == str(tmp_path / "a.jpg")
         dialog._go_next()
-        assert dialog._current_path() == str(tmp_path / "b.jpg")
-        dialog._go_next()
-        assert dialog._current_path() == str(tmp_path / "c.jpg")
+        assert Path(dialog._current_path()).name == "DSC_0001.jpg"
+        dialog.close()
+
+        # Changing Burst Order in the Main Grid does NOT affect an already-
+        # closed session retroactively, and requires a fresh open to apply -
+        # exactly the "close, change, reopen" workflow this fix asks for.
+        window._set_burst_sort_mode(BURST_SORT_CAPTURE_TIME)
+        dialog2 = _open_burst_loupe(window, monkeypatch)
+        assert [Path(p).name for p in dialog2.image_paths] == ["DSC_0001.jpg", "DSC_0002.jpg", "DSC_0003.jpg"]
+        dialog2.index = 0
+        assert Path(dialog2._current_path()).name == "DSC_0001.jpg"
+        dialog2._go_next()
+        assert Path(dialog2._current_path()).name == "DSC_0002.jpg"
+        dialog2._go_next()
+        assert Path(dialog2._current_path()).name == "DSC_0003.jpg"
+        dialog2.close()
     finally:
-        dialog_obj = captured.get("dialog")
-        if dialog_obj is not None:
-            dialog_obj.close()
         window.close()
         service.close()
 
 
-def test_burst_sort_survives_real_gallery_click_combo_popup_and_wheel(app, tmp_path, monkeypatch) -> None:
-    """The same regression as the test above, re-verified through paths a
-    unit test calling internal methods directly could still miss:
+def test_burst_order_menu_action_and_real_gallery_signals_drive_the_same_path(app, tmp_path, monkeypatch) -> None:
+    """Re-verifies the fix through paths a unit test calling internal
+    methods directly could still miss:
 
+    - changing Burst Order via the REAL View-menu QAction.trigger() (what an
+      actual menu click fires), not by setting window._burst_sort_mode
+      directly.
     - opening the Loupe via the REAL gallery double-click *signal*
       (QAbstractItemView.doubleClicked.emit), not by calling
-      _open_loupe_for_item directly - in case MainWindow wired the signal
-      to something else.
-    - picking "Capture Time" via a REAL simulated mouse click on the
-      combo's own popup view (QTest.mouseClick), not
-      combo.setCurrentIndex() - in case Qt's signal only fires for one and
-      not the other.
+      _open_loupe_for_item directly.
     - advancing via _on_wheel_navigate (what _ZoomView.wheelEvent actually
-      emits into) rather than only _go_next/_go_prev directly - the
-      report's own explicit ask: "verify that mouse wheel... follow the
-      selected sort mode."
-
-    If this test and the one above both pass, the sort toggle's entire
-    data flow - click to open, click to change sort, wheel to navigate -
-    is proven correct, not merely each internal method in isolation.
+      emits into) rather than only _go_next/_go_prev directly.
     """
-    from PIL import Image
-    from PySide6.QtCore import QSettings, Qt
-    from PySide6.QtTest import QTest
+    from PySide6.QtCore import Qt
 
-    from picklikeme.desktop import main_window as main_window_module
-    from picklikeme.desktop.dialogs.loupe_dialog import BURST_SORT_CAPTURE_TIME, LoupeDialog
-    from picklikeme.desktop.models.image_item import ImageItem
+    from picklikeme.desktop.main_window import BURST_SORT_CAPTURE_TIME
 
-    settings_path = str(tmp_path / "settings.ini")
-    monkeypatch.setattr(
-        main_window_module, "QSettings",
-        lambda *a, **k: QSettings(settings_path, QSettings.Format.IniFormat),
-    )
-
-    captured = {}
-
-    class _SpyLoupeDialog(LoupeDialog):
-        def exec(self):  # noqa: A003 - matches QDialog's own method name
-            from PySide6.QtWidgets import QDialog
-
-            captured["dialog"] = self
-            return QDialog.DialogCode.Accepted
-
-    monkeypatch.setattr(main_window_module, "LoupeDialog", _SpyLoupeDialog)
+    _isolate_settings(monkeypatch, tmp_path)
+    captured = _spy_loupe_dialog(monkeypatch)
 
     window, service = _window(tmp_path)
     try:
-        for name in ("a.jpg", "b.jpg", "c.jpg"):
-            Image.new("RGB", (16, 16), color="blue").save(tmp_path / name, format="JPEG")
-
-        # ranking_results matches burst_rank (rank #1 = highest score) - a
-        # burst with burst_rank set but NO actual score behind it is exactly
-        # the "unavailable" case _burst_score_available now detects (see
-        # test_an_unscored_burst_shows_the_no_effect_warning_and_both_
-        # sequences_coincide below); this test is specifically about a
-        # burst that HAS been scored.
-        window._all_items = [
-            ImageItem(
-                path=str(tmp_path / "a.jpg"), file_name="a.jpg", burst_id="b1", burst_size=3,
-                burst_rank=2, burst_best=False, captured_at="2024-01-01T10:00:00",
-                ranking_results={"ai-model": {"score": 0.60, "rank": 2}},
-            ),
-            ImageItem(
-                path=str(tmp_path / "b.jpg"), file_name="b.jpg", burst_id="b1", burst_size=3,
-                burst_rank=1, burst_best=True, captured_at="2024-01-01T10:00:01",
-                ranking_results={"ai-model": {"score": 0.90, "rank": 1}},
-            ),
-            ImageItem(
-                path=str(tmp_path / "c.jpg"), file_name="c.jpg", burst_id="b1", burst_size=3,
-                burst_rank=3, burst_best=False, captured_at="2024-01-01T10:00:02",
-                ranking_results={"ai-model": {"score": 0.30, "rank": 3}},
-            ),
-        ]
+        window._all_items = _scored_disagreeing_burst(tmp_path)
         window._on_toggle_collapse_bursts(True)
 
+        # A real menu-action trigger, not a direct attribute set.
+        window._burst_order_capture_time_action.trigger()
+        assert window._burst_sort_mode == BURST_SORT_CAPTURE_TIME
+        assert window._burst_order_capture_time_action.isChecked()
+        assert not window._burst_order_score_action.isChecked()
+
         # Real double-click *signal*, exactly what MainWindow.__init__ wires
-        # the gallery view to (self._gallery_view.doubleClicked.connect(
-        # self._open_loupe_for_index)) - not a direct method call.
+        # the gallery view to.
         index = window._gallery_model.index(0, 0)
         window._gallery_view.doubleClicked.emit(index)
 
         dialog = captured["dialog"]
-        assert dialog.image_paths == [str(tmp_path / n) for n in ("b.jpg", "a.jpg", "c.jpg")]
-        assert dialog._burst_best_label.text() == "Best Image: Yes"  # b.jpg, rank #1
-
-        # A real simulated mouse click on the combo's own popup - not
-        # setCurrentIndex().
-        combo = dialog._burst_sort_combo
-        combo.showPopup()
-        item_index = combo.model().index(combo.findData(BURST_SORT_CAPTURE_TIME), 0)
-        rect = combo.view().visualRect(item_index)
-        QTest.mouseClick(combo.view().viewport(), Qt.MouseButton.LeftButton, pos=rect.center())
-
-        assert combo.currentData() == BURST_SORT_CAPTURE_TIME
         assert dialog.image_paths == [str(tmp_path / n) for n in ("a.jpg", "b.jpg", "c.jpg")]
-        # b.jpg (rank #1, still Best) is now at position 2 of 3 in
-        # capture-time order - the label must reflect its NEW position,
-        # not the position it had under the old sort.
-        assert dialog._burst_rank_label.text() == "Burst Rank #1 of 3"
-        assert dialog._burst_best_label.text() == "Best Image: Yes"
+        assert dialog._burst_best_label.text() == "Best Image: No"  # a.jpg is rank #2
 
         # Wheel navigation - _ZoomView.wheelEvent emits navigateRequested,
         # which LoupeDialog connects straight to _on_wheel_navigate.
@@ -393,16 +395,13 @@ def test_burst_sort_survives_real_gallery_click_combo_popup_and_wheel(app, tmp_p
         assert dialog._current_path() == str(tmp_path / "a.jpg")
         dialog._on_wheel_navigate(1)  # +1 = next, the same signal a real wheel-forward sends
         assert dialog._current_path() == str(tmp_path / "b.jpg")
-        assert dialog._burst_best_label.text() == "Best Image: Yes"
+        assert dialog._burst_best_label.text() == "Best Image: Yes"  # b.jpg is rank #1
         dialog._on_wheel_navigate(1)
         assert dialog._current_path() == str(tmp_path / "c.jpg")
-        assert dialog._burst_best_label.text() == "Best Image: No"
         dialog._on_wheel_navigate(-1)  # -1 = previous
         assert dialog._current_path() == str(tmp_path / "b.jpg")
+        dialog.close()
     finally:
-        dialog_obj = captured.get("dialog")
-        if dialog_obj is not None:
-            dialog_obj.close()
         window.close()
         service.close()
 
@@ -431,6 +430,40 @@ def test_changing_color_source_re_ranks_bursts_by_that_strategy(app, tmp_path, m
     finally:
         window.close()
         service.close()
+
+
+def test_burst_sort_mode_is_remembered_via_qsettings_across_windows(app, tmp_path, monkeypatch) -> None:
+    """Burst Order now lives on MainWindow (see BURST_SORT_SETTINGS_KEY) -
+    persisted the moment it's changed (_set_burst_sort_mode), same as every
+    other QSettings-backed preference, so a photographer only has to pick it
+    once. A second MainWindow reading the same settings file starts with it
+    already applied, no menu interaction required."""
+    from PySide6.QtCore import QSettings
+
+    from picklikeme.desktop.main_window import BURST_SORT_BURST_SCORE, BURST_SORT_CAPTURE_TIME, BURST_SORT_SETTINGS_KEY
+
+    _isolate_settings(monkeypatch, tmp_path)
+
+    window, service = _window(tmp_path)
+    try:
+        assert window._burst_sort_mode == BURST_SORT_BURST_SCORE  # the default
+        window._burst_order_capture_time_action.trigger()
+        assert window._burst_sort_mode == BURST_SORT_CAPTURE_TIME
+    finally:
+        window.close()
+        service.close()
+
+    settings = QSettings(str(tmp_path / "settings.ini"), QSettings.Format.IniFormat)
+    assert settings.value(BURST_SORT_SETTINGS_KEY) == BURST_SORT_CAPTURE_TIME
+
+    window2, service2 = _window(tmp_path)
+    try:
+        assert window2._burst_sort_mode == BURST_SORT_CAPTURE_TIME
+        assert window2._burst_order_capture_time_action.isChecked()
+        assert not window2._burst_order_score_action.isChecked()
+    finally:
+        window2.close()
+        service2.close()
 
 
 # ---------------------------------------------------------------------------
@@ -478,35 +511,23 @@ def _open_burst_loupe(window, monkeypatch):
     """Opens the Loupe on the one visible (collapsed) burst card through the
     real MainWindow._open_loupe_for_item, capturing the constructed
     LoupeDialog (a thin exec()-stubbing subclass of the real class, not a
-    stand-in - see test_burst_sort_toggle_actually_changes_loupe_navigation_
-    order's own docstring for why)."""
-    from picklikeme.desktop import main_window as main_window_module
-    from picklikeme.desktop.dialogs.loupe_dialog import LoupeDialog
-
-    captured = {}
-
-    class _SpyLoupeDialog(LoupeDialog):
-        def exec(self):  # noqa: A003 - matches QDialog's own method name
-            from PySide6.QtWidgets import QDialog
-
-            captured["dialog"] = self
-            return QDialog.DialogCode.Accepted
-
-    monkeypatch.setattr(main_window_module, "LoupeDialog", _SpyLoupeDialog)
+    stand-in - see _spy_loupe_dialog)."""
+    captured = _spy_loupe_dialog(monkeypatch)
     (visible,) = window._gallery_model.items()
     window._open_loupe_for_item(visible)
     return captured["dialog"]
 
 
-def test_an_unscored_burst_shows_the_no_effect_warning_and_both_sequences_coincide(
-    app, tmp_path, monkeypatch
-) -> None:
+def test_an_unscored_burst_falls_back_to_capture_time_and_sets_status(app, tmp_path, monkeypatch) -> None:
     """The confirmed real-world scenario: burst_strategy (defaults to the
     AI model) never scored these images - burst_rank degenerates to capture
-    order, so both sort modes produce the SAME sequence. LoupeDialog now
-    surfaces this explicitly rather than silently looking broken."""
-    from picklikeme.desktop.dialogs.loupe_dialog import BURST_SORT_CAPTURE_TIME, BURST_SORT_BURST_SCORE
+    order (see burst_analysis.py), so the Main Grid's default Burst Score
+    preference silently produces the SAME sequence Capture Time would, and
+    _open_loupe_for_item surfaces the fallback as a status-bar message
+    rather than opening a Loupe that quietly ignores the setting."""
+    from picklikeme.desktop.main_window import BURST_SORT_BURST_SCORE, BURST_SORT_CAPTURE_TIME
 
+    _isolate_settings(monkeypatch, tmp_path)
     folder = _real_burst_folder(tmp_path, filenames_in_capture_order=["DSC_0001.jpg", "DSC_0002.jpg", "DSC_0003.jpg"])
     window, service = _window(tmp_path)
     try:
@@ -523,36 +544,43 @@ def test_an_unscored_burst_shows_the_no_effect_warning_and_both_sequences_coinci
         window._refresh_from_state(service.load_session())
         window._on_toggle_collapse_bursts(True)
 
+        assert window._burst_sort_mode == BURST_SORT_BURST_SCORE  # the default, unchanged
         dialog = _open_burst_loupe(window, monkeypatch)
         try:
-            assert "Burst Score unavailable" in dialog._burst_sort_warning_label.text()
             assert dialog._burst_ranking_status_label.text() == "Ranking: Not available"
-
-            combo = dialog._burst_sort_combo
-            combo.setCurrentIndex(combo.findData(BURST_SORT_CAPTURE_TIME))
-            capture_time_sequence = [Path(p).name for p in dialog.image_paths]
-            combo.setCurrentIndex(combo.findData(BURST_SORT_BURST_SCORE))
-            burst_score_sequence = [Path(p).name for p in dialog.image_paths]
-
+            assert "Burst Score unavailable" in window.state.status_message
+            score_mode_sequence = [Path(p).name for p in dialog.image_paths]
             # This is the data limitation itself, printed and pinned so a
             # future change to analyze_bursts's tie-break is a deliberate,
             # visible decision rather than a silent behaviour change.
-            assert capture_time_sequence == burst_score_sequence == ["DSC_0002.jpg", "DSC_0003.jpg", "DSC_0001.jpg"]
+            assert score_mode_sequence == ["DSC_0002.jpg", "DSC_0003.jpg", "DSC_0001.jpg"]
         finally:
             dialog.close()
+
+        # Explicitly requesting Capture Time (not relying on the fallback)
+        # must produce the identical sequence - "both coincide" for this
+        # unscored burst, matching the fallback's own logic.
+        window._set_burst_sort_mode(BURST_SORT_CAPTURE_TIME)
+        dialog2 = _open_burst_loupe(window, monkeypatch)
+        try:
+            assert [Path(p).name for p in dialog2.image_paths] == score_mode_sequence
+        finally:
+            dialog2.close()
     finally:
         window.close()
         service.close()
 
 
-def test_a_scored_burst_shows_no_warning_and_the_two_sequences_genuinely_differ(app, tmp_path, monkeypatch) -> None:
+def test_a_scored_burst_shows_genuinely_different_sequences_per_mode(app, tmp_path, monkeypatch) -> None:
     """The contrasting case: once burst_strategy HAS scored these images,
-    burst_rank carries real information and the two sort modes produce
-    genuinely different navigation orders - proving LoupeDialog's toggle
-    itself is correct once the underlying data actually differs."""
-    from picklikeme.desktop.dialogs.loupe_dialog import BURST_SORT_CAPTURE_TIME, BURST_SORT_BURST_SCORE
+    burst_rank carries real information and the two Burst Order modes
+    produce genuinely different navigation orders, with no fallback status
+    message - proving the Main Grid's sort logic itself is correct once the
+    underlying data actually differs."""
+    from picklikeme.desktop.main_window import BURST_SORT_CAPTURE_TIME
     from picklikeme.sidecar import AI_STRATEGY_ID
 
+    _isolate_settings(monkeypatch, tmp_path)
     folder = _real_burst_folder(tmp_path, filenames_in_capture_order=["DSC_0001.jpg", "DSC_0002.jpg", "DSC_0003.jpg"])
     window, service = _window(tmp_path)
     try:
@@ -571,50 +599,60 @@ def test_a_scored_burst_shows_no_warning_and_the_two_sequences_genuinely_differ(
         window.state.current_folder = str(folder)
         window._refresh_from_state(service.load_session())
         window._on_toggle_collapse_bursts(True)
+        window.state.status_message = ""
 
+        # Default mode (Burst Score).
         dialog = _open_burst_loupe(window, monkeypatch)
         try:
-            assert dialog._burst_sort_warning_label.text() == ""
-
-            combo = dialog._burst_sort_combo
-            combo.setCurrentIndex(combo.findData(BURST_SORT_CAPTURE_TIME))
-            capture_time_sequence = [Path(p).name for p in dialog.image_paths]
-            combo.setCurrentIndex(combo.findData(BURST_SORT_BURST_SCORE))
+            assert dialog._burst_ranking_status_label.text() == "Ranking: Available"
+            assert window.state.status_message == ""  # no fallback needed
             burst_score_sequence = [Path(p).name for p in dialog.image_paths]
-
-            assert capture_time_sequence == ["DSC_0002.jpg", "DSC_0003.jpg", "DSC_0001.jpg"]
             assert burst_score_sequence == ["DSC_0001.jpg", "DSC_0003.jpg", "DSC_0002.jpg"]
-            assert capture_time_sequence != burst_score_sequence
         finally:
             dialog.close()
+
+        window._set_burst_sort_mode(BURST_SORT_CAPTURE_TIME)
+        dialog2 = _open_burst_loupe(window, monkeypatch)
+        try:
+            capture_time_sequence = [Path(p).name for p in dialog2.image_paths]
+            assert capture_time_sequence == ["DSC_0002.jpg", "DSC_0003.jpg", "DSC_0001.jpg"]
+            assert capture_time_sequence != burst_score_sequence
+        finally:
+            dialog2.close()
     finally:
         window.close()
         service.close()
 
 
-def test_switching_capture_time_burst_score_and_back_restores_the_exact_original_order(
-    app, tmp_path, monkeypatch
-) -> None:
+def test_repeated_burst_order_switching_never_drifts_from_the_original_list(app, tmp_path, monkeypatch) -> None:
     """Regression test for a real bug found once Color Source matched the
     ranking strategy: Capture Time -> Burst Score -> Capture Time did not
     restore chronological order - it stayed in Burst Score order.
 
-    Root cause: the previous implementation re-sorted self.items IN PLACE
-    on every mode change. list.sort() is stable, so re-sorting an
-    already-Burst-Score-ordered list by captured_at only reorders images
-    with genuinely different timestamps - two images sharing the same EXIF
-    second (DSC_0002/DSC_0003 below - realistic for a fast burst, since
-    DateTimeOriginal is only 1-second resolution) kept whatever relative
-    order the PREVIOUS sort left them in, not the true original one. The
-    fix rebuilds every mode fresh from an immutable `_burst_members_original`
-    list, making each mode a pure function of fixed input regardless of
-    what was selected in between - this test exercises exactly that tie.
+    Root cause (in the old Loupe-internal implementation): it re-sorted
+    self.items IN PLACE on every mode change. list.sort() is stable, so
+    re-sorting an already-Burst-Score-ordered list by captured_at only
+    reorders images with genuinely different timestamps - two images
+    sharing the same EXIF second (DSC_0002/DSC_0003 below - realistic for a
+    fast burst, since DateTimeOriginal is only 1-second resolution) kept
+    whatever relative order the PREVIOUS sort left them in, not the true
+    original one.
+
+    MainWindow._sort_burst_members is a `@staticmethod` that always derives
+    fresh via `sorted()` from the list _open_loupe_for_item builds fresh
+    from self._all_items on every call - there is no persisted "current
+    order" for a later sort to accidentally build on top of, so this class
+    of bug is structurally not reachable here. This test exercises the
+    exact same tie the original regression used, now against three
+    independently opened Loupe sessions instead of one Loupe's internal
+    toggle.
     """
     from PIL import Image
 
-    from picklikeme.desktop.dialogs.loupe_dialog import BURST_SORT_CAPTURE_TIME, BURST_SORT_BURST_SCORE
+    from picklikeme.desktop.main_window import BURST_SORT_BURST_SCORE, BURST_SORT_CAPTURE_TIME
     from picklikeme.sidecar import AI_STRATEGY_ID
 
+    _isolate_settings(monkeypatch, tmp_path)
     folder = tmp_path / "shoot"
     folder.mkdir()
     filenames = ["DSC_0001.jpg", "DSC_0002.jpg", "DSC_0003.jpg", "DSC_0004.jpg"]
@@ -642,25 +680,27 @@ def test_switching_capture_time_burst_score_and_back_restores_the_exact_original
         window._refresh_from_state(service.load_session())
         window._on_toggle_collapse_bursts(True)
 
-        dialog = _open_burst_loupe(window, monkeypatch)
-        try:
-            combo = dialog._burst_sort_combo
-
-            def sequence_for(mode):
-                combo.setCurrentIndex(combo.findData(mode))
+        def sequence_for(mode):
+            window._set_burst_sort_mode(mode)
+            dialog = _open_burst_loupe(window, monkeypatch)
+            try:
                 return [Path(p).name for p in dialog.image_paths]
+            finally:
+                dialog.close()
 
-            capture_time_first = sequence_for(BURST_SORT_CAPTURE_TIME)
-            burst_score = sequence_for(BURST_SORT_BURST_SCORE)
-            capture_time_again = sequence_for(BURST_SORT_CAPTURE_TIME)
+        capture_time_first = sequence_for(BURST_SORT_CAPTURE_TIME)
+        burst_score = sequence_for(BURST_SORT_BURST_SCORE)
+        capture_time_again = sequence_for(BURST_SORT_CAPTURE_TIME)
 
-            assert capture_time_first == ["DSC_0003.jpg", "DSC_0002.jpg", "DSC_0001.jpg", "DSC_0004.jpg"]
-            assert burst_score == ["DSC_0001.jpg", "DSC_0003.jpg", "DSC_0004.jpg", "DSC_0002.jpg"]
-            # The actual regression: this must be byte-for-byte identical to
-            # capture_time_first, not left in Burst Score's order.
-            assert capture_time_again == capture_time_first
-        finally:
-            dialog.close()
+        # DSC_0002/DSC_0003 tie on captured_at - Python's sorted() is stable,
+        # so the tie resolves to whichever order they were already in within
+        # self._all_items (filename order here) BEFORE this sort, same as
+        # burst_score's own distinct-score ordering has no ties to resolve.
+        assert capture_time_first == ["DSC_0002.jpg", "DSC_0003.jpg", "DSC_0001.jpg", "DSC_0004.jpg"]
+        assert burst_score == ["DSC_0001.jpg", "DSC_0003.jpg", "DSC_0004.jpg", "DSC_0002.jpg"]
+        # The actual regression: this must be byte-for-byte identical to
+        # capture_time_first, not left in Burst Score's order.
+        assert capture_time_again == capture_time_first
     finally:
         window.close()
         service.close()
