@@ -40,6 +40,15 @@ class Palette:
     reject_fg: str
     neutral_bg: str
     neutral_fg: str
+    # "Skipped" (see thumbnail_delegate.py's _get_background_color) - an
+    # image the CURRENTLY SELECTED Color Source never scored at all (filtered
+    # out by that module, or simply never ranked by it), distinct from
+    # ordinary Neutral (scored, just not yet decided) and from Reject (scored
+    # and explicitly not in the keep cutoff). Amber/orange - a third hue
+    # family, not a shade of the existing green/red/gray, matching this
+    # file's own "perceptibly separated by hue AND saturation" rule above.
+    skipped_bg: str
+    skipped_fg: str
 
 
 DARK = Palette(
@@ -63,6 +72,8 @@ DARK = Palette(
     reject_fg="#ef5350",
     neutral_bg="#242424",
     neutral_fg="#9e9e9e",
+    skipped_bg="#4a331a",
+    skipped_fg="#ffa726",
 )
 
 LIGHT = Palette(
@@ -81,6 +92,8 @@ LIGHT = Palette(
     reject_fg="#c62828",
     neutral_bg="#f0f0f0",
     neutral_fg="#757575",
+    skipped_bg="#fdf0e0",
+    skipped_fg="#e65100",
 )
 
 PALETTES: dict[str, Palette] = {"dark": DARK, "light": LIGHT}

@@ -270,7 +270,7 @@ class MainWindow(QMainWindow):
         self._filter_combo = QComboBox(self)
         self._filter_combo.addItems([FILTER_LABELS[f] for f in FILTERS])
         self._filter_combo.currentIndexChanged.connect(self._on_filter_changed)
-        self._make_toolbar_combo_compact(self._filter_combo, min_chars=14, max_width=165)
+        self._make_toolbar_combo_compact(self._filter_combo, min_chars=13, max_width=150)
 
         # Product Direction: "the highest priority is now to move the
         # advanced filtering capabilities into the Review Window" - narrows
@@ -308,7 +308,7 @@ class MainWindow(QMainWindow):
             self._sort_combo.addItem(label, field)
         self._sort_combo.setCurrentIndex(max(0, self._sort_combo.findData(self._sort_field)))
         self._sort_combo.currentIndexChanged.connect(self._on_sort_field_changed)
-        self._make_toolbar_combo_compact(self._sort_combo, min_chars=14, max_width=160)
+        self._make_toolbar_combo_compact(self._sort_combo, min_chars=13, max_width=148)
 
         self._sort_direction_btn = QPushButton(self)
         self._sort_direction_btn.setCheckable(True)
@@ -320,7 +320,26 @@ class MainWindow(QMainWindow):
         for source, label in color_source_options():
             self._color_combo.addItem(label, source)
         self._color_combo.currentIndexChanged.connect(self._on_color_source_changed)
-        self._make_toolbar_combo_compact(self._color_combo, min_chars=13, max_width=150)
+        self._make_toolbar_combo_compact(self._color_combo, min_chars=12, max_width=138)
+
+        # A toolbar-level, always-visible way to see/change the Burst Order
+        # preference (see BURST_SORT_* and _set_burst_sort_mode) - the View
+        # menu's own "Burst Order" submenu still exists and stays in sync
+        # (both read/write the exact same self._burst_sort_mode /
+        # _set_burst_sort_mode, no second sorting mechanism). Two items only
+        # ("Time"/"Score"), so a compact combo reads cleanly without a label
+        # explaining it further - "Burst:" is enough context.
+        self._burst_sort_combo = QComboBox(self)
+        self._burst_sort_combo.addItem("Time", BURST_SORT_CAPTURE_TIME)
+        self._burst_sort_combo.addItem("Score", BURST_SORT_BURST_SCORE)
+        self._burst_sort_combo.setToolTip(
+            "Burst Order - the order Loupe navigation uses when opened from a collapsed burst card"
+        )
+        index = self._burst_sort_combo.findData(self._burst_sort_mode)
+        if index >= 0:
+            self._burst_sort_combo.setCurrentIndex(index)
+        self._burst_sort_combo.currentIndexChanged.connect(self._on_burst_sort_combo_changed)
+        self._make_toolbar_combo_compact(self._burst_sort_combo, min_chars=5, max_width=85)
 
         self._build_ui()
 
@@ -678,6 +697,7 @@ class MainWindow(QMainWindow):
         toolbar.addWidget(self._color_combo)
         toolbar.addAction(self._detector_boxes_action)
         toolbar.addAction(self._collapse_bursts_action)
+        toolbar.addWidget(self._burst_sort_combo)
 
         self.addToolBar(Qt.ToolBarArea.TopToolBarArea, toolbar)
         self.addToolBarBreak(Qt.ToolBarArea.TopToolBarArea)
@@ -1163,19 +1183,43 @@ class MainWindow(QMainWindow):
         always behaved - every image, individually. Enabled narrows the
         visible set to each burst's own burst_best image (see
         _filter_items) and shows a "+N" badge on any card whose burst has
-        other members, so opening one (see _open_loupe) can offer them."""
+        other members, so opening one (see _open_loupe) can offer them.
+
+        The action's own label always names the CURRENT action, not the
+        current state - "Collapse Bursts" while expanded (clicking it
+        collapses them), "Uncollapse Bursts" once collapsed (clicking it
+        expands them again), so the toolbar/menu text never silently
+        disagrees with what a click actually does right now."""
         self._collapse_bursts = checked
+        self._collapse_bursts_action.setText("Uncollapse Bursts" if checked else "Collapse Bursts")
         self._gallery_view.set_show_burst_badges(checked)
         self._apply_filter()
 
     def _set_burst_sort_mode(self, mode: str) -> None:
-        """The Burst Order View-menu choice - see BURST_SORT_* and
-        _open_loupe_for_item, the only place this value is read. Persisted
-        immediately, same as every other QSettings-backed preference in this
-        window (e.g. _set_theme), so it survives a restart without the
-        photographer needing to touch it twice."""
+        """The single place Burst Order is decided - see BURST_SORT_* and
+        _open_loupe_for_item, the only place this value is READ. Reachable
+        from two UI surfaces (the toolbar's _burst_sort_combo and the View
+        menu's "Burst Order" submenu, see _build_tool_bar/_build_menu_bar) -
+        both call this same setter rather than writing self._burst_sort_mode
+        directly, so this is also the one place that keeps them showing the
+        same value as each other. Persisted immediately, same as every other
+        QSettings-backed preference in this window (e.g. _set_theme), so it
+        survives a restart without the photographer needing to touch it
+        twice."""
         self._burst_sort_mode = mode
         self._settings.setValue(BURST_SORT_SETTINGS_KEY, mode)
+        self._burst_order_capture_time_action.setChecked(mode == BURST_SORT_CAPTURE_TIME)
+        self._burst_order_score_action.setChecked(mode == BURST_SORT_BURST_SCORE)
+        combo_index = self._burst_sort_combo.findData(mode)
+        if combo_index >= 0 and self._burst_sort_combo.currentIndex() != combo_index:
+            self._burst_sort_combo.blockSignals(True)
+            self._burst_sort_combo.setCurrentIndex(combo_index)
+            self._burst_sort_combo.blockSignals(False)
+
+    def _on_burst_sort_combo_changed(self, index: int) -> None:
+        mode = self._burst_sort_combo.itemData(index)
+        if mode is not None and mode != self._burst_sort_mode:
+            self._set_burst_sort_mode(mode)
 
     # -- filtering ------------------------------------------------------------
 
@@ -1353,19 +1397,33 @@ class MainWindow(QMainWindow):
             self._cutoff_spin.setValue(preset)
 
     def _apply_cutoff(self) -> None:
-        """Set the AI cutoff threshold, then apply the resulting AI
-        suggestions to the gallery - mirrors the web review UI's "Apply AI
-        Suggestions" behavior (review/session.py's apply_ai_suggestions,
-        server.py's /api/review/apply-ai-suggestions), not previously wired
-        into the desktop at all. A Neutral image has nothing manual at
-        risk and is always updated. An image already marked Keep/Reject
-        that disagrees with the new threshold is only overridden after an
-        explicit confirmation showing exactly how many go each direction -
-        "3 conflicts" doesn't tell a photographer whether they're about to
-        lose 3 Keeps or 3 Rejects, which matters."""
+        """Set the cutoff threshold, then apply the resulting suggestions to
+        the gallery - mirrors the web review UI's "Apply AI Suggestions"
+        behavior (review/session.py's apply_ai_suggestions, server.py's
+        /api/review/apply-ai-suggestions), not previously wired into the
+        desktop at all. A Neutral image has nothing manual at risk and is
+        always updated. An image already marked Keep/Reject that disagrees
+        with the new threshold is only overridden after an explicit
+        confirmation showing exactly how many go each direction - "3
+        conflicts" doesn't tell a photographer whether they're about to lose
+        3 Keeps or 3 Rejects, which matters.
+
+        Applies whichever strategy the Color Source picker currently shows
+        (self._color_source, same fallback-to-AI-model rule as
+        _on_color_source_changed), via ReviewSession.apply_algorithm_
+        suggestions - not the fixed-AI-model apply_ai_suggestions. Before
+        this, "Apply Cutoff" always wrote the AI model's own suggestion
+        regardless of Color Source, so applying a cutoff while viewing a
+        different algorithm's coloring ("Color by Algorithm") could leave a
+        clearly-top-scored image under THAT algorithm Reject-colored,
+        because the AI model - not the algorithm on screen - had actually
+        decided the cutoff. See apply_algorithm_suggestions's own docstring.
+        """
         if not self.state.current_folder:
             self._set_status("Open a folder before setting the AI cutoff")
             return
+        strategy_id = self._color_source or DEFAULT_STRATEGY_ID
+        strategy_label = self._color_combo.currentText() if self._color_source else "AI Model"
         percent = self._cutoff_spin.value()
         state = self.service.set_keep_percent(percent)
         self._refresh_preserving_scroll(state)
@@ -1374,7 +1432,7 @@ class MainWindow(QMainWindow):
         reject_to_keep = 0
         for image in state.get("images", []):
             status = image.get("review_status")
-            suggestion = image.get("ai_suggestion")
+            suggestion = image.get("algorithm_suggestion")
             if suggestion is None or status not in ("keep", "reject") or suggestion == status:
                 continue
             if status == "keep":
@@ -1386,12 +1444,12 @@ class MainWindow(QMainWindow):
         include_decided = False
         if conflicts:
             message = (
-                f"At this {percent:g}% cutoff, the AI disagrees with {conflicts} image(s) "
+                f"At this {percent:g}% cutoff, {strategy_label} disagrees with {conflicts} image(s) "
                 "you already decided:\n\n"
                 f"    {keep_to_reject} marked Keep would become Reject\n"
                 f"    {reject_to_keep} marked Reject would become Keep\n\n"
-                "Override these manual decisions to match the AI? Neutral images are "
-                "always updated to the AI's suggestion regardless."
+                f"Override these manual decisions to match {strategy_label}? Neutral images are "
+                "always updated to its suggestion regardless."
             )
             confirm = QMessageBox.question(
                 self, "PeakPic - Apply Cutoff", message,
@@ -1400,7 +1458,7 @@ class MainWindow(QMainWindow):
             )
             include_decided = confirm == QMessageBox.StandardButton.Yes
 
-        result = self.service.apply_ai_suggestions(include_decided=include_decided)
+        result = self.service.apply_algorithm_suggestions(strategy_id, include_decided=include_decided)
         self._refresh_from_state(result["state"])
         if include_decided:
             self._set_status(

@@ -91,6 +91,84 @@ def test_collapse_bursts_shows_only_the_best_of_each_burst(app, tmp_path) -> Non
         service.close()
 
 
+def test_collapse_bursts_action_label_always_names_the_next_click(app, tmp_path) -> None:
+    """The action's own text is "Collapse Bursts" while expanded (a click
+    collapses them) and "Uncollapse Bursts" once collapsed (a click expands
+    them again) - never a static label that could disagree with what
+    clicking it right now actually does. Same QAction is shared by the
+    toolbar button and the View menu item, so this one label update covers
+    both surfaces at once."""
+    window, service = _window(tmp_path)
+    try:
+        assert window._collapse_bursts_action.text() == "Collapse Bursts"
+
+        window._collapse_bursts_action.trigger()
+        assert window._collapse_bursts is True
+        assert window._collapse_bursts_action.text() == "Uncollapse Bursts"
+
+        window._collapse_bursts_action.trigger()
+        assert window._collapse_bursts is False
+        assert window._collapse_bursts_action.text() == "Collapse Bursts"
+    finally:
+        window.close()
+        service.close()
+
+
+def test_burst_order_toolbar_combo_reuses_the_existing_sort_mechanism(app, tmp_path, monkeypatch) -> None:
+    """The toolbar's own Burst Order control (item 1 of the redesign ask:
+    "expose the existing sorting mode more clearly") is not a second
+    sorting mechanism - it is a second UI surface over the exact same
+    self._burst_sort_mode/_set_burst_sort_mode/BURST_SORT_* the View menu's
+    "Burst Order" submenu already used (see test_burst_ui.py's other Burst
+    Order tests). Both the combo and the menu actions stay in sync with
+    each other because both ultimately call _set_burst_sort_mode - proven
+    here by changing it from one surface and reading it back from the
+    other."""
+    from picklikeme.desktop.main_window import BURST_SORT_BURST_SCORE, BURST_SORT_CAPTURE_TIME
+
+    _isolate_settings(monkeypatch, tmp_path)
+    window, service = _window(tmp_path)
+    try:
+        # Present, visible, and reflecting the real (default) mode from the
+        # moment the toolbar is built - not a separate combo that starts
+        # out of sync with whatever was already selected.
+        assert window._burst_sort_combo.currentData() == BURST_SORT_BURST_SCORE == window._burst_sort_mode
+
+        # Changing it via the TOOLBAR combo (a real index change, not a
+        # direct attribute set) must update self._burst_sort_mode AND the
+        # View menu's own actions - the single source of truth invariant.
+        index = window._burst_sort_combo.findData(BURST_SORT_CAPTURE_TIME)
+        window._burst_sort_combo.setCurrentIndex(index)
+        assert window._burst_sort_mode == BURST_SORT_CAPTURE_TIME
+        assert window._burst_order_capture_time_action.isChecked()
+        assert not window._burst_order_score_action.isChecked()
+
+        # And the reverse direction: changing it via the View menu action
+        # must update the toolbar combo back.
+        window._burst_order_score_action.trigger()
+        assert window._burst_sort_mode == BURST_SORT_BURST_SCORE
+        assert window._burst_sort_combo.currentData() == BURST_SORT_BURST_SCORE
+
+        # And it actually drives the real navigation order - the same
+        # invariant test_burst_order_is_decided_by_the_main_grid_before_
+        # the_loupe_ever_opens checks for the View menu path, exercised here
+        # through the toolbar combo instead.
+        captured = _spy_loupe_dialog(monkeypatch)
+        window._all_items = _scored_disagreeing_burst(tmp_path)
+        window._on_toggle_collapse_bursts(True)
+        (visible,) = window._gallery_model.items()
+
+        index = window._burst_sort_combo.findData(BURST_SORT_CAPTURE_TIME)
+        window._burst_sort_combo.setCurrentIndex(index)
+        window._open_loupe_for_item(visible)
+        dialog = captured["dialog"]
+        assert dialog.image_paths == [str(tmp_path / n) for n in ("a.jpg", "b.jpg", "c.jpg")]
+        dialog.close()
+    finally:
+        window.close()
+        service.close()
+
+
 def test_opening_a_card_normally_scopes_the_loupe_to_the_visible_gallery(app, tmp_path, monkeypatch) -> None:
     from picklikeme.desktop import main_window as main_window_module
 

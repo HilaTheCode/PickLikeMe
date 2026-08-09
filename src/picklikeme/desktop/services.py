@@ -73,6 +73,14 @@ class ReviewService:
         result["state"] = self.load_session()
         return result
 
+    def apply_algorithm_suggestions(self, strategy_id: str, *, include_decided: bool = False) -> dict[str, Any]:
+        """See ReviewSession.apply_algorithm_suggestions - the same bulk
+        cutoff-application as apply_ai_suggestions above, but against
+        `strategy_id`'s own suggestions rather than always the AI model."""
+        result = self.session.apply_algorithm_suggestions(strategy_id, include_decided=include_decided)
+        result["state"] = self.load_session()
+        return result
+
     def thumbnail_path(self, image_path: str, *, with_boxes: bool = False) -> Path | None:
         return review_thumbnail(image_path, with_boxes=with_boxes)
 

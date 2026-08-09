@@ -330,6 +330,18 @@ class ThumbnailCardDelegate(QAbstractItemDelegate):
         refresh with no separate logic here: algorithm_suggestion already
         reflects it.
 
+        A THIRD Priority-#2 outcome, alongside keep/reject: algorithm_
+        suggestion is None whenever the selected strategy never scored this
+        image at all (ReviewSession.suggestions_for only ever assigns keep/
+        reject to images it actually scored - see that method's own
+        docstring) - filtered out by that module (no visible eye, no
+        subject, ...) or simply never ranked by it. That is not the same
+        claim as Neutral ("scored, no decision yet") or Reject ("scored,
+        didn't clear the cutoff"), so it gets its own "Skipped" color rather
+        than silently falling through to plain Neutral, where it would be
+        indistinguishable from an image that DID get a fair look from this
+        algorithm.
+
         "Review Status" as the Color Source (self._color_source is None)
         has no algorithm to fall back to for Priority #2 - an undecided
         image simply stays neutral, exactly as it always has.
@@ -343,6 +355,8 @@ class ThumbnailCardDelegate(QAbstractItemDelegate):
                 return QColor(palette.keep_bg)
             if item.algorithm_suggestion == "reject":
                 return QColor(palette.reject_bg)
+            if item.algorithm_suggestion is None:
+                return QColor(palette.skipped_bg)
         if is_hovered:
             return QColor(palette.hover_bg)
         return QColor(palette.neutral_bg)

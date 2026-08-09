@@ -949,8 +949,39 @@ class ReviewSession:
         decide whether asking about a second, confirmed call is even worth
         it. `overridden` is how many of those were actually changed this
         call (always 0 unless `include_decided=True`).
+
+        Deliberately always the AI model specifically, never whichever
+        strategy `burst_strategy`/the desktop Color Source picker currently
+        names - see `_ai_suggestions`'s own docstring for why (this backs
+        `agreement_stats`/the evaluation-report tooling, which compare the
+        trained model against human judgement specifically, not "whichever
+        algorithm was on screen"). A caller that wants the CURRENTLY
+        SELECTED strategy's own cutoff applied instead wants
+        `apply_algorithm_suggestions` below.
         """
-        suggestions = self._ai_suggestions()
+        return self._apply_suggestions(self._ai_suggestions(), include_decided=include_decided)
+
+    def apply_algorithm_suggestions(self, strategy_id: str, *, include_decided: bool = False) -> dict:
+        """The general form of `apply_ai_suggestions` - bulk-accepts
+        `strategy_id`'s own current suggestion (`suggestions_for`, the same
+        per-strategy cutoff `ImageItem.algorithm_suggestion`/the gallery's
+        "Color by Algorithm" coloring already use) instead of being fixed to
+        the AI model.
+
+        Exists so the desktop's "Apply Cutoff" toolbar action can bulk-write
+        against WHICHEVER strategy the Color Source picker currently shows -
+        previously it always wrote the AI model's own suggestion regardless
+        of Color Source, so applying a cutoff while viewing a different
+        algorithm's coloring could leave review_status and that algorithm's
+        own top-N% picture visibly disagreeing (a scored-and-clearly-top
+        image ending up Reject-colored because the AI model, not the
+        strategy on screen, decided the cutoff). Same bulk-write mechanics
+        as `apply_ai_suggestions`, just parameterized on which suggestions
+        dict feeds it - see `_apply_suggestions`.
+        """
+        return self._apply_suggestions(self.suggestions_for(strategy_id), include_decided=include_decided)
+
+    def _apply_suggestions(self, suggestions: dict[str, str | None], *, include_decided: bool) -> dict:
         applied = 0
         overridden = 0
         conflicts = 0

@@ -639,10 +639,13 @@ def test_a_user_decision_always_overrides_the_color_source_suggestion(app) -> No
     assert delegate._get_background_color(palette, user_rejected_algo_keeps, False).name() == theme_color(palette.reject_bg)
 
 
-def test_an_image_the_chosen_strategy_never_scored_falls_back_to_neutral(app) -> None:
+def test_an_image_the_chosen_strategy_never_scored_gets_the_skipped_color(app) -> None:
     """An image Classic Vision filtered out (or that only the AI model has
-    scored) has no algorithm_suggestion from it - it must fall back to the
-    same plain color an unranked image gets by default, never be guessed at."""
+    scored) has no algorithm_suggestion from it - it must render in the
+    distinct "Skipped" color (see theme.Palette.skipped_bg and
+    _get_background_color's own docstring), never a guessed keep/reject,
+    and never silently identical to plain Neutral (a genuinely-scored image
+    with no decision yet) - those are different claims about the image."""
     from picklikeme.desktop import theme
     from picklikeme.desktop.models.image_item import ImageItem
     from picklikeme.desktop.views.gallery.thumbnail_delegate import ThumbnailCardDelegate
@@ -652,7 +655,9 @@ def test_an_image_the_chosen_strategy_never_scored_falls_back_to_neutral(app) ->
     delegate.set_color_source("classic-vision")
 
     unscored = ImageItem(path="/x/u.nef", file_name="u.nef", algorithm_suggestion=None)
-    assert delegate._get_background_color(palette, unscored, False).name() == theme_color(palette.neutral_bg)
+    color = delegate._get_background_color(palette, unscored, False).name()
+    assert color == theme_color(palette.skipped_bg)
+    assert color != theme_color(palette.neutral_bg)
 
 
 def test_selecting_a_color_source_propagates_to_the_gallery_delegate(app, tmp_path) -> None:

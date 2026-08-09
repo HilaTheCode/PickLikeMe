@@ -358,3 +358,273 @@ def test_arrow_key_navigation_does_not_reorder_or_change_sort_related_state(app,
     finally:
         dialog.close()
         service.close()
+
+
+# ---------------------------------------------------------------------------
+# Redesign: no Close button, prominent normalized score, zoom (keyboard,
+# pinch, persistence across navigation), Elements mode.
+# ---------------------------------------------------------------------------
+
+
+def test_there_is_no_close_button(app, tmp_path) -> None:
+    """Removed - the window's own native controls (and Escape, see
+    keyPressEvent) already close it; a dedicated "Close" button was just
+    spending bar space on something every window already offers for free."""
+    from PySide6.QtWidgets import QPushButton
+
+    dialog, service = _burst_dialog(tmp_path, n=1)
+    try:
+        button_texts = {b.text() for b in dialog.findChildren(QPushButton)}
+        assert "Close" not in button_texts
+    finally:
+        dialog.close()
+        service.close()
+
+
+def test_primary_score_is_normalized_with_exactly_three_decimals(app, tmp_path) -> None:
+    """"IMAGE SCORE: 0.900", never "90.0" (the old *100-scaled burst-row
+    reading), "0.90" (two decimals), or "0.9000" (four, matching the
+    secondary multi-strategy line's own precision) - exactly three."""
+    dialog, service = _burst_dialog(tmp_path, burst_strategy="ai-model", n=1)
+    try:
+        text = dialog._primary_score_label.text()
+        assert text == "IMAGE SCORE: 0.900"
+        assert "90.0" not in text
+        assert "0.9000" not in text
+    finally:
+        dialog.close()
+        service.close()
+
+
+def test_primary_score_shows_an_em_dash_when_the_active_strategy_never_scored_this_image(app, tmp_path) -> None:
+    dialog, service = _burst_dialog(tmp_path, burst_strategy=None, n=1)
+    try:
+        assert dialog._primary_score_label.text() == "IMAGE SCORE: —"
+    finally:
+        dialog.close()
+        service.close()
+
+
+def test_zoom_level_persists_across_navigation(app, tmp_path) -> None:
+    """Image A zoomed in -> Right Arrow -> Image B is at the same zoom - the
+    task's own explicit example ("Image A -> zoom to 150% -> press Right
+    Arrow -> Image B should remain at 150%"). _ZoomView.set_pixmap already
+    reapplies _manual_scale/_fit_mode on every image load (see that
+    method); this checks the WHOLE path end to end, through real
+    navigation - not a specific absolute scale number (zoom_by's factor is
+    relative to whatever Fit mode's own scale already was for this
+    - deliberately tiny, fast-to-generate - test image, which is not the
+    "150%" a real multi-megapixel photo's Fit scale would start near; what
+    matters here is that navigating preserves it exactly, at whatever value
+    it actually is)."""
+    dialog, service = _burst_dialog(tmp_path, n=3)
+    try:
+        dialog.show()
+        app.processEvents()
+
+        assert dialog._view._fit_mode is True  # starts at Fit, not a manual zoom
+        fit_scale = dialog._view.transform().m11()
+        dialog._view.zoom_by(1.5)
+        assert dialog._view._fit_mode is False
+        scale_after_zoom = dialog._view._manual_scale
+        assert scale_after_zoom != pytest.approx(fit_scale)  # zoom actually changed something
+
+        dialog._go_next()
+        assert dialog._view._fit_mode is False
+        assert dialog._view._manual_scale == pytest.approx(scale_after_zoom)
+        assert dialog._view.transform().m11() == pytest.approx(scale_after_zoom)
+
+        dialog._go_next()
+        assert dialog._view._manual_scale == pytest.approx(scale_after_zoom)
+    finally:
+        dialog.close()
+        service.close()
+
+
+def test_zoom_by_is_clamped_to_sane_bounds(app, tmp_path) -> None:
+    from picklikeme.desktop.dialogs.loupe_dialog import MAX_MANUAL_SCALE, MIN_MANUAL_SCALE
+
+    dialog, service = _burst_dialog(tmp_path, n=1)
+    try:
+        dialog.show()
+        app.processEvents()
+        for _ in range(60):
+            dialog._view.zoom_by(1.5)
+        assert dialog._view._manual_scale <= MAX_MANUAL_SCALE
+        for _ in range(60):
+            dialog._view.zoom_by(1 / 1.5)
+        assert dialog._view._manual_scale >= MIN_MANUAL_SCALE
+    finally:
+        dialog.close()
+        service.close()
+
+
+def test_keyboard_plus_minus_zoom_reuses_the_same_zoom_mechanism(app, tmp_path) -> None:
+    """+ / - are keyboard shortcuts for the same _view.zoom_by Ctrl+wheel
+    and trackpad pinch already call - not a second zoom implementation.
+    Both Key_Plus and Key_Equal are accepted for zoom-in, matching a
+    standard US keyboard where "+" is Shift+= ."""
+    dialog, service = _burst_dialog(tmp_path, n=1)
+    try:
+        dialog.show()
+        app.processEvents()
+        assert dialog._view._fit_mode is True
+
+        _press_key(app, dialog, Qt.Key.Key_Equal)
+        assert dialog._view._fit_mode is False
+        scale_after_one_zoom_in = dialog._view._manual_scale
+        assert scale_after_one_zoom_in > 1.0
+
+        _press_key(app, dialog, Qt.Key.Key_Minus)
+        assert dialog._view._manual_scale < scale_after_one_zoom_in
+    finally:
+        dialog.close()
+        service.close()
+
+
+def test_trackpad_pinch_native_gesture_zooms(app, tmp_path) -> None:
+    """macOS trackpad pinch arrives as QNativeGestureEvent/
+    ZoomNativeGesture, not QPinchGesture - see _ZoomView.event()'s own
+    docstring for why. value() is an incremental scale delta (e.g. +0.02
+    per tick), composed multiplicatively via the same zoom_by() Ctrl+wheel
+    and the keyboard shortcuts use - so a +0.2 tick means "scale by 1.2",
+    relative to whatever the view's current scale already was (Fit mode's
+    own scale here, same caveat as the zoom-persistence test above: not a
+    specific absolute number for this tiny test image)."""
+    from PySide6.QtCore import QPointF
+    from PySide6.QtGui import QNativeGestureEvent, QPointingDevice
+
+    dialog, service = _burst_dialog(tmp_path, n=1)
+    try:
+        dialog.show()
+        app.processEvents()
+        # A known, exact starting scale (1.0) rather than whatever Fit
+        # mode's own scale happens to be for this test image at this
+        # viewport size (irrelevant to what's under test here: does the
+        # gesture event apply the correct RELATIVE factor via zoom_by).
+        dialog._view._fit_mode = False
+        dialog._view.resetTransform()
+        dialog._view.scale(1.0, 1.0)
+        dialog._view._manual_scale = 1.0
+        scale_before = dialog._view.transform().m11()
+        assert scale_before == pytest.approx(1.0)
+
+        device = QPointingDevice.primaryPointingDevice()
+        point = QPointF(50, 50)
+        gesture = QNativeGestureEvent(
+            Qt.NativeGestureType.ZoomNativeGesture, device, 0, point, point, point, 0.2, QPointF(0, 0),
+        )
+        # dialog._view.event(gesture) directly, not QApplication.sendEvent -
+        # the offscreen QPA platform this suite runs under doesn't fully
+        # support routing a synthetic NativeGesture through the real
+        # notify()/event-loop pipeline (sendEvent() reliably returns False
+        # for one here even though the override itself handles it
+        # correctly - verified directly). A real trackpad pinch is
+        # delivered by genuine OS/Cocoa machinery no offscreen test can
+        # replicate anyway; what this test can and should verify is that
+        # _ZoomView.event() itself correctly recognizes and handles the
+        # event once Qt hands it one.
+        assert dialog._view.event(gesture) is True
+        assert dialog._view._fit_mode is False
+        assert dialog._view._manual_scale == pytest.approx(scale_before * 1.2, rel=0.05)
+    finally:
+        dialog.close()
+        service.close()
+
+
+def test_elements_and_boxes_toggles_are_mutually_exclusive(app, tmp_path) -> None:
+    """Checking one unchecks the other - both draw over the same eye/head
+    region, and showing both overlays at once would be clutter, not more
+    information (see _refresh_detection_overlay's own docstring)."""
+    dialog, service = _burst_dialog(tmp_path, n=1)
+    try:
+        dialog._boxes_btn.setChecked(True)
+        assert dialog._show_boxes is True
+        assert dialog._show_elements is False
+
+        dialog._elements_btn.setChecked(True)
+        assert dialog._show_elements is True
+        assert dialog._show_boxes is False
+        assert dialog._boxes_btn.isChecked() is False
+
+        dialog._boxes_btn.setChecked(True)
+        assert dialog._show_boxes is True
+        assert dialog._show_elements is False
+        assert dialog._elements_btn.isChecked() is False
+    finally:
+        dialog.close()
+        service.close()
+
+
+def test_elements_overlay_draws_left_eye_right_eye_and_head_with_confidence(app, tmp_path) -> None:
+    """Bounding rectangle + "Name — confidence" label (exactly two decimals)
+    for each of the three elements - synthesized from data the eye detector
+    already computed (see _ZoomView.set_elements_overlay's own docstring),
+    no detection algorithm involved."""
+    from unittest import mock
+
+    from PySide6.QtWidgets import QGraphicsRectItem, QGraphicsSimpleTextItem
+
+    dialog, service = _burst_dialog(tmp_path, n=1)
+    fake_eye = {
+        "source_size": (640, 480),
+        "accepted": True,
+        "confidence": 0.94,
+        "box": (280.0, 180.0, 360.0, 260.0),
+        "left": {"x": 300.0, "y": 200.0, "confidence": 0.94},
+        "right": {"x": 340.0, "y": 205.0, "confidence": 0.87},
+        "head_top": {"x": 320.0, "y": 140.0, "confidence": 0.7},
+        "beak": None, "left_shoulder": None, "right_shoulder": None,
+        "head_confidence": 0.99,
+    }
+    try:
+        with mock.patch.object(service, "eye_keypoints", return_value=fake_eye):
+            dialog._elements_btn.setChecked(True)
+            dialog.show()
+            app.processEvents()
+
+            boxes = [i for i in dialog._view._overlay_items if isinstance(i, QGraphicsRectItem)]
+            labels = [i for i in dialog._view._overlay_items if isinstance(i, QGraphicsSimpleTextItem)]
+            # 3 element boxes + 3 label-backing rects = 6 QGraphicsRectItem.
+            assert len(boxes) == 6
+            assert len(labels) == 3
+            label_texts = {label.text() for label in labels}
+            assert label_texts == {"Left Eye — 0.94", "Right Eye — 0.87", "Head — 0.99"}
+    finally:
+        dialog.close()
+        service.close()
+
+
+def test_elements_overlay_skips_an_element_with_no_confidence_to_show(app, tmp_path) -> None:
+    """Never fabricates a confidence - a backend (or record) with no
+    head_confidence at all must simply not draw a Head element, not draw
+    one with a made-up number."""
+    from unittest import mock
+
+    dialog, service = _burst_dialog(tmp_path, n=1)
+    fake_eye = {
+        "source_size": (640, 480),
+        "accepted": True,
+        "confidence": 0.94,
+        "box": (280.0, 180.0, 360.0, 260.0),
+        "left": {"x": 300.0, "y": 200.0, "confidence": 0.94},
+        "right": None,
+        "head_top": {"x": 320.0, "y": 140.0, "confidence": 0.7},
+        "beak": None, "left_shoulder": None, "right_shoulder": None,
+        "head_confidence": None,
+    }
+    try:
+        with mock.patch.object(service, "eye_keypoints", return_value=fake_eye):
+            dialog._elements_btn.setChecked(True)
+            dialog.show()
+            app.processEvents()
+
+            from PySide6.QtWidgets import QGraphicsSimpleTextItem
+
+            labels = {
+                i.text() for i in dialog._view._overlay_items if isinstance(i, QGraphicsSimpleTextItem)
+            }
+            assert labels == {"Left Eye — 0.94"}
+    finally:
+        dialog.close()
+        service.close()

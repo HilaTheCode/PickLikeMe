@@ -29,14 +29,15 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import QRectF, Qt, Signal
-from PySide6.QtGui import QColor, QFontMetrics, QKeyEvent, QMouseEvent, QPainter, QPen, QPixmap, QWheelEvent
+from PySide6.QtCore import QEvent, QRectF, Qt, Signal
+from PySide6.QtGui import QBrush, QColor, QFontMetrics, QKeyEvent, QMouseEvent, QPainter, QPen, QPixmap, QWheelEvent
 from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QFileDialog,
     QGraphicsPixmapItem,
     QGraphicsScene,
+    QGraphicsSimpleTextItem,
     QGraphicsView,
     QGridLayout,
     QHBoxLayout,
@@ -103,6 +104,34 @@ _ACTIVE_BUTTON_BORDER = "border: 2px solid #ffffff;"
 # so an undecided image doesn't read as "has a status" at a glance.
 _VIEW_BORDER_COLORS = {"keep": theme.DARK.keep_fg, "reject": theme.DARK.reject_fg}
 _VIEW_BORDER_WIDTH = 8
+
+# The bottom bar's own visual language - two rows (see LoupeDialog's own
+# __init__), Row 1 given a slightly lighter background and a bottom rule so
+# it reads as "the glance-at info" distinct from Row 2's "the controls",
+# without needing a heavier divider that would eat into the already-tight
+# vertical space of a maximized-but-not-fullscreen window.
+_BOTTOM_BAR_STYLESHEET = (
+    f"#loupeBottomBar {{ background-color: {theme.DARK.panel_bg}; border-top: 1px solid {theme.DARK.border}; }}"
+    f"#loupeBottomBar QLabel {{ color: {theme.DARK.text_primary}; }}"
+    "#loupeBottomBar QPushButton { padding: 5px 12px; }"
+    f"#loupeRow1 {{ background-color: {theme.DARK.hover_bg}; border-bottom: 1px solid {theme.DARK.border}; }}"
+)
+# "IMAGE SCORE: 0.384" - a filled, rounded badge (not just bold text) so it
+# reads as the one number that matters most in the bar at a glance, matching
+# the redesign's own "prominent image score" priority. accent (blue), not
+# keep/reject green/red: this is a raw algorithm score, not a decision - see
+# _get_background_color's own docstring on why those two concepts are kept
+# visually separate everywhere else in the app.
+_PRIMARY_SCORE_LABEL_STYLE = (
+    f"background-color: {theme.DARK.accent}; color: {theme.DARK.window_bg}; "
+    "font-weight: 700; font-size: 15px; padding: 6px 16px; border-radius: 6px;"
+)
+# Elements - an accent-colored border (rather than the plain default button
+# chrome every other tool button gets) so it reads as a distinctly prominent
+# control, matching the redesign's own "Clear Elements control" priority,
+# without being a solid fill that would compete with the score badge above
+# for "the one thing that stands out".
+_ELEMENTS_BUTTON_STYLE = f"border: 2px solid {theme.DARK.accent}; font-weight: 600;"
 
 
 # Caps on the bottom bar's own unbounded-text labels - neither grows with a
@@ -200,6 +229,13 @@ def _apply_brightness(pixmap: QPixmap, ev: float) -> QPixmap:
 BOX_PEN_WIDTH_OTHER = 15
 BOX_PEN_WIDTH_SELECTED = 20
 BOX_PEN_WIDTH_EYE = 20
+
+# Bounds on _ZoomView's manual scale (1.0 = 100%) - shared by Ctrl+wheel,
+# trackpad pinch, and the keyboard +/- shortcuts (see _ZoomView.zoom_by).
+# Purely a sanity clamp against "pinch/scroll past the point of being
+# useful", not a meaningful product decision about a specific max quality.
+MIN_MANUAL_SCALE = 0.1
+MAX_MANUAL_SCALE = 8.0
 
 
 class _ZoomView(QGraphicsView):
@@ -347,20 +383,157 @@ class _ZoomView(QGraphicsView):
             marker.setZValue(12)
             self._overlay_items.append(marker)
 
+    def set_elements_overlay(self, eye_data: dict | None) -> None:
+        """"Elements" mode (see LoupeDialog's Elements button) - Left Eye /
+        Right Eye / Head, each its own labeled bounding rectangle plus a
+        "Name — confidence" text label, for visually inspecting what the
+        eye detector found and how confident it was. Shares
+        clear_detection_overlay/_overlay_items with set_detection_overlay
+        (Boxes), so the two visualizations are naturally mutually exclusive
+        - LoupeDialog only ever calls one, matching whichever toggle is on
+        (see _refresh_detection_overlay), never both at once.
+
+        Synthesized entirely from data the eye detector ALREADY computed
+        and eye_keypoints_for already exposes - `left`/`right` (the two eye
+        channels' own keypoints - see eyes.detector.EyeDetection's own
+        docstring on why these are genuinely anatomical left/right, not
+        "primary vs secondary") and `head_top` (one of EyePose-v0's six
+        landmarks), paired with `head_confidence` (the holistic "is a head
+        here" scalar, not head_top's own landmark-position confidence - see
+        eye_keypoints_for's own docstring on why these are deliberately
+        different numbers). No detection runs here - this only draws three
+        already-known points as boxes. Box size is borrowed from the
+        primary eye box's own dimensions (`eye_data["box"]`) - the one
+        region size the detector already committed to for this image -
+        rather than an arbitrary fixed pixel count that would look right on
+        one image's resolution and wrong on another's; Head reuses that
+        same size scaled up, since a head is larger than a single eye.
+        """
+        self.clear_detection_overlay()
+        if self._pixmap_item is None or eye_data is None:
+            return
+        source_size = eye_data.get("source_size")
+        if not source_size or source_size[0] <= 0 or source_size[1] <= 0:
+            return
+        pixmap_size = self._pixmap_item.pixmap().size()
+        scale_x = pixmap_size.width() / source_size[0]
+        scale_y = pixmap_size.height() / source_size[1]
+
+        box = eye_data.get("box")
+        if box:
+            half_w = max(abs(box[2] - box[0]) / 2 * scale_x, 10.0)
+            half_h = max(abs(box[3] - box[1]) / 2 * scale_y, 10.0)
+        else:
+            half_w = half_h = 20.0
+
+        # Left Eye/Right Eye use their OWN keypoint's confidence (no
+        # separate scalar exists for either side individually). Head is
+        # NOT keypoint["confidence"] - deliberately always head_confidence
+        # specifically, even when that is None (a backend/record with no
+        # head_confidence at all), rather than silently falling back to
+        # head_top's own landmark-position confidence, a different, weaker
+        # claim (see eye_keypoints_for's own docstring on why these are two
+        # different numbers) - a None here means Head is skipped below.
+        elements = (
+            ("Left Eye", eye_data.get("left"), half_w, half_h, QColor(0, 229, 255), "own"),
+            ("Right Eye", eye_data.get("right"), half_w, half_h, QColor(255, 64, 255), "own"),
+            ("Head", eye_data.get("head_top"), half_w * 2.5, half_h * 2.5, QColor(255, 213, 79), eye_data.get("head_confidence")),
+        )
+        for name, keypoint, half_width, half_height, colour, confidence_source in elements:
+            if keypoint is None:
+                continue
+            confidence = keypoint.get("confidence") if confidence_source == "own" else confidence_source
+            if confidence is None:
+                continue
+            self._add_element_box(name, keypoint, half_width, half_height, colour, confidence, scale_x, scale_y)
+
+    def _add_element_box(
+        self, name: str, keypoint: dict, half_width: float, half_height: float,
+        colour: QColor, confidence: float, scale_x: float, scale_y: float,
+    ) -> None:
+        cx = keypoint["x"] * scale_x
+        cy = keypoint["y"] * scale_y
+        rect = QRectF(cx - half_width, cy - half_height, half_width * 2, half_height * 2)
+        box_item = self._scene.addRect(rect, QPen(colour, BOX_PEN_WIDTH_EYE))
+        box_item.setZValue(13)
+        self._overlay_items.append(box_item)
+
+        label = QGraphicsSimpleTextItem(f"{name} — {confidence:.2f}")
+        font = label.font()
+        font.setBold(True)
+        font.setPointSize(14)
+        label.setFont(font)
+        label.setBrush(QBrush(colour))
+        label_pos_y = rect.top() - label.boundingRect().height() - 4
+        label.setPos(rect.left(), label_pos_y)
+        label.setZValue(15)
+
+        # A dark backing rect behind the label - readable over any image
+        # content, the same reason review_thumbnail's own text overlays get
+        # one.
+        backing_rect = label.boundingRect().translated(rect.left(), label_pos_y).adjusted(-3, -1, 3, 1)
+        backing = self._scene.addRect(backing_rect, QPen(Qt.PenStyle.NoPen), QBrush(QColor(0, 0, 0, 170)))
+        backing.setZValue(14)
+        self._scene.addItem(label)
+        self._overlay_items.append(backing)
+        self._overlay_items.append(label)
+
     def _emit_zoom(self) -> None:
         self.zoomChanged.emit(self.transform().m11())
 
+    def zoom_by(self, factor: float) -> None:
+        """Scale by `factor` around whatever QGraphicsView's own
+        AnchorUnderMouse/transformation anchor currently resolves to (the
+        cursor for wheel/pinch, the view center when the mouse is
+        elsewhere) - the single mechanism Ctrl+wheel, trackpad pinch
+        (event(), below) and the keyboard +/- shortcuts (LoupeDialog.
+        keyPressEvent) all route through, so "how zoom actually changes" has
+        exactly one implementation. Clamped to MIN/MAX_MANUAL_SCALE so
+        repeated pinch/scroll/key input can't zoom out past a speck or in
+        past a useless blur. Leaves fit-to-window mode - a manual zoom
+        level, once set, is what should persist across navigation (see
+        set_pixmap), not silently snap back to Fit.
+        """
+        if self._pixmap_item is None:
+            return
+        current = self.transform().m11()
+        target = max(MIN_MANUAL_SCALE, min(MAX_MANUAL_SCALE, current * factor))
+        if abs(target - current) < 1e-9:
+            return
+        applied_factor = target / current
+        self.scale(applied_factor, applied_factor)
+        self._fit_mode = False
+        self._manual_scale = target
+        self._emit_zoom()
+
     def wheelEvent(self, event: QWheelEvent) -> None:  # noqa: N802 - Qt override signature
         if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
-            factor = 1.15 if event.angleDelta().y() > 0 else 1 / 1.15
-            self.scale(factor, factor)
-            self._fit_mode = False
-            self._manual_scale = self.transform().m11()
-            self._emit_zoom()
+            self.zoom_by(1.15 if event.angleDelta().y() > 0 else 1 / 1.15)
         else:
             direction = -1 if event.angleDelta().y() > 0 else 1
             self.navigateRequested.emit(direction)
         event.accept()
+
+    def event(self, event) -> bool:  # noqa: N802 - Qt override signature
+        # Trackpad pinch on macOS arrives as a native gesture event, not a
+        # QPinchGesture (that's the cross-platform QGestureEvent API, which
+        # needs an explicit grabGesture() registration and - per Qt's own
+        # macOS platform notes - is NOT how trackpad pinch is actually
+        # delivered there; QNativeGestureEvent/ZoomNativeGesture is the
+        # documented, reliable path). `value()` is the incremental scale
+        # delta for this event (e.g. 0.02 for a small pinch-out tick, not an
+        # absolute zoom level), so it composes into a multiplicative factor
+        # the same way one wheel-tick's fixed 1.15 does.
+        if event.type() == QEvent.Type.NativeGesture:
+            from PySide6.QtGui import QNativeGestureEvent
+
+            if (
+                isinstance(event, QNativeGestureEvent)
+                and event.gestureType() == Qt.NativeGestureType.ZoomNativeGesture
+            ):
+                self.zoom_by(1.0 + event.value())
+                return True
+        return super().event(event)
 
     def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:  # noqa: N802 - Qt override signature
         if self._pixmap_item is None:
@@ -442,6 +615,13 @@ class LoupeDialog(QDialog):
         # session; matches the web review UI where boxes is one shared
         # client-side flag covering both the grid and the Lightbox.
         self._show_boxes = show_boxes
+        # Elements mode - see _on_elements_toggled/_refresh_detection_overlay.
+        # Always starts off, unlike _show_boxes: there is no gallery-wide
+        # "Elements" toggle to sync with (Boxes mirrors the gallery's own
+        # Detector Boxes setting - see MainWindow._open_loupe - Elements is
+        # Loupe-only), and it is the more detailed/heavier of the two
+        # overlays, better opted into per session than carried over.
+        self._show_elements = False
         self.setWindowTitle("PeakPic - Loupe")
         # QDialog hides the maximize/minimize buttons by default on some
         # platforms (Windows in particular), and a fixed default size reads
@@ -496,17 +676,48 @@ class LoupeDialog(QDialog):
         for value, label in REASON_LABELS.items():
             self._reason_combo.addItem(label, value)
         self._reason_combo.currentIndexChanged.connect(self._on_reason_changed)
+        # NoFocus, same reasoning as every button below: Qt hands whichever
+        # widget was added first and accepts focus the dialog's INITIAL
+        # focus on show() - before this fix, that was _reason_combo (the
+        # first focusable widget added, since _view/the buttons are already
+        # NoFocus), which silently swallowed Key_Equal/Key_Minus (the
+        # keyboard zoom shortcuts) before LoupeDialog.keyPressEvent ever saw
+        # them, verified empirically the same way the button fix was: a
+        # focused QComboBox never even reached the dialog's own handler.
+        # Still fully usable with the mouse (click to open, click an item) -
+        # only its own keyboard type-ahead/arrow-key selection is gone,
+        # which was never this dialog's point of "usable without a mouse"
+        # (that's about image NAVIGATION - see the module docstring).
+        self._reason_combo.setFocusPolicy(Qt.FocusPolicy.NoFocus)
 
         self._reason_note = QLineEdit(self)
         self._reason_note.setPlaceholderText("Note (Other)")
         self._reason_note.setVisible(False)
         self._reason_note.setMaximumWidth(160)
+        # Deliberately NOT NoFocus, unlike everything else above - this is a
+        # genuine free-text field for the "Other" reason, and a photographer
+        # must be able to click into it and type normally (including
+        # Left/Right to move the cursor, and literal "+"/"-" characters) -
+        # the one place in this dialog where those keys correctly mean what
+        # a text field always means, not a global shortcut.
 
         self._counter_label = QLabel(self)
         self._name_label = QLabel(self)
-        self._score_label = QLabel(self)
         self._status_label = QLabel(self)
         self._ai_badge_label = QLabel(self)
+        # THE prominent score - see _primary_score/_update_info_labels.
+        # Deliberately its own, visually distinct label rather than folded
+        # into _score_label's multi-strategy line below: "IMAGE SCORE:
+        # 0.384", exactly three decimals, normalized (never the old *100
+        # "38.4" reading) - see _primary_score_text.
+        self._primary_score_label = QLabel(self)
+        self._primary_score_label.setObjectName("primaryScoreLabel")
+        self._primary_score_label.setStyleSheet(_PRIMARY_SCORE_LABEL_STYLE)
+        self._primary_score_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        # The full "every module's own score" line - still useful, but
+        # secondary/diagnostic detail now that one strategy's score has its
+        # own prominent readout above - see the module's Row 1/Row 2 split.
+        self._score_label = QLabel(self)
         self._zoom_label = QLabel("Fit", self)
         self._exposure_label = QLabel("+0.0 EV", self)
 
@@ -514,11 +725,12 @@ class LoupeDialog(QDialog):
         # a way to change burst order, only to see what it currently is and
         # whether Score means anything for this particular burst. To change
         # it: close the Loupe, change Burst Order in the Main Grid's View
-        # menu, reopen.
+        # menu, reopen. Burst Rank/Best (the "key ranking information" a
+        # burst session adds) live in Row 1 alongside the score; Color
+        # Source/Ranking Status are secondary detail in Row 2.
         self._burst_id_label = QLabel(self)
         self._burst_rank_label = QLabel(self)
         self._burst_best_label = QLabel(self)
-        self._burst_score_label = QLabel(self)
         self._burst_color_source_label = QLabel(self)
         self._burst_ranking_status_label = QLabel(self)
         if self._burst_scoped:
@@ -534,13 +746,13 @@ class LoupeDialog(QDialog):
                 self._burst_ranking_status_label.setStyleSheet(f"color: {theme.DARK.reject_fg};")
                 self._burst_ranking_status_label.setToolTip(
                     "This burst has no score from the current Color Source "
-                    f"({_strategy_label(self._burst_color_source)}) - Burst Rank/Score above are not "
+                    f"({_strategy_label(self._burst_color_source)}) - Burst Rank above is not "
                     "meaningful for it. Rank this folder with that strategy, or switch Color Source to "
                     "one that already has, then reopen the Loupe."
                 )
 
-        prev_btn = QPushButton("< Prev", self)
-        next_btn = QPushButton("Next >", self)
+        prev_btn = QPushButton("‹ Prev", self)
+        next_btn = QPushButton("Next ›", self)
         keep_btn = QPushButton("Keep (K)", self)
         reject_btn = QPushButton("Reject (R)", self)
         neutral_btn = QPushButton("Neutral (N)", self)
@@ -549,6 +761,19 @@ class LoupeDialog(QDialog):
             btn.setStyleSheet(_STATUS_BUTTON_STYLES[name])
         exp_down_btn = QPushButton("−", self)
         exp_up_btn = QPushButton("+", self)
+        # Elements - prominent (its own accent-bordered style, see
+        # _ELEMENTS_BUTTON_STYLE below) per the redesign's own "Clear
+        # Elements control" priority. Mutually exclusive with Boxes (see
+        # _refresh_detection_overlay) - both draw over the same eye/head
+        # region, and showing both at once would just be visual clutter,
+        # not more information.
+        self._elements_btn = QPushButton("Elements", self)
+        self._elements_btn.setCheckable(True)
+        self._elements_btn.setStyleSheet(_ELEMENTS_BUTTON_STYLE)
+        self._elements_btn.setToolTip(
+            "Show what the algorithm detected - Left Eye, Right Eye, and Head - as labeled "
+            "boxes with each one's own confidence"
+        )
         self._boxes_btn = QPushButton("Boxes", self)
         self._boxes_btn.setCheckable(True)
         self._boxes_btn.setChecked(self._show_boxes)
@@ -557,7 +782,6 @@ class LoupeDialog(QDialog):
             "the eye it measured, on this image"
         )
         save_jpeg_btn = QPushButton("Save JPEG", self)
-        close_btn = QPushButton("Close", self)
         for button in (exp_down_btn, exp_up_btn):
             button.setMaximumWidth(28)
         # None of these buttons has any legitimate use for arrow keys, and a
@@ -573,7 +797,7 @@ class LoupeDialog(QDialog):
         # since QPushButton.clicked isn't gated on focus policy.
         for button in (
             prev_btn, next_btn, keep_btn, reject_btn, neutral_btn,
-            exp_down_btn, exp_up_btn, self._boxes_btn, save_jpeg_btn, close_btn,
+            exp_down_btn, exp_up_btn, self._elements_btn, self._boxes_btn, save_jpeg_btn,
         ):
             button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
 
@@ -584,86 +808,117 @@ class LoupeDialog(QDialog):
         neutral_btn.clicked.connect(lambda: self._apply_status("neutral"))
         exp_down_btn.clicked.connect(lambda: self._adjust_exposure(-1))
         exp_up_btn.clicked.connect(lambda: self._adjust_exposure(1))
+        self._elements_btn.toggled.connect(self._on_elements_toggled)
         self._boxes_btn.toggled.connect(self._on_boxes_toggled)
         save_jpeg_btn.clicked.connect(self._save_jpeg)
-        close_btn.clicked.connect(self.accept)
+        # No Close button - see the module docstring: the window's own
+        # native controls (and Escape - see keyPressEvent) already close it,
+        # and a large "Close" button here was consuming bar space for
+        # something every window already offers for free.
 
         bottom_bar = QWidget(self)
         bottom_bar.setObjectName("loupeBottomBar")
-        bottom_bar.setStyleSheet(
-            f"#loupeBottomBar {{ background-color: {theme.DARK.panel_bg}; }}"
-            f"#loupeBottomBar QLabel {{ color: {theme.DARK.text_primary}; }}"
-            "#loupeBottomBar QPushButton { padding: 4px 10px; }"
-        )
-        # Three-column grid (stretch 1 : 0 : 1) rather than a single row of
-        # widgets - a plain QHBoxLayout can only pin content to the edges or
-        # to one side of a single stretch, it can't center a group. Equal
-        # stretch on the outer columns keeps the center column (the core
-        # Prev/Keep/Reject/Neutral/Next workflow) visually centered in the
-        # bar regardless of how wide the info/tools columns end up.
-        bar_layout = QGridLayout(bottom_bar)
-        bar_layout.setContentsMargins(10, 6, 10, 6)
-        bar_layout.setHorizontalSpacing(10)
-        bar_layout.setColumnStretch(0, 1)
-        bar_layout.setColumnStretch(1, 0)
-        bar_layout.setColumnStretch(2, 1)
+        bottom_bar.setStyleSheet(_BOTTOM_BAR_STYLESHEET)
 
-        info_group = QWidget(bottom_bar)
-        info_layout = QHBoxLayout(info_group)
-        info_layout.setContentsMargins(0, 0, 0, 0)
-        info_layout.setSpacing(10)
-        info_layout.addWidget(self._counter_label)
-        info_layout.addWidget(self._name_label)
-        info_layout.addWidget(self._score_label)
-        info_layout.addWidget(self._status_label)
-        info_layout.addWidget(self._ai_badge_label)
+        # Row 1 - the "what am I looking at, and how did it score" glance:
+        # counter/filename/status on the left, the one prominent score
+        # centered, this burst's own rank on the right when relevant. See
+        # the module docstring's Row 1/Row 2 split.
+        row1 = QWidget(bottom_bar)
+        row1.setObjectName("loupeRow1")
+        row1_layout = QGridLayout(row1)
+        row1_layout.setContentsMargins(16, 10, 16, 8)
+        row1_layout.setHorizontalSpacing(14)
+        row1_layout.setColumnStretch(0, 1)
+        row1_layout.setColumnStretch(1, 0)
+        row1_layout.setColumnStretch(2, 1)
 
-        actions_group = QWidget(bottom_bar)
-        actions_layout = QHBoxLayout(actions_group)
-        actions_layout.setContentsMargins(0, 0, 0, 0)
-        actions_layout.setSpacing(10)
-        actions_layout.addWidget(QLabel("Reason:"))
-        actions_layout.addWidget(self._reason_combo)
-        actions_layout.addWidget(self._reason_note)
-        actions_layout.addWidget(prev_btn)
-        actions_layout.addWidget(keep_btn)
-        actions_layout.addWidget(reject_btn)
-        actions_layout.addWidget(neutral_btn)
-        actions_layout.addWidget(next_btn)
+        row1_info_group = QWidget(row1)
+        row1_info_layout = QHBoxLayout(row1_info_group)
+        row1_info_layout.setContentsMargins(0, 0, 0, 0)
+        row1_info_layout.setSpacing(12)
+        row1_info_layout.addWidget(self._counter_label)
+        row1_info_layout.addWidget(self._name_label)
+        row1_info_layout.addWidget(self._status_label)
+        row1_info_layout.addWidget(self._ai_badge_label)
 
-        tools_group = QWidget(bottom_bar)
-        tools_layout = QHBoxLayout(tools_group)
-        tools_layout.setContentsMargins(0, 0, 0, 0)
-        tools_layout.setSpacing(10)
-        tools_layout.addWidget(self._zoom_label)
-        tools_layout.addWidget(exp_down_btn)
-        tools_layout.addWidget(self._exposure_label)
-        tools_layout.addWidget(exp_up_btn)
-        tools_layout.addWidget(self._boxes_btn)
-        tools_layout.addWidget(save_jpeg_btn)
-        tools_layout.addWidget(close_btn)
+        # Burst rank info AND the Color Source/Ranking Status detail live
+        # here together (row1's own right-hand group), not split across
+        # both rows - row 2's actions group (Reason/Prev/Keep/Reject/
+        # Neutral/Next, ~666px on its own) is already the single widest
+        # thing in the bar, so anything that can move off row 2 without
+        # hurting "Row 1 = info, Row 2 = controls" should, to keep row 2's
+        # own total comfortably under a MacBook's width - see this fix's
+        # own measurement (row 2 needed 1555px before this move).
+        row1_rank_group = QWidget(row1)
+        row1_rank_layout = QHBoxLayout(row1_rank_group)
+        row1_rank_layout.setContentsMargins(0, 0, 0, 0)
+        row1_rank_layout.setSpacing(12)
+        row1_rank_layout.addWidget(self._burst_id_label)
+        row1_rank_layout.addWidget(self._burst_rank_label)
+        row1_rank_layout.addWidget(self._burst_best_label)
+        row1_rank_layout.addWidget(self._burst_color_source_label)
+        row1_rank_layout.addWidget(self._burst_ranking_status_label)
 
-        bar_layout.addWidget(info_group, 0, 0, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        bar_layout.addWidget(actions_group, 0, 1, Qt.AlignmentFlag.AlignCenter)
-        bar_layout.addWidget(tools_group, 0, 2, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        row1_layout.addWidget(row1_info_group, 0, 0, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        row1_layout.addWidget(self._primary_score_label, 0, 1, Qt.AlignmentFlag.AlignCenter)
+        row1_layout.addWidget(row1_rank_group, 0, 2, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
 
-        if self._burst_scoped:
-            # A second bar row, only added for a burst-scoped session - read-
-            # only "Burst 18 / Burst Rank #2 of 7 / Best Image: Yes / Score
-            # 94.8" info (see the module docstring: no sort control here),
-            # kept separate from info_group above so a non-burst Loupe
-            # session's bar is byte-for-byte unchanged.
-            burst_group = QWidget(bottom_bar)
-            burst_layout = QHBoxLayout(burst_group)
-            burst_layout.setContentsMargins(0, 0, 0, 0)
-            burst_layout.setSpacing(10)
-            burst_layout.addWidget(self._burst_id_label)
-            burst_layout.addWidget(self._burst_rank_label)
-            burst_layout.addWidget(self._burst_best_label)
-            burst_layout.addWidget(self._burst_score_label)
-            burst_layout.addWidget(self._burst_color_source_label)
-            burst_layout.addWidget(self._burst_ranking_status_label)
-            bar_layout.addWidget(burst_group, 1, 0, 1, 3, Qt.AlignmentFlag.AlignCenter)
+        # Row 2 - secondary metadata (left) and every control (center:
+        # Reason/Prev/Keep/Reject/Neutral/Next, right: zoom/exposure/
+        # Elements/Boxes/Save JPEG). Same "outer columns share the leftover
+        # space, center column keeps its own size" trick as Row 1, so the
+        # core review workflow stays visually centered regardless of how
+        # wide the metadata/tools columns end up.
+        row2 = QWidget(bottom_bar)
+        row2.setObjectName("loupeRow2")
+        row2_layout = QGridLayout(row2)
+        row2_layout.setContentsMargins(16, 8, 16, 10)
+        row2_layout.setHorizontalSpacing(14)
+        row2_layout.setColumnStretch(0, 1)
+        row2_layout.setColumnStretch(1, 0)
+        row2_layout.setColumnStretch(2, 1)
+
+        row2_meta_group = QWidget(row2)
+        row2_meta_layout = QHBoxLayout(row2_meta_group)
+        row2_meta_layout.setContentsMargins(0, 0, 0, 0)
+        row2_meta_layout.setSpacing(12)
+        row2_meta_layout.addWidget(self._score_label)
+
+        row2_actions_group = QWidget(row2)
+        row2_actions_layout = QHBoxLayout(row2_actions_group)
+        row2_actions_layout.setContentsMargins(0, 0, 0, 0)
+        row2_actions_layout.setSpacing(10)
+        row2_actions_layout.addWidget(QLabel("Reason:"))
+        row2_actions_layout.addWidget(self._reason_combo)
+        row2_actions_layout.addWidget(self._reason_note)
+        row2_actions_layout.addWidget(prev_btn)
+        row2_actions_layout.addWidget(keep_btn)
+        row2_actions_layout.addWidget(reject_btn)
+        row2_actions_layout.addWidget(neutral_btn)
+        row2_actions_layout.addWidget(next_btn)
+
+        row2_tools_group = QWidget(row2)
+        row2_tools_layout = QHBoxLayout(row2_tools_group)
+        row2_tools_layout.setContentsMargins(0, 0, 0, 0)
+        row2_tools_layout.setSpacing(10)
+        row2_tools_layout.addWidget(self._zoom_label)
+        row2_tools_layout.addWidget(exp_down_btn)
+        row2_tools_layout.addWidget(self._exposure_label)
+        row2_tools_layout.addWidget(exp_up_btn)
+        row2_tools_layout.addWidget(self._elements_btn)
+        row2_tools_layout.addWidget(self._boxes_btn)
+        row2_tools_layout.addWidget(save_jpeg_btn)
+
+        row2_layout.addWidget(row2_meta_group, 0, 0, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        row2_layout.addWidget(row2_actions_group, 0, 1, Qt.AlignmentFlag.AlignCenter)
+        row2_layout.addWidget(row2_tools_group, 0, 2, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+        bottom_bar_layout = QVBoxLayout(bottom_bar)
+        bottom_bar_layout.setContentsMargins(0, 0, 0, 0)
+        bottom_bar_layout.setSpacing(0)
+        bottom_bar_layout.addWidget(row1)
+        bottom_bar_layout.addWidget(row2)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -774,6 +1029,17 @@ class LoupeDialog(QDialog):
         self._update_info_labels()
 
     def _refresh_detection_overlay(self) -> None:
+        """Boxes and Elements are mutually exclusive (see _on_boxes_toggled/
+        _on_elements_toggled - checking one unchecks the other), so exactly
+        one of these branches ever draws anything; the third case (neither
+        checked) just clears whatever was there."""
+        if self._show_elements:
+            try:
+                eye = self.service.eye_keypoints(self._current_path())
+            except Exception:  # noqa: BLE001 - a missing/unreadable eye record must not break the loupe
+                eye = None
+            self._view.set_elements_overlay(eye)
+            return
         if not self._show_boxes:
             self._view.clear_detection_overlay()
             return
@@ -789,6 +1055,16 @@ class LoupeDialog(QDialog):
 
     def _on_boxes_toggled(self, checked: bool) -> None:
         self._show_boxes = checked
+        if checked and self._elements_btn.isChecked():
+            self._elements_btn.setChecked(False)  # fires _on_elements_toggled, which also refreshes
+            return
+        self._refresh_detection_overlay()
+
+    def _on_elements_toggled(self, checked: bool) -> None:
+        self._show_elements = checked
+        if checked and self._boxes_btn.isChecked():
+            self._boxes_btn.setChecked(False)  # fires _on_boxes_toggled, which also refreshes
+            return
         self._refresh_detection_overlay()
 
     def _exposed_pixmap(self) -> QPixmap:
@@ -798,12 +1074,32 @@ class LoupeDialog(QDialog):
             return self._current_raw_pixmap
         return _apply_brightness(self._current_raw_pixmap, self._exposure_steps * EXPOSURE_STEP)
 
+    def _primary_strategy_id(self) -> str | None:
+        """Whichever ranking strategy is "the" algorithm right now - the
+        same one Burst Analysis/the gallery's Color Source picker/"Color by
+        Algorithm" coloring already treat as current (ReviewSession.
+        burst_strategy). The one score this dialog gives a single,
+        prominent, unambiguous readout to - see _primary_score_text."""
+        return getattr(self.service.session, "burst_strategy", None)
+
+    def _primary_score_text(self, info: dict) -> str:
+        """"IMAGE SCORE: 0.384" - the normalized [0, 1] score, exactly three
+        decimal places, never the *100 "38.4"-style reading the burst row
+        used to show (_update_burst_info_labels, before this - the same
+        number, just multiplied for a percent-style glance that turned out
+        to read as a totally different, wrong-looking scale)."""
+        strategy_id = self._primary_strategy_id()
+        entry = (info.get("ranking_results") or {}).get(strategy_id) or {} if strategy_id else {}
+        score = entry.get("score")
+        return f"IMAGE SCORE: {score:.3f}" if score is not None else "IMAGE SCORE: —"
+
     def _update_info_labels(self) -> None:
         path = self._current_path()
         info = self._current_item_info()
 
         self._counter_label.setText(f"Image {self.index + 1} of {len(self.image_paths)}")
         self._name_label.setText(Path(path).name)
+        self._primary_score_label.setText(self._primary_score_text(info))
         self._update_burst_info_labels()
 
         full_scores_text = self._scores_text(info)
@@ -825,23 +1121,18 @@ class LoupeDialog(QDialog):
             self._ai_badge_label.setText("")
 
     def _update_burst_info_labels(self) -> None:
-        """Burst ID / Burst Rank #X of N / Best Image / Score - only
-        populated for a burst-scoped session (see `_burst_scoped`); the
-        labels stay empty text otherwise so a non-burst Loupe session shows
-        nothing where this row would be."""
+        """Burst ID / Burst Rank #X of N / Best Image - only populated for a
+        burst-scoped session (see `_burst_scoped`); the labels stay empty
+        text otherwise so a non-burst Loupe session shows nothing where
+        this row would be. The score that produced burst_rank is the same
+        number _primary_score_text already shows prominently (both read
+        the same self._primary_strategy_id()) - no longer repeated here."""
         if not self._burst_scoped or self.items is None:
             return
         item = self.items[self.index]
         self._burst_id_label.setText(_format_burst_label(item.burst_id) if item.burst_id else "")
         self._burst_rank_label.setText(f"Burst Rank #{item.burst_rank} of {item.burst_size}")
         self._burst_best_label.setText(f"Best Image: {'Yes' if item.burst_best else 'No'}")
-        # The score that actually produced burst_rank - whichever ranking
-        # strategy Burst Analysis is currently keyed to (ReviewSession.
-        # burst_strategy), not necessarily the AI model. *100 to match a
-        # "94.8"-style readout instead of the score bar's raw "0.9480".
-        strategy_id = getattr(self.service.session, "burst_strategy", None)
-        score = item.score_for(strategy_id) if strategy_id else None
-        self._burst_score_label.setText(f"Score {score * 100:.1f}" if score is not None else "Score -")
 
 
     def _update_status_indicators(self, status: str) -> None:
@@ -928,6 +1219,16 @@ class LoupeDialog(QDialog):
             self._go_next()
         elif key == Qt.Key.Key_Left:
             self._go_prev()
+        elif key in (Qt.Key.Key_Plus, Qt.Key.Key_Equal):
+            # Key_Equal, not just Key_Plus: on a standard US keyboard "+" is
+            # Shift+= , and Qt reports the unshifted key (Key_Equal) for a
+            # plain "=" press - accepting both means the shortcut works
+            # whether or not the photographer holds Shift, matching how
+            # every other zoom-by-keyboard app (e.g. a browser's Ctrl+=)
+            # already behaves.
+            self._view.zoom_by(1.15)
+        elif key == Qt.Key.Key_Minus:
+            self._view.zoom_by(1 / 1.15)
         elif key == Qt.Key.Key_Escape:
             self.accept()
         else:

@@ -783,11 +783,13 @@ def test_loupe_burst_info_labels_show_id_rank_best_and_score(tmp_path) -> None:
         start_index=0, burst_scoped=True,
     )
 
-    # Position 0 is "b.jpg", rank #1 of 3, best, score 0.948.
+    # Position 0 is "b.jpg", rank #1 of 3, best, score 0.948 - shown by the
+    # prominent IMAGE SCORE label (normalized, exactly 3 decimals), not a
+    # separate burst-row score readout (removed - redundant with it).
     assert dialog._burst_id_label.text() == "Burst 18"
     assert dialog._burst_rank_label.text() == "Burst Rank #1 of 3"
     assert dialog._burst_best_label.text() == "Best Image: Yes"
-    assert dialog._burst_score_label.text() == "Score 94.8"
+    assert dialog._primary_score_label.text() == "IMAGE SCORE: 0.948"
 
     dialog._go_next()
     assert dialog._burst_rank_label.text() == "Burst Rank #2 of 3"

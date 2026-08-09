@@ -492,6 +492,90 @@ class ApplyAiSuggestionsTests(SessionTestCase):
         self.assertEqual(session._image_for(agreeing).review_status, REVIEW_STATUS_KEEP)
 
 
+class ApplyAlgorithmSuggestionsTests(SessionTestCase):
+    """apply_algorithm_suggestions - the general form of apply_ai_suggestions,
+    parameterized on which strategy's own cutoff to bulk-apply instead of
+    always the AI model. Added for the desktop "Apply Cutoff" toolbar
+    action: previously it always wrote the AI model's own suggestion no
+    matter which strategy the Color Source picker showed, so applying a
+    cutoff while viewing a different algorithm's coloring could leave a
+    clearly-top-scored image (under THAT algorithm) Reject-colored, because
+    the AI model - not the algorithm on screen - had decided the cutoff.
+    """
+
+    def test_applies_the_given_strategy_s_own_suggestion_not_the_ai_model_s(self):
+        shoot, images, _ = build_shoot(self.root, ranked=4)
+        session = self.session(shoot, keep_percent=50)
+        # A second strategy whose ranking is the exact REVERSE of the AI
+        # model's (images[0] is the AI's best pick and images[-1] its
+        # worst - see build_shoot's own docstring).
+        other_strategy = "classic-vision"
+        for index, path in enumerate(images):
+            image = session._image_for(str(path))
+            image.ranking_results[other_strategy] = {"score": index * 0.1, "rank": None}
+
+        result = session.apply_algorithm_suggestions(other_strategy)
+
+        self.assertEqual(result["applied"], 4)
+        # Reversed order: the AI's WORST pick (images[-1]) has the highest
+        # "classic-vision" score, so it - not images[0] - is Kept.
+        self.assertEqual(session._image_for(str(images[-1])).review_status, REVIEW_STATUS_KEEP)
+        self.assertEqual(session._image_for(str(images[0])).review_status, REVIEW_STATUS_REJECT)
+
+    def test_never_touches_an_image_the_given_strategy_never_scored(self):
+        shoot, images, _ = build_shoot(self.root, ranked=4)
+        session = self.session(shoot, keep_percent=50)
+        other_strategy = "classic-vision"
+        # Only scores TWO of the four images with the other strategy.
+        for index, path in enumerate(images[:2]):
+            image = session._image_for(str(path))
+            image.ranking_results[other_strategy] = {"score": 1.0 - index * 0.1, "rank": index + 1}
+
+        result = session.apply_algorithm_suggestions(other_strategy)
+
+        self.assertEqual(result["applied"], 2, "only the two images that strategy actually scored")
+        for path in images[2:]:
+            self.assertEqual(session._image_for(str(path)).review_status, REVIEW_STATUS_NEUTRAL)
+
+    def test_never_touches_an_image_already_decided_unless_told_to(self):
+        shoot, images, _ = build_shoot(self.root, ranked=4)
+        session = self.session(shoot, keep_percent=50)
+        other_strategy = "classic-vision"
+        for index, path in enumerate(images):
+            image = session._image_for(str(path))
+            image.ranking_results[other_strategy] = {"score": index * 0.1, "rank": None}
+        # Deliberately disagree with classic-vision's own top pick.
+        session.set_review_status(str(images[-1]), REVIEW_STATUS_REJECT)
+
+        result = session.apply_algorithm_suggestions(other_strategy, include_decided=False)
+        self.assertEqual(result["conflicts"], 1)
+        self.assertEqual(session._image_for(str(images[-1])).review_status, REVIEW_STATUS_REJECT)
+
+        result = session.apply_algorithm_suggestions(other_strategy, include_decided=True)
+        self.assertEqual(result["overridden"], 1)
+        self.assertEqual(session._image_for(str(images[-1])).review_status, REVIEW_STATUS_KEEP)
+
+    def test_apply_ai_suggestions_is_unaffected_and_stays_ai_specific(self):
+        """Regression: adding apply_algorithm_suggestions must not change
+        apply_ai_suggestions's own behavior - it is still always the AI
+        model, regardless of any other strategy's scores on the same
+        images (see apply_ai_suggestions's own docstring on why - it backs
+        agreement_stats/evaluation_report.py, which are deliberately
+        AI-specific)."""
+        shoot, images, _ = build_shoot(self.root, ranked=4)
+        session = self.session(shoot, keep_percent=50)
+        for index, path in enumerate(images):
+            image = session._image_for(str(path))
+            image.ranking_results["classic-vision"] = {"score": index * 0.1, "rank": None}
+
+        session.apply_ai_suggestions()
+
+        # AI model order preserved (images[0] best -> Keep), unaffected by
+        # classic-vision's reversed scores on the very same images.
+        self.assertEqual(session._image_for(str(images[0])).review_status, REVIEW_STATUS_KEEP)
+        self.assertEqual(session._image_for(str(images[-1])).review_status, REVIEW_STATUS_REJECT)
+
+
 class AgreementStatsTests(SessionTestCase):
     """How often the photographer's own review status matches the AI's
     suggestion - informational, for evaluating the model over time."""

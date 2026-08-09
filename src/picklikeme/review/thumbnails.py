@@ -368,6 +368,16 @@ def eye_keypoints_for(image_path: str, *, crop_cache_dir: str | Path | None = No
         "head_top": keypoint_dict(eye.head_top),
         "left_shoulder": keypoint_dict(eye.left_shoulder),
         "right_shoulder": keypoint_dict(eye.right_shoulder),
+        # The holistic "is a real head instance present at all" scalar (see
+        # eyes.detector.EyeDetection.head_confidence's own docstring) -
+        # independent of any single landmark's own confidence, so a caller
+        # showing a "Head" element alongside "Left Eye"/"Right Eye" pairs it
+        # with the confidence that actually answers "is this a head" rather
+        # than reusing head_top's own (a landmark-position confidence,
+        # answering a narrower question). None for a backend that never
+        # computed one - same "no fabricated data" rule every field here
+        # already follows.
+        "head_confidence": eye.head_confidence,
     }
 
 
