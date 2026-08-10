@@ -82,16 +82,38 @@ class ReviewService:
         return result
 
     def thumbnail_path(self, image_path: str, *, with_boxes: bool = False) -> Path | None:
-        return review_thumbnail(image_path, with_boxes=with_boxes)
+        return review_thumbnail(image_path, with_boxes=with_boxes, strategy_id=self.session.burst_strategy)
 
     def preview_path(self, image_path: str) -> Path:
         return review_preview(image_path)
 
     def detection_boxes(self, image_path: str) -> dict[str, Any] | None:
+        # Subject/bird-crop detection - the SAME upstream detection cache
+        # (analyzer.detections.DetectionCache) regardless of which eye
+        # detector/ranking strategy is currently selected, so this is never
+        # scoped to a strategy the way eye_keypoints below is.
         return detection_boxes_for(image_path)
 
-    def eye_keypoints(self, image_path: str) -> dict[str, Any] | None:
-        return eye_keypoints_for(image_path)
+    def eye_keypoints(self, image_path: str, *, strategy_id: str | None = None) -> dict[str, Any] | None:
+        """`strategy_id`'s own cached eye-detector result for `image_path` -
+        defaults to the currently selected strategy (`ReviewSession.
+        burst_strategy`/Color Source), but a caller (a future "Elements
+        Source" picker - see the Loupe redesign brief) may request a
+        DIFFERENT strategy's result explicitly.
+
+        Structurally impossible to return a mismatched run now: `eyes.cache`
+        keys its sidecar by (image, strategy) (see that module's own
+        docstring), so this simply asks for the right one rather than
+        reading whichever one happens to be cached and then checking it
+        after the fact, the way this method used to. A strategy with no eye
+        detector at all (the AI model - see `ranking.eye_detector_names`)
+        has no sidecar under its own id, so this naturally returns None for
+        it without any special-casing.
+        """
+        strategy_id = strategy_id or self.session.burst_strategy
+        if not strategy_id:
+            return None
+        return eye_keypoints_for(image_path, strategy_id)
 
     def save_jpeg(self, image_path: str, destination_path: str | Path) -> Path:
         from ..analyzer.contactsheets import export_jpeg_bytes

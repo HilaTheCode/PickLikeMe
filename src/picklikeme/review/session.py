@@ -256,9 +256,54 @@ class ReviewSession:
         self.input_folder = Path(input_folder).resolve()
         self.ranking_file = Path(ranking_file) if ranking_file else ranking_path(self.input_folder)
         self.run_metadata = read_run_metadata(self.input_folder)
+        self.burst_strategy = self.latest_run_strategy()
         with self._state_lock:
             self.warnings: list[str] = []
         self.load()
+
+    def latest_run_strategy(self) -> str:
+        """"Algorithm Ran Last": whichever strategy actually produced this
+        folder's most recent completed ranking run, not a hard-coded
+        constant - the ONE centralized definition of that concept, used both
+        to seed `burst_strategy` when a folder opens (see `open_folder`
+        above) and, on demand, by the desktop Color Source selector's own
+        explicit "Algorithm Ran Last" option (see `main_window.
+        color_source_options`) so a photographer can return to "whichever
+        is latest" after manually picking a specific strategy, without
+        needing to know its name.
+
+        Before this existed, `burst_strategy` (and therefore the desktop
+        Color Source selector, Grid coloring, filtering, cutoff, and Burst
+        ranking - everything downstream of it, see this attribute's own
+        docstring) always started at `AI_STRATEGY_ID` regardless of what had
+        actually been run on the folder. On a folder ranked only by Classic
+        Vision strategies (the AI model never run there at all - no
+        `ranking.csv`), that meant the Grid opened showing "no algorithm
+        suggestion" for literally every image by default - not because
+        nothing was detected, but because the strategy being displayed
+        simply had no data - while the Loupe's Elements/Boxes overlay (see
+        `review.thumbnails.eye_keypoints_for`) reads a detector-result cache
+        that is not gated by `burst_strategy` at all, so it could still show
+        real detections for the same images. Two different parts of the app
+        reading two different, disconnected notions of "the result" for the
+        same folder - this is the fix.
+
+        `run.json`'s own `strategy` field (see `sidecar.write_run_metadata`,
+        written by every strategy's own `rank_folder`) already records
+        exactly this - it just was not being read as a decision, only shown
+        as provenance text. Validated against `discover_strategy_rankings`
+        before trusting it: `run.json` could in principle name a strategy
+        whose CSV was later deleted, and an explicit fallback to
+        `AI_STRATEGY_ID` (still correct for a genuinely fresh, never-ranked
+        folder - every image legitimately starts Neutral there) is safer
+        than trusting stale provenance blindly.
+        """
+        from ..sidecar import discover_strategy_rankings
+
+        last_run_strategy = self.run_metadata.get("strategy")
+        if last_run_strategy and last_run_strategy in discover_strategy_rankings(self.input_folder):
+            return last_run_strategy
+        return AI_STRATEGY_ID
 
     def load(self) -> None:
         """(Re)build the gallery from the ranking, the folder, and the store.

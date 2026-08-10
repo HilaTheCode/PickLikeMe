@@ -153,21 +153,39 @@ def sort_options() -> list[tuple[str, str]]:
     return options
 
 
-def color_source_options() -> list[tuple[str | None, str]]:
-    """(strategy_id_or_None, label) for the Color combo, one entry per
-    analysis module plus the default.
+# Sentinel Color Source value meaning "Algorithm Ran Last" - see
+# color_source_options's own docstring and MainWindow._resolve_color_source
+# for how this differs from picking a specific strategy by name: this one
+# re-resolves to whichever strategy actually ran most recently EVERY time
+# it is used, rather than freezing to whatever that happened to be at
+# selection time. Not a real strategy_id (never registered in `ranking`),
+# so it can never collide with one - deliberately not `None`, which already
+# means "Review Status" (see below).
+ALGORITHM_RAN_LAST = "__algorithm_ran_last__"
 
+
+def color_source_options() -> list[tuple[str | None, str]]:
+    """(strategy_id_or_sentinel_or_None, label) for the Color combo - one
+    entry per analysis module, plus "Algorithm Ran Last" and "Review
+    Status".
+
+    `ALGORITHM_RAN_LAST` (listed first - the default a freshly opened
+    folder starts on, see `MainWindow.latest_run_strategy`) means "whichever
+    strategy actually produced this folder's most recent completed run" -
+    re-resolved every time it is used (`MainWindow._resolve_color_source`),
+    never pinned to one specific strategy the way picking it by name is.
     `None` means "tint a card's background by review status" - Keep/Reject
     green/red, Neutral the plain background - exactly today's behavior.
-    Anything else tints the background by that strategy's own score instead
-    (low to high, across whatever is currently visible), for scanning a
-    Classic Vision-ranked folder's ordering at a glance without needing to
-    sort by it first. Built from the registry, like `sort_options`, so a
-    future module is colorable the moment it is runnable.
+    Anything else (a real strategy_id) tints the background by that
+    strategy's own score instead (low to high, across whatever is currently
+    visible), for scanning a Classic Vision-ranked folder's ordering at a
+    glance without needing to sort by it first. The per-strategy entries are
+    built from the registry, like `sort_options`, so a future module is
+    colorable the moment it is runnable.
     """
     from ..ranking import available_strategies
 
-    options: list[tuple[str | None, str]] = [(None, "Review Status")]
+    options: list[tuple[str | None, str]] = [(ALGORITHM_RAN_LAST, "Algorithm Ran Last"), (None, "Review Status")]
     for info in available_strategies():
         options.append((info.strategy_id, f"{info.display_name} Score"))
     return options
@@ -223,10 +241,12 @@ class MainWindow(QMainWindow):
             if stored_burst_sort_mode in (BURST_SORT_CAPTURE_TIME, BURST_SORT_BURST_SCORE)
             else DEFAULT_BURST_SORT_MODE
         )
-        # None (the default) means "tint by review status" - see
-        # color_source_options(). Anything else is a strategy id whose score
-        # tints the background instead.
-        self._color_source: str | None = None
+        # ALGORITHM_RAN_LAST (the default, matching the combo's own first
+        # item - see color_source_options()) dynamically resolves to
+        # whichever strategy most recently ran (_resolve_color_source);
+        # None means "tint by review status"; anything else is a specific
+        # strategy id whose score tints the background instead.
+        self._color_source: str | None = ALGORITHM_RAN_LAST
         self._last_counts: dict[str, Any] = {}
         # Last-used parameters per ranking strategy, so re-running one starts
         # from what was chosen before rather than the defaults. Session-scoped
@@ -953,6 +973,7 @@ class MainWindow(QMainWindow):
             state = self.service.load_session()
             self.state.current_folder = state.get("input_folder") or self.state.current_folder
             self.state.image_count = state.get("counts", {}).get("total", 0)
+            self._sync_color_source_from_session()
             self._refresh_from_state(state)
             self.event_bus.publish("folder-opened", {"folder": self.state.current_folder, "count": self.state.image_count})
             self.job_manager.submit(
@@ -1056,7 +1077,7 @@ class MainWindow(QMainWindow):
         shared filtering engine's generic shape - see filtering.py's own
         docstring for why this adapter, rather than a data-model
         unification, is what "one shared engine" means here."""
-        strategy_id = self._color_source or DEFAULT_STRATEGY_ID
+        strategy_id = self._resolve_color_source() or DEFAULT_STRATEGY_ID
         records: list[FilterableRecord] = []
         for item in self._all_items:
             metrics = item.metrics.get(strategy_id) or {}
@@ -1251,13 +1272,61 @@ class MainWindow(QMainWindow):
             self._gallery_view.setCurrentIndex(self._gallery_model.index(0, 0))
         self._gallery_view.set_empty_message(self._empty_message_for_current_state())
 
+    def _sync_color_source_from_session(self) -> None:
+        """Make the Color Source combo (and everything it drives - Grid
+        coloring, Apply Cutoff, Burst ranking, Filtering) reflect THIS
+        folder's own "Algorithm Ran Last" (`ReviewSession.
+        latest_run_strategy`) rather than whatever the combo happened
+        to be showing from a previously-open folder, or its own first-item
+        default ("Review Status", index 0 - see `color_source_options`).
+
+        Before this existed, `_color_source` (a plain UI-local variable, set
+        ONLY by `_on_color_source_changed`) was never synchronised FROM
+        `ReviewSession.burst_strategy` - only ever pushed the other
+        direction, combo -> session. On a freshly opened folder that had
+        been ranked only by a non-default strategy, that meant the combo
+        kept showing "Review Status" while the session had already
+        (correctly, after `latest_run_strategy`) selected the strategy
+        that actually has data - a real, visible mismatch between what the
+        photographer sees selected and what the Grid/Cutoff/Filter actually
+        use, which is exactly the class of bug this whole pass exists to
+        close. Called once per folder open (`_finish_open_folder`) and once
+        per completed ranking run (`_run_ranking`'s `_on_success`) - a fresh
+        ranking result IS the new "Algorithm Ran Last" the moment it
+        finishes, so the Grid should reflect it immediately without the
+        photographer having to touch the Color Source combo by hand.
+        """
+        self._color_source = ALGORITHM_RAN_LAST
+        index = self._color_combo.findData(ALGORITHM_RAN_LAST)
+        self._color_combo.blockSignals(True)
+        self._color_combo.setCurrentIndex(max(0, index))
+        self._color_combo.blockSignals(False)
+        resolved = self._resolve_color_source()
+        self.service.set_burst_strategy(resolved or DEFAULT_STRATEGY_ID)
+        self._gallery_view.set_color_source(resolved)
+
+    def _resolve_color_source(self) -> str | None:
+        """What `self._color_source` actually means right now: a real
+        strategy_id, `None` (Review Status), or - if it is the
+        `ALGORITHM_RAN_LAST` sentinel - whichever strategy
+        `ReviewSession.latest_run_strategy` currently resolves to, re-checked
+        on every call rather than cached, so it always tracks the true
+        latest run even as new rankings complete. Every caller that used to
+        read `self._color_source` directly to decide what to score/color/
+        filter by now goes through this instead - see `color_source_options`
+        for why the sentinel exists.
+        """
+        if self._color_source == ALGORITHM_RAN_LAST:
+            return self.service.session.latest_run_strategy()
+        return self._color_source
+
     def _on_color_source_changed(self, index: int) -> None:
         self._color_source = self._color_combo.itemData(index)
         # Burst Analysis ranks each burst's members by this same "selected
         # ranking strategy" (see ReviewSession.set_burst_strategy) - "Review
         # Status" (None) is not a ranking strategy, so that case falls back
         # to the AI model, same as burst_strategy's own default.
-        self.service.set_burst_strategy(self._color_source or DEFAULT_STRATEGY_ID)
+        self.service.set_burst_strategy(self._resolve_color_source() or DEFAULT_STRATEGY_ID)
         # Scroll-preserving (see _refresh_preserving_scroll's own docstring,
         # Manual QA Issue 1): switching Color Source recolors the whole
         # gallery through the same full model reset a decision change does,
@@ -1281,7 +1350,7 @@ class MainWindow(QMainWindow):
         `items` is no longer used: algorithm_suggestion is already computed
         per-item against the current threshold, so there is no separate
         score range to derive from whichever set is currently visible."""
-        self._gallery_view.set_color_source(self._color_source)
+        self._gallery_view.set_color_source(self._resolve_color_source())
 
     @staticmethod
     def _filter_items(items: list[ImageItem], current_filter: str) -> list[ImageItem]:
@@ -1422,7 +1491,7 @@ class MainWindow(QMainWindow):
         if not self.state.current_folder:
             self._set_status("Open a folder before setting the AI cutoff")
             return
-        strategy_id = self._color_source or DEFAULT_STRATEGY_ID
+        strategy_id = self._resolve_color_source() or DEFAULT_STRATEGY_ID
         strategy_label = self._color_combo.currentText() if self._color_source else "AI Model"
         percent = self._cutoff_spin.value()
         state = self.service.set_keep_percent(percent)
@@ -1686,6 +1755,15 @@ class MainWindow(QMainWindow):
             # was cached), so every cached pixmap must be dropped before the
             # gallery repaints, not just the session state refreshed.
             self.cache_manager.clear_thumbnails()
+            # The ranking that just finished is now this folder's own
+            # "Algorithm Ran Last" (ReviewService.rank_folder already
+            # re-opened the session, which recomputed
+            # ReviewSession.burst_strategy from it - see
+            # ReviewSession.latest_run_strategy) - sync the Color
+            # Source combo to match before repainting the gallery, so it
+            # shows this run's results without the photographer needing to
+            # touch the combo themselves.
+            self._sync_color_source_from_session()
             self._refresh_from_state(result["state"])
             self._set_status(self._ranking_summary(result))
             device = result.get("device")
@@ -2002,7 +2080,7 @@ class MainWindow(QMainWindow):
         dialog = AnalyticsDashboard(
             settings=self._settings,
             root_folder=self.state.current_folder,
-            color_source=self._color_source,
+            color_source=self._resolve_color_source(),
             keep_percent=self.service.session.keep_percent,
             parent=self,
         )

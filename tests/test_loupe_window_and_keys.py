@@ -532,10 +532,10 @@ def test_trackpad_pinch_native_gesture_zooms(app, tmp_path) -> None:
         service.close()
 
 
-def test_elements_and_boxes_toggles_are_mutually_exclusive(app, tmp_path) -> None:
-    """Checking one unchecks the other - both draw over the same eye/head
-    region, and showing both overlays at once would be clutter, not more
-    information (see _refresh_detection_overlay's own docstring)."""
+def test_elements_and_boxes_are_independently_toggleable(app, tmp_path) -> None:
+    """Manual QA: Elements must not accidentally hide Boxes, or vice versa -
+    checking one must never uncheck the other. Both, either, or neither can
+    be active at once (see _refresh_detection_overlay's own docstring)."""
     dialog, service = _burst_dialog(tmp_path, n=1)
     try:
         dialog._boxes_btn.setChecked(True)
@@ -544,13 +544,13 @@ def test_elements_and_boxes_toggles_are_mutually_exclusive(app, tmp_path) -> Non
 
         dialog._elements_btn.setChecked(True)
         assert dialog._show_elements is True
-        assert dialog._show_boxes is False
-        assert dialog._boxes_btn.isChecked() is False
+        assert dialog._show_boxes is True  # unchanged - Boxes stays on
+        assert dialog._boxes_btn.isChecked() is True
 
-        dialog._boxes_btn.setChecked(True)
-        assert dialog._show_boxes is True
-        assert dialog._show_elements is False
-        assert dialog._elements_btn.isChecked() is False
+        dialog._boxes_btn.setChecked(False)
+        assert dialog._show_boxes is False
+        assert dialog._show_elements is True  # unchanged - Elements stays on
+        assert dialog._elements_btn.isChecked() is True
     finally:
         dialog.close()
         service.close()
@@ -625,6 +625,68 @@ def test_elements_overlay_skips_an_element_with_no_confidence_to_show(app, tmp_p
                 i.text() for i in dialog._view._overlay_items if isinstance(i, QGraphicsSimpleTextItem)
             }
             assert labels == {"Left Eye — 0.94"}
+    finally:
+        dialog.close()
+        service.close()
+
+
+# ---------------------------------------------------------------------------
+# 3. A corrupt cached preview must self-heal, not show a permanently blank
+#    Loupe with no error at all - see review.thumbnails.review_preview's own
+#    atomic-write fix and this file's _load_current isNull() check.
+# ---------------------------------------------------------------------------
+
+
+def test_a_corrupt_cached_preview_is_deleted_and_regenerated(app, tmp_path) -> None:
+    """Reproduces the real failure: QPixmap silently returns a null pixmap
+    (no exception) for a truncated/corrupt cached preview JPEG - previously
+    invisible to _load_current, which never checked isNull(). The cache
+    lookup only ever checked existence, so a corrupt file was served
+    forever. Both are fixed now: a stale corrupt cache entry is deleted and
+    regenerated on the very next load."""
+    dialog, service = _burst_dialog(tmp_path, n=1)
+    try:
+        path = dialog._current_path()
+        cached_preview = service.preview_path(path)
+        assert cached_preview.is_file()
+
+        # Simulate an interrupted write: truncate the real cached preview to
+        # a handful of garbage bytes - non-empty, so a naive "0 bytes means
+        # corrupt" check alone would miss it; only a real decode attempt
+        # (QPixmap's own) catches this.
+        cached_preview.write_bytes(b"\xff\xd8\xff\x00garbage-not-a-real-jpeg")
+
+        dialog._load_current()  # must not raise, and must not stay blank
+
+        assert dialog._current_raw_pixmap is not None
+        assert not dialog._current_raw_pixmap.isNull()
+        # The cache healed itself: the same path now holds a real, decodable
+        # image again rather than the garbage bytes written above.
+        assert cached_preview.stat().st_size > len(b"\xff\xd8\xff\x00garbage-not-a-real-jpeg")
+    finally:
+        dialog.close()
+        service.close()
+
+
+def test_a_missing_preview_source_still_shows_a_warning_not_a_silent_blank(app, tmp_path, monkeypatch) -> None:
+    """If regeneration itself fails (e.g. the source file was deleted from
+    disk between opening the Loupe and navigating to it), the failure must
+    be visible - a warning dialog, not an indistinguishable blank frame."""
+    from unittest import mock
+
+    dialog, service = _burst_dialog(tmp_path, n=1)
+    try:
+        path = dialog._current_path()
+        cached_preview = service.preview_path(path)
+        cached_preview.write_bytes(b"not a real jpeg at all")
+        # Regeneration itself now fails too (source unreadable/removed).
+        with mock.patch.object(service, "preview_path", side_effect=[cached_preview, FileNotFoundError("gone")]):
+            with mock.patch(
+                "picklikeme.desktop.dialogs.loupe_dialog.QMessageBox.warning"
+            ) as warn:
+                dialog._load_current()
+                assert warn.called
+        assert dialog._current_raw_pixmap.isNull()
     finally:
         dialog.close()
         service.close()

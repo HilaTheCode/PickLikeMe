@@ -165,7 +165,15 @@ def review_preview(
 
     cache_dir = cache_dir or REVIEW_PREVIEW_CACHE
     target = _preview_cache_path(cache_dir, image_path)
-    if target.exists():
+    # A 0-byte file is what an interrupted write (crash, force-quit, a full
+    # disk) leaves behind now that the write itself is atomic (see below) -
+    # this only ever catches a file left over from BEFORE that fix, since an
+    # atomic write can never itself be observed half-finished. Treated as a
+    # cache miss rather than trusted, so a stale corrupt entry heals itself
+    # on the next read instead of being served forever - see the Loupe
+    # reliability investigation this responds to (a null QPixmap from a
+    # truncated cached JPEG, with nothing upstream ever re-checking it).
+    if target.exists() and target.stat().st_size > 0:
         try:
             os.utime(target, None)  # mark "recently used" - see _enforce_cache_budget
         except OSError:
@@ -174,7 +182,14 @@ def review_preview(
 
     image = load_source_image(image_path)
     target.parent.mkdir(parents=True, exist_ok=True)
-    image.save(target, format="JPEG", quality=92)
+    # Written to a temporary name and renamed into place on success - the
+    # same write-then-replace discipline the Vision Cache's own crop/
+    # detection writers already use, so a process killed mid-write can never
+    # leave a partial JPEG parked at the real cache path (the failure mode
+    # this function's own 0-byte check above exists to heal from).
+    tmp = target.with_name(target.name + ".tmp")
+    image.save(tmp, format="JPEG", quality=92)
+    tmp.replace(target)
 
     count = _writes_since_sweep.get(cache_dir, 0) + 1
     if count >= PREVIEW_CACHE_SWEEP_INTERVAL_WRITES:
@@ -203,6 +218,7 @@ def review_thumbnail(
     image_path: str,
     *,
     with_boxes: bool = False,
+    strategy_id: str | None = None,
     size: int = REVIEW_THUMBNAIL_SIZE,
     cache_dir: Path | None = None,
 ) -> Path | None:
@@ -213,12 +229,16 @@ def review_thumbnail(
     rebuilt. Falls back to the plain thumbnail when the image has no recorded
     detections, which is the honest answer: there are no boxes to draw.
 
-    Also draws the eye detector's result (see `eye_keypoints_for`) when
-    Classic Vision has run on this image. The overlaid file's own cache key
-    reflects whether eye data was available (see
-    `contactsheets.annotated_thumbnail_path`'s `has_eye`), so a folder
-    toggled to Detector Boxes before its first Classic Vision run does not
-    keep serving a stale, eye-less copy back once one exists.
+    Also draws the eye detector's result (see `eye_keypoints_for`) for
+    `strategy_id` - the currently selected ranking strategy/Color Source
+    (`None` when no strategy applies, e.g. the AI model, which has no eye
+    detector at all - see `eye_keypoints_for`'s own docstring), never
+    "whichever strategy happened to run last" (see `eyes.cache`'s module
+    docstring for the bug this fixes). The overlaid file's own cache key
+    reflects both whether eye data was available AND which strategy it came
+    from (see `contactsheets.annotated_thumbnail_path`'s `has_eye`/
+    `eye_strategy_id`), so switching Color Source never serves a different
+    strategy's stale overlaid thumbnail back.
     """
     from ..analyzer.contactsheets import annotate_thumbnail, annotated_thumbnail_path, build_thumbnail
 
@@ -227,8 +247,8 @@ def review_thumbnail(
     if plain is None or not with_boxes:
         return plain
 
-    eye = eye_keypoints_for(image_path)
-    overlaid = annotated_thumbnail_path(cache_dir, image_path, size, has_eye=eye is not None)
+    eye = eye_keypoints_for(image_path, strategy_id) if strategy_id else None
+    overlaid = annotated_thumbnail_path(cache_dir, image_path, size, has_eye=eye is not None, eye_strategy_id=strategy_id)
     if overlaid.exists():
         return overlaid
 
@@ -296,17 +316,26 @@ def close_detections() -> None:
         _detection_cache = None
 
 
-def eye_keypoints_for(image_path: str, *, crop_cache_dir: str | Path | None = None) -> dict | None:
-    """A Classic Vision run's eye-detector result for one image, in
-    full-frame pixel coordinates - the same read-only shape
-    `detection_boxes_for` returns, for a caller (the Gallery overlay, the
-    Loupe) that wants to draw the eye box and both raw left/right keypoints
-    alongside the subject box.
+def eye_keypoints_for(image_path: str, strategy_id: str, *, crop_cache_dir: str | Path | None = None) -> dict | None:
+    """`strategy_id`'s own eye-detector result for one image, in full-frame
+    pixel coordinates - the same read-only shape `detection_boxes_for`
+    returns, for a caller (the Gallery overlay, the Loupe) that wants to
+    draw the eye box and both raw left/right keypoints alongside the
+    subject box.
 
-    None when Classic Vision has never run on this image (no cached eye
+    `strategy_id` is REQUIRED, not inferred: `eyes.cache` keys its sidecar
+    by (image, strategy) precisely so a caller can never accidentally read
+    a different strategy's cached result than the one it means to display
+    (see that module's own docstring for the bug this closes - Elements/
+    Boxes showing a stale, mismatched run). A caller with no strategy that
+    has an eye detector at all (the AI model) simply has nothing to pass
+    here that would resolve to a real record - see
+    `ranking.eye_detector_names` for which strategies do.
+
+    None when `strategy_id` has never run on this image (no cached eye
     record - see `eyes.cache`) or there is no recorded subject box to map it
     against. Review must never run the eye detector itself, only ever read
-    what an earlier Classic Vision run already computed - the same rule
+    what an earlier ranking run already computed - the same rule
     `detection_boxes_for` and `detected_category_for` already follow.
 
     The eye record's box/keypoints are in the subject CROP's own pixel
@@ -323,7 +352,7 @@ def eye_keypoints_for(image_path: str, *, crop_cache_dir: str | Path | None = No
     """
     from ..eyes.cache import read_eye_detection
 
-    eye = read_eye_detection(crop_cache_dir or DEFAULT_CROP_CACHE_DIR, image_path)
+    eye = read_eye_detection(crop_cache_dir or DEFAULT_CROP_CACHE_DIR, image_path, strategy_id)
     if eye is None:
         return None
     try:
@@ -356,6 +385,17 @@ def eye_keypoints_for(image_path: str, *, crop_cache_dir: str | Path | None = No
         "source_size": record.source_size,
         "accepted": eye.accepted,
         "confidence": eye.confidence,
+        # Which eye detector actually produced this cached record - see
+        # eyes.cache.EyeRecord.detector_id's own docstring. This sidecar
+        # holds exactly one slot per image, overwritten by whichever eye
+        # detector last ran on it, regardless of which ranking strategy a
+        # caller currently has selected (ReviewSession.burst_strategy) - a
+        # caller that cares whether this record actually belongs to the
+        # CURRENTLY selected run (the desktop Loupe/Gallery overlay does -
+        # see desktop.services.ReviewService.eye_keypoints) needs this field
+        # to check, since nothing here can know what "currently selected"
+        # means on its own.
+        "detector_id": eye.detector_id,
         "box": (x1, y1, x2, y2),
         "left": keypoint_dict(eye.left),
         "right": keypoint_dict(eye.right),
@@ -381,9 +421,10 @@ def eye_keypoints_for(image_path: str, *, crop_cache_dir: str | Path | None = No
     }
 
 
-def eye_keypoints_in_crop_for(image_path: str, *, crop_cache_dir: str | Path | None = None) -> dict | None:
-    """The same eye-detector result as `eye_keypoints_for`, left in the
-    subject CROP's own pixel space instead of rescaled onto the full frame.
+def eye_keypoints_in_crop_for(image_path: str, strategy_id: str, *, crop_cache_dir: str | Path | None = None) -> dict | None:
+    """The same eye-detector result as `eye_keypoints_for` (see its own
+    docstring for why `strategy_id` is required), left in the subject
+    CROP's own pixel space instead of rescaled onto the full frame.
 
     Manual QA Issue 3: landmarks drawn on the full photo overlap and become
     unreadable, because the head - the only part of the frame any of them
@@ -399,7 +440,7 @@ def eye_keypoints_in_crop_for(image_path: str, *, crop_cache_dir: str | Path | N
     """
     from ..eyes.cache import read_eye_detection
 
-    eye = read_eye_detection(crop_cache_dir or DEFAULT_CROP_CACHE_DIR, image_path)
+    eye = read_eye_detection(crop_cache_dir or DEFAULT_CROP_CACHE_DIR, image_path, strategy_id)
     if eye is None:
         return None
     crop_width, crop_height = eye.subject_crop_size
@@ -415,6 +456,7 @@ def eye_keypoints_in_crop_for(image_path: str, *, crop_cache_dir: str | Path | N
         "source_size": (crop_width, crop_height),
         "accepted": eye.accepted,
         "confidence": eye.confidence,
+        "detector_id": eye.detector_id,  # see eye_keypoints_for's own comment
         "box": tuple(eye.box),
         "left": keypoint_dict(eye.left),
         "right": keypoint_dict(eye.right),

@@ -1290,5 +1290,62 @@ class BurstInfoTests(SessionTestCase):
             self.assertIn("burst_best", image_payload)
 
 
+class DefaultBurstStrategyTests(SessionTestCase):
+    """"Algorithm Ran Last": which strategy's results a freshly opened
+    folder shows by default - see ReviewSession.latest_run_strategy's
+    own docstring for the real bug this closes (a folder ranked only by a
+    non-AI strategy used to open showing "no algorithm suggestion" for
+    every image, because burst_strategy was hard-coded to the AI model
+    regardless of what had actually been run)."""
+
+    def test_a_folder_ranked_only_by_a_non_ai_strategy_defaults_to_it(self):
+        from picklikeme.sidecar import strategy_ranking_path, write_run_metadata
+
+        shoot, _, _ = build_shoot(self.root, ranked=0)  # no ai-model ranking.csv at all
+        real_image = shoot / "a.jpg"
+        real_image.write_bytes(b"frame")
+        write_strategy_ranking(strategy_ranking_path(shoot, "classic-vision"), [(real_image, 0.9)])
+        write_run_metadata(shoot, strategy="classic-vision")
+
+        session = self.session(shoot)
+
+        self.assertEqual(session.burst_strategy, "classic-vision")
+
+    def test_a_never_ranked_folder_still_defaults_to_the_ai_model(self):
+        shoot = self.root / "fresh"
+        shoot.mkdir()
+        (shoot / "a.jpg").write_bytes(b"frame")
+
+        session = self.session(shoot)
+
+        self.assertEqual(session.burst_strategy, AI_STRATEGY_ID)
+
+    def test_a_stale_run_json_pointing_at_a_deleted_strategy_falls_back_to_ai_model(self):
+        """run.json can in principle name a strategy whose CSV was later
+        deleted - trusting it blindly would leave burst_strategy pointing
+        at nothing. Falls back to the AI model, the same safe default a
+        genuinely fresh folder gets."""
+        from picklikeme.sidecar import write_run_metadata
+
+        shoot, images, _ = build_shoot(self.root, ranked=0)
+        write_run_metadata(shoot, strategy="classic-vision-fusion-mammals")  # no matching CSV exists
+
+        session = self.session(shoot)
+
+        self.assertEqual(session.burst_strategy, AI_STRATEGY_ID)
+
+    def test_a_folder_with_a_real_ai_model_ranking_still_defaults_to_it(self):
+        """The ordinary case, unchanged: an AI-ranked folder's run.json
+        names "ai-model" and the default is exactly what it always was."""
+        from picklikeme.sidecar import write_run_metadata
+
+        shoot, images, _ = build_shoot(self.root, ranked=3)
+        write_run_metadata(shoot, strategy=AI_STRATEGY_ID)
+
+        session = self.session(shoot)
+
+        self.assertEqual(session.burst_strategy, AI_STRATEGY_ID)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -112,7 +112,14 @@ class ReviewRequestHandler(AnnotationRequestHandler):
         from .thumbnails import review_thumbnail
 
         try:
-            thumbnail = review_thumbnail(str(target), with_boxes=want_boxes)
+            # burst_strategy is the web UI's own "selected strategy" (see
+            # _post_burst_strategy) - the same concept the desktop Color
+            # Source picker's ALGORITHM_RAN_LAST-resolved value feeds
+            # review_thumbnail with, so the boxes overlay here shows the
+            # currently selected run's eye data too, not none at all.
+            thumbnail = review_thumbnail(
+                str(target), with_boxes=want_boxes, strategy_id=self.session.burst_strategy
+            )
         except Exception as exc:  # noqa: BLE001 - a bad frame must not break the gallery
             logger.warning("No thumbnail for %s: %s", target, exc)
             self._send_json({"error": f"could not build a thumbnail: {exc}"}, status=500)

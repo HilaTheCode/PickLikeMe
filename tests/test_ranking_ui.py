@@ -564,12 +564,13 @@ def test_declining_the_rebuild_prompt_shows_the_plain_error_instead(app, tmp_pat
 # ---------------------------------------------------------------------------
 
 
-def test_color_source_options_lists_review_status_and_every_strategy(app) -> None:
-    from picklikeme.desktop.main_window import color_source_options
+def test_color_source_options_lists_algorithm_ran_last_review_status_and_every_strategy(app) -> None:
+    from picklikeme.desktop.main_window import ALGORITHM_RAN_LAST, color_source_options
 
     options = color_source_options()
-    assert options[0] == (None, "Review Status")
-    ids = [source for source, _ in options[1:]]
+    assert options[0] == (ALGORITHM_RAN_LAST, "Algorithm Ran Last")
+    assert options[1] == (None, "Review Status")
+    ids = [source for source, _ in options[2:]]
     assert set(ids) == {info.strategy_id for info in available_strategies()}
     labels = dict(options)
     assert labels["ai-model"] == "AI Model Score"
@@ -681,6 +682,93 @@ def test_selecting_a_color_source_propagates_to_the_gallery_delegate(app, tmp_pa
         window._color_source = None
         window._update_color_source(visible)
         assert window._gallery_view._delegate._color_source is None
+    finally:
+        window.close()
+        service.close()
+
+
+# ---------------------------------------------------------------------------
+# "Algorithm Ran Last" - the centralized, dynamically-resolving Color Source
+# option (see main_window.ALGORITHM_RAN_LAST / MainWindow._resolve_color_source
+# / ReviewSession.latest_run_strategy).
+# ---------------------------------------------------------------------------
+
+
+def _window_with_service(tmp_path):
+    from picklikeme.desktop.application import ApplicationState, WorkerManager
+    from picklikeme.desktop.main_window import MainWindow
+    from picklikeme.desktop.services import ReviewService
+    from picklikeme.desktop.settings import DesktopSettings
+
+    service = ReviewService(db_path=tmp_path / "annotations.sqlite")
+    window = MainWindow(
+        state=ApplicationState(), settings=DesktopSettings(),
+        service=service, worker_manager=WorkerManager(),
+    )
+    return window, service
+
+
+def test_algorithm_ran_last_is_the_selected_combo_item_by_default(app, tmp_path) -> None:
+    from picklikeme.desktop.main_window import ALGORITHM_RAN_LAST
+
+    window, service = _window_with_service(tmp_path)
+    try:
+        assert window._color_source == ALGORITHM_RAN_LAST
+        assert window._color_combo.currentData() == ALGORITHM_RAN_LAST
+    finally:
+        window.close()
+        service.close()
+
+
+def test_algorithm_ran_last_resolves_to_whichever_strategy_actually_ran(app, tmp_path) -> None:
+    """The core requirement: selecting "Algorithm Ran Last" must track
+    whichever strategy most recently completed a run - never a fixed
+    default, never whatever happened to be first in the registry."""
+    from picklikeme.sidecar import strategy_ranking_path, write_run_metadata
+
+    from picklikeme.review.session import ReviewSession
+
+    shoot = tmp_path / "shoot"
+    shoot.mkdir()
+    image = shoot / "a.jpg"
+    image.write_bytes(b"frame")
+    _write_csv(strategy_ranking_path(shoot, "classic-vision-fusion-mammals"), [(image, 0.7)])
+    write_run_metadata(shoot, strategy="classic-vision-fusion-mammals")
+
+    window, service = _window_with_service(tmp_path)
+    try:
+        service.open_folder(shoot)
+        window._sync_color_source_from_session()
+
+        from picklikeme.desktop.main_window import ALGORITHM_RAN_LAST
+
+        assert window._color_source == ALGORITHM_RAN_LAST
+        assert window._resolve_color_source() == "classic-vision-fusion-mammals"
+    finally:
+        window.close()
+        service.close()
+
+
+def _write_csv(target, entries) -> None:
+    import csv
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with target.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["metric", "value"])
+        writer.writerow([])
+        writer.writerow(["rank", "image_path", "score", "label"])
+        for rank, (path, score) in enumerate(entries, start=1):
+            writer.writerow([rank, str(path), f"{score:.6f}", 0])
+
+
+def test_a_manually_selected_strategy_does_not_change_when_a_different_strategy_ranks(app, tmp_path) -> None:
+    """Picking a specific strategy by name pins to it - only the
+    ALGORITHM_RAN_LAST sentinel re-resolves dynamically."""
+    window, service = _window_with_service(tmp_path)
+    try:
+        window._color_source = "classic-vision-eyepose-v0"
+        assert window._resolve_color_source() == "classic-vision-eyepose-v0"
     finally:
         window.close()
         service.close()

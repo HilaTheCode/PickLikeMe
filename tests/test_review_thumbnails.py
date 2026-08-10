@@ -106,7 +106,7 @@ class EyeKeypointsForTests(unittest.TestCase):
     def test_no_cached_eye_record_means_no_overlay(self):
         """No eye record at all - Classic Vision has never run on this image."""
         with mock.patch("picklikeme.eyes.cache.read_eye_detection", return_value=None):
-            self.assertIsNone(thumbnails_module.eye_keypoints_for("some/path.jpg"))
+            self.assertIsNone(thumbnails_module.eye_keypoints_for("some/path.jpg", "classic-vision-eyepose-v0"))
 
     def test_no_recorded_subject_means_no_overlay(self):
         """An eye was cached, but there is no subject box to map it against -
@@ -122,7 +122,7 @@ class EyeKeypointsForTests(unittest.TestCase):
                 detections.return_value.get.return_value = mock.Mock(
                     selected=None, source_size=(800, 600), expanded_box=None,
                 )
-                self.assertIsNone(thumbnails_module.eye_keypoints_for("some/path.jpg"))
+                self.assertIsNone(thumbnails_module.eye_keypoints_for("some/path.jpg", "classic-vision-eyepose-v0"))
 
     def test_no_expanded_box_means_no_overlay(self):
         """A record with a selected subject but no recorded expanded_box (a
@@ -142,7 +142,7 @@ class EyeKeypointsForTests(unittest.TestCase):
                     source_size=(800, 600),
                     expanded_box=None,
                 )
-                self.assertIsNone(thumbnails_module.eye_keypoints_for("some/path.jpg"))
+                self.assertIsNone(thumbnails_module.eye_keypoints_for("some/path.jpg", "classic-vision-eyepose-v0"))
 
     def test_rescales_the_box_and_keypoints_from_crop_space_to_frame_space(self):
         """A 100x100 subject crop mapped onto a 200x200 full-frame box at
@@ -169,7 +169,7 @@ class EyeKeypointsForTests(unittest.TestCase):
                 detections.return_value.get.return_value = mock.Mock(
                     selected=subject, source_size=(1920, 1080), expanded_box=(400.0, 300.0, 600.0, 500.0),
                 )
-                result = thumbnails_module.eye_keypoints_for("some/path.jpg")
+                result = thumbnails_module.eye_keypoints_for("some/path.jpg", "classic-vision-eyepose-v0")
 
         self.assertEqual(result["source_size"], (1920, 1080))
         self.assertTrue(result["accepted"])
@@ -207,7 +207,7 @@ class EyeKeypointsForTests(unittest.TestCase):
                     source_size=(100, 100),
                     expanded_box=(0.0, 0.0, 10.0, 10.0),
                 )
-                thumbnails_module.eye_keypoints_for("some/path.jpg")
+                thumbnails_module.eye_keypoints_for("some/path.jpg", "classic-vision-eyepose-v0")
                 _, kwargs = detections.return_value.get.call_args
                 self.assertFalse(kwargs.get("allow_detect", True))
 
@@ -221,7 +221,7 @@ class EyeKeypointsInCropForTests(unittest.TestCase):
 
     def test_no_cached_eye_record_means_no_overlay(self):
         with mock.patch("picklikeme.eyes.cache.read_eye_detection", return_value=None):
-            self.assertIsNone(thumbnails_module.eye_keypoints_in_crop_for("some/path.jpg"))
+            self.assertIsNone(thumbnails_module.eye_keypoints_in_crop_for("some/path.jpg", "classic-vision-eyepose-v0"))
 
     def test_returns_keypoints_untransformed_in_the_crops_own_pixel_space(self):
         """Deliberately does NOT need detection_boxes_for/_detections at
@@ -240,7 +240,7 @@ class EyeKeypointsInCropForTests(unittest.TestCase):
             head_top=EyeKeypoint(x=20.0, y=10.0, confidence=0.7),
         )
         with mock.patch("picklikeme.eyes.cache.read_eye_detection", return_value=record):
-            result = thumbnails_module.eye_keypoints_in_crop_for("some/path.jpg")
+            result = thumbnails_module.eye_keypoints_in_crop_for("some/path.jpg", "classic-vision-eyepose-v0")
 
         self.assertEqual(result["source_size"], (120, 90))
         self.assertTrue(result["accepted"])
@@ -261,7 +261,7 @@ class EyeKeypointsInCropForTests(unittest.TestCase):
             box=(0.0, 0.0, 1.0, 1.0), confidence=0.5, left=None, right=None,
         )
         with mock.patch("picklikeme.eyes.cache.read_eye_detection", return_value=record):
-            self.assertIsNone(thumbnails_module.eye_keypoints_in_crop_for("some/path.jpg"))
+            self.assertIsNone(thumbnails_module.eye_keypoints_in_crop_for("some/path.jpg", "classic-vision-eyepose-v0"))
 
 
 def _write_fake_cache_file(cache_dir: Path, name: str, size_bytes: int, age_seconds: float) -> Path:

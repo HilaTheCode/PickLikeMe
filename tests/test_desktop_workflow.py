@@ -868,3 +868,75 @@ def test_run_in_background_reports_progress_and_result() -> None:
     assert events.get("result") == "done"
     assert events.get("stage") == "working"
     assert events.get("progress") == [(1, 2), (2, 2)]
+
+
+# ---------------------------------------------------------------------------
+# Result / Run Consistency - eye_keypoints must never show a different
+# strategy's cached result than the one currently selected (burst_strategy).
+# See eyes.cache's module docstring (one slot per image, overwritten by
+# whichever eye detector ran last) and ReviewService._eye_record_for_
+# selected_strategy's own docstring for the failure mode this closes.
+# ---------------------------------------------------------------------------
+
+
+def test_eye_keypoints_requests_the_selected_strategys_own_cached_record(tmp_path):
+    """eyes.cache is now keyed by (image, strategy) - see that module's own
+    docstring - so eye_keypoints simply asks for the currently selected
+    strategy's own record rather than reading whichever one happens to be
+    cached and checking it afterward. Structurally impossible to return a
+    different strategy's result now: verified here by asserting exactly
+    which strategy_id was requested."""
+    from unittest import mock
+
+    service = ReviewService(db_path=tmp_path / "annotations.sqlite")
+    service.session.burst_strategy = "classic-vision-eyepose-v0"
+    fake_record = {"detector_id": "eyepose-v0", "box": (0, 0, 10, 10), "left": None, "right": None}
+    with mock.patch("picklikeme.desktop.services.eye_keypoints_for", return_value=fake_record) as fake:
+        result = service.eye_keypoints("/some/image.jpg")
+    fake.assert_called_once_with("/some/image.jpg", "classic-vision-eyepose-v0")
+    assert result == fake_record
+
+
+def test_eye_keypoints_accepts_an_explicit_strategy_override(tmp_path):
+    """A future "Elements Source" picker (see the Loupe redesign brief) can
+    ask for a DIFFERENT strategy's result than the one currently selected as
+    Color Source, without changing burst_strategy itself."""
+    from unittest import mock
+
+    service = ReviewService(db_path=tmp_path / "annotations.sqlite")
+    service.session.burst_strategy = "classic-vision-eyepose-v0"
+    fake_record = {"detector_id": "superanimal-bird", "box": (0, 0, 10, 10), "left": None, "right": None}
+    with mock.patch("picklikeme.desktop.services.eye_keypoints_for", return_value=fake_record) as fake:
+        result = service.eye_keypoints("/some/image.jpg", strategy_id="classic-vision")
+    fake.assert_called_once_with("/some/image.jpg", "classic-vision")
+    assert result == fake_record
+
+
+def test_eye_keypoints_returns_none_under_the_ai_model_strategy(tmp_path):
+    """The AI model has no eye detector at all - selecting it must never
+    show a leftover Classic Vision eye record. No special-casing needed:
+    no sidecar was ever written under the "ai-model" key (see eyes.cache's
+    own docstring), so a real cache read naturally returns None."""
+    from unittest import mock
+
+    service = ReviewService(db_path=tmp_path / "annotations.sqlite")
+    service.session.burst_strategy = "ai-model"
+    with mock.patch("picklikeme.desktop.services.eye_keypoints_for", return_value=None) as fake:
+        result = service.eye_keypoints("/some/image.jpg")
+    fake.assert_called_once_with("/some/image.jpg", "ai-model")
+    assert result is None
+
+
+def test_detection_boxes_are_never_gated_by_the_selected_strategy(tmp_path):
+    """Subject/bird-crop boxes come from the shared upstream detection
+    cache (analyzer.detections.DetectionCache), the SAME regardless of
+    which eye-detector strategy is selected - unlike eye_keypoints, this
+    must always pass through untouched."""
+    from unittest import mock
+
+    service = ReviewService(db_path=tmp_path / "annotations.sqlite")
+    service.session.burst_strategy = "classic-vision-eyepose-v0"
+    fake_boxes = {"source_size": (100, 100), "selected": None, "others": [], "expanded_box": None}
+    with mock.patch("picklikeme.desktop.services.detection_boxes_for", return_value=fake_boxes):
+        result = service.detection_boxes("/some/image.jpg")
+    assert result == fake_boxes

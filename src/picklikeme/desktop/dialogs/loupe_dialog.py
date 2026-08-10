@@ -126,12 +126,17 @@ _PRIMARY_SCORE_LABEL_STYLE = (
     f"background-color: {theme.DARK.accent}; color: {theme.DARK.window_bg}; "
     "font-weight: 700; font-size: 15px; padding: 6px 16px; border-radius: 6px;"
 )
-# Elements - an accent-colored border (rather than the plain default button
-# chrome every other tool button gets) so it reads as a distinctly prominent
-# control, matching the redesign's own "Clear Elements control" priority,
-# without being a solid fill that would compete with the score badge above
-# for "the one thing that stands out".
-_ELEMENTS_BUTTON_STYLE = f"border: 2px solid {theme.DARK.accent}; font-weight: 600;"
+# Elements - an accent-colored border ONLY while active (Manual QA: the
+# border must not show all the time - only the active visual state should
+# be shown when Elements is actually on), via :checked rather than an
+# unconditional border every other tool button lacks. font-weight stays
+# unconditional (a checkable button's own label reads fine slightly
+# bolder regardless of state, and it keeps the button's width stable
+# between checked/unchecked rather than reflowing the bottom bar).
+_ELEMENTS_BUTTON_STYLE = (
+    f"QPushButton {{ font-weight: 600; }}"
+    f"QPushButton:checked {{ border: 2px solid {theme.DARK.accent}; }}"
+)
 
 
 # Caps on the bottom bar's own unbounded-text labels - neither grows with a
@@ -229,6 +234,12 @@ def _apply_brightness(pixmap: QPixmap, ev: float) -> QPixmap:
 BOX_PEN_WIDTH_OTHER = 15
 BOX_PEN_WIDTH_SELECTED = 20
 BOX_PEN_WIDTH_EYE = 20
+# Manual QA: Elements' own boxes (_add_element_box) are much smaller than a
+# subject/eye detection box (they bound a single eye or head region, not a
+# whole bird), so BOX_PEN_WIDTH_EYE's 20px reads as a solid block that
+# obscures the exact location it exists to point at. Thin enough to trace
+# the actual boundary at a normal zoom level while staying visible.
+ELEMENT_BOX_PEN_WIDTH = 3
 
 # Bounds on _ZoomView's manual scale (1.0 = 100%) - shared by Ctrl+wheel,
 # trackpad pinch, and the keyboard +/- shortcuts (see _ZoomView.zoom_by).
@@ -303,6 +314,14 @@ class _ZoomView(QGraphicsView):
             self._pixmap_item.setPixmap(pixmap)
 
     def clear_detection_overlay(self) -> None:
+        """Wipes every overlay item, Boxes' and Elements' alike - the one
+        shared clear point, called once by `LoupeDialog.
+        _refresh_detection_overlay` before drawing whichever of
+        `set_detection_overlay`/`set_elements_overlay` are currently active.
+        Neither of those two clears on its own (see their own docstrings),
+        specifically so calling both in the same refresh composes rather
+        than each erasing the other's work - Boxes and Elements are
+        independently toggleable, not mutually exclusive."""
         for item in self._overlay_items:
             self._scene.removeItem(item)
         self._overlay_items = []
@@ -323,8 +342,14 @@ class _ZoomView(QGraphicsView):
         against the currently-displayed pixmap's own size rather than
         assumed to match 1:1, since nothing guarantees the preview was
         never resized relative to the source frame.
+
+        Does NOT clear the overlay itself - see `clear_detection_overlay`'s
+        own docstring for why: Boxes and Elements must be independently
+        toggleable and drawable together, so the caller
+        (`LoupeDialog._refresh_detection_overlay`) clears once, up front,
+        then calls whichever of this/`set_elements_overlay` are currently
+        active - never either of them clearing out what the other just drew.
         """
-        self.clear_detection_overlay()
         if self._pixmap_item is None:
             return
         source_size = (boxes_data or {}).get("source_size") or (eye_data or {}).get("source_size")
@@ -388,10 +413,10 @@ class _ZoomView(QGraphicsView):
         Right Eye / Head, each its own labeled bounding rectangle plus a
         "Name — confidence" text label, for visually inspecting what the
         eye detector found and how confident it was. Shares
-        clear_detection_overlay/_overlay_items with set_detection_overlay
-        (Boxes), so the two visualizations are naturally mutually exclusive
-        - LoupeDialog only ever calls one, matching whichever toggle is on
-        (see _refresh_detection_overlay), never both at once.
+        `_overlay_items` with `set_detection_overlay` (Boxes), but neither
+        clears it internally (see `clear_detection_overlay`'s own
+        docstring) - the two are independently toggleable and compose when
+        both are active, not mutually exclusive.
 
         Synthesized entirely from data the eye detector ALREADY computed
         and eye_keypoints_for already exposes - `left`/`right` (the two eye
@@ -409,7 +434,6 @@ class _ZoomView(QGraphicsView):
         one image's resolution and wrong on another's; Head reuses that
         same size scaled up, since a head is larger than a single eye.
         """
-        self.clear_detection_overlay()
         if self._pixmap_item is None or eye_data is None:
             return
         source_size = eye_data.get("source_size")
@@ -454,7 +478,7 @@ class _ZoomView(QGraphicsView):
         cx = keypoint["x"] * scale_x
         cy = keypoint["y"] * scale_y
         rect = QRectF(cx - half_width, cy - half_height, half_width * 2, half_height * 2)
-        box_item = self._scene.addRect(rect, QPen(colour, BOX_PEN_WIDTH_EYE))
+        box_item = self._scene.addRect(rect, QPen(colour, ELEMENT_BOX_PEN_WIDTH))
         box_item.setZValue(13)
         self._overlay_items.append(box_item)
 
@@ -761,12 +785,10 @@ class LoupeDialog(QDialog):
             btn.setStyleSheet(_STATUS_BUTTON_STYLES[name])
         exp_down_btn = QPushButton("−", self)
         exp_up_btn = QPushButton("+", self)
-        # Elements - prominent (its own accent-bordered style, see
-        # _ELEMENTS_BUTTON_STYLE below) per the redesign's own "Clear
-        # Elements control" priority. Mutually exclusive with Boxes (see
-        # _refresh_detection_overlay) - both draw over the same eye/head
-        # region, and showing both at once would just be visual clutter,
-        # not more information.
+        # Elements - prominent while active (its own accent-bordered style,
+        # see _ELEMENTS_BUTTON_STYLE below) per the redesign's own "Clear
+        # Elements control" priority. Independently toggleable from Boxes
+        # (see _refresh_detection_overlay) - both may be on at once.
         self._elements_btn = QPushButton("Elements", self)
         self._elements_btn.setCheckable(True)
         self._elements_btn.setStyleSheet(_ELEMENTS_BUTTON_STYLE)
@@ -1023,48 +1045,65 @@ class LoupeDialog(QDialog):
             QMessageBox.warning(self, "PeakPic - Loupe", f"Could not load preview:\n{exc}")
             return
         pixmap = QPixmap(str(preview))
+        if pixmap.isNull():
+            # QPixmap fails silently (no exception - only a Qt stderr
+            # warning) on a corrupt/truncated cached preview JPEG, which
+            # `preview_path` alone cannot detect since it only checks that
+            # the file exists, not that it decodes. A stale, pre-atomic-write
+            # cache entry left over from before this cache was written
+            # atomically (see review.thumbnails.review_preview) is the known
+            # cause - delete it and regenerate once before giving up, so a
+            # single corrupt cache file heals itself on the next visit
+            # instead of showing a permanently blank Loupe for that image.
+            try:
+                Path(preview).unlink(missing_ok=True)
+                preview = self.service.preview_path(path)
+                pixmap = QPixmap(str(preview))
+            except Exception:  # noqa: BLE001 - regeneration failing must not crash the loupe either
+                pixmap = QPixmap()
+        if pixmap.isNull():
+            QMessageBox.warning(
+                self, "PeakPic - Loupe",
+                f"Could not display this image (the preview failed to decode):\n{path}",
+            )
         self._current_raw_pixmap = pixmap
         self._view.set_pixmap(self._exposed_pixmap())
         self._refresh_detection_overlay()
         self._update_info_labels()
 
     def _refresh_detection_overlay(self) -> None:
-        """Boxes and Elements are mutually exclusive (see _on_boxes_toggled/
-        _on_elements_toggled - checking one unchecks the other), so exactly
-        one of these branches ever draws anything; the third case (neither
-        checked) just clears whatever was there."""
-        if self._show_elements:
-            try:
-                eye = self.service.eye_keypoints(self._current_path())
-            except Exception:  # noqa: BLE001 - a missing/unreadable eye record must not break the loupe
-                eye = None
-            self._view.set_elements_overlay(eye)
+        """Boxes and Elements are independently toggleable - either, both,
+        or neither can be active at once (Manual QA: Elements must never
+        accidentally hide Boxes). One shared clear up front, then each
+        active mode draws additively on top - see `_ZoomView.
+        clear_detection_overlay`'s own docstring for why neither
+        `set_detection_overlay` nor `set_elements_overlay` clears on its
+        own anymore."""
+        self._view.clear_detection_overlay()
+        if not self._show_boxes and not self._show_elements:
             return
-        if not self._show_boxes:
-            self._view.clear_detection_overlay()
-            return
-        try:
-            boxes = self.service.detection_boxes(self._current_path())
-        except Exception:  # noqa: BLE001 - a missing/unreadable detection record must not break the loupe
-            boxes = None
         try:
             eye = self.service.eye_keypoints(self._current_path())
         except Exception:  # noqa: BLE001 - a missing/unreadable eye record must not break the loupe
             eye = None
-        self._view.set_detection_overlay(boxes, eye)
+        if self._show_boxes:
+            try:
+                boxes = self.service.detection_boxes(self._current_path())
+            except Exception:  # noqa: BLE001 - a missing/unreadable detection record must not break the loupe
+                boxes = None
+            self._view.set_detection_overlay(boxes, eye)
+        if self._show_elements:
+            self._view.set_elements_overlay(eye)
 
     def _on_boxes_toggled(self, checked: bool) -> None:
+        """Independent of Elements (see _refresh_detection_overlay) - both
+        can be on, off, or any combination; toggling one never touches the
+        other's own checked state."""
         self._show_boxes = checked
-        if checked and self._elements_btn.isChecked():
-            self._elements_btn.setChecked(False)  # fires _on_elements_toggled, which also refreshes
-            return
         self._refresh_detection_overlay()
 
     def _on_elements_toggled(self, checked: bool) -> None:
         self._show_elements = checked
-        if checked and self._boxes_btn.isChecked():
-            self._boxes_btn.setChecked(False)  # fires _on_boxes_toggled, which also refreshes
-            return
         self._refresh_detection_overlay()
 
     def _exposed_pixmap(self) -> QPixmap:

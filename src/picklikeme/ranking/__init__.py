@@ -101,6 +101,32 @@ def metric_labels() -> dict[str, dict[str, str]]:
     return labels
 
 
+def eye_detector_names() -> dict[str, str]:
+    """strategy_id -> the `eyes.build_eye_detector` name that strategy's own
+    ranking run used, for a caller that needs to check whether a cached
+    `eyes.cache.EyeRecord` (see that module's own docstring: one slot per
+    image, overwritten by whichever eye detector ran on it last) actually
+    belongs to the CURRENTLY selected strategy - `desktop.services.
+    ReviewService.eye_keypoints`/`.detection_boxes` is exactly that caller:
+    the Loupe's Elements/Boxes overlay must never show a different run's
+    result as if it were the selected one (see the "Result / Run
+    Consistency" investigation this responds to).
+
+    Read from each strategy class's own `_eye_detector_name` attribute (see
+    `ranking.classic.ClassicVisionStrategy`), the same "declared on the
+    class, discovered generically" convention `metric_labels` already
+    establishes - a strategy with no eye detector at all (the AI model) is
+    simply not a key here, which a caller reads as "this strategy has no
+    eye data, full stop," not "unknown."
+    """
+    names: dict[str, str] = {}
+    for strategy in _STRATEGIES:
+        declared = getattr(strategy, "_eye_detector_name", None)
+        if declared:
+            names[strategy.info.strategy_id] = declared
+    return names
+
+
 def get_strategy(strategy_id: str) -> RankingStrategy:
     """Construct a strategy by id."""
     for strategy in _STRATEGIES:
@@ -131,6 +157,7 @@ __all__ = [
     "StrategyInfo",
     "WeightedParams",
     "available_strategies",
+    "eye_detector_names",
     "get_strategy",
     "metric_labels",
     "score_labels",

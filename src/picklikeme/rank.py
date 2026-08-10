@@ -142,6 +142,7 @@ def rank_folder(
 
     write_run_metadata(
         input_folder,
+        strategy=AI_STRATEGY_ID,
         backbone=backbone,
         checkpoint=str(checkpoint_path.resolve()),
         image_count=len(dataset),
@@ -379,6 +380,7 @@ def main() -> None:
     else:
         write_run_metadata(
             input_folder,
+            strategy=AI_STRATEGY_ID,
             backbone=args.backbone,
             checkpoint=str(checkpoint_path.resolve()),
             image_count=len(dataset),

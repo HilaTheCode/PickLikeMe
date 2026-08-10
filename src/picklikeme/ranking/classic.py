@@ -753,7 +753,10 @@ class ClassicVisionStrategy:
             # non-filtering) decision needs the Gallery/Loupe overlay to show.
             if candidate.eye is not None and candidate.subject_crop is not None:
                 crop_height, crop_width = candidate.subject_crop.shape[:2]
-                save_eye_detection(crop_cache_dir, image_path, (crop_width, crop_height), candidate.eye)
+                save_eye_detection(
+                    crop_cache_dir, image_path, (crop_width, crop_height), candidate.eye,
+                    strategy_id=self.info.strategy_id,
+                )
             if debug_dir is not None:
                 save_debug_image(candidate, self.info.strategy_id, debug_dir)
             if reason is not None:

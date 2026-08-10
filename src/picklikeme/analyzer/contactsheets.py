@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import re
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -237,7 +238,11 @@ def read_capture_timestamp(image_path: str) -> str | None:
 def build_thumbnail(image_path: str, size: int, cache_dir: Path) -> Path | None:
     """Return a cached square thumbnail of the full frame, generating it if needed."""
     target = _thumbnail_cache_path(cache_dir, image_path, size)
-    if target.exists():
+    # A 0-byte file is what an interrupted write leaves behind from before
+    # this function wrote atomically - never trusted, same reasoning as
+    # review.thumbnails.review_preview's identical check (see that
+    # function's own comment for the failure mode this heals).
+    if target.exists() and target.stat().st_size > 0:
         return target
     try:
         image = load_source_image(image_path)
@@ -249,7 +254,12 @@ def build_thumbnail(image_path: str, size: int, cache_dir: Path) -> Path | None:
     canvas = Image.new("RGB", (size, size), BACKGROUND)
     canvas.paste(image, ((size - image.width) // 2, (size - image.height) // 2))
     target.parent.mkdir(parents=True, exist_ok=True)
-    canvas.save(target, "JPEG", quality=88)
+    # Atomic write - see review.thumbnails.review_preview's identical
+    # tmp-then-replace discipline (and bird_crop.save_crop_png's, the
+    # original precedent both were missing).
+    tmp = target.with_name(target.name + ".tmp")
+    canvas.save(tmp, "JPEG", quality=88)
+    tmp.replace(target)
     return target
 
 
@@ -465,19 +475,35 @@ def _dashed_rectangle(draw, box, colour, width: int, dash: int | None = None) ->
         draw.line([(x2, y), (x2, min(y + dash, y2))], fill=colour, width=width)
 
 
-def annotated_thumbnail_path(thumbnails_dir: Path, image_path: str, size: int, *, has_eye: bool = False) -> Path:
+def annotated_thumbnail_path(
+    thumbnails_dir: Path, image_path: str, size: int, *, has_eye: bool = False, eye_strategy_id: str | None = None
+) -> Path:
     """Where the annotated copy lives: beside the plain one, distinct suffix.
 
-    `has_eye` gives a distinct path (`_boxes_eyes` instead of `_boxes`) when
-    an eye overlay will be drawn onto it, so the cache key itself reflects
-    whether Classic Vision had run yet - a folder opened and toggled to
-    Detector Boxes before its first Classic Vision run gets a plain
-    `_boxes` file; running Classic Vision afterward writes a fresh
-    `_boxes_eyes` one instead of serving the stale, eye-less copy back
-    forever (see `review.thumbnails.review_thumbnail`).
+    `has_eye` gives a distinct path (`_boxes_eyes...` instead of `_boxes`)
+    when an eye overlay will be drawn onto it, so the cache key itself
+    reflects whether a ranking run had happened yet - a folder opened and
+    toggled to Detector Boxes before its first ranking run gets a plain
+    `_boxes` file; ranking it afterward writes a fresh `_boxes_eyes...` one
+    instead of serving the stale, eye-less copy back forever (see
+    `review.thumbnails.review_thumbnail`).
+
+    `eye_strategy_id`, when `has_eye` is set, is folded into that same
+    suffix - the same "algorithm-specific artifacts must not overwrite each
+    other" requirement `eyes.cache`'s own module docstring documents applies
+    here too: two different strategies' eye overlays for the same image are
+    two different renders, not one shared file that whichever ran last wins.
+    `None` (the pre-multi-strategy shape) keeps the original, unsuffixed
+    `_boxes_eyes` name.
     """
     plain = _thumbnail_cache_path(thumbnails_dir, image_path, size)
-    suffix = "_boxes_eyes" if has_eye else "_boxes"
+    if not has_eye:
+        suffix = "_boxes"
+    elif eye_strategy_id:
+        safe_id = re.sub(r"[^A-Za-z0-9_.-]", "_", eye_strategy_id)
+        suffix = f"_boxes_eyes_{safe_id}"
+    else:
+        suffix = "_boxes_eyes"
     return plain.with_name(f"{plain.stem}{suffix}{plain.suffix}")
 
 
