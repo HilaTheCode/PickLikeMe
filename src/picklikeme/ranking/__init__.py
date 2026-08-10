@@ -27,26 +27,40 @@ from .base import (
     WeightedParams,
 )
 from .classic import (
+    ClassicVisionBirdFusionParams,
+    ClassicVisionBirdFusionStrategy,
     ClassicVisionEyePoseParams,
     ClassicVisionEyePoseStrategy,
+    ClassicVisionMammalFusionParams,
+    ClassicVisionMammalFusionStrategy,
     ClassicVisionParams,
     ClassicVisionStrategy,
 )
+from .combined import ClassicVisionCombinedParams, ClassicVisionCombinedStrategy
 
 DEFAULT_STRATEGY_ID = AIModelStrategy.info.strategy_id
 
 # Ordered: this is the order the Rank menu offers them in, default first.
-# The two Classic Vision entries are separate, independently selectable
+# The Classic Vision entries are separate, independently selectable
 # strategies (see ranking.classic's module docstring) - not one strategy
 # with a hidden backend switch - so the photographer always knows exactly
-# which algorithm a run used, and both backends' results coexist on a
-# folder for direct comparison. EyePose-v0 is listed first among the two as
-# the recommended one for new analyses; SuperAnimal-Bird stays fully
-# available.
+# which algorithm a run used, and every backend's results coexist on a
+# folder for direct comparison. EyePose-v0 is listed first among the
+# single-model Bird backends as the recommended one for new analyses;
+# SuperAnimal-Bird stays fully available. The two Fusion strategies (see
+# eyes.domains - Ranking Mode = Birds/Mammals) are listed after the
+# established single-model Bird backends: Birds-Fusion combines EyePose-v0
+# with SuperAnimal-Bird through the shared Fusion layer, Mammals-Fusion is
+# the new safari-workflow entry point (SuperAnimal-Quadruped) - see
+# eyes.superanimal_quadruped for why EyePose-v0 is deliberately not used
+# there.
 _STRATEGIES: tuple[type, ...] = (
     AIModelStrategy,
     ClassicVisionEyePoseStrategy,
     ClassicVisionStrategy,
+    ClassicVisionBirdFusionStrategy,
+    ClassicVisionMammalFusionStrategy,
+    ClassicVisionCombinedStrategy,
 )
 
 
@@ -102,8 +116,14 @@ __all__ = [
     "GROUP_WEIGHTS",
     "AIModelParams",
     "AIModelStrategy",
+    "ClassicVisionBirdFusionParams",
+    "ClassicVisionBirdFusionStrategy",
+    "ClassicVisionCombinedParams",
+    "ClassicVisionCombinedStrategy",
     "ClassicVisionEyePoseParams",
     "ClassicVisionEyePoseStrategy",
+    "ClassicVisionMammalFusionParams",
+    "ClassicVisionMammalFusionStrategy",
     "ClassicVisionParams",
     "ClassicVisionStrategy",
     "ParamSpec",

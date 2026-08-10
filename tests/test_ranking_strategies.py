@@ -124,7 +124,14 @@ def _candidate(**overrides) -> FilterCandidate:
 
 def test_every_strategy_is_registered_with_the_ai_model_first() -> None:
     infos = available_strategies()
-    assert [i.strategy_id for i in infos] == ["ai-model", "classic-vision-eyepose-v0", "classic-vision"]
+    assert [i.strategy_id for i in infos] == [
+        "ai-model",
+        "classic-vision-eyepose-v0",
+        "classic-vision",
+        "classic-vision-fusion-birds",
+        "classic-vision-fusion-mammals",
+        "classic-vision-fusion-combined",
+    ]
     # The AI model stays the default: strategies were added to give it company,
     # never to demote it.
     assert DEFAULT_STRATEGY_ID == "ai-model"
@@ -162,9 +169,12 @@ def test_listing_strategies_does_not_import_torch() -> None:
 
     for module in ("picklikeme.ranking", "picklikeme.ranking.classic", "picklikeme.eyes.detector"):
         assert module in sys.modules or True  # imported at module load, above
-    # Constructing every strategy must still be cheap - no weights, no CUDA.
+    # Constructing every strategy must still be cheap - no weights, no CUDA -
+    # including the three Fusion/Ranking-Mode strategies (eyes.domains):
+    # FusionEyeDetector and its sub-detectors are only ever constructed
+    # inside rank_folder, never by __init__ itself.
     strategies = [get_strategy(i.strategy_id) for i in available_strategies()]
-    assert len(strategies) == 3
+    assert len(strategies) == 6
 
 
 # ---------------------------------------------------------------------------

@@ -34,7 +34,7 @@ them:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Callable, Protocol
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     import numpy as np
@@ -144,6 +144,19 @@ class EyeDetection:
     head_top: EyeKeypoint | None = None
     left_shoulder: EyeKeypoint | None = None
     right_shoulder: EyeKeypoint | None = None
+    # Set only by a fusion detector (see `eyes.fusion.FusionEyeDetector`) -
+    # `None` for every single-model backend, exactly like `head_confidence`
+    # stays `None` for a backend that does not compute one. One of
+    # `eyes.fusion.STATUS_*` - AGREE/SINGLE_MODEL/DISAGREEMENT/
+    # LOW_CONFIDENCE/NO_DETECTION - a finer-grained account of *why*
+    # `accepted` came out the way it did than the boolean alone carries, for
+    # a debugging overlay or report that wants to say more than pass/fail.
+    fusion_status: str | None = None
+    # Which sub-detector id(s) actually contributed to the final `box`/
+    # `center`/`confidence` above - one id for AGREE (fused) or SINGLE_MODEL,
+    # empty for DISAGREEMENT/LOW_CONFIDENCE/NO_DETECTION (nothing was
+    # trusted enough to contribute). `None` for a non-fusion backend.
+    source_detectors: tuple[str, ...] | None = None
 
 
 class EyeDetector(Protocol):
@@ -211,11 +224,32 @@ def build_eye_detector(name: str = "superanimal-bird", **kwargs) -> EyeDetector:
     above and never need to change.
     """
     from .eyepose_v0 import EyePoseV0EyeDetector
+    from .fusion import FusionEyeDetector
     from .superanimal_bird import SuperAnimalBirdEyeDetector
+    from .superanimal_quadruped import SuperAnimalQuadrupedEyeDetector
 
-    detectors: dict[str, type] = {
+    def _birds_fusion(**kwargs):
+        from .domains import RANKING_MODE_BIRDS, build_domain_fusion_detector
+
+        return build_domain_fusion_detector(RANKING_MODE_BIRDS, **kwargs)
+
+    def _mammals_fusion(**kwargs):
+        from .domains import RANKING_MODE_MAMMALS, build_domain_fusion_detector
+
+        return build_domain_fusion_detector(RANKING_MODE_MAMMALS, **kwargs)
+
+    detectors: dict[str, Callable[..., EyeDetector]] = {
         SuperAnimalBirdEyeDetector.detector_id: SuperAnimalBirdEyeDetector,
         EyePoseV0EyeDetector.detector_id: EyePoseV0EyeDetector,
+        SuperAnimalQuadrupedEyeDetector.detector_id: SuperAnimalQuadrupedEyeDetector,
+        FusionEyeDetector.detector_id: FusionEyeDetector,
+        # Domain-specific Fusion Layer entry points (see eyes.domains) - each
+        # constructs FusionEyeDetector with the Ranking Mode's own
+        # sub-detectors/default weights rather than FusionEyeDetector's own
+        # (bird-only) built-in default, which only fires when a caller builds
+        # "fusion-v1" directly with no sub_detectors override.
+        "fusion-birds": _birds_fusion,
+        "fusion-mammals": _mammals_fusion,
     }
     try:
         cls = detectors[name]

@@ -68,11 +68,13 @@ from ..auto_crop import resolve_device
 from ..bird_crop import CropParams, crop_cache_path, read_detections
 from ..config import DEFAULT_CROP_CACHE_DIR, DEFAULT_MAX_CSV_ROWS
 from ..dataset import UnlabeledImageDataset
+from ..eyes.domains import BIRDS_PROFILE, MAMMALS_PROFILE
 from ..eyes.eyepose_v0 import (
     DEFAULT_MAX_EYE_HEAD_DISTANCE_RATIO as EYEPOSE_DEFAULT_MAX_HEAD_DISTANCE_RATIO,
 )
 from ..eyes.eyepose_v0 import DEFAULT_MIN_CONFIDENCE as EYEPOSE_DEFAULT_MIN_CONFIDENCE
 from ..eyes.eyepose_v0 import DEFAULT_MIN_HEAD_CONFIDENCE as EYEPOSE_DEFAULT_MIN_HEAD_CONFIDENCE
+from ..eyes.fusion import DEFAULT_AGREEMENT_THRESHOLD, DEFAULT_MIN_FUSED_CONFIDENCE, FusionConfig, ModelWeight
 from ..eyes.superanimal_bird import DEFAULT_MAX_EYE_DISAGREEMENT, DEFAULT_MIN_CONFIDENCE
 from ..preprocess import build_cache
 from ..sidecar import (
@@ -615,6 +617,46 @@ class ClassicVisionStrategy:
         """
         return {"min_confidence": params.min_eye_confidence, "max_eye_disagreement": params.max_eye_disagreement}
 
+    def _eye_detector_metadata(self, params) -> dict:
+        """A JSON/CSV-safe summary of this run's eye-detector configuration,
+        for `write_run_metadata`/`analytics.record_run` - separate from
+        `_eye_detector_kwargs` because that one's return value is allowed to
+        contain a real object (see `ClassicVisionBirdFusionStrategy`'s own
+        override: a `FusionConfig` instance, not JSON-serialisable) since it
+        is only ever passed straight to a detector's constructor, never
+        persisted. Defaults to `_eye_detector_kwargs` unchanged, which is
+        already flat primitives for every non-Fusion backend.
+        """
+        return self._eye_detector_kwargs(params)
+
+    def _build_eye_filter_router(
+        self,
+        params,
+        resolved_device: str,
+        image_paths: list[str],
+        crop_cache_dir: str | Path,
+    ) -> Callable[[str], object]:
+        """A function mapping an image path to the `EyeDetector` that should
+        run on it - one detector for the whole folder by default (today's
+        behaviour, unchanged), built once here rather than inside
+        `rank_folder`'s own loop.
+
+        The one override point `ranking.combined.ClassicVisionCombinedStrategy`
+        needs for per-Burst domain routing (see that module's own docstring):
+        it overrides this single method to classify each Burst once and
+        return a different detector per path, while `rank_folder`'s loop
+        itself never changes - every other strategy still gets exactly one
+        shared detector, exactly as before this hook existed.
+        """
+        from ..eyes import build_eye_detector
+
+        detector = build_eye_detector(
+            self._eye_detector_name,
+            device=resolved_device,
+            **self._eye_detector_kwargs(params),
+        )
+        return lambda image_path: detector
+
     def rank_folder(
         self,
         input_folder: str | Path,
@@ -693,12 +735,7 @@ class ClassicVisionStrategy:
 
         if on_stage is not None:
             on_stage("Loading the eye detector")
-        eye_detector = build_eye_detector(
-            self._eye_detector_name,
-            device=resolved_device,
-            **self._eye_detector_kwargs(params),
-        )
-        chain = FilterChain([SubjectFilter(), EyeFilter(eye_detector)])
+        detector_for_image = self._build_eye_filter_router(params, resolved_device, image_paths, crop_cache_dir)
 
         if on_stage is not None:
             on_stage("Filtering and measuring images")
@@ -707,6 +744,7 @@ class ClassicVisionStrategy:
         counts: dict[str, int] = {}
         for index, image_path in enumerate(image_paths, start=1):
             candidate = self._load_candidate(image_path, crop_cache_dir)
+            chain = FilterChain([SubjectFilter(), EyeFilter(detector_for_image(image_path))])
             reason = chain.reject_reason(candidate)
             # Persisted whenever the eye detector actually ran on this image,
             # regardless of whether EyeFilter accepted the result - see
@@ -765,7 +803,7 @@ class ClassicVisionStrategy:
             filtered=counts,
             weights=params.normalized_weights(),
             eye_detector=self._eye_detector_name,
-            **self._eye_detector_kwargs(params),
+            **self._eye_detector_metadata(params),
         )
         runtime_seconds = time.perf_counter() - start_time
         record_run(
@@ -793,7 +831,7 @@ class ClassicVisionStrategy:
                 "algorithm_version": ALGORITHM_VERSION,
                 "weights": params.normalized_weights(),
                 "eye_detector": self._eye_detector_name,
-                **self._eye_detector_kwargs(params),
+                **self._eye_detector_metadata(params),
                 **resolve_environment_info(),
             },
             device=resolved_device,
@@ -895,4 +933,194 @@ class ClassicVisionEyePoseStrategy(ClassicVisionStrategy):
             "min_confidence": params.eye_confidence_threshold,
             "max_head_distance_ratio": params.max_head_distance_ratio,
             "min_head_confidence": params.detection_head_confidence_threshold,
+        }
+
+
+# ---------------------------------------------------------------------------
+# Fusion backends - Ranking Mode = Birds / Mammals (see eyes.domains). Eye
+# localisation for these two backends comes from the shared Fusion/
+# Validation layer (eyes.fusion.FusionEyeDetector) rather than a single
+# model - see that module's own docstring for the algorithm, and
+# eyes.domains for which concrete detectors/default weights each Ranking
+# Mode selects. Filtering, scoring, CSV/report writing are all inherited
+# from ClassicVisionStrategy unchanged, exactly like ClassicVisionEyePoseStrategy
+# above - only info/params_class/param_specs/_eye_detector_name/
+# _eye_detector_kwargs differ.
+# ---------------------------------------------------------------------------
+
+BIRD_FUSION_STRATEGY_ID = "classic-vision-fusion-birds"
+MAMMAL_FUSION_STRATEGY_ID = "classic-vision-fusion-mammals"
+
+
+def _fusion_weight_specs(profile, help_prefix: str) -> tuple[ParamSpec, ...]:
+    """One ParamSpec per model in a domain profile's default weights - a
+    single-model domain (Mammals, today) still gets a real, adjustable
+    weight field, not a hidden constant, so adding a second mammal model
+    later needs no new UI wiring (see eyes.domains.DomainProfile's own
+    docstring)."""
+    return tuple(
+        ParamSpec(
+            name=f"{model_weight.detector_id.replace('-', '_')}_model_weight",
+            label=f"{model_weight.detector_id} model weight",
+            default=model_weight.weight,
+            minimum=0.0,
+            maximum=1.0,
+            group=GROUP_WEIGHTS,
+            decimals=2,
+            help=f"{help_prefix} how much the Fusion Layer trusts {model_weight.detector_id}.",
+        )
+        for model_weight in profile.default_model_weights
+    )
+
+
+def _fusion_threshold_specs() -> tuple[ParamSpec, ...]:
+    return (
+        ParamSpec(
+            name="agreement_threshold",
+            label="Agreement threshold",
+            default=DEFAULT_AGREEMENT_THRESHOLD,
+            minimum=0.0,
+            maximum=5.0,
+            group=GROUP_THRESHOLDS,
+            decimals=2,
+            help="How close (in head-scale units) two models' predictions must be to count as agreeing, rather than a disagreement.",
+        ),
+        ParamSpec(
+            name="min_fused_confidence",
+            label="Minimum fused confidence",
+            default=DEFAULT_MIN_FUSED_CONFIDENCE,
+            minimum=0.0,
+            maximum=1.0,
+            group=GROUP_THRESHOLDS,
+            decimals=2,
+            help="Below this, the fused result counts as not visible and the image is filtered out.",
+        ),
+    )
+
+
+@dataclass(frozen=True)
+class ClassicVisionBirdFusionParams(WeightedParams):
+    """Ranking Mode: Birds, via the shared Fusion Layer - EyePose-v0 +
+    SuperAnimal-Bird combined (see eyes.fusion, eyes.domains.BIRDS_PROFILE),
+    rather than either backend scored alone (see ClassicVisionEyePoseStrategy/
+    ClassicVisionStrategy for the two single-model Bird strategies this sits
+    alongside - all three remain independently selectable/cached)."""
+
+    eye_sharpness_weight: float = 70.0
+    subject_sharpness_weight: float = 10.0
+    subject_size_weight: float = 20.0
+    eyepose_v0_model_weight: float = BIRDS_PROFILE.default_model_weights[0].weight
+    superanimal_bird_model_weight: float = BIRDS_PROFILE.default_model_weights[1].weight
+    agreement_threshold: float = DEFAULT_AGREEMENT_THRESHOLD
+    min_fused_confidence: float = DEFAULT_MIN_FUSED_CONFIDENCE
+    detection_confidence_threshold: float = CropParams.conf_threshold
+    crop_confidence_threshold: float = CropParams.min_crop_confidence
+
+    @classmethod
+    def specs(cls) -> tuple[ParamSpec, ...]:
+        return (
+            *_scoring_weight_specs(),
+            *_fusion_weight_specs(BIRDS_PROFILE, "Birds Ranking Mode:"),
+            *_fusion_threshold_specs(),
+            *_detection_specs(),
+        )
+
+
+class ClassicVisionBirdFusionStrategy(ClassicVisionStrategy):
+    info = StrategyInfo(
+        strategy_id=BIRD_FUSION_STRATEGY_ID,
+        display_name="Classic Vision Ranking (Birds - Fusion)",
+        description=(
+            "Ranking Mode: Birds. Eye localisation: EyePose-v0 + SuperAnimal-Bird, "
+            "combined through the shared Fusion/Validation layer - agreement, "
+            "geometric plausibility and per-model trust decide the final eye "
+            "rather than either model alone."
+        ),
+        score_label="Classic (Birds Fusion)",
+    )
+    params_class = ClassicVisionBirdFusionParams
+    param_specs = ClassicVisionBirdFusionParams.specs()
+    metric_labels = METRIC_LABELS
+    _eye_detector_name = "fusion-birds"
+
+    def _eye_detector_kwargs(self, params: ClassicVisionBirdFusionParams) -> dict:
+        return {
+            "config": FusionConfig(
+                model_weights=(
+                    ModelWeight("eyepose-v0", params.eyepose_v0_model_weight),
+                    ModelWeight("superanimal-bird", params.superanimal_bird_model_weight),
+                ),
+                agreement_threshold=params.agreement_threshold,
+                min_fused_confidence=params.min_fused_confidence,
+            )
+        }
+
+    def _eye_detector_metadata(self, params: ClassicVisionBirdFusionParams) -> dict:
+        return {
+            "eyepose_v0_model_weight": params.eyepose_v0_model_weight,
+            "superanimal_bird_model_weight": params.superanimal_bird_model_weight,
+            "agreement_threshold": params.agreement_threshold,
+            "min_fused_confidence": params.min_fused_confidence,
+        }
+
+
+@dataclass(frozen=True)
+class ClassicVisionMammalFusionParams(WeightedParams):
+    """Ranking Mode: Mammals, via the shared Fusion Layer -
+    SuperAnimal-Quadruped today (see eyes.domains.MAMMALS_PROFILE); the same
+    Fusion Layer ClassicVisionBirdFusionParams uses, just constructed with a
+    different domain profile's detectors/weights - never a second fusion
+    implementation (see eyes.fusion's own module docstring)."""
+
+    eye_sharpness_weight: float = 70.0
+    subject_sharpness_weight: float = 10.0
+    subject_size_weight: float = 20.0
+    superanimal_quadruped_model_weight: float = MAMMALS_PROFILE.default_model_weights[0].weight
+    agreement_threshold: float = DEFAULT_AGREEMENT_THRESHOLD
+    min_fused_confidence: float = DEFAULT_MIN_FUSED_CONFIDENCE
+    detection_confidence_threshold: float = CropParams.conf_threshold
+    crop_confidence_threshold: float = CropParams.min_crop_confidence
+
+    @classmethod
+    def specs(cls) -> tuple[ParamSpec, ...]:
+        return (
+            *_scoring_weight_specs(),
+            *_fusion_weight_specs(MAMMALS_PROFILE, "Mammals Ranking Mode:"),
+            *_fusion_threshold_specs(),
+            *_detection_specs(),
+        )
+
+
+class ClassicVisionMammalFusionStrategy(ClassicVisionStrategy):
+    info = StrategyInfo(
+        strategy_id=MAMMAL_FUSION_STRATEGY_ID,
+        display_name="Classic Vision Ranking (Mammals - Fusion)",
+        description=(
+            "Ranking Mode: Mammals. Eye localisation: SuperAnimal-Quadruped, "
+            "through the shared Fusion/Validation layer. Does NOT use "
+            "EyePose-v0 - it is a bird-specific model (see eyes.domains)."
+        ),
+        score_label="Classic (Mammals Fusion)",
+    )
+    params_class = ClassicVisionMammalFusionParams
+    param_specs = ClassicVisionMammalFusionParams.specs()
+    metric_labels = METRIC_LABELS
+    _eye_detector_name = "fusion-mammals"
+
+    def _eye_detector_kwargs(self, params: ClassicVisionMammalFusionParams) -> dict:
+        return {
+            "config": FusionConfig(
+                model_weights=(
+                    ModelWeight("superanimal-quadruped", params.superanimal_quadruped_model_weight),
+                ),
+                agreement_threshold=params.agreement_threshold,
+                min_fused_confidence=params.min_fused_confidence,
+            )
+        }
+
+    def _eye_detector_metadata(self, params: ClassicVisionMammalFusionParams) -> dict:
+        return {
+            "superanimal_quadruped_model_weight": params.superanimal_quadruped_model_weight,
+            "agreement_threshold": params.agreement_threshold,
+            "min_fused_confidence": params.min_fused_confidence,
         }
