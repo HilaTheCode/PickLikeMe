@@ -641,14 +641,21 @@ def _seed_agreement_scenario(tmp_path: Path) -> Path:
 
 
 @pytest.mark.skipif(QApplication is None, reason="PySide6 not installed")
-def test_user_vs_algorithm_tab_is_first_and_shows_the_confusion_matrix(tmp_path: Path) -> None:
+def test_algorithms_tab_holds_user_vs_algorithm_and_shows_the_confusion_matrix(tmp_path: Path) -> None:
+    """Redesign (docs/UX Design/20260810/Ver1.0): the header tab bar is now
+    Overview/Algorithms/Domains/Trends/Quality/Export - Overview (the live
+    folder's own KPIs/charts) is first, not a historical-experiment tab;
+    User vs Algorithm now lives under the "Algorithms" tab, unrenamed and
+    functionally unchanged - see AnalyticsDashboard.__init__."""
     from picklikeme.desktop.dialogs.analytics_dashboard import AnalyticsDashboard
 
     _seed_agreement_scenario(tmp_path)
     app = QApplication.instance() or QApplication([])
     dialog = AnalyticsDashboard(species_db=tmp_path / "species.db", analytics_db=tmp_path / "analytics.db", annotations_db=tmp_path / "annotations.sqlite")
 
-    assert dialog._tabs.tabText(0) == "User vs Algorithm"
+    assert dialog._tabs.tabText(0) == "Overview"
+    assert dialog._tabs.tabText(1) == "Algorithms"
+    assert dialog._tabs.widget(1) is dialog._user_vs_algorithm_tab
     dialog._experiment_list.setCurrentRow(0)
     app.processEvents()
 

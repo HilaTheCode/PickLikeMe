@@ -67,7 +67,7 @@ def test_analytics_dashboard_opens(tmp_path) -> None:
     app = QApplication.instance() or QApplication([])
     dashboard = AnalyticsDashboard(
         analytics_db=tmp_path / "analytics.sqlite", annotations_db=tmp_path / "annotations.sqlite",
-        crop_cache_dir=tmp_path / "crops", species_db=tmp_path / "species.db", parent=None,
+        species_db=tmp_path / "species.db", parent=None,
     )
     try:
         assert dashboard is not None

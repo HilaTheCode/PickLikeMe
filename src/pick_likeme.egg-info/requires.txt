@@ -10,3 +10,14 @@ matplotlib
 pyarrow
 tqdm
 PyYAML
+open_clip_torch
+PySide6
+
+[eyepose-cpu]
+onnxruntime
+
+[eyepose-export]
+ultralytics
+
+[eyepose-gpu]
+onnxruntime-gpu==1.28.0

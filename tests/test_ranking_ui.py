@@ -157,15 +157,15 @@ def test_the_rank_menu_offers_every_registered_strategy(app, tmp_path) -> None:
         service.close()
 
 
-def test_the_toolbar_rank_button_is_a_split_button_with_a_dropdown(app, tmp_path) -> None:
+def test_the_rank_button_is_a_split_button_with_a_dropdown(app, tmp_path) -> None:
     """Single click runs the default strategy; the arrow offers the others.
 
     Asserted through the style option rather than `QToolButton.menu()`, which
-    returns None here by design: QToolBar builds the button with
-    setDefaultAction(), and the button paints/popups the *action's* menu while
-    `menu()` only ever reports an explicitly-set one.
+    returns None here by design: the button is built with setDefaultAction(),
+    and the button paints/popups the *action's* menu while `menu()` only ever
+    reports an explicitly-set one.
     """
-    from PySide6.QtWidgets import QStyleOptionToolButton, QToolBar, QToolButton
+    from PySide6.QtWidgets import QStyleOptionToolButton, QToolButton
 
     from picklikeme.desktop.application import ApplicationState, WorkerManager
     from picklikeme.desktop.main_window import MainWindow
@@ -181,10 +181,11 @@ def test_the_toolbar_rank_button_is_a_split_button_with_a_dropdown(app, tmp_path
     )
     try:
         window.initialize()
-        # Rank lives on the toolbar's second row (main_toolbar_2) - see the
-        # top-toolbar layout fix's two-row split in _build_tool_bar.
-        button = window.findChild(QToolBar, "main_toolbar_2").widgetForAction(window._rank_action)
-        assert isinstance(button, QToolButton)
+        # Rank lives on the redesigned primary toolbar (see
+        # MainWindow._build_primary_bar) as a standalone QToolButton, not
+        # inside a QToolBar - findable by its own objectName.
+        button = window.findChild(QToolButton, "rankButton")
+        assert button is not None
         assert button.popupMode() == QToolButton.ToolButtonPopupMode.MenuButtonPopup
 
         option = QStyleOptionToolButton()
@@ -198,9 +199,11 @@ def test_the_toolbar_rank_button_is_a_split_button_with_a_dropdown(app, tmp_path
         service.close()
 
 
-def test_the_gallery_card_shows_one_row_per_analysis_module(app) -> None:
-    """Both scores side by side, neither overwriting the other, driven by the
-    data rather than by naming the two modules that exist today."""
+def test_the_gallery_card_shows_only_the_selected_color_sources_own_score(app) -> None:
+    """Redesign rule (PeakPick_UI_Design_Spec.md): "do not show every
+    algorithm score on each thumbnail" - the card shows exactly the
+    currently selected Color Source's own score, normalized `0.xxx`, never
+    every module's score stacked in rows."""
     from picklikeme.desktop.models.image_item import ImageItem
     from picklikeme.desktop.views.gallery.thumbnail_delegate import ThumbnailCardDelegate
 
@@ -211,49 +214,37 @@ def test_the_gallery_card_shows_one_row_per_analysis_module(app) -> None:
             "classic-vision": {"score": 0.42, "rank": 11},
         },
     )
-    # score/rank are properties derived from ranking_results, not separate
-    # fields - so they must agree with what was passed in.
     assert item.score == pytest.approx(0.75)
     assert item.rank == 3
-    rows = ThumbnailCardDelegate._score_rows(item)
-    assert [label for label, _ in rows] == ["AI", "Classic (SuperAnimal)"]  # AI first
-    assert rows[0][1] == "0.7500 · #3"
-    assert rows[1][1] == "0.4200 · #11"
+
+    delegate = ThumbnailCardDelegate()
+    delegate.set_color_source("ai-model")
+    assert delegate._selected_score_text(item) == "0.750"
+    delegate.set_color_source("classic-vision")
+    assert delegate._selected_score_text(item) == "0.420"
+    # "Review Status" (no Color Source selected) has no single algorithm to
+    # draw a score from.
+    delegate.set_color_source(None)
+    assert delegate._selected_score_text(item) == "—"
 
 
-def test_a_card_shows_the_module_it_has_and_stays_quiet_about_the_rest(app) -> None:
+def test_a_score_badge_reads_em_dash_for_a_strategy_that_never_scored_this_image(app) -> None:
     from picklikeme.desktop.models.image_item import ImageItem
     from picklikeme.desktop.views.gallery.thumbnail_delegate import ThumbnailCardDelegate
-
-    only_classic = ImageItem(
-        path="/x/b.nef", file_name="b.nef",
-        ranking_results={"classic-vision": {"score": 0.9, "rank": 1}},
-    )
-    assert only_classic.score is None  # no "ai-model" entry - not the same as unranked-by-everyone
-    assert ThumbnailCardDelegate._score_rows(only_classic) == [("Classic (SuperAnimal)", "0.9000 · #1")]
 
     unscored = ImageItem(path="/x/c.nef", file_name="c.nef")
-    assert ThumbnailCardDelegate._score_rows(unscored) == [("", "Unranked")]
+    delegate = ThumbnailCardDelegate()
+    delegate.set_color_source("ai-model")
+    assert delegate._selected_score_text(unscored) == "—"
 
 
-def test_an_unknown_module_is_labelled_by_its_id_rather_than_dropped(app) -> None:
-    from picklikeme.desktop.models.image_item import ImageItem
-    from picklikeme.desktop.views.gallery.thumbnail_delegate import ThumbnailCardDelegate
-
-    item = ImageItem(
-        path="/x/d.nef", file_name="d.nef",
-        ranking_results={"burst-analysis": {"score": 0.5, "rank": 2}},
-    )
-    assert ThumbnailCardDelegate._score_rows(item) == [("burst-analysis", "0.5000 · #2")]
-
-
-def test_the_card_reserves_room_for_every_score_row_it_will_draw(app) -> None:
+def test_the_card_reserves_room_for_the_image_metadata_and_button_row(app) -> None:
     """Cards are a uniform grid, so the height must already account for the
-    rows - otherwise a second module's score would overlap the buttons."""
+    thumbnail, the name/meta rows, and the button row - not overlap."""
     from picklikeme.desktop.views.gallery.thumbnail_delegate import ThumbnailCardDelegate as D
 
-    assert D.MAX_SCORE_ROWS >= 2
-    assert D.CARD_HEIGHT >= 252 + (D.MAX_SCORE_ROWS - 1) * D.SCORE_ROW_HEIGHT
+    minimum = D.PADDING + D.THUMBNAIL_HEIGHT + D.SPACING + D.NAME_ROW_HEIGHT + D.META_ROW_HEIGHT + D.SPACING + D.BUTTON_HEIGHT + D.PADDING
+    assert D.CARD_HEIGHT == minimum
 
 
 def test_the_loupe_shows_every_module_score_on_one_line(app) -> None:
@@ -578,56 +569,46 @@ def test_color_source_options_lists_algorithm_ran_last_review_status_and_every_s
     assert labels["classic-vision-eyepose-v0"] == "Classic Vision Ranking (EyePose-v0, recommended) Score"
 
 
-def test_default_coloring_is_unchanged_when_no_color_source_is_set(app) -> None:
-    """Backward compatibility: a delegate that never had set_color_source
-    called behaves exactly as before this feature existed - plain
-    review-status coloring, ignoring any strategy score on the item."""
-    from picklikeme.desktop import theme
+def test_default_status_is_review_when_no_color_source_is_set(app) -> None:
+    """"Review Status" as Color Source (never called set_color_source, or
+    explicitly None) has no algorithm to fall back to - an undecided image
+    is plain "Review", ignoring any strategy score on the item."""
     from picklikeme.desktop.models.image_item import ImageItem
     from picklikeme.desktop.views.gallery.thumbnail_delegate import ThumbnailCardDelegate
 
     delegate = ThumbnailCardDelegate()
-    palette = theme.current_palette()
     keep_item = ImageItem(path="/x/a.nef", file_name="a.nef", review_status="keep",
                            ranking_results={"classic-vision": {"score": 0.1}})
-    assert delegate._get_background_color(palette, keep_item, False).name() == theme_color(palette.keep_bg)
-
-
-def theme_color(hex_value: str) -> str:
-    from PySide6.QtGui import QColor
-
-    return QColor(hex_value).name()
+    assert delegate._resolve_status(keep_item) == "keep"
+    neutral_item = ImageItem(path="/x/b.nef", file_name="b.nef")
+    assert delegate._resolve_status(neutral_item) == "review"
 
 
 def test_color_source_colors_by_the_chosen_strategy_s_keep_reject_suggestion(app) -> None:
     """Priority #2 of the coloring policy: with no User Decision, an
-    image's background follows the chosen Color Source's own keep/reject
+    image's status follows the chosen Color Source's own keep/reject
     suggestion (ImageItem.algorithm_suggestion) - a binary call at the
     current threshold, not a score gradient."""
-    from picklikeme.desktop import theme
     from picklikeme.desktop.models.image_item import ImageItem
     from picklikeme.desktop.views.gallery.thumbnail_delegate import ThumbnailCardDelegate
 
     delegate = ThumbnailCardDelegate()
-    palette = theme.current_palette()
     delegate.set_color_source("classic-vision")
 
     suggested_reject = ImageItem(path="/x/low.nef", file_name="low.nef", algorithm_suggestion="reject")
     suggested_keep = ImageItem(path="/x/high.nef", file_name="high.nef", algorithm_suggestion="keep")
 
-    assert delegate._get_background_color(palette, suggested_reject, False).name() == theme_color(palette.reject_bg)
-    assert delegate._get_background_color(palette, suggested_keep, False).name() == theme_color(palette.keep_bg)
+    assert delegate._resolve_status(suggested_reject) == "reject"
+    assert delegate._resolve_status(suggested_keep) == "keep"
 
 
 def test_a_user_decision_always_overrides_the_color_source_suggestion(app) -> None:
     """Priority #1: the photographer's own Keep/Reject wins even when the
     algorithm's own suggestion, for the very same image, disagrees."""
-    from picklikeme.desktop import theme
     from picklikeme.desktop.models.image_item import ImageItem
     from picklikeme.desktop.views.gallery.thumbnail_delegate import ThumbnailCardDelegate
 
     delegate = ThumbnailCardDelegate()
-    palette = theme.current_palette()
     delegate.set_color_source("classic-vision")
 
     user_kept_algo_rejects = ImageItem(
@@ -636,29 +617,58 @@ def test_a_user_decision_always_overrides_the_color_source_suggestion(app) -> No
     user_rejected_algo_keeps = ImageItem(
         path="/x/b.nef", file_name="b.nef", review_status="reject", algorithm_suggestion="keep",
     )
-    assert delegate._get_background_color(palette, user_kept_algo_rejects, False).name() == theme_color(palette.keep_bg)
-    assert delegate._get_background_color(palette, user_rejected_algo_keeps, False).name() == theme_color(palette.reject_bg)
+    assert delegate._resolve_status(user_kept_algo_rejects) == "keep"
+    assert delegate._resolve_status(user_rejected_algo_keeps) == "reject"
 
 
-def test_an_image_the_chosen_strategy_never_scored_gets_the_skipped_color(app) -> None:
-    """An image Classic Vision filtered out (or that only the AI model has
-    scored) has no algorithm_suggestion from it - it must render in the
-    distinct "Skipped" color (see theme.Palette.skipped_bg and
-    _get_background_color's own docstring), never a guessed keep/reject,
-    and never silently identical to plain Neutral (a genuinely-scored image
-    with no decision yet) - those are different claims about the image."""
-    from picklikeme.desktop import theme
+def test_an_image_the_chosen_strategy_explicitly_filtered_gets_filtered_out(app) -> None:
+    """A strategy that recorded an explicit filter reason for this image DID
+    examine it - "Filtered Out" (gray), distinct from "Skipped" (purple,
+    below - never touched at all) and from plain "Review" (see the design
+    spec's own "Skipped is intentionally different from Reject" rule,
+    generalized to Filtered Out too)."""
     from picklikeme.desktop.models.image_item import ImageItem
     from picklikeme.desktop.views.gallery.thumbnail_delegate import ThumbnailCardDelegate
 
     delegate = ThumbnailCardDelegate()
-    palette = theme.current_palette()
     delegate.set_color_source("classic-vision")
 
-    unscored = ImageItem(path="/x/u.nef", file_name="u.nef", algorithm_suggestion=None)
-    color = delegate._get_background_color(palette, unscored, False).name()
-    assert color == theme_color(palette.skipped_bg)
-    assert color != theme_color(palette.neutral_bg)
+    filtered = ImageItem(
+        path="/x/u.nef", file_name="u.nef", algorithm_suggestion=None,
+        filter_reasons={"classic-vision": "NO_VISIBLE_EYE"},
+    )
+    assert delegate._resolve_status(filtered) == "filtered"
+
+
+def test_an_image_the_chosen_strategy_never_touched_gets_skipped(app) -> None:
+    """No ranking_result AND no filter_reasons entry for this strategy at
+    all - never touched, not merely filtered - renders "Skipped", never
+    silently identical to "Filtered Out" or plain "Review"."""
+    from picklikeme.desktop.models.image_item import ImageItem
+    from picklikeme.desktop.views.gallery.thumbnail_delegate import ThumbnailCardDelegate
+
+    delegate = ThumbnailCardDelegate()
+    delegate.set_color_source("classic-vision")
+
+    untouched = ImageItem(path="/x/v.nef", file_name="v.nef", algorithm_suggestion=None)
+    assert delegate._resolve_status(untouched) == "skipped"
+
+
+def test_an_image_the_chosen_strategy_scored_with_no_suggestion_stays_review(app) -> None:
+    """Scored (has a ranking_result) but algorithm_suggestion is None (e.g.
+    between thresholds) - still "Review", not "Skipped"/"Filtered Out",
+    since the strategy DID produce a real result for this image."""
+    from picklikeme.desktop.models.image_item import ImageItem
+    from picklikeme.desktop.views.gallery.thumbnail_delegate import ThumbnailCardDelegate
+
+    delegate = ThumbnailCardDelegate()
+    delegate.set_color_source("classic-vision")
+
+    scored = ImageItem(
+        path="/x/w.nef", file_name="w.nef", algorithm_suggestion=None,
+        ranking_results={"classic-vision": {"score": 0.5}},
+    )
+    assert delegate._resolve_status(scored) == "review"
 
 
 def test_selecting_a_color_source_propagates_to_the_gallery_delegate(app, tmp_path) -> None:

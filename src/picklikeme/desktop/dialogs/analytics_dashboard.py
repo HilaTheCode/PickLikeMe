@@ -46,6 +46,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QDoubleSpinBox,
+    QFileDialog,
     QFrame,
     QHBoxLayout,
     QHeaderView,
@@ -53,6 +54,7 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QLineEdit,
+    QMessageBox,
     QPushButton,
     QRadioButton,
     QSplitter,
@@ -64,6 +66,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from .. import theme
 from ...analyzer.annotations import DEFAULT_ANNOTATIONS_DB, AnnotationStore
 from ...analytics.agreement import (
     AgreementReport,
@@ -74,10 +77,24 @@ from ...analytics.agreement import (
 from ...analytics.reports import metric_statistics, run_statistics
 from ...analytics.store import DEFAULT_ANALYTICS_DB, AnalyticsStore
 from ...burst_analysis import BurstInfo, ScoredImage, analyze_bursts
+from ...ranking import available_strategies, eye_detector_names, score_labels
 from ...ranking.classic import read_filter_report
 from ...ranking.filters import REJECT_REASON_LABELS
 from ...species.classifier import UNKNOWN_SPECIES
 from ..filtering import FilterableRecord, apply_filters
+from ..models.image_item import ImageItem
+from ..views.gallery.thumbnail_delegate import DOMAIN_BY_STRATEGY
+from ..widgets.design_system import (
+    RADIUS_LG,
+    SPACING,
+    STATUS_CATEGORIES,
+    STATUS_LABELS as STATUS_CATEGORY_LABELS,
+    ChartCard,
+    KpiCard,
+    Panel,
+    resolve_review_status,
+    status_color,
+)
 from ..widgets.advanced_filters_panel import AdvancedFiltersPanel
 
 # run_id/folder/started_at (etc.) are not "algorithm identity" facts a
@@ -1137,6 +1154,392 @@ def _build_run_records(
     return records
 
 
+def _live_score(item: ImageItem, color_source: str | None) -> float | None:
+    """The one score an Overview/Domains chart plots for `item` - the
+    resolved Color Source's own score, or the AI model's when no strategy
+    is selected ("Review Status") - the same fallback `MainWindow._apply_
+    cutoff` already uses, so a Dashboard opened from the live Review
+    context never disagrees with what the Grid itself is showing."""
+    from ...sidecar import AI_STRATEGY_ID
+
+    return item.score_for(color_source or AI_STRATEGY_ID)
+
+
+def _domain_groups() -> list[str]:
+    """Every domain label in use, in a stable order - see
+    `thumbnail_delegate.DOMAIN_BY_STRATEGY`."""
+    return list(dict.fromkeys(DOMAIN_BY_STRATEGY.values()))
+
+
+class OverviewTab(QWidget):
+    """The Dashboard's default landing page (`03_Analytics_Dashboard.svg`) -
+    a KPI row plus Score Distribution / Top Algorithms charts and short
+    natural-language Insights, all computed from the LIVE currently-open
+    Review folder (the same `ImageItem` list the Grid itself is showing),
+    never from a single selected historical experiment run the way every
+    other tab here is. This is why it needs its own data path
+    (`set_items`) instead of `show_run`: "how is this folder doing right
+    now, across every algorithm" is a different question from "how did
+    THIS ONE past run do", and conflating them would mean Overview goes
+    blank the moment nothing is selected in the Experiment Browser - the
+    opposite of "immediately communicate what dataset is currently being
+    analyzed" (this dashboard's own Phase 3 mandate).
+    """
+
+    def __init__(self, *, parent=None) -> None:
+        super().__init__(parent)
+        self._items: list[ImageItem] = []
+        self._color_source: str | None = None
+
+        self._kpi_cards: dict[str, KpiCard] = {}
+        kpi_row = QHBoxLayout()
+        kpi_row.setSpacing(SPACING * 2)
+        total_card = KpiCard("Total Images", parent=self)
+        kpi_row.addWidget(total_card)
+        self._kpi_cards["total"] = total_card
+        palette_now = theme.current_palette()
+        for status in STATUS_CATEGORIES:
+            card = KpiCard(STATUS_CATEGORY_LABELS[status], value_color=status_color(palette_now, status), parent=self)
+            kpi_row.addWidget(card)
+            self._kpi_cards[status] = card
+
+        self._score_distribution = ChartCard("Score Distribution", parent=self)
+        self._top_algorithms = ChartCard("Top Algorithms (Avg Score)", parent=self)
+        charts_row = QHBoxLayout()
+        charts_row.setSpacing(SPACING * 2)
+        charts_row.addWidget(self._score_distribution, 1)
+        charts_row.addWidget(self._top_algorithms, 1)
+
+        self._insights_panel = Panel(radius=RADIUS_LG, parent=self)
+        insights_layout = QVBoxLayout(self._insights_panel)
+        insights_layout.setContentsMargins(SPACING * 2, SPACING * 2, SPACING * 2, SPACING * 2)
+        title = QLabel("Insights", self._insights_panel)
+        title.setStyleSheet("font-size: 13px; font-weight: 700; border: none;")
+        insights_layout.addWidget(title)
+        self._insights_label = QLabel(self._insights_panel)
+        self._insights_label.setWordWrap(True)
+        self._insights_label.setStyleSheet("border: none;")
+        insights_layout.addWidget(self._insights_label)
+
+        layout = QVBoxLayout(self)
+        layout.addLayout(kpi_row)
+        layout.addLayout(charts_row, 1)
+        layout.addWidget(self._insights_panel)
+
+    def set_items(self, items: list[ImageItem], *, color_source: str | None) -> None:
+        self._items = items
+        self._color_source = color_source
+        self._refresh()
+
+    def _refresh(self) -> None:
+        items = self._items
+        counts = {status: 0 for status in STATUS_CATEGORIES}
+        for item in items:
+            counts[resolve_review_status(item, self._color_source)] += 1
+        self._kpi_cards["total"].set_value(str(len(items)))
+        for status in STATUS_CATEGORIES:
+            self._kpi_cards[status].set_value(str(counts[status]))
+
+        self._draw_score_distribution()
+        self._draw_top_algorithms()
+        self._draw_insights(counts)
+
+    def _draw_score_distribution(self) -> None:
+        card = self._score_distribution
+        card.clear()
+        scores = [s for item in self._items if (s := _live_score(item, self._color_source)) is not None]
+        card.set_empty(not scores)
+        if not scores:
+            return
+        ax = card.figure.add_subplot(111)
+        ax.hist(scores, bins=20, color=theme.current_palette().secondary_accent)
+        card.style_axes(ax)
+        card.figure.tight_layout()
+        card.redraw()
+
+    def _draw_top_algorithms(self) -> None:
+        card = self._top_algorithms
+        card.clear()
+        labels = score_labels()
+        bars: list[tuple[str, float]] = []
+        for info in available_strategies():
+            values = [
+                s for item in self._items
+                if (s := item.score_for(info.strategy_id)) is not None
+            ]
+            if values:
+                bars.append((labels.get(info.strategy_id, info.strategy_id), statistics.fmean(values)))
+        bars.sort(key=lambda pair: pair[1])
+        card.set_empty(not bars)
+        if not bars:
+            return
+        ax = card.figure.add_subplot(111)
+        names = [name for name, _ in bars]
+        values = [value for _, value in bars]
+        ax.barh(names, values, color=theme.current_palette().keep_fg)
+        ax.set_xlim(0, 1)
+        card.style_axes(ax)
+        card.figure.tight_layout()
+        card.redraw()
+
+    def _draw_insights(self, counts: dict[str, int]) -> None:
+        total = len(self._items)
+        lines: list[str] = []
+        if total == 0:
+            self._insights_label.setText("Open a folder to see insights.")
+            return
+
+        domain_stats = _compute_domain_stats(self._items)
+        scored_domains = [(name, stats) for name, stats in domain_stats.items() if stats["avg_score"] is not None]
+        best_domain = max(scored_domains, key=lambda kv: kv[1]["avg_score"], default=None)
+        if best_domain is not None:
+            lines.append(
+                f"• {best_domain[0]} has the highest average score ({best_domain[1]['avg_score']:.3f})."
+            )
+
+        eye_capable = set(eye_detector_names())
+        with_eye_capable_scores = sum(
+            1 for item in self._items if eye_capable & set(item.ranking_results)
+        )
+        if with_eye_capable_scores:
+            lines.append(
+                f"• {100 * with_eye_capable_scores / total:.0f}% of images were scored by an "
+                "eye-detection-capable algorithm."
+            )
+
+        lines.append(f"• {100 * counts['keep'] / total:.0f}% are currently in Keep.")
+        if counts["review"]:
+            lines.append(f"• {counts['review']} image(s) still need manual review.")
+
+        self._insights_label.setText("\n".join(lines) if lines else "No insights yet - rank this folder first.")
+
+
+def _compute_domain_stats(items: list[ImageItem]) -> dict[str, dict[str, float | int | None]]:
+    """Per domain group (see `DOMAIN_BY_STRATEGY`): average score across
+    every (item, strategy) pair in that domain, and how many images at
+    least one strategy in that domain actually scored - the shared
+    computation `OverviewTab`'s insight and `DomainsTab`'s own two charts
+    both read, so they can never quietly disagree with each other."""
+    domain_scores: dict[str, list[float]] = {domain: [] for domain in _domain_groups()}
+    domain_image_counts: dict[str, int] = {domain: 0 for domain in _domain_groups()}
+    for item in items:
+        touched_domains: set[str] = set()
+        for strategy_id, entry in item.ranking_results.items():
+            domain = DOMAIN_BY_STRATEGY.get(strategy_id)
+            score = entry.get("score")
+            if domain is None or score is None:
+                continue
+            domain_scores[domain].append(score)
+            touched_domains.add(domain)
+        for domain in touched_domains:
+            domain_image_counts[domain] += 1
+    return {
+        domain: {
+            "avg_score": statistics.fmean(scores) if scores else None,
+            "count": domain_image_counts[domain],
+        }
+        for domain, scores in domain_scores.items()
+    }
+
+
+class DomainsTab(QWidget):
+    """Score by Domain / Domain Breakdown - the same live-folder data path
+    as `OverviewTab` (see that class's own docstring for why this is not a
+    `show_run`-style historical-experiment tab)."""
+
+    def __init__(self, *, parent=None) -> None:
+        super().__init__(parent)
+        self._items: list[ImageItem] = []
+        self._score_by_domain = ChartCard("Score by Domain", parent=self)
+        self._domain_breakdown = ChartCard("Domain Breakdown", parent=self)
+        layout = QHBoxLayout(self)
+        layout.setSpacing(SPACING * 2)
+        layout.addWidget(self._score_by_domain, 1)
+        layout.addWidget(self._domain_breakdown, 1)
+
+    def set_items(self, items: list[ImageItem]) -> None:
+        self._items = items
+        self._refresh()
+
+    def _refresh(self) -> None:
+        stats = _compute_domain_stats(self._items)
+        total = len(self._items)
+
+        score_card = self._score_by_domain
+        score_card.clear()
+        scored = [(domain, s["avg_score"]) for domain, s in stats.items() if s["avg_score"] is not None]
+        score_card.set_empty(not scored)
+        if scored:
+            ax = score_card.figure.add_subplot(111)
+            ax.barh([d for d, _ in scored], [v for _, v in scored], color=theme.current_palette().secondary_accent)
+            ax.set_xlim(0, 1)
+            score_card.style_axes(ax)
+            score_card.figure.tight_layout()
+            score_card.redraw()
+
+        breakdown_card = self._domain_breakdown
+        breakdown_card.clear()
+        counted = [(domain, s["count"]) for domain, s in stats.items() if s["count"] > 0]
+        breakdown_card.set_empty(not counted or not total)
+        if counted and total:
+            ax = breakdown_card.figure.add_subplot(111)
+            palette_colors = [theme.current_palette().keep_fg, theme.current_palette().secondary_accent,
+                               theme.current_palette().skipped_fg, theme.current_palette().neutral_fg]
+            ax.pie(
+                [c for _, c in counted], labels=[f"{d} {100 * c / total:.0f}%" for d, c in counted],
+                colors=palette_colors[: len(counted)], textprops={"color": theme.current_palette().text_muted, "fontsize": 8},
+            )
+            breakdown_card.figure.tight_layout()
+            breakdown_card.redraw()
+
+
+class ExportTab(QWidget):
+    """Real CSV export - the selected experiment's own currently-filtered
+    records (whatever `AnalyticsDashboard._apply_filters_to_tabs` last
+    computed - the same records `RunSummaryTab`/`SpeciesAnalysisTab` are
+    showing), written with Python's own `csv` module. No placeholder
+    "coming soon" button - see the design spec's own "do not add controls
+    merely because there is empty space" rule; this tab exists to DO the
+    one real thing "Export" can honestly mean here today.
+    """
+
+    def __init__(self, *, parent=None) -> None:
+        super().__init__(parent)
+        self._records: list[FilterableRecord] = []
+        palette = theme.current_palette()
+        self._summary_label = QLabel("Select an experiment to export its records.", self)
+        self._summary_label.setWordWrap(True)
+        export_button = QPushButton("Export Filtered Records to CSV…", self)
+        export_button.clicked.connect(self._export)
+        layout = QVBoxLayout(self)
+        layout.addWidget(self._summary_label)
+        layout.addWidget(export_button, 0, Qt.AlignmentFlag.AlignLeft)
+        layout.addStretch(1)
+
+    def set_records(self, records: list[FilterableRecord]) -> None:
+        self._records = records
+        self._summary_label.setText(f"{len(records)} record(s) currently in view, ready to export.")
+
+    def _export(self) -> None:
+        import csv
+
+        if not self._records:
+            QMessageBox.information(self, "PeakPick - Export", "No records to export - select an experiment first.")
+            return
+        destination, _ = QFileDialog.getSaveFileName(self, "Export Records to CSV", "peakpick_export.csv", "CSV Files (*.csv)")
+        if not destination:
+            return
+        fields = list(FilterableRecord.__dataclass_fields__)
+        with open(destination, "w", newline="", encoding="utf-8") as handle:
+            writer = csv.writer(handle)
+            writer.writerow(fields)
+            for record in self._records:
+                writer.writerow([getattr(record, field) for field in fields])
+        QMessageBox.information(self, "PeakPick - Export", f"Exported {len(self._records)} record(s) to:\n{destination}")
+
+
+class TrendsTab(QWidget):
+    """Score Over Time (live-folder, by capture time - the same data path
+    as `OverviewTab`) stacked above the existing `RunSummaryTab` (a
+    selected experiment's own numeric trends/statistics) - two different
+    senses of "trends" the design's single header tab covers, neither one
+    replacing the other."""
+
+    def __init__(self, run_summary_tab: "RunSummaryTab", *, parent=None) -> None:
+        super().__init__(parent)
+        self._items: list[ImageItem] = []
+        self._score_over_time = ChartCard("Score Over Time", parent=self)
+        self._score_over_time.setMaximumHeight(260)
+        layout = QVBoxLayout(self)
+        layout.addWidget(self._score_over_time)
+        layout.addWidget(run_summary_tab, 1)
+
+    def set_items(self, items: list[ImageItem], *, color_source: str | None) -> None:
+        self._items = items
+        card = self._score_over_time
+        card.clear()
+        dated = sorted(
+            ((item.captured_at, _live_score(item, color_source)) for item in items if item.captured_at),
+            key=lambda pair: pair[0],
+        )
+        dated = [(when, score) for when, score in dated if score is not None]
+        card.set_empty(not dated)
+        if not dated:
+            return
+        ax = card.figure.add_subplot(111)
+        ax.plot(range(len(dated)), [score for _, score in dated], color=theme.current_palette().secondary_accent)
+        ax.set_xticks([])
+        card.style_axes(ax)
+        card.figure.tight_layout()
+        card.redraw()
+
+
+class QualityTab(QWidget):
+    """Detection Success Rate / Keep Rate by Algorithm charts (live-folder)
+    above the existing Species Analysis / Burst Analytics tabs (a selected
+    experiment's own classification-quality/burst detail) as an inner tab
+    strip - both are "how good is the output" questions the design's
+    single header tab covers together."""
+
+    def __init__(self, species_tab: "SpeciesAnalysisTab", burst_tab: "BurstAnalyticsTab", *, parent=None) -> None:
+        super().__init__(parent)
+        self._items: list[ImageItem] = []
+        self._detection_rate = ChartCard("Detection Success Rate", parent=self)
+        self._keep_rate = ChartCard("Keep Rate by Algorithm", parent=self)
+        self._detection_rate.setMaximumHeight(220)
+        self._keep_rate.setMaximumHeight(220)
+        charts_row = QHBoxLayout()
+        charts_row.setSpacing(SPACING * 2)
+        charts_row.addWidget(self._detection_rate, 1)
+        charts_row.addWidget(self._keep_rate, 1)
+
+        inner_tabs = QTabWidget(self)
+        inner_tabs.addTab(species_tab, "Species Analysis")
+        inner_tabs.addTab(burst_tab, "Burst Analytics")
+
+        layout = QVBoxLayout(self)
+        layout.addLayout(charts_row)
+        layout.addWidget(inner_tabs, 1)
+
+    def set_items(self, items: list[ImageItem], *, color_source: str | None) -> None:
+        self._items = items
+        total = len(items)
+        labels = score_labels()
+
+        detection_card = self._detection_rate
+        detection_card.clear()
+        rates = []
+        for info in available_strategies():
+            touched = sum(1 for item in items if info.strategy_id in item.ranking_results)
+            if touched:
+                rates.append((labels.get(info.strategy_id, info.strategy_id), touched / total if total else 0.0))
+        detection_card.set_empty(not rates)
+        if rates:
+            ax = detection_card.figure.add_subplot(111)
+            ax.barh([n for n, _ in rates], [v for _, v in rates], color=theme.current_palette().keep_fg)
+            ax.set_xlim(0, 1)
+            detection_card.style_axes(ax)
+            detection_card.figure.tight_layout()
+            detection_card.redraw()
+
+        keep_card = self._keep_rate
+        keep_card.clear()
+        keep_rates = []
+        for info in available_strategies():
+            scored = [item for item in items if info.strategy_id in item.ranking_results]
+            if scored:
+                kept = sum(1 for item in scored if resolve_review_status(item, info.strategy_id) == "keep")
+                keep_rates.append((labels.get(info.strategy_id, info.strategy_id), kept / len(scored)))
+        keep_card.set_empty(not keep_rates)
+        if keep_rates:
+            ax = keep_card.figure.add_subplot(111)
+            ax.barh([n for n, _ in keep_rates], [v for _, v in keep_rates], color=theme.current_palette().secondary_accent)
+            ax.set_xlim(0, 1)
+            keep_card.style_axes(ax)
+            keep_card.figure.tight_layout()
+            keep_card.redraw()
+
+
 class AnalyticsDashboard(QDialog):
     """The Experiment Browser (left) plus an Experiment Metadata header,
     Advanced Filters, and User vs Algorithm / Run Summary / Species
@@ -1175,6 +1578,7 @@ class AnalyticsDashboard(QDialog):
         root_folder: str | None = None,
         color_source: str | None = None,
         keep_percent: float | None = None,
+        items: list[ImageItem] | None = None,
         parent=None,
     ) -> None:
         super().__init__(parent)
@@ -1207,6 +1611,13 @@ class AnalyticsDashboard(QDialog):
         self._root_folder = root_folder
         self._color_source = color_source
         self._keep_percent = keep_percent
+        # The live Grid's own ImageItem list, for the Overview/Domains/
+        # Trends tabs - see OverviewTab's own docstring for why these read
+        # a different data source than every historical-experiment tab
+        # here. A snapshot, like everything else this dashboard was opened
+        # with (never re-read afterward - MainWindow builds a fresh
+        # dashboard every time it is opened).
+        self._live_items: list[ImageItem] = list(items) if items is not None else []
         # Every image the currently-selected run touched, as FilterableRecords
         # (see _build_run_records) - rebuilt once per experiment selection,
         # never per filter change (_apply_filters_to_tabs only re-filters
@@ -1293,15 +1704,29 @@ class AnalyticsDashboard(QDialog):
         self._species_analysis_tab = SpeciesAnalysisTab(self)
         self._species_analysis_tab.speciesDrillDownRequested.connect(self._on_species_drill_down)
         self._burst_analytics_tab = BurstAnalyticsTab(annotation_store=self._annotation_store, parent=self)
+        self._export_tab = ExportTab(parent=self)
+
+        # Overview/Domains/Trends(Score Over Time) read the LIVE Review
+        # folder (self._live_items), independent of which historical
+        # experiment is selected in the Browser below - see OverviewTab's
+        # own docstring. Algorithms/Quality wrap the existing per-
+        # experiment tabs (User vs Algorithm, Run Summary, Species
+        # Analysis, Burst Analytics) unchanged, just relocated under the
+        # design's own six-tab header (Overview/Algorithms/Domains/Trends/
+        # Quality/Export).
+        self._overview_tab = OverviewTab(parent=self)
+        self._domains_tab = DomainsTab(parent=self)
+        self._trends_tab = TrendsTab(self._run_summary_tab, parent=self)
+        self._quality_tab = QualityTab(self._species_analysis_tab, self._burst_analytics_tab, parent=self)
 
         self._tabs = QTabWidget(self)
-        # User vs Algorithm first - "the primary dashboard page" (see this
-        # module's own Phase 2 mandate): the purpose of PickLikeMe is
-        # agreement with the photographer, not maximizing a score.
-        self._tabs.addTab(self._user_vs_algorithm_tab, "User vs Algorithm")
-        self._tabs.addTab(self._run_summary_tab, "Run Summary")
-        self._tabs.addTab(self._species_analysis_tab, "Species Analysis")
-        self._tabs.addTab(self._burst_analytics_tab, "Burst Analytics")
+        self._tabs.addTab(self._overview_tab, "Overview")
+        self._tabs.addTab(self._user_vs_algorithm_tab, "Algorithms")
+        self._tabs.addTab(self._domains_tab, "Domains")
+        self._tabs.addTab(self._trends_tab, "Trends")
+        self._tabs.addTab(self._quality_tab, "Quality")
+        self._tabs.addTab(self._export_tab, "Export")
+        self._refresh_live_tabs()
 
         detail_column = QVBoxLayout()
         detail_column.addWidget(self._metadata_panel)
@@ -1344,8 +1769,17 @@ class AnalyticsDashboard(QDialog):
             self._experiment_list.setCurrentRow(0)
 
     def _update_empty_state(self) -> None:
+        """Show the tab strip whenever there is ANYTHING to show - either a
+        historical experiment to select (the pre-redesign condition,
+        `_user_vs_algorithm_tab`/`_run_summary_tab`/etc. all need one) OR a
+        live folder open in Review (`self._live_items`, which Overview/
+        Domains/Trends' own charts need instead - see OverviewTab's own
+        docstring for why they read a different data source). Only when
+        NEITHER exists - a dashboard opened with nothing recorded and no
+        folder open - does the placeholder win."""
         has_experiments = self._experiment_list.count() > 0
-        self._detail_stack.setCurrentIndex(0 if has_experiments else 1)
+        has_live_data = bool(self._live_items)
+        self._detail_stack.setCurrentIndex(0 if (has_experiments or has_live_data) else 1)
 
     def _scope_is_current_root(self) -> bool:
         return self._scope_current_root_radio.isChecked() and bool(self._root_folder)
@@ -1466,6 +1900,18 @@ class AnalyticsDashboard(QDialog):
         self._run_summary_tab.show_run(self._store, run_id, records=filtered_records)
         self._species_analysis_tab.show_run(self._store, run_id, records=filtered_records)
         self._burst_analytics_tab.show_run(self._store, run_id, paths=paths)
+        self._export_tab.set_records(filtered_records if filtered_records is not None else records)
+
+    def _refresh_live_tabs(self) -> None:
+        """Overview/Domains/Trends' own live-folder charts (see
+        OverviewTab's docstring) - computed once from `self._live_items`,
+        independent of the Experiment Browser's selection, so they are
+        already populated even before any historical experiment has been
+        clicked."""
+        self._overview_tab.set_items(self._live_items, color_source=self._color_source)
+        self._domains_tab.set_items(self._live_items)
+        self._trends_tab.set_items(self._live_items, color_source=self._color_source)
+        self._quality_tab.set_items(self._live_items, color_source=self._color_source)
 
     def _on_drill_down(self, paths: list, label: str) -> None:
         """A User vs Algorithm confusion-matrix cell or KPI card was

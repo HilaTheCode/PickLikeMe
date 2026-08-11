@@ -1,2 +1,3 @@
 [console_scripts]
+peakpic-desktop = picklikeme.desktop.app:main
 picklikeme = picklikeme.ingest.cli:main

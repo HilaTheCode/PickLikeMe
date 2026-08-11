@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="420" height="330" viewBox="0 0 420 330">
+<rect width="420" height="330" fill="#0B1014"/>
+<text x="24" y="30" font-family="Inter,Arial,sans-serif" font-size="18px" font-weight="700" fill="#F2F5F7" text-anchor="start">Thumbnail Card — anatomy</text>
+<rect x="24" y="50" width="372" height="250" rx="10" fill="#1B242C" stroke="#42CC8E" stroke-width="2"/>
+<rect x="26" y="52" width="368" height="155" rx="8" fill="#4A6B52"/><path d="M26 163.6 Q92.24 126.39999999999999 165.84 163.6 T290.96 148.1 T394 163.6 L394 207 L26 207 Z" fill="#24382A"/><ellipse cx="217.36" cy="141.89999999999998" rx="47.84" ry="27.9" fill="#171D20"/><circle cx="239.44" cy="110.9" r="13.175" fill="#171D20"/><circle cx="254.16" cy="107.025" r="2.17" fill="#DCEB74"/><path d="M239.44 117.1 L283.59999999999997 124.85" stroke="#171D20" stroke-width="4.416" stroke-linecap="round"/>
+<rect x="34" y="174" width="92" height="28" rx="6" fill="#0B1014CC"/><text x="44" y="194" font-family="Inter,Arial,sans-serif" font-size="19px" font-weight="700" fill="#F2F5F7" text-anchor="start">0.946</text>
+<text x="38" y="226" font-family="Inter,Arial,sans-serif" font-size="12px" font-weight="600" fill="#F2F5F7" text-anchor="start">001   DSC00034.ARW</text>
+<text x="38" y="247" font-family="Inter,Arial,sans-serif" font-size="10px" font-weight="400" fill="#9AA8B2" text-anchor="start">14:23:51</text>
+<text x="360" y="226" font-family="Inter,Arial,sans-serif" font-size="16px" font-weight="400" fill="#F2F5F7" text-anchor="end">♥</text>
+<text x="38" y="270" font-family="Inter,Arial,sans-serif" font-size="10px" font-weight="700" fill="#42CC8E" text-anchor="start">Keep</text>
+<text x="350" y="270" font-family="Inter,Arial,sans-serif" font-size="10px" font-weight="600" fill="#9AA8B2" text-anchor="end">Bird</text>
+<text x="38" y="288" font-family="Inter,Arial,sans-serif" font-size="9px" font-weight="400" fill="#9AA8B2" text-anchor="start">Optional: 1–5 rating dots</text>
+<text x="412" y="78" font-family="Inter,Arial,sans-serif" font-size="12px" font-weight="700" fill="#F5C542" text-anchor="end">1</text>
+<text x="412" y="104" font-family="Inter,Arial,sans-serif" font-size="12px" font-weight="700" fill="#F5C542" text-anchor="end">2</text>
+<text x="412" y="129" font-family="Inter,Arial,sans-serif" font-size="12px" font-weight="700" fill="#F5C542" text-anchor="end">3</text>
+<text x="412" y="154" font-family="Inter,Arial,sans-serif" font-size="12px" font-weight="700" fill="#F5C542" text-anchor="end">4</text>
+</svg>

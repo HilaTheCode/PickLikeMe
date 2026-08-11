@@ -29,8 +29,20 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, QRectF, Qt, Signal
-from PySide6.QtGui import QBrush, QColor, QFontMetrics, QKeyEvent, QMouseEvent, QPainter, QPen, QPixmap, QWheelEvent
+from PySide6.QtCore import QEvent, QPointF, QRectF, Qt, Signal
+from PySide6.QtGui import (
+    QAction,
+    QActionGroup,
+    QBrush,
+    QColor,
+    QFontMetrics,
+    QKeyEvent,
+    QMouseEvent,
+    QPainter,
+    QPen,
+    QPixmap,
+    QWheelEvent,
+)
 from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
@@ -43,8 +55,10 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QMenu,
     QMessageBox,
     QPushButton,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -60,6 +74,15 @@ from ...analyzer.contactsheets import EYE_BOX_ACCEPTED, EYE_BOX_REJECTED, OTHER_
 from .. import theme
 from ..models.image_item import ImageItem
 from ..services import ReviewService
+from ..views.gallery.thumbnail_delegate import DOMAIN_BY_STRATEGY
+from ..widgets.design_system import (
+    RADIUS_LG,
+    SPACING,
+    AlgorithmResultRow,
+    ConfidenceBar,
+    NavigationControl,
+    Panel,
+)
 
 REASON_LABELS: dict[str, str] = {
     REVIEW_REASON_EYES_NOT_SEEN: "Eyes not seen",
@@ -77,6 +100,33 @@ REASON_LABELS: dict[str, str] = {
 EXPOSURE_STEP = 1 / 3
 EXPOSURE_MIN_STEPS = -9
 EXPOSURE_MAX_STEPS = 9
+
+# View Mode - which of the two side panels (Algorithm Results, left;
+# Elements Source, right) are visible around the central image viewport.
+# One layout, two independently hideable widgets (see LoupeDialog.
+# _apply_view_mode) - never four separate layouts - so hiding a panel is
+# just a visibility flip the same QHBoxLayout already reclaims space for
+# via its one stretch=1 widget (the image), not a structural change.
+VIEW_MODE_FULL_REVIEW = "full_review"
+VIEW_MODE_FOCUS_IMAGE = "focus_image"
+VIEW_MODE_ANALYSIS = "analysis"
+VIEW_MODE_ELEMENTS = "elements"
+VIEW_MODE_LABELS = {
+    VIEW_MODE_FULL_REVIEW: "Full Review",
+    VIEW_MODE_FOCUS_IMAGE: "Focus Image",
+    VIEW_MODE_ANALYSIS: "Analysis",
+    VIEW_MODE_ELEMENTS: "Elements",
+}
+# (show_algorithm_results, show_elements_source) per mode - the one table
+# _apply_view_mode reads, so a mode's own meaning is defined once, here,
+# not re-derived with a chain of if/elif branches.
+VIEW_MODE_PANEL_VISIBILITY = {
+    VIEW_MODE_FULL_REVIEW: (True, True),
+    VIEW_MODE_FOCUS_IMAGE: (False, False),
+    VIEW_MODE_ANALYSIS: (True, False),
+    VIEW_MODE_ELEMENTS: (False, True),
+}
+DEFAULT_VIEW_MODE = VIEW_MODE_FULL_REVIEW
 
 STATUS_LABELS = {"keep": "Keep", "reject": "Reject", "neutral": "Neutral"}
 # Always the dark palette's semantic colors, regardless of the app theme -
@@ -292,9 +342,43 @@ class _ZoomView(QGraphicsView):
         self._fit_mode = True
         self._manual_scale = 1.0
         self._overlay_items: list = []
+        # The viewport's own center, as a FRACTION of the current pixmap's
+        # own width/height (0.0-1.0 each) - captured just before a new
+        # pixmap replaces this one (see _capture_pan_fraction/set_pixmap
+        # below), so navigating while zoomed in on a specific region keeps
+        # looking at that same relative region on the next image, rather
+        # than silently re-centering on it. None while at Fit (nothing
+        # meaningful to preserve - Fit always centers the whole frame) or
+        # before any image has ever been loaded.
+        self._pan_fraction: tuple[float, float] | None = None
+
+    def _capture_pan_fraction(self) -> None:
+        """Record the CURRENT pixmap's own viewport-center fraction, before
+        it gets replaced - the read half of the pan-position-persistence
+        pair `set_pixmap` writes below. A no-op (leaves `_pan_fraction`
+        None) at Fit or before any pixmap has ever been shown, since Fit
+        always re-centers the whole frame by definition - there is no pan
+        position to preserve."""
+        if self._pixmap_item is None or self._fit_mode:
+            self._pan_fraction = None
+            return
+        old_size = self._pixmap_item.pixmap().size()
+        if old_size.width() <= 0 or old_size.height() <= 0:
+            self._pan_fraction = None
+            return
+        center = self.mapToScene(self.viewport().rect().center())
+        self._pan_fraction = (center.x() / old_size.width(), center.y() / old_size.height())
 
     def set_pixmap(self, pixmap: QPixmap) -> None:
-        """Load a new image, applying the current zoom mode (fit or manual)."""
+        """Load a new image, applying the current zoom mode (fit or manual)
+        AND, while zoomed, the same relative pan position as the image just
+        being replaced (see _capture_pan_fraction) - zooming to 200% and
+        panning to a specific region, then navigating, keeps looking at
+        that same region on the next image rather than silently
+        re-centering. Captured BEFORE the scene is cleared, since that is
+        the last moment the outgoing pixmap's own geometry/transform is
+        still valid to read."""
+        self._capture_pan_fraction()
         self._scene.clear()
         self._overlay_items = []  # scene.clear() already deleted these Qt objects
         self._pixmap_item = self._scene.addPixmap(pixmap)
@@ -305,7 +389,11 @@ class _ZoomView(QGraphicsView):
                 self.fitInView(self._pixmap_item, Qt.AspectRatioMode.KeepAspectRatio)
             else:
                 self.scale(self._manual_scale, self._manual_scale)
-                self.centerOn(self._pixmap_item)
+                if self._pan_fraction is not None:
+                    size = pixmap.size()
+                    self.centerOn(QPointF(self._pan_fraction[0] * size.width(), self._pan_fraction[1] * size.height()))
+                else:
+                    self.centerOn(self._pixmap_item)
         self._emit_zoom()
 
     def update_pixmap(self, pixmap: QPixmap) -> None:
@@ -530,6 +618,24 @@ class _ZoomView(QGraphicsView):
         self._manual_scale = target
         self._emit_zoom()
 
+    def set_zoom_percent(self, percent: float) -> None:
+        """Jump straight to an absolute zoom level - the Loupe's zoom
+        presets (100%/150%/200%/300% - see the design spec's own "useful
+        zoom presets" requirement), as opposed to `zoom_by`'s relative
+        step. Leaves fit-to-window mode and persists across navigation,
+        exactly like a manual pinch/wheel/keyboard zoom does."""
+        if self._pixmap_item is None:
+            return
+        target = max(MIN_MANUAL_SCALE, min(MAX_MANUAL_SCALE, percent / 100.0))
+        current = self.transform().m11()
+        if abs(target - current) < 1e-9:
+            return
+        applied_factor = target / current
+        self.scale(applied_factor, applied_factor)
+        self._fit_mode = False
+        self._manual_scale = target
+        self._emit_zoom()
+
     def wheelEvent(self, event: QWheelEvent) -> None:  # noqa: N802 - Qt override signature
         if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
             self.zoom_by(1.15 if event.angleDelta().y() > 0 else 1 / 1.15)
@@ -700,58 +806,41 @@ class LoupeDialog(QDialog):
         for value, label in REASON_LABELS.items():
             self._reason_combo.addItem(label, value)
         self._reason_combo.currentIndexChanged.connect(self._on_reason_changed)
-        # NoFocus, same reasoning as every button below: Qt hands whichever
-        # widget was added first and accepts focus the dialog's INITIAL
-        # focus on show() - before this fix, that was _reason_combo (the
-        # first focusable widget added, since _view/the buttons are already
-        # NoFocus), which silently swallowed Key_Equal/Key_Minus (the
-        # keyboard zoom shortcuts) before LoupeDialog.keyPressEvent ever saw
-        # them, verified empirically the same way the button fix was: a
-        # focused QComboBox never even reached the dialog's own handler.
-        # Still fully usable with the mouse (click to open, click an item) -
-        # only its own keyboard type-ahead/arrow-key selection is gone,
-        # which was never this dialog's point of "usable without a mouse"
-        # (that's about image NAVIGATION - see the module docstring).
         self._reason_combo.setFocusPolicy(Qt.FocusPolicy.NoFocus)
 
         self._reason_note = QLineEdit(self)
         self._reason_note.setPlaceholderText("Note (Other)")
         self._reason_note.setVisible(False)
         self._reason_note.setMaximumWidth(160)
-        # Deliberately NOT NoFocus, unlike everything else above - this is a
-        # genuine free-text field for the "Other" reason, and a photographer
-        # must be able to click into it and type normally (including
-        # Left/Right to move the cursor, and literal "+"/"-" characters) -
-        # the one place in this dialog where those keys correctly mean what
-        # a text field always means, not a global shortcut.
+        # Deliberately NOT NoFocus, unlike everything else in this dialog -
+        # this is a genuine free-text field for the "Other" reason, and a
+        # photographer must be able to click into it and type normally
+        # (including Left/Right to move the cursor, and literal "+"/"-"
+        # characters) - the one place in this dialog where those keys
+        # correctly mean what a text field always means, not a global
+        # shortcut.
 
-        self._counter_label = QLabel(self)
         self._name_label = QLabel(self)
         self._status_label = QLabel(self)
         self._ai_badge_label = QLabel(self)
-        # THE prominent score - see _primary_score/_update_info_labels.
-        # Deliberately its own, visually distinct label rather than folded
-        # into _score_label's multi-strategy line below: "IMAGE SCORE:
-        # 0.384", exactly three decimals, normalized (never the old *100
-        # "38.4" reading) - see _primary_score_text.
+        # THE prominent score (design spec 6D: "must not be buried in small
+        # metadata text") - its own large badge, centered above the image,
+        # exactly three decimals, normalized - see _primary_score_text.
         self._primary_score_label = QLabel(self)
         self._primary_score_label.setObjectName("primaryScoreLabel")
         self._primary_score_label.setStyleSheet(_PRIMARY_SCORE_LABEL_STYLE)
         self._primary_score_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        # The full "every module's own score" line - still useful, but
-        # secondary/diagnostic detail now that one strategy's score has its
-        # own prominent readout above - see the module's Row 1/Row 2 split.
+        # The full "every module's own score" line - kept as a secondary/
+        # diagnostic detail (its own tooltip carries the per-metric
+        # breakdown); the Algorithm Results panel below is the primary,
+        # always-visible place every score is shown now.
         self._score_label = QLabel(self)
         self._zoom_label = QLabel("Fit", self)
         self._exposure_label = QLabel("+0.0 EV", self)
 
-        # Read-only info - see the module docstring: the Loupe never offers
-        # a way to change burst order, only to see what it currently is and
-        # whether Score means anything for this particular burst. To change
-        # it: close the Loupe, change Burst Order in the Main Grid's View
-        # menu, reopen. Burst Rank/Best (the "key ranking information" a
-        # burst session adds) live in Row 1 alongside the score; Color
-        # Source/Ranking Status are secondary detail in Row 2.
+        # Read-only burst info - see the module docstring: the Loupe never
+        # offers a way to change burst order, only to see what it currently
+        # is and whether Score means anything for this particular burst.
         self._burst_id_label = QLabel(self)
         self._burst_rank_label = QLabel(self)
         self._burst_best_label = QLabel(self)
@@ -775,11 +864,41 @@ class LoupeDialog(QDialog):
                     "one that already has, then reopen the Loupe."
                 )
 
-        prev_btn = QPushButton("‹ Prev", self)
-        next_btn = QPushButton("Next ›", self)
-        keep_btn = QPushButton("Keep (K)", self)
-        reject_btn = QPushButton("Reject (R)", self)
-        neutral_btn = QPushButton("Neutral (N)", self)
+        # Elements Source - the algorithm whose crop/head/eye results the
+        # Elements/Boxes overlays draw (design spec 6B: "selecting an
+        # algorithm in the Algorithm Results panel makes it the Elements
+        # source"). Defaults to the same strategy Color Source/Burst
+        # Analysis already use (self._primary_strategy_id()) when it is one
+        # of the algorithms that actually scored this image; otherwise the
+        # first one that did, so the Loupe never opens with Elements
+        # pointed at a strategy this image has no data for at all. Re-picked
+        # on every navigation (_load_current) with the same rule, since a
+        # different image may have a different set of algorithms that
+        # scored it.
+        self._elements_source_id: str | None = None
+
+        self._nav_control = NavigationControl(parent=self)
+        self._nav_control.previous.connect(self._go_prev)
+        self._nav_control.next.connect(lambda: self._go_next())
+
+        self._algo_results_container, self._algo_rows_layout = self._build_algorithm_results_panel()
+        self._algo_rows: dict[str, AlgorithmResultRow] = {}
+        self._metadata_rows_layout = self._build_metadata_panel()
+
+        self._elements_source_combo = QComboBox(self)
+        self._elements_source_combo.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._elements_source_combo.currentIndexChanged.connect(self._on_elements_source_combo_changed)
+        self._head_bar = ConfidenceBar("Head", parent=self)
+        self._left_eye_bar = ConfidenceBar("Left Eye", parent=self)
+        self._right_eye_bar = ConfidenceBar("Right Eye", parent=self)
+        self._detection_info_rows_layout = QVBoxLayout()
+        self._detection_info_rows_layout.setContentsMargins(0, 0, 0, 0)
+        self._detection_info_rows_layout.setSpacing(4)
+        self._elements_panel = self._build_elements_panel()
+
+        keep_btn = QPushButton("K", self)
+        reject_btn = QPushButton("R", self)
+        neutral_btn = QPushButton("Neutral", self)
         self._status_buttons = {"keep": keep_btn, "reject": reject_btn, "neutral": neutral_btn}
         for name, btn in self._status_buttons.items():
             btn.setStyleSheet(_STATUS_BUTTON_STYLES[name])
@@ -793,17 +912,20 @@ class LoupeDialog(QDialog):
         self._elements_btn.setCheckable(True)
         self._elements_btn.setStyleSheet(_ELEMENTS_BUTTON_STYLE)
         self._elements_btn.setToolTip(
-            "Show what the algorithm detected - Left Eye, Right Eye, and Head - as labeled "
-            "boxes with each one's own confidence"
+            "Show what the selected Elements Source algorithm detected - Left Eye, Right Eye, "
+            "and Head - as labeled boxes with each one's own confidence"
         )
         self._boxes_btn = QPushButton("Boxes", self)
         self._boxes_btn.setCheckable(True)
         self._boxes_btn.setChecked(self._show_boxes)
         self._boxes_btn.setToolTip(
-            "Show the AI's detected-subject bounding box and, when Classic Vision has run, "
-            "the eye it measured, on this image"
+            "Show the AI's detected-subject bounding box and the Elements Source's own "
+            "measured eye, on this image"
         )
         save_jpeg_btn = QPushButton("Save JPEG", self)
+        self._view_mode: str = DEFAULT_VIEW_MODE
+        view_mode_btn = self._build_view_mode_control()
+        self._apply_view_mode()
         for button in (exp_down_btn, exp_up_btn):
             button.setMaximumWidth(28)
         # None of these buttons has any legitimate use for arrow keys, and a
@@ -818,13 +940,11 @@ class LoupeDialog(QDialog):
         # NoFocus (see that class) - mouse clicks still work identically,
         # since QPushButton.clicked isn't gated on focus policy.
         for button in (
-            prev_btn, next_btn, keep_btn, reject_btn, neutral_btn,
-            exp_down_btn, exp_up_btn, self._elements_btn, self._boxes_btn, save_jpeg_btn,
+            keep_btn, reject_btn, neutral_btn,
+            exp_down_btn, exp_up_btn, self._elements_btn, self._boxes_btn, save_jpeg_btn, view_mode_btn,
         ):
             button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
 
-        prev_btn.clicked.connect(self._go_prev)
-        next_btn.clicked.connect(lambda: self._go_next())
         keep_btn.clicked.connect(lambda: self._apply_status("keep"))
         reject_btn.clicked.connect(lambda: self._apply_status("reject"))
         neutral_btn.clicked.connect(lambda: self._apply_status("neutral"))
@@ -838,102 +958,79 @@ class LoupeDialog(QDialog):
         # and a large "Close" button here was consuming bar space for
         # something every window already offers for free.
 
+        # Zoom presets (design spec 6F) - 100%/150%/200%/300%, alongside the
+        # existing Fit/+/-/pinch/wheel mechanisms, all routed through
+        # `_ZoomView.set_zoom_percent`/`.zoom_by` (the one place zoom
+        # actually changes - see that class's own docstring).
+        preset_buttons = []
+        for percent in (100, 150, 200, 300):
+            btn = QPushButton(f"{percent}%", self)
+            btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            btn.clicked.connect(lambda _checked=False, p=percent: self._view.set_zoom_percent(p))
+            preset_buttons.append(btn)
+
         bottom_bar = QWidget(self)
         bottom_bar.setObjectName("loupeBottomBar")
         bottom_bar.setStyleSheet(_BOTTOM_BAR_STYLESHEET)
 
-        # Row 1 - the "what am I looking at, and how did it score" glance:
-        # counter/filename/status on the left, the one prominent score
-        # centered, this burst's own rank on the right when relevant. See
-        # the module docstring's Row 1/Row 2 split.
         row1 = QWidget(bottom_bar)
         row1.setObjectName("loupeRow1")
-        row1_layout = QGridLayout(row1)
-        row1_layout.setContentsMargins(16, 10, 16, 8)
-        row1_layout.setHorizontalSpacing(14)
-        row1_layout.setColumnStretch(0, 1)
-        row1_layout.setColumnStretch(1, 0)
-        row1_layout.setColumnStretch(2, 1)
+        row1_layout = QHBoxLayout(row1)
+        row1_layout.setContentsMargins(16, 8, 16, 8)
+        row1_layout.setSpacing(12)
+        row1_layout.addWidget(self._name_label)
+        row1_layout.addWidget(self._status_label)
+        row1_layout.addWidget(self._ai_badge_label)
+        row1_layout.addStretch(1)
+        row1_layout.addWidget(self._burst_id_label)
+        row1_layout.addWidget(self._burst_rank_label)
+        row1_layout.addWidget(self._burst_best_label)
+        row1_layout.addWidget(self._burst_color_source_label)
+        row1_layout.addWidget(self._burst_ranking_status_label)
+        row1_layout.addWidget(self._score_label)
 
-        row1_info_group = QWidget(row1)
-        row1_info_layout = QHBoxLayout(row1_info_group)
-        row1_info_layout.setContentsMargins(0, 0, 0, 0)
-        row1_info_layout.setSpacing(12)
-        row1_info_layout.addWidget(self._counter_label)
-        row1_info_layout.addWidget(self._name_label)
-        row1_info_layout.addWidget(self._status_label)
-        row1_info_layout.addWidget(self._ai_badge_label)
-
-        # Burst rank info AND the Color Source/Ranking Status detail live
-        # here together (row1's own right-hand group), not split across
-        # both rows - row 2's actions group (Reason/Prev/Keep/Reject/
-        # Neutral/Next, ~666px on its own) is already the single widest
-        # thing in the bar, so anything that can move off row 2 without
-        # hurting "Row 1 = info, Row 2 = controls" should, to keep row 2's
-        # own total comfortably under a MacBook's width - see this fix's
-        # own measurement (row 2 needed 1555px before this move).
-        row1_rank_group = QWidget(row1)
-        row1_rank_layout = QHBoxLayout(row1_rank_group)
-        row1_rank_layout.setContentsMargins(0, 0, 0, 0)
-        row1_rank_layout.setSpacing(12)
-        row1_rank_layout.addWidget(self._burst_id_label)
-        row1_rank_layout.addWidget(self._burst_rank_label)
-        row1_rank_layout.addWidget(self._burst_best_label)
-        row1_rank_layout.addWidget(self._burst_color_source_label)
-        row1_rank_layout.addWidget(self._burst_ranking_status_label)
-
-        row1_layout.addWidget(row1_info_group, 0, 0, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        row1_layout.addWidget(self._primary_score_label, 0, 1, Qt.AlignmentFlag.AlignCenter)
-        row1_layout.addWidget(row1_rank_group, 0, 2, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-
-        # Row 2 - secondary metadata (left) and every control (center:
-        # Reason/Prev/Keep/Reject/Neutral/Next, right: zoom/exposure/
-        # Elements/Boxes/Save JPEG). Same "outer columns share the leftover
-        # space, center column keeps its own size" trick as Row 1, so the
-        # core review workflow stays visually centered regardless of how
-        # wide the metadata/tools columns end up.
         row2 = QWidget(bottom_bar)
         row2.setObjectName("loupeRow2")
         row2_layout = QGridLayout(row2)
         row2_layout.setContentsMargins(16, 8, 16, 10)
-        row2_layout.setHorizontalSpacing(14)
+        row2_layout.setHorizontalSpacing(10)
         row2_layout.setColumnStretch(0, 1)
         row2_layout.setColumnStretch(1, 0)
         row2_layout.setColumnStretch(2, 1)
 
-        row2_meta_group = QWidget(row2)
-        row2_meta_layout = QHBoxLayout(row2_meta_group)
-        row2_meta_layout.setContentsMargins(0, 0, 0, 0)
-        row2_meta_layout.setSpacing(12)
-        row2_meta_layout.addWidget(self._score_label)
+        row2_left_group = QWidget(row2)
+        row2_left_layout = QHBoxLayout(row2_left_group)
+        row2_left_layout.setContentsMargins(0, 0, 0, 0)
+        row2_left_layout.setSpacing(10)
+        row2_left_layout.addWidget(keep_btn)
+        row2_left_layout.addWidget(reject_btn)
+        row2_left_layout.addWidget(neutral_btn)
+        row2_left_layout.addWidget(QLabel("Reason:"))
+        row2_left_layout.addWidget(self._reason_combo)
+        row2_left_layout.addWidget(self._reason_note)
 
-        row2_actions_group = QWidget(row2)
-        row2_actions_layout = QHBoxLayout(row2_actions_group)
-        row2_actions_layout.setContentsMargins(0, 0, 0, 0)
-        row2_actions_layout.setSpacing(10)
-        row2_actions_layout.addWidget(QLabel("Reason:"))
-        row2_actions_layout.addWidget(self._reason_combo)
-        row2_actions_layout.addWidget(self._reason_note)
-        row2_actions_layout.addWidget(prev_btn)
-        row2_actions_layout.addWidget(keep_btn)
-        row2_actions_layout.addWidget(reject_btn)
-        row2_actions_layout.addWidget(neutral_btn)
-        row2_actions_layout.addWidget(next_btn)
+        row2_zoom_group = QWidget(row2)
+        row2_zoom_layout = QHBoxLayout(row2_zoom_group)
+        row2_zoom_layout.setContentsMargins(0, 0, 0, 0)
+        row2_zoom_layout.setSpacing(6)
+        row2_zoom_layout.addWidget(self._zoom_label)
+        row2_zoom_layout.addWidget(exp_down_btn)
+        row2_zoom_layout.addWidget(self._exposure_label)
+        row2_zoom_layout.addWidget(exp_up_btn)
+        for btn in preset_buttons:
+            row2_zoom_layout.addWidget(btn)
 
         row2_tools_group = QWidget(row2)
         row2_tools_layout = QHBoxLayout(row2_tools_group)
         row2_tools_layout.setContentsMargins(0, 0, 0, 0)
         row2_tools_layout.setSpacing(10)
-        row2_tools_layout.addWidget(self._zoom_label)
-        row2_tools_layout.addWidget(exp_down_btn)
-        row2_tools_layout.addWidget(self._exposure_label)
-        row2_tools_layout.addWidget(exp_up_btn)
         row2_tools_layout.addWidget(self._elements_btn)
         row2_tools_layout.addWidget(self._boxes_btn)
+        row2_tools_layout.addWidget(view_mode_btn)
         row2_tools_layout.addWidget(save_jpeg_btn)
 
-        row2_layout.addWidget(row2_meta_group, 0, 0, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        row2_layout.addWidget(row2_actions_group, 0, 1, Qt.AlignmentFlag.AlignCenter)
+        row2_layout.addWidget(row2_left_group, 0, 0, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        row2_layout.addWidget(row2_zoom_group, 0, 1, Qt.AlignmentFlag.AlignCenter)
         row2_layout.addWidget(row2_tools_group, 0, 2, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
 
         bottom_bar_layout = QVBoxLayout(bottom_bar)
@@ -942,11 +1039,40 @@ class LoupeDialog(QDialog):
         bottom_bar_layout.addWidget(row1)
         bottom_bar_layout.addWidget(row2)
 
+        hint_label = QLabel(
+            "←/→ Navigate   |   K Keep   |   R Reject   |   +/- Zoom   |   Ctrl +/- Brightness", self
+        )
+        hint_label.setStyleSheet(f"color: {theme.DARK.text_muted}; font-size: 10px; padding: 2px 16px;")
+
+        center_column = QVBoxLayout()
+        center_column.setContentsMargins(0, 0, 0, 0)
+        center_column.setSpacing(SPACING)
+        center_column.addWidget(self._primary_score_label, 0, Qt.AlignmentFlag.AlignHCenter)
+        center_column.addWidget(self._view, 1)
+        center_column_widget = QWidget(self)
+        center_column_widget.setLayout(center_column)
+
+        # The photograph is the dominant content (design spec's own first
+        # principle) - `center_column_widget` is the ONLY stretch=1 widget
+        # here, so it is the one that claims every pixel of width neither
+        # side panel needs. The two side panels are capped, not fixed (see
+        # their own build methods' docstrings), so this ratio holds - and
+        # the image gets MORE, not less, room - the moment either panel has
+        # less content than its cap.
+        body = QHBoxLayout()
+        body.setContentsMargins(SPACING * 2, SPACING, SPACING * 2, 0)
+        body.setSpacing(SPACING * 2)
+        body.addWidget(self._algo_results_container, 0)
+        body.addWidget(center_column_widget, 1)
+        body.addWidget(self._elements_panel, 0)
+
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(0)
-        layout.addWidget(self._view, 1)
+        layout.setSpacing(SPACING)
+        layout.addWidget(self._nav_control)
+        layout.addLayout(body, 1)
         layout.addWidget(bottom_bar)
+        layout.addWidget(hint_label)
 
         self._load_current()
 
@@ -1068,6 +1194,7 @@ class LoupeDialog(QDialog):
             )
         self._current_raw_pixmap = pixmap
         self._view.set_pixmap(self._exposed_pixmap())
+        self._refresh_algorithm_results()
         self._refresh_detection_overlay()
         self._update_info_labels()
 
@@ -1078,14 +1205,41 @@ class LoupeDialog(QDialog):
         active mode draws additively on top - see `_ZoomView.
         clear_detection_overlay`'s own docstring for why neither
         `set_detection_overlay` nor `set_elements_overlay` clears on its
-        own anymore."""
+        own anymore.
+
+        Both overlays' EYE data reads the SAME strategy -
+        `self._elements_source_id`, the algorithm currently selected in the
+        Algorithm Results panel (design spec 6B) - never a silently
+        different one. Before this, the eye/head data behind both overlays
+        defaulted to whichever strategy happened to be Color Source
+        (`ReviewService.eye_keypoints`'s own default), which could disagree
+        with an algorithm the photographer had explicitly picked for
+        inspection here; now there is exactly one "which algorithm's
+        detections am I looking at" answer, shown explicitly in the
+        Elements Source panel, and both overlays honor it.
+
+        `self._elements_source_id` being None (no algorithm has scored this
+        image at all - a genuinely unranked folder, or one ranked only by
+        the AI model, which has no eye detector) means there is no EYE data
+        to fetch, full stop - but that must never suppress Boxes' own
+        SUBJECT box, which comes from `service.detection_boxes` and has no
+        strategy dependency at all (see the module docstring's own "Loupe
+        must open a valid image even when no algorithm has detected
+        anything... detection is an optional analysis layer, never a
+        prerequisite" rule). A prior version of this method returned early
+        whenever `_elements_source_id` was None, which silently blanked
+        Boxes too - fixed by only skipping the eye lookup itself, never the
+        Boxes call.
+        """
         self._view.clear_detection_overlay()
         if not self._show_boxes and not self._show_elements:
             return
-        try:
-            eye = self.service.eye_keypoints(self._current_path())
-        except Exception:  # noqa: BLE001 - a missing/unreadable eye record must not break the loupe
-            eye = None
+        eye = None
+        if self._elements_source_id is not None:
+            try:
+                eye = self.service.eye_keypoints(self._current_path(), strategy_id=self._elements_source_id)
+            except Exception:  # noqa: BLE001 - a missing/unreadable eye record must not break the loupe
+                eye = None
         if self._show_boxes:
             try:
                 boxes = self.service.detection_boxes(self._current_path())
@@ -1093,6 +1247,9 @@ class LoupeDialog(QDialog):
                 boxes = None
             self._view.set_detection_overlay(boxes, eye)
         if self._show_elements:
+            # set_elements_overlay already no-ops on eye_data=None (see its
+            # own docstring) - no special-casing needed here for "no
+            # algorithm selected", it simply has nothing to draw.
             self._view.set_elements_overlay(eye)
 
     def _on_boxes_toggled(self, checked: bool) -> None:
@@ -1105,6 +1262,354 @@ class LoupeDialog(QDialog):
     def _on_elements_toggled(self, checked: bool) -> None:
         self._show_elements = checked
         self._refresh_detection_overlay()
+
+    # -- View Mode ----------------------------------------------------------
+
+    def _build_view_mode_control(self) -> QToolButton:
+        """A compact "View: <mode>" button/menu (never four separate
+        buttons) - one QActionGroup of four exclusive, checkable actions,
+        so exactly one mode is ever active and the button's own label
+        always names it. Panel visibility itself lives in
+        `_apply_view_mode`, the one place `VIEW_MODE_PANEL_VISIBILITY` is
+        read - this method only builds the control that picks a mode."""
+        button = QToolButton(self)
+        button.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        button.setToolTip(
+            "Full Review: both panels. Focus Image: photo only. Analysis: Algorithm Results "
+            "only. Elements: Elements Source only. The image itself is always visible in every "
+            "mode - this only ever hides the side panels, never the photograph."
+        )
+        menu = QMenu(button)
+        group = QActionGroup(self)
+        group.setExclusive(True)
+        self._view_mode_actions: dict[str, QAction] = {}
+        for mode, label in VIEW_MODE_LABELS.items():
+            action = QAction(label, self)
+            action.setCheckable(True)
+            action.setChecked(mode == self._view_mode)
+            action.triggered.connect(lambda _checked=False, m=mode: self._set_view_mode(m))
+            group.addAction(action)
+            menu.addAction(action)
+            self._view_mode_actions[mode] = action
+        button.setMenu(menu)
+        self._view_mode_button = button
+        self._update_view_mode_button_text()
+        return button
+
+    def _set_view_mode(self, mode: str) -> None:
+        self._view_mode = mode
+        self._view_mode_actions[mode].setChecked(True)
+        self._update_view_mode_button_text()
+        self._apply_view_mode()
+
+    def _update_view_mode_button_text(self) -> None:
+        self._view_mode_button.setText(f"View: {VIEW_MODE_LABELS[self._view_mode]}")
+
+    def _apply_view_mode(self) -> None:
+        """Show/hide the Algorithm Results / Elements Source side panels
+        per the current View Mode - never the photograph itself, which
+        stays visible in every mode (see the module docstring's "Loupe must
+        open a valid image even when no algorithm has detected anything"
+        rule). One layout throughout (`body`, built once in __init__): the
+        two panels are ordinary widgets in it with `stretch=0`, and the
+        image viewport is its one `stretch=1` widget, so hiding either
+        panel is purely a visibility flip - Qt's own layout engine already
+        reclaims the released width for the image, exactly as it already
+        does for the Boxes/Elements/Info-era single show/hide toggle this
+        replaces. Persists across navigation for free: nothing in
+        `_load_current`/per-image refresh touches panel visibility, so
+        whatever the photographer picked stays picked until they change it
+        again."""
+        show_algorithm_results, show_elements_source = VIEW_MODE_PANEL_VISIBILITY[self._view_mode]
+        self._algo_results_container.setVisible(show_algorithm_results)
+        self._elements_panel.setVisible(show_elements_source)
+
+    # -- Algorithm Results / Elements Source ------------------------------
+
+    def _build_algorithm_results_panel(self) -> tuple[QWidget, QVBoxLayout]:
+        """A compact LEFT inspection panel - `setMaximumWidth`, not
+        `setFixedWidth`: the design's own `02_Loupe.svg` sizes this panel
+        at 260px against a 1470px-wide reference, but a FIXED width never
+        yields space back on a narrower window, which is exactly what
+        starved the center image column down to a sliver on a smaller
+        screen (see this module's own layout-proportions note on `body`,
+        below). A maximum lets Qt shrink this panel toward its own
+        content's minimum size instead, so the image viewport - the
+        stretch=1 widget in `body` - is always what absorbs a width
+        shortfall, never the reverse.
+        """
+        palette = theme.current_palette()
+        panel = Panel(radius=RADIUS_LG, parent=self)
+        panel.setMaximumWidth(260)
+        outer = QVBoxLayout(panel)
+        outer.setContentsMargins(SPACING * 2, SPACING * 2, SPACING * 2, SPACING * 2)
+        outer.setSpacing(SPACING)
+        title = QLabel("ALGORITHM RESULTS", panel)
+        title.setStyleSheet(f"color: {palette.text_primary}; font-size: 13px; font-weight: 700; border: none;")
+        subtitle = QLabel("Latest successful run per algorithm", panel)
+        subtitle.setWordWrap(True)
+        subtitle.setStyleSheet(f"color: {palette.text_muted}; font-size: 10px; border: none;")
+        outer.addWidget(title)
+        outer.addWidget(subtitle)
+        rows_layout = QVBoxLayout()
+        rows_layout.setContentsMargins(0, 0, 0, 0)
+        rows_layout.setSpacing(6)
+        outer.addLayout(rows_layout)
+        outer.addStretch(1)
+        return panel, rows_layout
+
+    def _build_metadata_panel(self) -> QVBoxLayout:
+        """Appended to the bottom of the Algorithm Results panel - see
+        `_refresh_algorithm_results`, which repopulates it every navigation
+        (Filename/Capture Time are always real; Camera/Lens/ISO/Shutter
+        show "—" - no live EXIF pipeline is wired into desktop Review today,
+        see the module's own known-compromise note in the redesign
+        handoff)."""
+        palette = theme.current_palette()
+        outer = self._algo_results_container.layout()
+        title = QLabel("METADATA", self._algo_results_container)
+        title.setStyleSheet(f"color: {palette.text_primary}; font-size: 12px; font-weight: 700; border: none;")
+        outer.addWidget(title)
+        rows_layout = QVBoxLayout()
+        rows_layout.setContentsMargins(0, 0, 0, 0)
+        rows_layout.setSpacing(3)
+        outer.addLayout(rows_layout)
+        return rows_layout
+
+    def _build_elements_panel(self) -> QWidget:
+        """A compact RIGHT inspection panel - see `_build_algorithm_results_
+        panel`'s own docstring for why this is a maximum (340px, matching
+        `02_Loupe.svg`'s own ELEMENTS SOURCE panel width at 1470px), not a
+        fixed width."""
+        palette = theme.current_palette()
+        panel = Panel(radius=RADIUS_LG, parent=self)
+        panel.setMaximumWidth(340)
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(SPACING * 2, SPACING * 2, SPACING * 2, SPACING * 2)
+        layout.setSpacing(SPACING)
+
+        title = QLabel("ELEMENTS SOURCE", panel)
+        title.setStyleSheet(f"color: {palette.text_primary}; font-size: 13px; font-weight: 700; border: none;")
+        layout.addWidget(title)
+        layout.addWidget(self._elements_source_combo)
+
+        layout.addSpacing(SPACING)
+        layout.addWidget(self._head_bar)
+        layout.addWidget(self._left_eye_bar)
+        layout.addWidget(self._right_eye_bar)
+
+        hint = QLabel("Click an algorithm on the left to switch Elements.", panel)
+        hint.setWordWrap(True)
+        hint.setStyleSheet(f"color: {palette.text_muted}; font-size: 10px; border: none;")
+        layout.addWidget(hint)
+
+        layout.addSpacing(SPACING)
+        info_title = QLabel("DETECTION INFO", panel)
+        info_title.setStyleSheet(f"color: {palette.text_primary}; font-size: 12px; font-weight: 700; border: none;")
+        layout.addWidget(info_title)
+        layout.addLayout(self._detection_info_rows_layout)
+
+        layout.addStretch(1)
+        return panel
+
+    def _refresh_algorithm_results(self) -> None:
+        """Rebuild the Algorithm Results panel for the current image - one
+        row per strategy that actually has a `ranking_results` entry for
+        it (design spec: "the exact algorithms shown must come from the
+        algorithms that actually have valid latest-run results... do not
+        invent results"), highest score first, matching whichever
+        `score_labels()` name the registry gives it. Also re-picks
+        `self._elements_source_id` for the new image (see that attribute's
+        own docstring) and repopulates the Metadata rows.
+        """
+        from ...ranking import score_labels
+
+        info = self._current_item_info()
+        scores = info.get("ranking_results") or {}
+        labels = score_labels()
+        available = sorted(
+            ((sid, entry.get("score")) for sid, entry in scores.items() if entry.get("score") is not None),
+            key=lambda pair: -pair[1],
+        )
+        available_ids = [sid for sid, _ in available]
+
+        # Remove rows for strategies no longer present, add rows for new
+        # ones - rebuilding from scratch every navigation would flicker and
+        # lose hover state for no benefit, since the strategy SET rarely
+        # changes between adjacent images in the same folder.
+        for sid in list(self._algo_rows):
+            if sid not in available_ids:
+                row = self._algo_rows.pop(sid)
+                self._algo_rows_layout.removeWidget(row)
+                row.deleteLater()
+        for sid, score in available:
+            row = self._algo_rows.get(sid)
+            if row is None:
+                row = AlgorithmResultRow(sid, labels.get(sid, sid), parent=self._algo_results_container)
+                row.selected.connect(self._select_elements_source)
+                self._algo_rows[sid] = row
+                self._algo_rows_layout.addWidget(row)
+            row.set_score_text(f"{score:.3f}")
+
+        # Re-order rows to match the current image's own score ranking.
+        for index, sid in enumerate(available_ids):
+            self._algo_rows_layout.insertWidget(index, self._algo_rows[sid])
+
+        self._elements_source_combo.blockSignals(True)
+        self._elements_source_combo.clear()
+        for sid, _score in available:
+            self._elements_source_combo.addItem(labels.get(sid, sid), sid)
+        self._elements_source_combo.blockSignals(False)
+
+        primary = self._primary_strategy_id()
+        if self._elements_source_id not in available_ids:
+            self._elements_source_id = primary if primary in available_ids else (available_ids[0] if available_ids else None)
+        self._apply_elements_source_selection()
+
+    def _select_elements_source(self, strategy_id: str) -> None:
+        """An Algorithm Results row was clicked - design spec 6B: this
+        algorithm becomes the Elements source immediately, no separate
+        hidden mechanism."""
+        self._elements_source_id = strategy_id
+        self._apply_elements_source_selection()
+        self._refresh_detection_overlay()
+        self._refresh_elements_confidence()
+
+    def _on_elements_source_combo_changed(self, index: int) -> None:
+        strategy_id = self._elements_source_combo.itemData(index)
+        if strategy_id and strategy_id != self._elements_source_id:
+            self._select_elements_source(strategy_id)
+
+    def _apply_elements_source_selection(self) -> None:
+        """Sync every widget that shows "which algorithm is selected" -
+        the highlighted Algorithm Results row and the Elements Source
+        combo - from `self._elements_source_id`, so the two can never
+        disagree about which one is currently active."""
+        for sid, row in self._algo_rows.items():
+            row.set_active(sid == self._elements_source_id)
+        combo_index = self._elements_source_combo.findData(self._elements_source_id)
+        if combo_index >= 0 and self._elements_source_combo.currentIndex() != combo_index:
+            self._elements_source_combo.blockSignals(True)
+            self._elements_source_combo.setCurrentIndex(combo_index)
+            self._elements_source_combo.blockSignals(False)
+        self._refresh_elements_confidence()
+        self._refresh_detection_info()
+        self._refresh_metadata_rows()
+
+    def _refresh_elements_confidence(self) -> None:
+        """Head/Left Eye/Right Eye confidence bars (design spec 6C) - read
+        from the Elements Source's own cached eye record, the exact same
+        data `_refresh_detection_overlay`'s Elements/Boxes overlays draw
+        (see `eyes.cache`'s own per-strategy keying), so a bar can never
+        show a different algorithm's confidence than the box currently
+        drawn on the photograph."""
+        eye = None
+        if self._elements_source_id is not None:
+            try:
+                eye = self.service.eye_keypoints(self._current_path(), strategy_id=self._elements_source_id)
+            except Exception:  # noqa: BLE001 - a missing/unreadable eye record must not break the loupe
+                eye = None
+        head = (eye or {}).get("head_top") or {}
+        left = (eye or {}).get("left") or {}
+        right = (eye or {}).get("right") or {}
+        head_confidence = (eye or {}).get("head_confidence") if eye else None
+        self._head_bar.set_value(head_confidence, color=theme.current_palette().keep_fg)
+        self._left_eye_bar.set_value(left.get("confidence"), color=theme.current_palette().secondary_accent)
+        self._right_eye_bar.set_value(right.get("confidence"), color=theme.current_palette().skipped_fg)
+
+    def _refresh_detection_info(self) -> None:
+        """DETECTION INFO panel (design spec's own "Domain/Object/
+        Confidence/Eye distance/Pose quality/Status" example) - built only
+        from data this codebase actually records for the Elements Source
+        strategy, never invented: Domain (a static, UI-level fact about
+        which detector family that strategy targets - see
+        thumbnail_delegate.DOMAIN_BY_STRATEGY), Confidence/Status (the
+        cached eye record's own confidence/accepted fields), and whichever
+        of that strategy's own metrics (eye_confidence/subject_size/eye_
+        sharpness/subject_sharpness - see ranking.classic.METRIC_LABELS)
+        this image actually has. "Object" (species) and "Eye distance"/
+        "Pose quality" (the mockup's own placeholder numbers) are omitted -
+        no per-image species/pose-quality data reaches the Loupe today,
+        and showing a fabricated number would be a worse answer than
+        showing none."""
+        from ...ranking import metric_labels
+
+        while self._detection_info_rows_layout.count():
+            item = self._detection_info_rows_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+
+        rows: list[tuple[str, str]] = []
+        domain = DOMAIN_BY_STRATEGY.get(self._elements_source_id or "")
+        if domain:
+            rows.append(("Domain", domain))
+
+        eye = None
+        if self._elements_source_id is not None:
+            try:
+                eye = self.service.eye_keypoints(self._current_path(), strategy_id=self._elements_source_id)
+            except Exception:  # noqa: BLE001
+                eye = None
+        if eye is not None:
+            if eye.get("confidence") is not None:
+                rows.append(("Confidence", f"{eye['confidence']:.2f}"))
+            rows.append(("Status", "Good" if eye.get("accepted") else "Low confidence"))
+
+        info = self._current_item_info()
+        strategy_metrics = (info.get("metrics") or {}).get(self._elements_source_id or "") or {}
+        names = metric_labels().get(self._elements_source_id or "", {})
+        for name, value in strategy_metrics.items():
+            rows.append((names.get(name, name), f"{value:.3f}"))
+
+        if not rows:
+            rows.append(("Status", "No detection data for this algorithm"))
+
+        for label, value in rows:
+            self._detection_info_rows_layout.addWidget(self._info_row(label, value))
+
+    def _refresh_metadata_rows(self) -> None:
+        """Filename/Capture Time (real) plus Camera/Lens/ISO/Shutter -
+        placeholders ("—"): no live EXIF pipeline reaches desktop Review
+        today (see `ingest/metadata.py`'s own exiftool-based extraction,
+        which runs at ingest time, not per-image on Loupe navigation) - see
+        this module's own docstring in the redesign handoff for why this
+        is a deliberate, honest compromise rather than a fabricated value.
+        """
+        while self._metadata_rows_layout.count():
+            item = self._metadata_rows_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+
+        path = self._current_path()
+        info = self._current_item_info()
+        rows = [
+            ("Filename", Path(path).name),
+            ("Capture Time", (info.get("captured_at") or "—").split("T")[-1][:8] if info.get("captured_at") else "—"),
+            ("Camera", "—"),
+            ("Lens", "—"),
+            ("ISO", "—"),
+            ("Shutter", "—"),
+        ]
+        for label, value in rows:
+            self._metadata_rows_layout.addWidget(self._info_row(label, value))
+
+    @staticmethod
+    def _info_row(label: str, value: str) -> QWidget:
+        palette = theme.current_palette()
+        row = QWidget()
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(0, 0, 0, 0)
+        label_widget = QLabel(label)
+        label_widget.setStyleSheet(f"color: {palette.text_muted}; font-size: 10px; border: none;")
+        value_widget = QLabel(value)
+        value_widget.setStyleSheet(f"color: {palette.text_primary}; font-size: 10px; font-weight: 600; border: none;")
+        value_widget.setAlignment(Qt.AlignmentFlag.AlignRight)
+        layout.addWidget(label_widget)
+        layout.addStretch(1)
+        layout.addWidget(value_widget)
+        return row
 
     def _exposed_pixmap(self) -> QPixmap:
         if self._current_raw_pixmap is None:
@@ -1136,7 +1641,7 @@ class LoupeDialog(QDialog):
         path = self._current_path()
         info = self._current_item_info()
 
-        self._counter_label.setText(f"Image {self.index + 1} of {len(self.image_paths)}")
+        self._nav_control.set_position(self.index + 1, len(self.image_paths))
         self._name_label.setText(Path(path).name)
         self._primary_score_label.setText(self._primary_score_text(info))
         self._update_burst_info_labels()

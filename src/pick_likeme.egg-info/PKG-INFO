@@ -15,3 +15,11 @@ Requires-Dist: matplotlib
 Requires-Dist: pyarrow
 Requires-Dist: tqdm
 Requires-Dist: PyYAML
+Requires-Dist: open_clip_torch
+Requires-Dist: PySide6
+Provides-Extra: eyepose-export
+Requires-Dist: ultralytics; extra == "eyepose-export"
+Provides-Extra: eyepose-cpu
+Requires-Dist: onnxruntime; extra == "eyepose-cpu"
+Provides-Extra: eyepose-gpu
+Requires-Dist: onnxruntime-gpu==1.28.0; extra == "eyepose-gpu"

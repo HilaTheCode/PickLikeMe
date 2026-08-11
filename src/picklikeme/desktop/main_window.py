@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import QModelIndex, QSize, Qt, QSettings, QThreadPool, QTimer
+from PySide6.QtCore import QModelIndex, Qt, QSettings, QThreadPool, QTimer
 from PySide6.QtGui import QAction, QActionGroup, QIcon, QKeySequence, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -13,7 +13,10 @@ from PySide6.QtWidgets import (
     QDockWidget,
     QDoubleSpinBox,
     QFileDialog,
+    QHBoxLayout,
     QLabel,
+    QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QMenu,
     QMenuBar,
@@ -24,8 +27,8 @@ from PySide6.QtWidgets import (
     QStyle,
     QStyleFactory,
     QTextEdit,
-    QToolBar,
     QToolButton,
+    QVBoxLayout,
     QWidget,
 )
 
@@ -38,7 +41,20 @@ from .core.events import EventBus
 from .core.jobs import JobManager, JobSpec, run_in_background as _real_run_in_background
 from .core.thumbnail_loader import ThumbnailLoadTask, ThumbnailReadySignal
 from .filtering import FilterableRecord, apply_filters
+from .views.gallery.thumbnail_delegate import DOMAIN_BY_STRATEGY
 from .widgets.advanced_filters_panel import AdvancedFiltersPanel
+from .widgets.design_system import (
+    PRIMARY_HEIGHT,
+    RADIUS_LG,
+    RADIUS_SM,
+    SPACING,
+    LabeledCombo,
+    LabeledSearch,
+    Panel,
+    PrimaryButton,
+    SecondaryButton,
+    StatusLegend,
+)
 from .widgets.recent_items import DEFAULT_RECENT_ITEMS_LIMIT, RecentItemsMenu
 
 run_in_background = _real_run_in_background
@@ -102,12 +118,6 @@ FILTER_LABELS = {
     "filtered": "Filtered (Skipped by an analysis module)",
 }
 KEEP_PERCENT_PRESETS = (5.0, 10.0, 20.0, 25.0, 35.0)
-# Bump whenever _build_tool_bar's toolbar/row structure changes - passed to
-# QMainWindow.save/restoreState() so a stale QSettings blob saved under an
-# older toolbar arrangement (e.g. the pre-fix single-row toolbar) is
-# recognized as a version mismatch and ignored rather than silently
-# reapplied over the newly-built layout on every launch.
-TOOLBAR_STATE_VERSION = 1
 # Burst member order for a burst-scoped Loupe session (opened from a
 # collapsed burst card - see _open_loupe_for_item). Owned entirely by the
 # Main Grid, not the Loupe: the Loupe used to carry its own Capture Time /
@@ -189,6 +199,21 @@ def color_source_options() -> list[tuple[str | None, str]]:
     for info in available_strategies():
         options.append((info.strategy_id, f"{info.display_name} Score"))
     return options
+
+
+# The Grid's secondary-toolbar "Domain" filter (01_Grid.svg) - a UI-level
+# grouping of the registered strategies' own DOMAIN_BY_STRATEGY label (see
+# thumbnail_delegate.py), not a new backend concept: "Birds" narrows to
+# images at least one Birds-domain strategy actually scored, and so on.
+# Built from the same DOMAIN_BY_STRATEGY dict the thumbnail card's own
+# domain indicator reads, so the filter option list and a card's own label
+# can never name a domain differently from each other.
+DOMAIN_ALL = "all"
+
+
+def domain_options() -> list[tuple[str, str]]:
+    labels = dict.fromkeys(DOMAIN_BY_STRATEGY.values())  # de-duplicated, insertion order
+    return [(DOMAIN_ALL, "All Domains")] + [(label, label) for label in labels]
 
 
 class MainWindow(QMainWindow):
@@ -361,6 +386,24 @@ class MainWindow(QMainWindow):
         self._burst_sort_combo.currentIndexChanged.connect(self._on_burst_sort_combo_changed)
         self._make_toolbar_combo_compact(self._burst_sort_combo, min_chars=5, max_width=85)
 
+        # Grid redesign secondary toolbar (01_Grid.svg) - Domain narrows to
+        # images at least one strategy in that domain group actually scored
+        # (see thumbnail_delegate.DOMAIN_BY_STRATEGY/domain_options above);
+        # Search is a plain filename substring filter, both composed with
+        # the existing Filter combo/Collapse Bursts/Advanced Filters in
+        # _apply_filter - one more AND-combined narrowing, not a second
+        # filtering mechanism.
+        self._domain_combo = QComboBox(self)
+        for value, label in domain_options():
+            self._domain_combo.addItem(label, value)
+        self._domain_combo.currentIndexChanged.connect(self._on_domain_changed)
+        self._make_toolbar_combo_compact(self._domain_combo, min_chars=12, max_width=140)
+        self._domain_filter = DOMAIN_ALL
+
+        self._search_widget = LabeledSearch("Search", "Filename or tag…", parent=self)
+        self._search_widget.edit.textChanged.connect(self._on_search_changed)
+        self._search_text = ""
+
         self._build_ui()
 
     @staticmethod
@@ -388,20 +431,16 @@ class MainWindow(QMainWindow):
 
     def _build_ui(self) -> None:
         self.setWindowTitle("PeakPic Desktop")
-        # Wide enough that both toolbar rows show every control (Color,
-        # Collapse Bursts included) without Qt's overflow ">>" chevron on a
-        # first launch with no saved window/geometry yet - see the top
-        # toolbar's own two-row split in _build_tool_bar. A user's own
+        # 1470px-class MacBook screen (the design spec's own target width)
+        # plus a little slack, so the redesigned chrome never opens already
+        # cramped on a first launch with no saved geometry yet. A user's own
         # resize is remembered afterwards via _save_state/_restore_state.
-        self.resize(1520, 820)
-        self.setDockOptions(self.dockOptions() | self.DockOption.AnimatedDocks)
+        self.resize(1520, 900)
         self._apply_theme(self._settings.value("theme", theme.DEFAULT_THEME))
+        self._build_menu_bar()
         self.setCentralWidget(self._central_widget)
         self._central_widget.setLayout(self._build_central_layout())
-        self._build_menu_bar()
-        self._build_tool_bar()
         self._build_status_bar()
-        self._build_docks()
         self._restore_state()
 
     def _apply_theme(self, name: str) -> None:
@@ -442,14 +481,231 @@ class MainWindow(QMainWindow):
         self._settings.setValue("theme", theme.current_theme_name())
 
     def _build_central_layout(self) -> Any:
-        from PySide6.QtWidgets import QVBoxLayout
-
+        """The Grid screen's full chrome (`01_Grid.svg`): a primary toolbar
+        (the high-value actions), a secondary toolbar (filter/sort/color/
+        domain/search/view), a left sidebar (Recent Folders/Collections),
+        the thumbnail grid, and a bottom status legend - built from the
+        design system's own reusable components (`widgets/design_system.py`)
+        rather than as a one-off layout, per the redesign's own "build
+        reusable components instead of implementing each screen
+        independently" rule."""
         layout = QVBoxLayout(self._central_widget)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(0)
-        layout.addWidget(self._advanced_filters_panel)
-        layout.addWidget(self._gallery_view)
+        layout.setContentsMargins(SPACING * 2, SPACING * 2, SPACING * 2, SPACING * 2)
+        layout.setSpacing(SPACING)
+        layout.addWidget(self._build_primary_bar())
+        layout.addWidget(self._build_secondary_bar())
+
+        body = QHBoxLayout()
+        body.setSpacing(SPACING * 2)
+        body.addWidget(self._build_sidebar())
+
+        main_column = QVBoxLayout()
+        main_column.setSpacing(SPACING)
+        main_column.addWidget(self._advanced_filters_panel)
+        main_column.addWidget(self._gallery_view, 1)
+        legend_panel = Panel(radius=RADIUS_LG, parent=self._central_widget)
+        legend_layout = QVBoxLayout(legend_panel)
+        legend_layout.setContentsMargins(SPACING * 2, SPACING, SPACING * 2, SPACING)
+        legend_layout.addWidget(StatusLegend(parent=legend_panel))
+        main_column.addWidget(legend_panel)
+        main_column_widget = QWidget(self._central_widget)
+        main_column_widget.setLayout(main_column)
+        body.addWidget(main_column_widget, 1)
+
+        layout.addLayout(body, 1)
         return layout
+
+    def _build_primary_bar(self) -> QWidget:
+        """The Grid's primary toolbar (`04_Toolbar.svg`) - Rank/Apply
+        Cutoff/Keep/Reject/Clear Selection/Export on the left (the
+        high-value, one-click actions), Color Source/Sort on the right
+        (the two controls that change what the whole grid displays) -
+        matching the SVG's own single-row arrangement at 1470px width."""
+        palette = theme.current_palette()
+        bar = Panel(radius=RADIUS_LG, parent=self._central_widget)
+        layout = QHBoxLayout(bar)
+        layout.setContentsMargins(SPACING * 2, SPACING, SPACING * 2, SPACING)
+        layout.setSpacing(SPACING)
+
+        brand = QLabel("△ PeakPick", bar)
+        brand.setStyleSheet(f"color: {palette.text_primary}; font-size: 18px; font-weight: 700; border: none;")
+        layout.addWidget(brand)
+        layout.addSpacing(SPACING * 2)
+
+        self._rank_button = QToolButton(bar)
+        self._rank_button.setObjectName("rankButton")
+        self._rank_button.setDefaultAction(self._rank_action)
+        self._rank_button.setPopupMode(QToolButton.ToolButtonPopupMode.MenuButtonPopup)
+        self._rank_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
+        self._rank_button.setText("Rank")
+        self._rank_button.setMinimumHeight(PRIMARY_HEIGHT)
+        self._rank_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._rank_button.setStyleSheet(
+            f"QToolButton {{ background-color: {palette.panel_bg_secondary}; color: {palette.text_primary}; "
+            f"border: 1px solid {palette.accent}; border-radius: {RADIUS_SM}px; "
+            f"padding: 4px {SPACING * 2}px; font-weight: 600; font-size: 12px; }}"
+            f"QToolButton:hover {{ background-color: {palette.hover_bg}; }}"
+            f"QToolButton::menu-button {{ border: none; width: 16px; }}"
+        )
+        layout.addWidget(self._rank_button)
+
+        self._apply_cutoff_button = PrimaryButton("Apply Cutoff", self._cutoff_subtitle(), accent_color=palette.accent, parent=bar)
+        self._apply_cutoff_button.clicked.connect(self._apply_cutoff_action.trigger)
+        layout.addWidget(self._apply_cutoff_button)
+        self._cutoff_combo.setParent(bar)
+        self._cutoff_spin.setParent(bar)
+        layout.addWidget(self._cutoff_combo)
+        layout.addWidget(self._cutoff_spin)
+        self._cutoff_spin.valueChanged.connect(lambda _v: self._apply_cutoff_button.set_subtitle(self._cutoff_subtitle()))
+
+        keep_btn = PrimaryButton("Keep", "Selected", accent_color=palette.keep_fg, parent=bar)
+        keep_btn.clicked.connect(self._keep_action.trigger)
+        layout.addWidget(keep_btn)
+
+        reject_btn = PrimaryButton("Reject", "Selected", accent_color=palette.reject_fg, parent=bar)
+        reject_btn.clicked.connect(self._reject_action.trigger)
+        layout.addWidget(reject_btn)
+
+        clear_btn = PrimaryButton("Clear", "Selection", parent=bar)
+        clear_btn.clicked.connect(self._clear_selection_action.trigger)
+        layout.addWidget(clear_btn)
+
+        export_btn = PrimaryButton("Export", "Keep-marked", parent=bar)
+        export_btn.setToolTip(self._import_action.toolTip())
+        export_btn.clicked.connect(self._import_action.trigger)
+        layout.addWidget(export_btn)
+
+        layout.addStretch(1)
+
+        self._color_combo.setParent(bar)
+        color_widget = LabeledCombo("Color Source", combo=self._color_combo, parent=bar)
+        layout.addWidget(color_widget)
+
+        self._sort_combo.setParent(bar)
+        sort_widget = LabeledCombo("Sort", combo=self._sort_combo, parent=bar)
+        sort_row = QHBoxLayout()
+        sort_row.setContentsMargins(0, 0, 0, 0)
+        sort_row.setSpacing(4)
+        sort_row.addWidget(sort_widget)
+        self._sort_direction_btn.setParent(bar)
+        sort_row.addWidget(self._sort_direction_btn, 0, Qt.AlignmentFlag.AlignBottom)
+        sort_container = QWidget(bar)
+        sort_container.setLayout(sort_row)
+        layout.addWidget(sort_container)
+
+        return bar
+
+    def _cutoff_subtitle(self) -> str:
+        return f"Top {self._cutoff_spin.value():g}%"
+
+    def _build_secondary_bar(self) -> QWidget:
+        """The Grid's secondary toolbar - Filter/Domain/Search/Burst/View,
+        plus the Detector Boxes/Collapse Bursts toggles."""
+        palette = theme.current_palette()
+        bar = Panel(radius=RADIUS_LG, parent=self._central_widget)
+        layout = QHBoxLayout(bar)
+        layout.setContentsMargins(SPACING * 2, SPACING, SPACING * 2, SPACING)
+        layout.setSpacing(SPACING * 2)
+
+        self._filter_combo.setParent(bar)
+        layout.addWidget(LabeledCombo("Filter", combo=self._filter_combo, parent=bar))
+
+        self._domain_combo.setParent(bar)
+        layout.addWidget(LabeledCombo("Domain", combo=self._domain_combo, parent=bar))
+
+        self._search_widget.setParent(bar)
+        layout.addWidget(self._search_widget)
+
+        self._burst_sort_combo.setParent(bar)
+        layout.addWidget(LabeledCombo("Burst", combo=self._burst_sort_combo, parent=bar))
+
+        view_combo = QComboBox(bar)
+        view_combo.addItem("Grid")
+        view_combo.setEnabled(False)
+        view_combo.setToolTip("Only Grid view is currently available.")
+        LabeledCombo.cap_width(view_combo, min_chars=6, max_width=90)
+        view_widget = LabeledCombo("View", combo=view_combo, parent=bar)
+        layout.addWidget(view_widget)
+
+        layout.addStretch(1)
+
+        boxes_btn = SecondaryButton("Detector Boxes", checkable=True, parent=bar)
+        boxes_btn.setToolTip(self._detector_boxes_action.toolTip())
+        boxes_btn.toggled.connect(self._detector_boxes_action.setChecked)
+        self._detector_boxes_action.toggled.connect(boxes_btn.setChecked)
+        layout.addWidget(boxes_btn)
+
+        collapse_btn = SecondaryButton("Collapse Bursts", checkable=True, parent=bar)
+        collapse_btn.setToolTip(self._collapse_bursts_action.toolTip())
+        collapse_btn.toggled.connect(self._collapse_bursts_action.setChecked)
+        self._collapse_bursts_action.toggled.connect(collapse_btn.setChecked)
+        layout.addWidget(collapse_btn)
+
+        return bar
+
+    def _build_sidebar(self) -> QWidget:
+        """The Grid's left sidebar (`01_Grid.svg`) - Recent Folders (real,
+        backed by the same QSettings-persisted list the File menu's Recent
+        Folders submenu already uses - see RecentItemsMenu) and a
+        Collections section. Collections has no backend concept anywhere in
+        this codebase yet (no persisted "collection" of images exists) - shown
+        as a labeled placeholder rather than a non-functional button, per
+        the design spec's own "do not add controls merely because there is
+        empty space" rule; a real Collections feature is future work, not
+        something this visual redesign pass should fabricate."""
+        palette = theme.current_palette()
+        sidebar = Panel(radius=RADIUS_LG, parent=self._central_widget)
+        sidebar.setFixedWidth(200)
+        layout = QVBoxLayout(sidebar)
+        layout.setContentsMargins(SPACING * 2, SPACING * 2, SPACING * 2, SPACING * 2)
+        layout.setSpacing(SPACING)
+
+        libraries_label = QLabel("LIBRARIES", sidebar)
+        libraries_label.setStyleSheet(f"color: {palette.text_muted}; font-size: 11px; font-weight: 700; border: none;")
+        layout.addWidget(libraries_label)
+
+        recent_label = QLabel("Recent Folders", sidebar)
+        recent_label.setStyleSheet(f"color: {palette.text_muted}; font-size: 12px; border: none;")
+        layout.addWidget(recent_label)
+
+        self._recent_folders_list = QListWidget(sidebar)
+        self._recent_folders_list.setFrameShape(QListWidget.Shape.NoFrame)
+        self._recent_folders_list.setStyleSheet(
+            f"QListWidget {{ background: transparent; border: none; color: {palette.text_primary}; font-size: 12px; }}"
+            f"QListWidget::item {{ padding: 4px 6px; border-radius: 6px; }}"
+            f"QListWidget::item:selected {{ background-color: {palette.hover_bg}; color: {palette.accent}; }}"
+            f"QListWidget::item:hover {{ background-color: {palette.hover_bg}; }}"
+        )
+        self._recent_folders_list.itemClicked.connect(
+            lambda item: self._open_recent_folder(item.data(Qt.ItemDataRole.UserRole))
+        )
+        layout.addWidget(self._recent_folders_list)
+        self._refresh_recent_sidebar()
+
+        layout.addSpacing(SPACING * 2)
+        collections_label = QLabel("COLLECTIONS", sidebar)
+        collections_label.setStyleSheet(f"color: {palette.text_muted}; font-size: 11px; font-weight: 700; border: none;")
+        layout.addWidget(collections_label)
+        collections_placeholder = QLabel("Coming in a future update", sidebar)
+        collections_placeholder.setWordWrap(True)
+        collections_placeholder.setStyleSheet(f"color: {palette.text_muted}; font-size: 11px; border: none;")
+        layout.addWidget(collections_placeholder)
+
+        layout.addStretch(1)
+        return sidebar
+
+    def _refresh_recent_sidebar(self) -> None:
+        """Keeps the sidebar's Recent Folders list in sync with
+        `self._recent_folders_menu` - called whenever that list changes
+        (a folder opened, Recent Folders cleared)."""
+        if not hasattr(self, "_recent_folders_list"):
+            return
+        self._recent_folders_list.clear()
+        for folder in self._recent_folders_menu.items():
+            item = QListWidgetItem(Path(folder).name)
+            item.setData(Qt.ItemDataRole.UserRole, folder)
+            item.setToolTip(folder)
+            self._recent_folders_list.addItem(item)
 
     def _std_icon(self, pixmap: QStyle.StandardPixmap) -> QIcon:
         """A platform-native stand-in icon. Cheap and always available;
@@ -518,6 +774,10 @@ class MainWindow(QMainWindow):
         self._select_all_action = self._make_action(
             "Select All", icon=SP.SP_FileDialogListView, shortcut=QKeySequence.StandardKey.SelectAll,
             tooltip="Select every currently visible (filtered) image", triggered=self._select_all_visible,
+        )
+        self._clear_selection_action = self._make_action(
+            "Clear Selection", icon=SP.SP_DialogResetButton,
+            tooltip="Deselect every image", triggered=self._clear_selection,
         )
 
         # One entry per registered ranking strategy (picklikeme.ranking), built
@@ -597,6 +857,7 @@ class MainWindow(QMainWindow):
 
         review_menu = menu_bar.addMenu("Review")
         review_menu.addAction(self._select_all_action)
+        review_menu.addAction(self._clear_selection_action)
         review_menu.addSeparator()
         review_menu.addAction(self._keep_action)
         review_menu.addAction(self._reject_action)
@@ -672,96 +933,6 @@ class MainWindow(QMainWindow):
         help_menu = menu_bar.addMenu("Help")
         help_menu.addAction(about_action)
 
-    def _build_tool_bar(self) -> None:
-        """Groups mirror the workflow: Open -> Review decisions/Loupe ->
-        AI ranking/cutoff -> Organize/Import/Species/Crop -> Preferences.
-
-        Two rows, split at that same workflow boundary (row 1 ends after
-        Collapse Bursts; row 2 starts at AI Ranking). Even with the Filter/
-        Sort/Color combo boxes capped to a compact width (see
-        _make_toolbar_combo_compact), everything through Collapse Bursts
-        plus AI ranking/cutoff plus Organize/Import/Species/Crop plus
-        Settings is simply too many controls for one row on a MacBook-width
-        window - Filter/Sort/Color/Collapse Bursts are the controls a
-        photographer reaches for on every image, so they stay on row 1 and
-        are what row 1's width is budgeted for; the coarser, one-off actions
-        (ranking a whole folder, importing, organizing, Settings) move to
-        row 2."""
-        toolbar = QToolBar("Main", self)
-        toolbar.setObjectName("main_toolbar")
-        toolbar.setMovable(False)
-        toolbar.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
-        toolbar.setIconSize(QSize(20, 20))
-        toolbar.setContentsMargins(2, 2, 2, 2)
-        if toolbar.layout() is not None:
-            toolbar.layout().setSpacing(2)
-
-        toolbar.addAction(self._open_action)
-        toolbar.addSeparator()
-
-        toolbar.addWidget(QLabel("Filter:"))
-        toolbar.addWidget(self._filter_combo)
-        toolbar.addSeparator()
-
-        toolbar.addAction(self._select_all_action)
-        toolbar.addAction(self._keep_action)
-        toolbar.addAction(self._reject_action)
-        toolbar.addAction(self._neutral_action)
-        toolbar.addAction(self._loupe_action)
-        toolbar.addSeparator()
-
-        toolbar.addWidget(QLabel("Sort:"))
-        toolbar.addWidget(self._sort_combo)
-        toolbar.addWidget(self._sort_direction_btn)
-        toolbar.addWidget(QLabel("Color:"))
-        toolbar.addWidget(self._color_combo)
-        toolbar.addAction(self._detector_boxes_action)
-        toolbar.addAction(self._collapse_bursts_action)
-        toolbar.addWidget(self._burst_sort_combo)
-
-        self.addToolBar(Qt.ToolBarArea.TopToolBarArea, toolbar)
-        self.addToolBarBreak(Qt.ToolBarArea.TopToolBarArea)
-
-        toolbar2 = QToolBar("Main (Ranking & Organize)", self)
-        toolbar2.setObjectName("main_toolbar_2")
-        toolbar2.setMovable(False)
-        toolbar2.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
-        toolbar2.setIconSize(QSize(20, 20))
-        toolbar2.setContentsMargins(2, 2, 2, 2)
-        if toolbar2.layout() is not None:
-            toolbar2.layout().setSpacing(2)
-
-        toolbar2.addAction(self._rank_action)
-        # MenuButtonPopup, not InstantPopup: the button's own half still runs
-        # the default strategy on a single click (see _build_actions), and only
-        # the arrow opens the list of the others.
-        #
-        # The menu comes from the QAction (set in _build_actions), not from
-        # setMenu() on the button: QToolBar builds its button with
-        # setDefaultAction(), and the button paints and popups its default
-        # action's menu. Note that `QToolButton.menu()` still returns None in
-        # that arrangement - it only reports an explicitly-set menu - so it is
-        # a misleading thing to assert on; the style option's HasMenu feature
-        # is what actually decides whether the arrow is drawn.
-        rank_button = toolbar2.widgetForAction(self._rank_action)
-        if isinstance(rank_button, QToolButton):
-            rank_button.setPopupMode(QToolButton.ToolButtonPopupMode.MenuButtonPopup)
-        toolbar2.addWidget(QLabel("AI cutoff:"))
-        toolbar2.addWidget(self._cutoff_combo)
-        toolbar2.addWidget(self._cutoff_spin)
-        toolbar2.addAction(self._apply_cutoff_action)
-        toolbar2.addSeparator()
-
-        toolbar2.addAction(self._organize_action)
-        toolbar2.addAction(self._import_action)
-        toolbar2.addAction(self._species_action)
-        toolbar2.addAction(self._crop_action)
-        toolbar2.addSeparator()
-
-        toolbar2.addAction(self._settings_action)
-
-        self.addToolBar(Qt.ToolBarArea.TopToolBarArea, toolbar2)
-
     def _build_status_bar(self) -> None:
         status_bar = QStatusBar(self)
         status_bar.addWidget(self._folder_label)
@@ -786,20 +957,13 @@ class MainWindow(QMainWindow):
             f'<span style="color:{palette.neutral_fg}">Neutral {neutral}</span>'
         )
 
-    def _build_docks(self) -> None:
-        pass
-
     def _restore_state(self) -> None:
         geometry = self._settings.value("window/geometry")
         if geometry is not None:
             self.restoreGeometry(geometry)
-        state = self._settings.value("window/state")
-        if state is not None:
-            self.restoreState(state, TOOLBAR_STATE_VERSION)
 
     def _save_state(self) -> None:
         self._settings.setValue("window/geometry", self.saveGeometry())
-        self._settings.setValue("window/state", self.saveState(TOOLBAR_STATE_VERSION))
 
     def initialize(self) -> None:
         self._initialized = True
@@ -807,6 +971,7 @@ class MainWindow(QMainWindow):
         self._status_label.setText("Ready")
         self._status_message_label.setText(self.state.status_message)
         self._recent_folders_menu.reload()
+        self._refresh_recent_sidebar()
 
     # -- folder loading, with a progress indicator while it runs ------------
 
@@ -818,6 +983,7 @@ class MainWindow(QMainWindow):
         the stack with a less useful error."""
         if not Path(folder).is_dir():
             self._recent_folders_menu.remove(folder)
+            self._refresh_recent_sidebar()
             QMessageBox.warning(
                 self, "PeakPic - Open Folder", f"This folder could no longer be found:\n{folder}"
             )
@@ -912,6 +1078,7 @@ class MainWindow(QMainWindow):
             return self.service.load_session()
 
         self._recent_folders_menu.remember(folder_path)
+        self._refresh_recent_sidebar()
         self.state.current_folder = result.get("input_folder") or self.state.current_folder
         self.state.image_count = result.get("counts", {}).get("total", 0)
         # A genuinely new folder - species lookups keyed by the old folder's
@@ -1248,10 +1415,23 @@ class MainWindow(QMainWindow):
         self._current_filter = FILTERS[index] if 0 <= index < len(FILTERS) else "all"
         self._apply_filter()
 
+    def _on_domain_changed(self, index: int) -> None:
+        self._domain_filter = self._domain_combo.itemData(index) or DOMAIN_ALL
+        self._apply_filter()
+
+    def _on_search_changed(self, text: str) -> None:
+        self._search_text = text.strip().lower()
+        self._apply_filter()
+
     def _apply_filter(self) -> None:
         filtered = self._filter_items(self._all_items, self._current_filter)
         if self._collapse_bursts:
             filtered = [item for item in filtered if item.burst_best]
+        if self._domain_filter != DOMAIN_ALL:
+            domain_strategies = {sid for sid, label in DOMAIN_BY_STRATEGY.items() if label == self._domain_filter}
+            filtered = [item for item in filtered if domain_strategies & set(item.ranking_results)]
+        if self._search_text:
+            filtered = [item for item in filtered if self._search_text in item.display_name.lower()]
         criteria = self._advanced_filters_panel.criteria
         if criteria.is_active():
             # AND the Advanced Filters panel's own narrowing on top of the
@@ -1552,6 +1732,10 @@ class MainWindow(QMainWindow):
         self._gallery_view.selectAll()
         count = len(self._gallery_model.items())
         self._set_status(f"Selected {count} image(s)" if count else "No images to select")
+
+    def _clear_selection(self) -> None:
+        self._gallery_view.clearSelection()
+        self._set_status("Selection cleared")
 
     def _selected_image_paths(self) -> list[str]:
         """Every multi-selected image, or the single current one when
@@ -2082,6 +2266,7 @@ class MainWindow(QMainWindow):
             root_folder=self.state.current_folder,
             color_source=self._resolve_color_source(),
             keep_percent=self.service.session.keep_percent,
+            items=self._all_items,
             parent=self,
         )
         dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)

@@ -41,39 +41,77 @@ class Palette:
     neutral_bg: str
     neutral_fg: str
     # "Skipped" (see thumbnail_delegate.py's _get_background_color) - an
-    # image the CURRENTLY SELECTED Color Source never scored at all (filtered
-    # out by that module, or simply never ranked by it), distinct from
-    # ordinary Neutral (scored, just not yet decided) and from Reject (scored
-    # and explicitly not in the keep cutoff). Amber/orange - a third hue
-    # family, not a shade of the existing green/red/gray, matching this
-    # file's own "perceptibly separated by hue AND saturation" rule above.
+    # image the CURRENTLY SELECTED Color Source never even touched (no
+    # score, no recorded filter reason), distinct from "Filtered Out"
+    # (that module DID look at it and explicitly excluded it - see
+    # filtered_bg/filtered_fg below), from ordinary Neutral/Review (scored,
+    # just not yet decided) and from Reject (scored and explicitly not in
+    # the keep cutoff). Purple - a hue family not otherwise used by any
+    # other status, matching this file's own "perceptibly separated by hue
+    # AND saturation" rule above.
     skipped_bg: str
     skipped_fg: str
+    # "Filtered Out" - the selected Color Source's own module DID examine
+    # this image and explicitly excluded it (a recorded filter reason - see
+    # `ImageItem.filter_reasons`), as opposed to "Skipped" above (never
+    # touched at all). Muted gray - deliberately desaturated relative to
+    # every other status color, since "the algorithm looked and passed" is
+    # informational, not a Keep/Reject/Review verdict needing the same
+    # visual weight.
+    filtered_bg: str = "#2a2f36"
+    filtered_fg: str = "#8B95A0"
+    # A second control-surface tone, one step lighter than panel_bg - the
+    # PeakPick design system's "Secondary panel/control" token, used for
+    # buttons/combos/input chrome that sits ON TOP of a panel_bg surface
+    # (so the two remain visually distinct, not one flat plane). Defaults
+    # to panel_bg's own DARK/LIGHT values via __post_init__ below for any
+    # Palette that does not set it explicitly, so this stays optional.
+    panel_bg_secondary: str = ""
+    # The design system's secondary "information" accent (distinct from
+    # `accent`, the one Keep/Select/primary-action color) - used for
+    # secondary data series (a second confidence bar, a second chart
+    # series) that must read as related-but-different from the primary
+    # accent, never confusable with a review-status color.
+    secondary_accent: str = "#5AA7FF"
+
+    def __post_init__(self) -> None:
+        if not self.panel_bg_secondary:
+            object.__setattr__(self, "panel_bg_secondary", self.panel_bg)
 
 
 DARK = Palette(
     name="dark",
-    window_bg="#1e1e1e",
-    panel_bg="#252526",
-    text_primary="#e0e0e0",
-    text_muted="#9e9e9e",
-    border="#3c3c3c",
-    hover_bg="#2d2d30",
-    selection_border="#4fc3f7",
-    accent="#4fc3f7",
-    # Kept perceptibly separated from neutral_bg and from each other by hue
-    # AND saturation, not just luminance - a screenshot of the first pass
-    # (keep_bg #1b3a1f / reject_bg #3a1c1c / neutral_bg #2a2a2a) showed all
-    # three clustering into the same dark-gray band at a glance, defeating
-    # "immediately recognizable" review status on the gallery cards.
-    keep_bg="#1d4a27",
-    keep_fg="#66bb6a",
-    reject_bg="#4a1f1f",
-    reject_fg="#ef5350",
-    neutral_bg="#242424",
-    neutral_fg="#9e9e9e",
-    skipped_bg="#4a331a",
-    skipped_fg="#ffa726",
+    # PeakPick design system tokens (docs/UX Design/20260810/Ver1.0/
+    # PeakPick_UI_Design_Spec.md) - background/primary panel/secondary
+    # panel/divider/text/accent, applied here rather than duplicated so
+    # every dialog that already reads `theme.current_palette()` (not just
+    # Grid/Loupe/Dashboard) picks up the same coherent system.
+    window_bg="#0B1014",
+    panel_bg="#141B21",
+    panel_bg_secondary="#1B242C",
+    text_primary="#F2F5F7",
+    text_muted="#9AA8B2",
+    border="#2B3740",
+    hover_bg="#202A32",
+    selection_border="#F5C542",
+    accent="#F5C542",
+    secondary_accent="#5AA7FF",
+    # Kept perceptibly separated from each other and from filtered_bg/
+    # skipped_bg by hue AND saturation, not just luminance - see this
+    # dataclass's own docstring/comments above.
+    keep_bg="#173327",
+    keep_fg="#42CC8E",
+    reject_bg="#3A1E1E",
+    reject_fg="#EF4444",
+    # "Review" (undecided, no algorithm opinion, or Color Source = Review
+    # Status) - the same gold as `accent`, per the design spec's five-
+    # category legend (Keep/Review/Reject/Filtered Out/Skipped).
+    neutral_bg="#332B14",
+    neutral_fg="#F5C542",
+    skipped_bg="#241B33",
+    skipped_fg="#9B6BDB",
+    filtered_bg="#242A30",
+    filtered_fg="#8B95A0",
 )
 
 LIGHT = Palette(

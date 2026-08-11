@@ -1,0 +1,579 @@
+"""Shared PeakPick design-system components (2026-08 redesign).
+
+One place the Grid, Loupe and Analytics Dashboard all build their chrome
+from, so the three screens read as one product (docs/UX Design/20260810/
+Ver1.0/PeakPick_UI_Design_Spec.md's own "create reusable components instead
+of implementing each screen independently" rule) rather than three
+independently-styled layouts that happen to share a color import.
+
+Every color/spacing/radius value here is read from `theme.current_palette()`
+at construction time (matching `ThumbnailCardDelegate`'s own "read fresh on
+paint" convention) - nothing is hard-coded twice. `SPACING`/`RADIUS_*`/
+`PRIMARY_HEIGHT`/`SECONDARY_HEIGHT` are the "8px rhythm / 7-12px radii /
+44px-primary-36px-secondary" rules from the design spec, defined once here
+so a screen's own layout code asks for `SPACING * 2` rather than a bare
+"16" whose relationship to the base rhythm is not obvious from reading it.
+"""
+
+from __future__ import annotations
+
+from typing import Callable
+
+from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import QFont, QFontMetrics
+from PySide6.QtWidgets import (
+    QComboBox,
+    QFrame,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QPushButton,
+    QSizePolicy,
+    QVBoxLayout,
+    QWidget,
+)
+
+from .. import theme
+
+SPACING = 8
+RADIUS_SM = 7
+RADIUS_MD = 9
+RADIUS_LG = 12
+PRIMARY_HEIGHT = 44
+SECONDARY_HEIGHT = 36
+
+# The five review-status/coloring categories the whole app now shares - see
+# thumbnail_delegate.py's own _get_background_color for the exact resolution
+# rule ("what makes an image Keep vs Review vs Reject vs Filtered Out vs
+# Skipped"). One tuple, in legend/reading order, so the Grid's StatusLegend
+# and any future consumer never risk listing them in a different order or
+# under a different label than the coloring logic itself uses.
+STATUS_CATEGORIES: tuple[str, ...] = ("keep", "review", "reject", "filtered", "skipped")
+STATUS_LABELS: dict[str, str] = {
+    "keep": "Keep",
+    "review": "Review",
+    "reject": "Reject",
+    "filtered": "Filtered Out",
+    "skipped": "Skipped",
+}
+
+
+def status_color(palette: theme.Palette, status: str) -> str:
+    """The one foreground/border color for a status category - shared by
+    StatusLegend, the thumbnail delegate's card border, and the Loupe's own
+    status readouts, so "what color is Reject" has exactly one answer."""
+    return {
+        "keep": palette.keep_fg,
+        "review": palette.neutral_fg,
+        "reject": palette.reject_fg,
+        "filtered": palette.filtered_fg,
+        "skipped": palette.skipped_fg,
+    }.get(status, palette.text_muted)
+
+
+def status_bg(palette: theme.Palette, status: str) -> str:
+    return {
+        "keep": palette.keep_bg,
+        "review": palette.neutral_bg,
+        "reject": palette.reject_bg,
+        "filtered": palette.filtered_bg,
+        "skipped": palette.skipped_bg,
+    }.get(status, palette.panel_bg_secondary)
+
+
+def resolve_review_status(item, color_source: str | None) -> str:
+    """The one shared "which of the five categories is this image" answer -
+    used by the Grid's thumbnail card border/status text (`ThumbnailCard
+    Delegate._resolve_status`, a thin wrapper around this) AND the Analytics
+    Dashboard's Overview KPI row/charts (`analytics_dashboard.py`'s
+    `OverviewTab`/`DomainsTab`), so the Grid and the Dashboard can never
+    disagree about how many images are "Keep" for the same folder/Color
+    Source - see this function's own reasoning below.
+
+    The photographer's own review_status always wins. Only once an image
+    has no User Decision (still Neutral) does the currently selected Color
+    Source get a say, and even then only a binary keep/reject call via
+    `item.algorithm_suggestion` (never a score gradient). `color_source`
+    is None ("Review Status") means no algorithm to fall back to - a plain
+    "review" (undecided). With a real strategy id: `algorithm_suggestion`
+    keep/reject wins; failing that, a recorded filter reason for THIS
+    strategy means "filtered" (the algorithm examined and excluded this
+    image); no ranking_result and no filter_reasons entry for it at all
+    means "skipped" (never touched); a ranking_result with no keep/reject
+    suggestion either way is still "review" (the strategy DID score it).
+    """
+    if item.review_status == "keep":
+        return "keep"
+    if item.review_status == "reject":
+        return "reject"
+    if color_source is None:
+        return "review"
+    if item.algorithm_suggestion == "keep":
+        return "keep"
+    if item.algorithm_suggestion == "reject":
+        return "reject"
+    if color_source in item.filter_reasons:
+        return "filtered"
+    if color_source in item.ranking_results:
+        return "review"
+    return "skipped"
+
+
+def app_font(*, bold: bool = False, size: int | None = None) -> QFont:
+    """"Inter if available, otherwise a clean system sans-serif" (design
+    spec) - QFont's own family-fallback already does exactly this: asking
+    for "Inter" on a machine without it installed silently substitutes the
+    platform default sans rather than erroring, so no availability check is
+    needed here."""
+    font = QFont("Inter")
+    font.setStyleHint(QFont.StyleHint.SansSerif)
+    if bold:
+        font.setBold(True)
+        font.setWeight(QFont.Weight.DemiBold)
+    if size is not None:
+        font.setPointSize(size)
+    return font
+
+
+def button_qss(palette: theme.Palette, *, height: int, border_color: str | None = None, radius: int = RADIUS_SM) -> str:
+    border = border_color or palette.border
+    return (
+        f"QPushButton {{ background-color: {palette.panel_bg_secondary}; color: {palette.text_primary}; "
+        f"border: 1px solid {border}; border-radius: {radius}px; min-height: {height}px; "
+        f"padding: 0 {SPACING * 2}px; text-align: left; font-weight: 600; }}"
+        f"QPushButton:hover {{ background-color: {palette.hover_bg}; }}"
+        f"QPushButton:pressed {{ background-color: {palette.border}; }}"
+        f"QPushButton:disabled {{ color: {palette.text_muted}; border-color: {palette.border}; }}"
+    )
+
+
+class PrimaryButton(QPushButton):
+    """A toolbar-weight action button - ~44px, an optional small caption
+    under the title (e.g. "Rank" / "Run Algorithm"), matching
+    `04_Toolbar.svg`'s two-line button anatomy. `accent_color` borders the
+    button in that color instead of the plain divider - used for the
+    handful of primary actions the toolbar mockup itself borders (Rank,
+    Apply Cutoff, Keep=green, Reject=red)."""
+
+    def __init__(self, title: str, subtitle: str | None = None, *, accent_color: str | None = None, parent=None) -> None:
+        super().__init__(parent)
+        palette = theme.current_palette()
+        self.setMinimumHeight(PRIMARY_HEIGHT)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._title = title
+        self._subtitle = subtitle
+        text = f"{title}\n{subtitle}" if subtitle else title
+        self.setText(text)
+        border = accent_color or palette.border
+        self.setStyleSheet(
+            f"QPushButton {{ background-color: {palette.panel_bg_secondary}; color: {palette.text_primary}; "
+            f"border: 1px solid {border}; border-radius: {RADIUS_SM}px; padding: 4px {SPACING * 2}px; "
+            f"text-align: left; font-weight: 600; font-size: 12px; }}"
+            f"QPushButton:hover {{ background-color: {palette.hover_bg}; }}"
+            f"QPushButton:pressed {{ background-color: {palette.border}; }}"
+            f"QPushButton:disabled {{ color: {palette.text_muted}; }}"
+        )
+
+    def set_subtitle(self, subtitle: str | None) -> None:
+        """Update the small caption line (e.g. Apply Cutoff's own "Top 5%"
+        reflecting the currently chosen percent) without rebuilding the
+        button or its style."""
+        self._subtitle = subtitle
+        self.setText(f"{self._title}\n{subtitle}" if subtitle else self._title)
+
+
+class SecondaryButton(QPushButton):
+    """A ~36px control-weight button, for anything not promoted to primary
+    toolbar weight - Clear Selection, per-tool buttons, dialog actions."""
+
+    def __init__(self, title: str, *, checkable: bool = False, parent=None) -> None:
+        super().__init__(title, parent)
+        palette = theme.current_palette()
+        self.setMinimumHeight(SECONDARY_HEIGHT)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.setCheckable(checkable)
+        self.setStyleSheet(
+            f"QPushButton {{ background-color: {palette.panel_bg_secondary}; color: {palette.text_primary}; "
+            f"border: 1px solid {palette.border}; border-radius: {RADIUS_SM}px; padding: 0 {SPACING * 2}px; "
+            f"font-weight: 600; font-size: 12px; }}"
+            f"QPushButton:hover {{ background-color: {palette.hover_bg}; }}"
+            f"QPushButton:checked {{ border: 2px solid {palette.accent}; color: {palette.accent}; }}"
+            f"QPushButton:disabled {{ color: {palette.text_muted}; }}"
+        )
+
+
+class LabeledCombo(QWidget):
+    """A small caption label stacked above a combo box - the
+    "Filter"/"Domain"/"Search"/"Burst"/"View" anatomy from `01_Grid.svg`'s
+    secondary toolbar, as one reusable unit instead of a bare QComboBox with
+    a sibling QLabel a caller has to remember to add every time."""
+
+    def __init__(self, caption: str, *, combo: QComboBox | None = None, parent=None) -> None:
+        super().__init__(parent)
+        palette = theme.current_palette()
+        # `combo`, when given, is an ALREADY-CONSTRUCTED QComboBox this
+        # widget only wraps/styles/captions - reparented here rather than
+        # built fresh, so a caller with existing wiring on that exact
+        # instance (signal connections, other code holding a reference to
+        # it - e.g. MainWindow's own `_filter_combo`) keeps working
+        # unchanged; only where it visually lives moves.
+        self.combo = combo if combo is not None else QComboBox(self)
+        if combo is not None:
+            self.combo.setParent(self)
+        self.combo.setMinimumHeight(SECONDARY_HEIGHT - 6)
+        self.combo.setStyleSheet(
+            f"QComboBox {{ background-color: {palette.panel_bg_secondary}; color: {palette.text_primary}; "
+            f"border: 1px solid {palette.border}; border-radius: {RADIUS_SM}px; padding: 2px {SPACING}px; "
+            f"font-size: 12px; }}"
+            f"QComboBox:hover {{ border-color: {palette.accent}; }}"
+            f"QComboBox QAbstractItemView {{ background-color: {palette.panel_bg_secondary}; "
+            f"color: {palette.text_primary}; selection-background-color: {palette.hover_bg}; }}"
+        )
+        caption_label = QLabel(caption, self)
+        caption_label.setStyleSheet(f"color: {palette.text_muted}; font-size: 10px; font-weight: 600;")
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(2)
+        layout.addWidget(caption_label)
+        layout.addWidget(self.combo)
+
+    @staticmethod
+    def cap_width(combo: QComboBox, *, min_chars: int, max_width: int) -> None:
+        """Same fix as `main_window._make_toolbar_combo_compact` - a combo
+        must not grow to fit its single longest item (a ranking strategy's
+        full display name can run 50+ characters)."""
+        combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        combo.setMinimumContentsLength(min_chars)
+        combo.setMaximumWidth(max_width)
+        combo.currentTextChanged.connect(combo.setToolTip)
+        combo.setToolTip(combo.currentText())
+
+
+class LabeledSearch(QWidget):
+    """The "Search" secondary-toolbar control - a captioned QLineEdit,
+    the text-input equivalent of LabeledCombo above."""
+
+    def __init__(self, caption: str, placeholder: str, *, parent=None) -> None:
+        super().__init__(parent)
+        palette = theme.current_palette()
+        self.edit = QLineEdit(self)
+        self.edit.setPlaceholderText(placeholder)
+        self.edit.setMinimumHeight(SECONDARY_HEIGHT - 6)
+        self.edit.setStyleSheet(
+            f"QLineEdit {{ background-color: {palette.panel_bg_secondary}; color: {palette.text_primary}; "
+            f"border: 1px solid {palette.border}; border-radius: {RADIUS_SM}px; padding: 2px {SPACING}px; "
+            f"font-size: 12px; }}"
+            f"QLineEdit:focus {{ border-color: {palette.accent}; }}"
+        )
+        caption_label = QLabel(caption, self)
+        caption_label.setStyleSheet(f"color: {palette.text_muted}; font-size: 10px; font-weight: 600;")
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(2)
+        layout.addWidget(caption_label)
+        layout.addWidget(self.edit)
+
+
+class Panel(QFrame):
+    """A rounded, `panel_bg`-filled container - the base surface every
+    grouped block of controls/content sits on (the sidebar, the secondary
+    toolbar row, a Dashboard chart card, the Loupe's side panels). Plain
+    QSS on a QFrame, the same mechanism `SummaryCard`
+    (analytics_dashboard.py) already used, generalized so it is not
+    redefined per screen."""
+
+    def __init__(self, *, radius: int = RADIUS_LG, bordered: bool = True, parent=None) -> None:
+        super().__init__(parent)
+        palette = theme.current_palette()
+        self.setObjectName("dsPanel")
+        border = f"1px solid {palette.border}" if bordered else "none"
+        self.setStyleSheet(
+            f"#dsPanel {{ background-color: {palette.panel_bg}; border-radius: {radius}px; border: {border}; }}"
+        )
+
+
+class StatusLegend(QWidget):
+    """A horizontal colored-dot legend for the five review-status
+    categories (`STATUS_CATEGORIES`) - the Grid's bottom legend
+    (`01_Grid.svg`), reused wherever else the same five colors need
+    explaining (e.g. a Dashboard KPI row)."""
+
+    def __init__(self, *, parent=None) -> None:
+        super().__init__(parent)
+        palette = theme.current_palette()
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(SPACING * 3)
+        layout.addStretch(1)
+        for status in STATUS_CATEGORIES:
+            color = status_color(palette, status)
+            dot = QLabel("●", self)
+            dot.setStyleSheet(f"color: {color}; font-size: 12px;")
+            label = QLabel(STATUS_LABELS[status], self)
+            label.setStyleSheet(f"color: {palette.text_muted}; font-size: 11px;")
+            entry = QHBoxLayout()
+            entry.setSpacing(6)
+            entry.addWidget(dot)
+            entry.addWidget(label)
+            wrapper = QWidget(self)
+            wrapper.setLayout(entry)
+            layout.addWidget(wrapper)
+        layout.addStretch(1)
+
+
+class KpiCard(Panel):
+    """One glanceable "803 / Total Images"-style number - the Dashboard's
+    KPI row (`03_Analytics_Dashboard.svg`) anatomy: a large bold value over
+    a small muted caption, optionally tinted a status color."""
+
+    def __init__(self, title: str, *, value_color: str | None = None, parent=None) -> None:
+        super().__init__(parent=parent)
+        palette = theme.current_palette()
+        color = value_color or palette.text_primary
+        self._value_label = QLabel("—", self)
+        self._value_label.setStyleSheet(f"color: {color}; font-size: 24px; font-weight: 700; border: none;")
+        title_label = QLabel(title, self)
+        title_label.setStyleSheet(f"color: {palette.text_muted}; font-size: 11px; font-weight: 600; border: none;")
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(SPACING * 2, SPACING * 2, SPACING * 2, SPACING * 2)
+        layout.setSpacing(4)
+        layout.addWidget(self._value_label)
+        layout.addWidget(title_label)
+
+    def set_value(self, value: str) -> None:
+        self._value_label.setText(value)
+
+
+class ChartCard(Panel):
+    """A titled panel holding one matplotlib chart - the Dashboard's chart
+    tiles (Score Distribution, Top Algorithms, ...). Styled to match the
+    dark design system (transparent figure/axes background, palette-driven
+    text/grid colors) once, here, so every chart in the dashboard looks
+    like it belongs to the same system rather than matplotlib's own
+    default light theme leaking through.
+    """
+
+    def __init__(self, title: str, *, parent=None) -> None:
+        super().__init__(parent=parent)
+        palette = theme.current_palette()
+        title_label = QLabel(title, self)
+        title_label.setStyleSheet(f"color: {palette.text_primary}; font-size: 13px; font-weight: 700; border: none;")
+
+        from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
+        from matplotlib.figure import Figure
+
+        self.figure = Figure(figsize=(4, 2.6), dpi=100)
+        self.figure.patch.set_alpha(0.0)
+        self.canvas = FigureCanvasQTAgg(self.figure)
+        self.canvas.setStyleSheet("background: transparent;")
+        self.canvas.setMinimumHeight(180)
+
+        self._empty_label = QLabel("No data yet", self)
+        self._empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._empty_label.setStyleSheet(f"color: {palette.text_muted}; font-size: 11px; border: none;")
+        self._empty_label.setVisible(False)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(SPACING * 2, SPACING * 2, SPACING * 2, SPACING * 2)
+        layout.setSpacing(SPACING)
+        layout.addWidget(title_label)
+        layout.addWidget(self.canvas, 1)
+        layout.addWidget(self._empty_label)
+
+    def style_axes(self, ax) -> None:
+        """Apply the dashboard's dark chart theme to one Axes - text/tick/
+        spine colors from the current palette, transparent background so
+        the surrounding Panel's own fill shows through."""
+        palette = theme.current_palette()
+        ax.set_facecolor("none")
+        ax.tick_params(colors=palette.text_muted, labelsize=8)
+        for spine in ax.spines.values():
+            spine.set_color(palette.border)
+        ax.xaxis.label.set_color(palette.text_muted)
+        ax.yaxis.label.set_color(palette.text_muted)
+        ax.title.set_color(palette.text_primary)
+
+    def clear(self) -> None:
+        self.figure.clear()
+
+    def set_empty(self, empty: bool) -> None:
+        self.canvas.setVisible(not empty)
+        self._empty_label.setVisible(empty)
+
+    def redraw(self) -> None:
+        self.canvas.draw_idle()
+
+
+class ConfidenceBar(QWidget):
+    """A labeled horizontal confidence meter - "Head  0.98" over a filled
+    bar (`02_Loupe.svg`'s Elements panel). `color` is the bar's own fill
+    (Head/Left Eye/Right Eye each get a distinct color in the Loupe, mirroring
+    the overlay markers drawn on the photograph itself)."""
+
+    def __init__(self, label: str, *, parent=None) -> None:
+        super().__init__(parent)
+        palette = theme.current_palette()
+        self._palette = palette
+        self._label_widget = QLabel(label, self)
+        self._label_widget.setStyleSheet(f"color: {palette.text_muted}; font-size: 11px; font-weight: 500;")
+        self._value_label = QLabel("—", self)
+        self._value_label.setStyleSheet(f"color: {palette.text_primary}; font-size: 12px; font-weight: 700;")
+        self._value_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
+        header = QHBoxLayout()
+        header.setContentsMargins(0, 0, 0, 0)
+        header.addWidget(self._label_widget)
+        header.addStretch(1)
+        header.addWidget(self._value_label)
+
+        self._track = QFrame(self)
+        self._track.setFixedHeight(8)
+        self._track.setStyleSheet(f"background-color: {palette.panel_bg_secondary}; border-radius: 4px;")
+        track_layout = QHBoxLayout(self._track)
+        track_layout.setContentsMargins(0, 0, 0, 0)
+        track_layout.setSpacing(0)
+        self._fill = QFrame(self._track)
+        self._fill.setStyleSheet(f"background-color: {palette.secondary_accent}; border-radius: 4px;")
+        track_layout.addWidget(self._fill)
+        track_layout.addStretch(1)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+        layout.addLayout(header)
+        layout.addWidget(self._track)
+
+    def set_value(self, value: float | None, *, color: str | None = None) -> None:
+        """`value` in [0, 1], or None to show the bar as empty/unknown
+        ("—", zero-width fill) - never a fabricated 0.0 that would read as
+        "confidently zero" instead of "no data"."""
+        fill_color = color or self._palette.secondary_accent
+        self._fill.setStyleSheet(f"background-color: {fill_color}; border-radius: 4px;")
+        if value is None:
+            self._value_label.setText("—")
+            self._fill.setFixedWidth(0)
+            return
+        clamped = max(0.0, min(1.0, value))
+        self._value_label.setText(f"{clamped:.2f}")
+        # Deferred to the next event-loop turn so self._track has its real
+        # laid-out width by the time this reads it (at construction/first
+        # call the track may still be at its pre-layout size hint).
+        from PySide6.QtCore import QTimer
+
+        def _apply() -> None:
+            track_width = max(0, self._track.width())
+            self._fill.setFixedWidth(int(track_width * clamped))
+
+        QTimer.singleShot(0, _apply)
+        _apply()
+
+
+class AlgorithmResultRow(QFrame):
+    """One selectable row in the Loupe's Algorithm Results panel - name +
+    score, highlighted when it is the current Elements Source. Clicking
+    anywhere on the row selects it (`selected` signal), matching
+    `02_Loupe.svg`'s "click an algorithm to switch Elements" interaction."""
+
+    selected = Signal(str)  # strategy_id
+
+    def __init__(self, strategy_id: str, label: str, *, parent=None) -> None:
+        super().__init__(parent)
+        self.strategy_id = strategy_id
+        self._is_active = False
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setObjectName("algoResultRow")
+
+        self._name_label = QLabel(label, self)
+        self._score_label = QLabel("—", self)
+        self._score_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self._hint_label = QLabel("select", self)
+
+        top_row = QHBoxLayout()
+        top_row.setContentsMargins(0, 0, 0, 0)
+        top_row.addWidget(self._name_label)
+        top_row.addStretch(1)
+        top_row.addWidget(self._hint_label)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(SPACING * 2, SPACING, SPACING * 2, SPACING)
+        layout.setSpacing(2)
+        layout.addLayout(top_row)
+        layout.addWidget(self._score_label)
+        self._apply_style()
+
+    def set_score_text(self, text: str) -> None:
+        self._score_label.setText(text)
+
+    def set_active(self, active: bool) -> None:
+        self._is_active = active
+        self._apply_style()
+
+    def _apply_style(self) -> None:
+        palette = theme.current_palette()
+        if self._is_active:
+            self.setStyleSheet(
+                f"#algoResultRow {{ background-color: {palette.hover_bg}; border: 2px solid {palette.accent}; "
+                f"border-radius: {RADIUS_MD}px; }}"
+            )
+            self._hint_label.setVisible(False)
+            self._name_label.setStyleSheet(f"color: {palette.text_primary}; font-size: 13px; font-weight: 700;")
+            self._score_label.setStyleSheet(f"color: {palette.text_primary}; font-size: 18px; font-weight: 700; border: none;")
+        else:
+            self.setStyleSheet(
+                f"#algoResultRow {{ background-color: {palette.panel_bg}; border: 1px solid {palette.border}; "
+                f"border-radius: {RADIUS_MD}px; }}"
+            )
+            self._hint_label.setVisible(True)
+            self._hint_label.setStyleSheet(f"color: {palette.text_muted}; font-size: 9px; border: none;")
+            self._name_label.setStyleSheet(f"color: {palette.text_primary}; font-size: 13px; font-weight: 600; border: none;")
+            self._score_label.setStyleSheet(f"color: {palette.text_primary}; font-size: 18px; font-weight: 700; border: none;")
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802 - Qt override signature
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.selected.emit(self.strategy_id)
+        super().mousePressEvent(event)
+
+
+class NavigationControl(QWidget):
+    """"← Previous | N / Total | Next →" - the Loupe's top navigation bar
+    (`02_Loupe.svg`). Purely presentational; a caller wires `previous`/
+    `next` clicks and calls `set_position`."""
+
+    previous = Signal()
+    next = Signal()
+
+    def __init__(self, *, parent=None) -> None:
+        super().__init__(parent)
+        palette = theme.current_palette()
+        self._prev_btn = QPushButton("‹  Previous", self)
+        self._next_btn = QPushButton("Next  ›", self)
+        for btn in (self._prev_btn, self._next_btn):
+            btn.setFlat(True)
+            btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            btn.setStyleSheet(
+                f"QPushButton {{ color: {palette.text_primary}; border: none; font-size: 13px; font-weight: 500; "
+                f"background: transparent; padding: {SPACING}px {SPACING * 2}px; }}"
+                f"QPushButton:hover {{ color: {palette.accent}; }}"
+            )
+        self._prev_btn.clicked.connect(self.previous.emit)
+        self._next_btn.clicked.connect(self.next.emit)
+
+        self._counter_label = QLabel("0 / 0", self)
+        self._counter_label.setStyleSheet(f"color: {palette.text_primary}; font-size: 14px; font-weight: 700;")
+        self._counter_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(SPACING * 2, 0, SPACING * 2, 0)
+        layout.addWidget(self._prev_btn, 0, Qt.AlignmentFlag.AlignLeft)
+        layout.addStretch(1)
+        layout.addWidget(self._counter_label, 0, Qt.AlignmentFlag.AlignCenter)
+        layout.addStretch(1)
+        layout.addWidget(self._next_btn, 0, Qt.AlignmentFlag.AlignRight)
+
+    def set_position(self, index: int, total: int) -> None:
+        self._counter_label.setText(f"{index} / {total}")
+        self._prev_btn.setEnabled(index > 1)
+        self._next_btn.setEnabled(index < total)
