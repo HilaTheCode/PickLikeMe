@@ -83,7 +83,7 @@ from ..sidecar import (
     strategy_ranking_path,
     write_run_metadata,
 )
-from .base import GROUP_THRESHOLDS, GROUP_WEIGHTS, ParamSpec, StrategyInfo, WeightedParams
+from .base import GROUP_THRESHOLDS, GROUP_WEIGHTS, ParamSpec, StrategyInfo, WeightedParams, use_subject_filter_spec
 from .filters import EyeFilter, FilterCandidate, FilterChain, SubjectFilter
 from .metrics import (
     normalized_subject_size,
@@ -328,6 +328,7 @@ class ClassicVisionParams(WeightedParams):
                 ),
             ),
             *_detection_specs(),
+            use_subject_filter_spec(),
         )
 
 
@@ -417,6 +418,7 @@ class ClassicVisionEyePoseParams(WeightedParams):
                 ),
             ),
             *_detection_specs(),
+            use_subject_filter_spec(),
         )
 
 
@@ -604,6 +606,16 @@ class ClassicVisionStrategy:
     # Which eyes.build_eye_detector name this backend runs - the ONE thing
     # that actually differs at the detector level; overridden per subclass.
     _eye_detector_name = "superanimal-bird"
+    # Whether EyeFilter re-checks the crop's COCO class label against the
+    # chosen detector's own supports() before running it (see EyeFilter's
+    # own docstring for why this exists at all). True everywhere except
+    # ClassicVisionCombinedStrategy, which overrides this to False: it
+    # already decides subject eligibility per Burst via a crop-based CLIP
+    # domain classification (see ranking.combined) before a detector is ever
+    # selected, so re-asking a COCO label the whole point was to stop
+    # trusting for exactly this would only reintroduce the bug that
+    # architecture exists to avoid.
+    _gate_by_subject_label = True
 
     def _eye_detector_kwargs(self, params: ClassicVisionParams) -> dict:
         """This backend's own params -> `eyes.build_eye_detector` kwargs.
@@ -743,8 +755,13 @@ class ClassicVisionStrategy:
         rejected: dict[str, str] = {}
         counts: dict[str, int] = {}
         for index, image_path in enumerate(image_paths, start=1):
-            candidate = self._load_candidate(image_path, crop_cache_dir)
-            chain = FilterChain([SubjectFilter(), EyeFilter(detector_for_image(image_path))])
+            candidate = self._load_candidate(
+                image_path, crop_cache_dir, require_selected_detection=params.use_subject_filter
+            )
+            eye_filter = EyeFilter(
+                detector_for_image(image_path), gate_by_subject_label=self._gate_by_subject_label
+            )
+            chain = FilterChain([SubjectFilter(), eye_filter])
             reason = chain.reject_reason(candidate)
             # Persisted whenever the eye detector actually ran on this image,
             # regardless of whether EyeFilter accepted the result - see
@@ -853,13 +870,40 @@ class ClassicVisionStrategy:
         }
 
     @staticmethod
-    def _load_candidate(image_path: str, crop_cache_dir: str | Path) -> FilterCandidate:
+    def _load_candidate(
+        image_path: str, crop_cache_dir: str | Path, *, require_selected_detection: bool = True
+    ) -> FilterCandidate:
         """Assemble one candidate from what preprocessing already wrote.
 
         Reads only - the cached crop PNG and the detection sidecar beside it.
         An image whose crop or record is unreadable comes back with nothing
         filled in, which `SubjectFilter` correctly rejects as NO_SUBJECT: from
         the algorithm's point of view there is indeed no subject it can see.
+
+        `require_selected_detection` (True = today's original, unchanged
+        behavior) is `WeightedParams.use_subject_filter` threaded down from
+        `rank_folder`. `bird_crop.build_crop` always writes SOME crop for an
+        image it could decode - a tight subject crop when the shared COCO
+        detector confidently found one ("selected" is present), otherwise the
+        full decoded frame as a fallback (see that module's own docstring).
+        Historically this method only ever exposed the first case; the second
+        made every filter downstream reject the image as NO_SUBJECT even
+        though a real, readable crop existed on disk.
+
+        The Eye-Detector Ensemble Evidence Study found that gate - a COCO
+        class + confidence judgement - to be the least reliable stage in the
+        pipeline, while the crop itself (whichever kind) was consistently
+        usable. Passing `require_selected_detection=False` (the
+        `use_subject_filter=False` default) relaxes exactly this: the crop
+        file is read whenever it exists, and `subject_box`/`crop_box` fall
+        back to the whole decoded frame when there is no tight detection to
+        use instead - an honest "we don't know where in the frame the
+        subject is, only that a photograph exists" default, not a fabricated
+        detection. `subject_label` stays `None` in that case (no COCO class
+        was ever assigned), which already makes `EyeFilter`'s own class-label
+        gate a no-op (see that class's own docstring) - so a strategy that
+        still can't find what it needs (e.g. no visible eye) rejects the
+        image through its OWN existing reason, never NO_SUBJECT again.
         """
         import cv2
 
@@ -870,29 +914,47 @@ class ClassicVisionStrategy:
 
         selected = record.get("selected")
         source_size = record.get("source_size")
-        if not selected or not source_size or len(source_size) != 2:
+        if not source_size or len(source_size) != 2:
             return candidate
-        box = selected.get("box")
-        if not box or len(box) != 4:
+        if not selected and require_selected_detection:
             return candidate
+
+        box = selected.get("box") if selected else None
+        if selected and (not box or len(box) != 4):
+            if require_selected_detection:
+                return candidate
+            box = None  # a malformed "selected" entry is no better than none
 
         crop_path = crop_cache_path(crop_cache_dir, image_path)
         image_bgr = cv2.imread(str(crop_path))
         if image_bgr is None:
             return candidate
 
-        expanded = record.get("expanded_box")
-
+        width, height = int(source_size[0]), int(source_size[1])
         candidate.subject_crop = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
-        candidate.subject_box = tuple(float(v) for v in box)
-        # The crop's own rectangle - see FilterCandidate.crop_box's docstring.
-        # None only for a record written before expanded_box existed (a very
-        # old, pre-Vision-Cache cache entry); CROP_CACHE_VERSION's v6 bump
-        # already forces those to rebuild, so this is a defensive fallback,
-        # not the expected path.
-        candidate.crop_box = tuple(float(v) for v in expanded) if expanded and len(expanded) == 4 else None
-        candidate.source_size = (int(source_size[0]), int(source_size[1]))
-        candidate.subject_label = int(selected.get("label", -1))
+        candidate.source_size = (width, height)
+
+        if box is not None:
+            expanded = record.get("expanded_box")
+            candidate.subject_box = tuple(float(v) for v in box)
+            # The crop's own rectangle - see FilterCandidate.crop_box's docstring.
+            # None only for a record written before expanded_box existed (a very
+            # old, pre-Vision-Cache cache entry); CROP_CACHE_VERSION's v6 bump
+            # already forces those to rebuild, so this is a defensive fallback,
+            # not the expected path.
+            candidate.crop_box = (
+                tuple(float(v) for v in expanded) if expanded and len(expanded) == 4 else None
+            )
+            candidate.subject_label = int(selected.get("label", -1))
+        else:
+            # No confident detection, and the caller asked for the crop
+            # anyway (require_selected_detection=False): the whole frame is
+            # both the subject box and the crop's own rectangle, since
+            # nothing more specific was ever located. subject_label stays
+            # None - see this method's own docstring.
+            whole_frame = (0.0, 0.0, float(width), float(height))
+            candidate.subject_box = whole_frame
+            candidate.crop_box = whole_frame
         return candidate
 
 
@@ -1026,6 +1088,7 @@ class ClassicVisionBirdFusionParams(WeightedParams):
             *_fusion_weight_specs(BIRDS_PROFILE, "Birds Ranking Mode:"),
             *_fusion_threshold_specs(),
             *_detection_specs(),
+            use_subject_filter_spec(),
         )
 
 
@@ -1091,6 +1154,7 @@ class ClassicVisionMammalFusionParams(WeightedParams):
             *_fusion_weight_specs(MAMMALS_PROFILE, "Mammals Ranking Mode:"),
             *_fusion_threshold_specs(),
             *_detection_specs(),
+            use_subject_filter_spec(),
         )
 
 

@@ -24,7 +24,7 @@ from PySide6.QtWidgets import (
 )
 
 from ...config import DEFAULT_CHECKPOINT_PATH
-from ...ranking import GROUP_WEIGHTS
+from ...ranking import GROUP_WEIGHTS, GROUP_OPTIONS
 from ...species.classifier import available_classifiers
 from .dialog_utils import polish_dialog
 
@@ -116,10 +116,23 @@ class AlgorithmParametersDialog(QDialog):
 
         initial = initial or params_cls()
         self._spins: dict[str, QDoubleSpinBox] = {}
+        self._checks: dict[str, QCheckBox] = {}
 
         weights_form = QFormLayout()
         other_form = QFormLayout()
+        options_form = QFormLayout()
         for spec in self._specs:
+            if spec.is_boolean:
+                # A yes/no pipeline switch (e.g. Use Subject Filter) reads as
+                # a checkbox, not a spin box showing a bare 0 or 1 - see
+                # ParamSpec.is_boolean's own docstring.
+                check = QCheckBox(self)
+                check.setChecked(bool(getattr(initial, spec.name)))
+                if spec.help:
+                    check.setToolTip(spec.help)
+                self._checks[spec.name] = check
+                options_form.addRow(f"{spec.label}:", check)
+                continue
             spin = QDoubleSpinBox(self)
             spin.setRange(spec.minimum, spec.maximum)
             spin.setDecimals(spec.decimals)
@@ -144,6 +157,9 @@ class AlgorithmParametersDialog(QDialog):
         if other_form.rowCount():
             layout.addWidget(QLabel("Thresholds", self))
             layout.addLayout(other_form)
+        if options_form.rowCount():
+            layout.addWidget(QLabel("Options", self))
+            layout.addLayout(options_form)
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok
@@ -163,13 +179,16 @@ class AlgorithmParametersDialog(QDialog):
     def reset_to_defaults(self) -> None:
         """Every parameter back to the value its own spec declares."""
         for spec in self._specs:
-            self._spins[spec.name].setValue(float(spec.default))
+            if spec.is_boolean:
+                self._checks[spec.name].setChecked(bool(spec.default))
+            else:
+                self._spins[spec.name].setValue(float(spec.default))
 
     def parameters(self):
         """The chosen values, as the strategy's own params dataclass."""
-        return self._params_cls.from_values(
-            {name: float(spin.value()) for name, spin in self._spins.items()}
-        )
+        values: dict[str, float | bool] = {name: float(spin.value()) for name, spin in self._spins.items()}
+        values.update({name: check.isChecked() for name, check in self._checks.items()})
+        return self._params_cls.from_values(values)
 
 
 class SpeciesLanguageDialog(QDialog):

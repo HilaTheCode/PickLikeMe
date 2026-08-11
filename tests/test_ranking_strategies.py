@@ -131,6 +131,7 @@ def test_every_strategy_is_registered_with_the_ai_model_first() -> None:
         "classic-vision-fusion-birds",
         "classic-vision-fusion-mammals",
         "classic-vision-fusion-combined",
+        "crop-sharpness",
     ]
     # The AI model stays the default: strategies were added to give it company,
     # never to demote it.
@@ -174,7 +175,7 @@ def test_listing_strategies_does_not_import_torch() -> None:
     # FusionEyeDetector and its sub-detectors are only ever constructed
     # inside rank_folder, never by __init__ itself.
     strategies = [get_strategy(i.strategy_id) for i in available_strategies()]
-    assert len(strategies) == 6
+    assert len(strategies) == 7
 
 
 # ---------------------------------------------------------------------------
@@ -449,6 +450,19 @@ def test_a_good_candidate_passes_and_keeps_the_eye_for_scoring() -> None:
     assert chain.reject_reason(candidate) is None
     assert candidate.eye is not None
     assert candidate.eye.confidence == pytest.approx(0.9)
+
+
+def test_gate_by_subject_label_false_lets_a_coco_mislabeled_subject_through() -> None:
+    """A caller that has already decided subject eligibility some other way
+    (see ranking.combined.ClassicVisionCombinedStrategy, which classifies the
+    crop itself via CLIP before a detector is even chosen) must not have that
+    decision second-guessed by a COCO class label - the whole architectural
+    point (see docs from this task's Colobus-monkey-as-"bird" finding)."""
+    detector = _FakeEyeDetector(detection=_eye(), supported=False)
+    chain = FilterChain([SubjectFilter(), EyeFilter(detector, gate_by_subject_label=False)])
+    candidate = _candidate(subject_label=COCO_PERSON_CLASS)
+    assert chain.reject_reason(candidate) is None
+    assert detector.detect_calls == 1
 
 
 def test_the_filter_chain_is_extensible_without_touching_its_callers() -> None:

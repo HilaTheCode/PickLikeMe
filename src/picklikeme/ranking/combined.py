@@ -64,7 +64,7 @@ from ..eyes.domain_detector import (
 )
 from ..eyes.domains import BIRDS_PROFILE, MAMMALS_PROFILE, build_domain_fusion_detector
 from ..eyes.fusion import DEFAULT_AGREEMENT_THRESHOLD, DEFAULT_MIN_FUSED_CONFIDENCE, FusionConfig, ModelWeight
-from .base import GROUP_THRESHOLDS, GROUP_WEIGHTS, ParamSpec, StrategyInfo, WeightedParams
+from .base import GROUP_THRESHOLDS, GROUP_WEIGHTS, ParamSpec, StrategyInfo, WeightedParams, use_subject_filter_spec
 from .classic import (
     METRIC_LABELS,
     ClassicVisionStrategy,
@@ -129,6 +129,7 @@ class ClassicVisionCombinedParams(WeightedParams):
             ),
             *_fusion_threshold_specs(),
             *_detection_specs(),
+            use_subject_filter_spec(),
         )
 
 
@@ -161,6 +162,19 @@ class ClassicVisionCombinedStrategy(ClassicVisionStrategy):
     # introspection/logging that reads _eye_detector_name still sees
     # something meaningful.
     _eye_detector_name = "fusion-birds"
+    # This strategy already answers "is the crop's subject a bird or a
+    # mammal" itself, per Burst, from the crop's own pixels
+    # (_build_eye_filter_router -> _classify_burst -> ClipDomainDetector) -
+    # before a detector is ever chosen for a given image. Re-checking the
+    # crop's COCO class label at EyeFilter time (the base class's default)
+    # would ask the exact question this architecture exists to stop trusting
+    # COCO for: a real, measured case on this project's own data is a
+    # Colobus monkey crop COCO itself recorded as class 16/"bird" at 0.99
+    # confidence (see eyes.domains.MAMMALS_PROFILE's own docstring) - gating
+    # on that label here could reject a crop this strategy already
+    # correctly routed to a domain-appropriate detector. See EyeFilter's own
+    # docstring for the general mechanism this flag controls.
+    _gate_by_subject_label = False
 
     def _eye_detector_kwargs(self, params: ClassicVisionCombinedParams) -> dict:
         return {}

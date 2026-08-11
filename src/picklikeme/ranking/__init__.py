@@ -19,12 +19,14 @@ from __future__ import annotations
 
 from .ai_model import AIModelParams, AIModelStrategy
 from .base import (
+    GROUP_OPTIONS,
     GROUP_THRESHOLDS,
     GROUP_WEIGHTS,
     ParamSpec,
     RankingStrategy,
     StrategyInfo,
     WeightedParams,
+    use_subject_filter_spec,
 )
 from .classic import (
     ClassicVisionBirdFusionParams,
@@ -37,6 +39,7 @@ from .classic import (
     ClassicVisionStrategy,
 )
 from .combined import ClassicVisionCombinedParams, ClassicVisionCombinedStrategy
+from .crop_sharpness import CropSharpnessParams, CropSharpnessStrategy
 
 DEFAULT_STRATEGY_ID = AIModelStrategy.info.strategy_id
 
@@ -53,7 +56,10 @@ DEFAULT_STRATEGY_ID = AIModelStrategy.info.strategy_id
 # with SuperAnimal-Bird through the shared Fusion layer, Mammals-Fusion is
 # the new safari-workflow entry point (SuperAnimal-Quadruped) - see
 # eyes.superanimal_quadruped for why EyePose-v0 is deliberately not used
-# there.
+# there. Crop Sharpness is listed last: it is a deliberately different kind
+# of signal (whole-crop sharpness, no eye/head detection at all - see
+# crop_sharpness.py's own module docstring) rather than another member of
+# the eye-detection family the entries above build on.
 _STRATEGIES: tuple[type, ...] = (
     AIModelStrategy,
     ClassicVisionEyePoseStrategy,
@@ -61,6 +67,7 @@ _STRATEGIES: tuple[type, ...] = (
     ClassicVisionBirdFusionStrategy,
     ClassicVisionMammalFusionStrategy,
     ClassicVisionCombinedStrategy,
+    CropSharpnessStrategy,
 )
 
 
@@ -138,6 +145,7 @@ def get_strategy(strategy_id: str) -> RankingStrategy:
 
 __all__ = [
     "DEFAULT_STRATEGY_ID",
+    "GROUP_OPTIONS",
     "GROUP_THRESHOLDS",
     "GROUP_WEIGHTS",
     "AIModelParams",
@@ -152,6 +160,8 @@ __all__ = [
     "ClassicVisionMammalFusionStrategy",
     "ClassicVisionParams",
     "ClassicVisionStrategy",
+    "CropSharpnessParams",
+    "CropSharpnessStrategy",
     "ParamSpec",
     "RankingStrategy",
     "StrategyInfo",

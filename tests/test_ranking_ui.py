@@ -41,8 +41,14 @@ def _dialog(initial=None):
 
 
 def test_the_dialog_builds_one_field_per_declared_parameter(app) -> None:
+    """One widget per spec - a spin box for a number, a checkbox for a
+    boolean switch (see ParamSpec.is_boolean) - so `_spins | _checks`
+    together cover every declared parameter exactly once."""
     dialog = _dialog()
-    assert set(dialog._spins) == {spec.name for spec in ClassicVisionParams.specs()}
+    specs = ClassicVisionParams.specs()
+    assert set(dialog._spins) == {spec.name for spec in specs if not spec.is_boolean}
+    assert set(dialog._checks) == {spec.name for spec in specs if spec.is_boolean}
+    assert set(dialog._spins) | set(dialog._checks) == {spec.name for spec in specs}
     dialog.close()
 
 

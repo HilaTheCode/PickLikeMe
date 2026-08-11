@@ -186,10 +186,27 @@ class EyeFilter:
     whichever of the three questions actually failed, not a constant -
     which is exactly why `FilterChain` reads it after `check` rather than
     caching it up front.
+
+    `gate_by_subject_label` (default True, matching every backend's original
+    behavior): whether question 1 is even asked. It exists because the COCO
+    class label behind `candidate.subject_label` is reliable only for the
+    classes COCO genuinely has (bird, in particular) - see
+    `eyes.domains.DomainProfile.gate_by_subject_label`'s own docstring for
+    the measured case this documents (a Colobus monkey recorded as COCO
+    class 16/"bird" at 0.99 confidence). A caller that has ALREADY decided
+    subject eligibility some other way before constructing this filter's
+    detector - `ranking.combined.ClassicVisionCombinedStrategy` classifies
+    the crop itself, per Burst, via `eyes.domain_detector.ClipDomainDetector`,
+    before ever building the per-image detector - must not have that
+    decision second-guessed by a COCO label the whole point was to stop
+    trusting for this. Passing False turns question 1 into a no-op (every
+    candidate proceeds to question 2), because the detector handed to this
+    filter is already known to be domain-appropriate by construction.
     """
 
-    def __init__(self, detector: "EyeDetector") -> None:
+    def __init__(self, detector: "EyeDetector", gate_by_subject_label: bool = True) -> None:
         self._detector = detector
+        self._gate_by_subject_label = gate_by_subject_label
         self._reason = NO_VISIBLE_EYE
 
     @property
@@ -200,7 +217,11 @@ class EyeFilter:
         self._reason = NO_VISIBLE_EYE
         if candidate.subject_crop is None:
             return False
-        if candidate.subject_label is not None and not self._detector.supports(candidate.subject_label):
+        if (
+            self._gate_by_subject_label
+            and candidate.subject_label is not None
+            and not self._detector.supports(candidate.subject_label)
+        ):
             self._reason = UNSUPPORTED_SUBJECT
             return False
         candidate.eye = self._detector.detect(candidate.subject_crop)
