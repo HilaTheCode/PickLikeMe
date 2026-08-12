@@ -464,11 +464,11 @@ class BulkStatusEndpointTests(ReviewServerTestCase):
 
 
 class ApplyAiSuggestionsEndpointTests(ReviewServerTestCase):
-    """Bulk-accepting the AI's current suggestion - the one endpoint that
-    lets the ranking set a review status at all, and only because the
-    photographer explicitly asked for it."""
+    """Recording the AI's current cutoff as an ALGORITHM decision. It is not
+    a review: no image gains a User Decision here (see
+    ReviewSession._apply_suggestions)."""
 
-    def test_applies_the_suggestion_to_every_neutral_ranked_image(self):
+    def test_records_an_algorithm_decision_without_deciding_anything(self):
         payload = self.post("/api/review/apply-ai-suggestions", {})
 
         self.assertTrue(payload["ok"])
@@ -476,8 +476,13 @@ class ApplyAiSuggestionsEndpointTests(ReviewServerTestCase):
         by_path = {i["image_path"]: i for i in payload["state"]["images"]}
         for image in payload["state"]["images"]:
             if image["ai_suggestion"] is not None:
-                self.assertEqual(image["review_status"], image["ai_suggestion"])
-        self.assertEqual(by_path[str(self.extra[0])]["review_status"], "neutral")
+                self.assertEqual(image["algorithm_decision"], image["ai_suggestion"])
+            self.assertEqual(image["review_status"], "neutral", "nobody reviewed anything")
+            self.assertEqual(image["user_decision"], "undecided")
+        # Resolved: on macOS the temp dir is reached through a /private
+        # symlink, and the session stores the resolved spelling.
+        self.assertIsNone(by_path[str(self.extra[0].resolve())]["algorithm_decision"])
+        self.assertEqual(payload["state"]["counts"]["keep"], 0)
 
     def test_never_touches_an_image_already_decided(self):
         best = str(self.images[0])
@@ -494,7 +499,7 @@ class ApplyAiSuggestionsEndpointTests(ReviewServerTestCase):
 
         payload = self.post("/api/review/apply-ai-suggestions", {})
 
-        self.assertEqual(payload["applied"], 0)
+        self.assertEqual(payload["applied"], 0, "the cutoff is already recorded for every ranked image")
 
     def test_conflicts_are_reported_but_never_overridden_by_default(self):
         """Phase 9: never silently overwrite a photographer's own Keep/Reject."""
@@ -508,15 +513,18 @@ class ApplyAiSuggestionsEndpointTests(ReviewServerTestCase):
         by_path = {i["image_path"]: i for i in payload["state"]["images"]}
         self.assertEqual(by_path[best]["review_status"], "reject")
 
-    def test_include_decided_overrides_the_disagreeing_image(self):
+    def test_include_decided_still_never_overrides_a_user_decision(self):
+        """include_decided re-writes an earlier ALGORITHM decision at a new
+        threshold. It is not, and cannot become, permission to overwrite
+        what the photographer decided."""
         best = str(self.images[0])
         self.post("/api/review/status", {"image_path": best, "status": "reject"})
 
         payload = self.post("/api/review/apply-ai-suggestions", {"include_decided": True})
 
-        self.assertEqual(payload["overridden"], 1)
+        self.assertEqual(payload["overridden"], 0)
         by_path = {i["image_path"]: i for i in payload["state"]["images"]}
-        self.assertEqual(by_path[best]["review_status"], "keep")
+        self.assertEqual(by_path[best]["review_status"], "reject")
 
 
 class AgreementStatsEndpointTests(ReviewServerTestCase):

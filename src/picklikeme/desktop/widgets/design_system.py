@@ -35,6 +35,21 @@ from PySide6.QtWidgets import (
 
 from .. import theme
 
+# Every ranking score and score component is displayed with exactly three
+# decimals - 0.000 / 0.237 / 0.812 / 1.000 - wherever the user can see one:
+# the Grid card badge, the Loupe header and diagnostics line, and the
+# Analytics Dashboard's score/metric readouts. Defined once so the same
+# number cannot appear at one precision on one screen and another elsewhere.
+# Stored values stay full-precision floats; this is presentation only.
+SCORE_FORMAT = ".3f"
+
+
+def format_score(value: float | None, *, empty: str = "—") -> str:
+    """A score as the user sees it: three decimals, or `empty` when there is
+    no score to show. The one place that formatting decision is made."""
+    return empty if value is None else f"{value:{SCORE_FORMAT}}"
+
+
 SPACING = 8
 RADIUS_SM = 7
 RADIUS_MD = 9
@@ -42,81 +57,159 @@ RADIUS_LG = 12
 PRIMARY_HEIGHT = 44
 SECONDARY_HEIGHT = 36
 
-# The five review-status/coloring categories the whole app now shares - see
-# thumbnail_delegate.py's own _get_background_color for the exact resolution
-# rule ("what makes an image Keep vs Review vs Reject vs Filtered Out vs
-# Skipped"). One tuple, in legend/reading order, so the Grid's StatusLegend
-# and any future consumer never risk listing them in a different order or
-# under a different label than the coloring logic itself uses.
-STATUS_CATEGORIES: tuple[str, ...] = ("keep", "review", "reject", "filtered", "skipped")
+# ---------------------------------------------------------------------------
+# Grid coloring: TWO independent modes, never one blended answer.
+#
+# The Color selector picks exactly one of them, and the mode it picks is the
+# ONLY input to a card's color:
+#
+#   User Decision (color_source is None)  -> USER_DECISION_CATEGORIES
+#       Keep / Reject / Undecided, read from `item.user_decision` and nothing
+#       else. An image with no decision is Undecided, full stop - no score, no
+#       suggestion, no filter verdict, no cutoff and no recorded algorithm
+#       decision can color it Keep or Reject.
+#
+#   An algorithm (color_source is a strategy id) -> ALGORITHM_CATEGORIES
+#       Scored / Filtered Out / Skipped, read from that strategy's own result
+#       for the image. A Scored card is additionally tinted along a low->high
+#       ramp by its ACTUAL score (see `score_ramp_color`), which is what
+#       "the color corresponds to that algorithm's score" means. The
+#       photographer's own decisions do not enter into it at all.
+#
+# These used to be one function that answered in one five-value vocabulary,
+# with User Decision winning and, failing that, the algorithm's binary
+# keep/reject-at-a-threshold suggestion borrowing the SAME Keep/Reject colors.
+# That made the two modes mutually contaminating in both directions: an
+# algorithm-colored grid was tinted by whatever had been reviewed, and it
+# showed a threshold verdict rather than the score it claimed to be showing.
+# ---------------------------------------------------------------------------
+
+USER_DECISION_KEEP = "keep"
+USER_DECISION_REJECT = "reject"
+USER_DECISION_UNDECIDED = "undecided"
+USER_DECISION_CATEGORIES: tuple[str, ...] = (
+    USER_DECISION_KEEP,
+    USER_DECISION_REJECT,
+    USER_DECISION_UNDECIDED,
+)
+
+ALGORITHM_SCORED = "scored"
+ALGORITHM_FILTERED = "filtered"
+ALGORITHM_SKIPPED = "skipped"
+ALGORITHM_CATEGORIES: tuple[str, ...] = (ALGORITHM_SCORED, ALGORITHM_FILTERED, ALGORITHM_SKIPPED)
+
 STATUS_LABELS: dict[str, str] = {
-    "keep": "Keep",
-    "review": "Review",
-    "reject": "Reject",
-    "filtered": "Filtered Out",
-    "skipped": "Skipped",
+    USER_DECISION_KEEP: "Keep",
+    USER_DECISION_REJECT: "Reject",
+    USER_DECISION_UNDECIDED: "Undecided",
+    ALGORITHM_SCORED: "Scored",
+    ALGORITHM_FILTERED: "Filtered Out",
+    ALGORITHM_SKIPPED: "Skipped",
 }
+
+# The one user-facing name for the non-algorithm Color mode. Lives here,
+# next to the categories it selects, so the Color combo, the Analytics
+# Dashboard's header card and the legend can never call it three things.
+# It replaced "Review Status", which read as a property of the review
+# process rather than as the photographer's own verdict - exactly the
+# distinction that got lost.
+USER_DECISION_LABEL = "User Decision"
+
+
+def categories_for_color_source(color_source: str | None) -> tuple[str, ...]:
+    """Which category vocabulary the selected Color mode speaks - the one
+    place a legend, a KPI row or a count decides that, so no consumer can
+    display Keep/Reject counters for an algorithm mode that never produces
+    them."""
+    return USER_DECISION_CATEGORIES if color_source is None else ALGORITHM_CATEGORIES
 
 
 def status_color(palette: theme.Palette, status: str) -> str:
-    """The one foreground/border color for a status category - shared by
+    """The one foreground/border color for a category - shared by
     StatusLegend, the thumbnail delegate's card border, and the Loupe's own
     status readouts, so "what color is Reject" has exactly one answer."""
     return {
-        "keep": palette.keep_fg,
-        "review": palette.neutral_fg,
-        "reject": palette.reject_fg,
-        "filtered": palette.filtered_fg,
-        "skipped": palette.skipped_fg,
+        USER_DECISION_KEEP: palette.keep_fg,
+        USER_DECISION_REJECT: palette.reject_fg,
+        USER_DECISION_UNDECIDED: palette.filtered_fg,
+        ALGORITHM_SCORED: palette.accent,
+        ALGORITHM_FILTERED: palette.filtered_fg,
+        ALGORITHM_SKIPPED: palette.skipped_fg,
     }.get(status, palette.text_muted)
 
 
 def status_bg(palette: theme.Palette, status: str) -> str:
     return {
-        "keep": palette.keep_bg,
-        "review": palette.neutral_bg,
-        "reject": palette.reject_bg,
-        "filtered": palette.filtered_bg,
-        "skipped": palette.skipped_bg,
+        USER_DECISION_KEEP: palette.keep_bg,
+        USER_DECISION_REJECT: palette.reject_bg,
+        USER_DECISION_UNDECIDED: palette.filtered_bg,
+        ALGORITHM_SCORED: palette.neutral_bg,
+        ALGORITHM_FILTERED: palette.filtered_bg,
+        ALGORITHM_SKIPPED: palette.skipped_bg,
     }.get(status, palette.panel_bg_secondary)
 
 
-def resolve_review_status(item, color_source: str | None) -> str:
-    """The one shared "which of the five categories is this image" answer -
-    used by the Grid's thumbnail card border/status text (`ThumbnailCard
-    Delegate._resolve_status`, a thin wrapper around this) AND the Analytics
-    Dashboard's Overview KPI row/charts (`analytics_dashboard.py`'s
-    `OverviewTab`/`DomainsTab`), so the Grid and the Dashboard can never
-    disagree about how many images are "Keep" for the same folder/Color
-    Source - see this function's own reasoning below.
+def resolve_user_decision(item) -> str:
+    """The photographer's own verdict for this card: Keep, Reject, or
+    Undecided. The complete rule - there is no second clause.
 
-    The photographer's own review_status always wins. Only once an image
-    has no User Decision (still Neutral) does the currently selected Color
-    Source get a say, and even then only a binary keep/reject call via
-    `item.algorithm_suggestion` (never a score gradient). `color_source`
-    is None ("Review Status") means no algorithm to fall back to - a plain
-    "review" (undecided). With a real strategy id: `algorithm_suggestion`
-    keep/reject wins; failing that, a recorded filter reason for THIS
-    strategy means "filtered" (the algorithm examined and excluded this
-    image); no ranking_result and no filter_reasons entry for it at all
-    means "skipped" (never touched); a ranking_result with no keep/reject
-    suggestion either way is still "review" (the strategy DID score it).
+    `item.user_decision` is already the three-state value the session
+    computed from DECISION_SOURCE_USER rows alone (see `review.session.
+    ReviewImage.user_decision`); this reads it defensively via
+    `review.user_decision.normalize` so an item type that only carries the
+    legacy `review_status` spelling still lands on Undecided rather than on
+    something unexpected.
     """
-    if item.review_status == "keep":
-        return "keep"
-    if item.review_status == "reject":
-        return "reject"
+    from ...review.user_decision import normalize
+
+    return normalize(getattr(item, "user_decision", None) or getattr(item, "review_status", None))
+
+
+def resolve_algorithm_state(item, strategy_id: str) -> str:
+    """What `strategy_id` itself did with this image - never a keep/reject.
+
+    Scored: it produced a score (`score_for`), so the card is colored by
+    that score. Filtered Out: it examined the image and explicitly excluded
+    it, recording a reason. Skipped: it never touched the image at all -
+    a genuinely different thing from being filtered, and the distinction the
+    design spec calls out by name.
+    """
+    if item.score_for(strategy_id) is not None:
+        return ALGORITHM_SCORED
+    if strategy_id in item.filter_reasons:
+        return ALGORITHM_FILTERED
+    return ALGORITHM_SKIPPED
+
+
+def resolve_status(item, color_source: str | None) -> str:
+    """Dispatch to whichever of the two modes `color_source` names - the one
+    entry point the Grid delegate and the Analytics Dashboard share, so they
+    can never disagree about a card."""
     if color_source is None:
-        return "review"
-    if item.algorithm_suggestion == "keep":
-        return "keep"
-    if item.algorithm_suggestion == "reject":
-        return "reject"
-    if color_source in item.filter_reasons:
-        return "filtered"
-    if color_source in item.ranking_results:
-        return "review"
-    return "skipped"
+        return resolve_user_decision(item)
+    return resolve_algorithm_state(item, color_source)
+
+
+def score_ramp_color(palette: theme.Palette, fraction: float) -> str:
+    """Low-to-high score tint for an algorithm color mode: `fraction` 0.0 is
+    the lowest score currently on screen, 1.0 the highest.
+
+    Interpolated between the palette's own Reject and Keep hues so the ramp
+    reads the way every other color in the app does (bad -> good), while
+    staying a continuous gradient rather than the two-bucket threshold
+    verdict this replaced - the point is to see the ordering, including how
+    close together the middle of it is.
+    """
+    fraction = 0.0 if fraction < 0.0 else 1.0 if fraction > 1.0 else fraction
+    low = _rgb(palette.reject_fg)
+    high = _rgb(palette.keep_fg)
+    blended = tuple(round(a + (b - a) * fraction) for a, b in zip(low, high))
+    return "#%02X%02X%02X" % blended
+
+
+def _rgb(color: str) -> tuple[int, int, int]:
+    value = color.lstrip("#")
+    return (int(value[0:2], 16), int(value[2:4], 16), int(value[4:6], 16))
 
 
 def app_font(*, bold: bool = False, size: int | None = None) -> QFont:
@@ -295,32 +388,56 @@ class Panel(QFrame):
 
 
 class StatusLegend(QWidget):
-    """A horizontal colored-dot legend for the five review-status
-    categories (`STATUS_CATEGORIES`) - the Grid's bottom legend
-    (`01_Grid.svg`), reused wherever else the same five colors need
-    explaining (e.g. a Dashboard KPI row)."""
+    """A horizontal colored-dot legend for the categories the CURRENTLY
+    SELECTED Color mode actually produces - the Grid's bottom legend
+    (`01_Grid.svg`).
 
-    def __init__(self, *, parent=None) -> None:
+    Rebuilt by `set_color_source` whenever the mode changes, because the two
+    modes have genuinely different vocabularies (see
+    `categories_for_color_source`). A legend that always listed Keep/Reject
+    was itself part of the confusion: it promised those colors meant a
+    decision even while an algorithm mode was painting them from a cutoff.
+    """
+
+    def __init__(self, *, color_source: str | None = None, parent=None) -> None:
         super().__init__(parent)
+        self._color_source = color_source
+        self._layout = QHBoxLayout(self)
+        self._layout.setContentsMargins(0, 0, 0, 0)
+        self._layout.setSpacing(SPACING * 3)
+        self._rebuild()
+
+    def set_color_source(self, color_source: str | None) -> None:
+        if color_source == self._color_source:
+            return
+        self._color_source = color_source
+        self._rebuild()
+
+    def categories(self) -> tuple[str, ...]:
+        return categories_for_color_source(self._color_source)
+
+    def _rebuild(self) -> None:
+        while self._layout.count():
+            entry = self._layout.takeAt(0)
+            widget = entry.widget()
+            if widget is not None:
+                widget.deleteLater()
         palette = theme.current_palette()
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(SPACING * 3)
-        layout.addStretch(1)
-        for status in STATUS_CATEGORIES:
+        self._layout.addStretch(1)
+        for status in self.categories():
             color = status_color(palette, status)
             dot = QLabel("●", self)
             dot.setStyleSheet(f"color: {color}; font-size: 12px;")
             label = QLabel(STATUS_LABELS[status], self)
             label.setStyleSheet(f"color: {palette.text_muted}; font-size: 11px;")
-            entry = QHBoxLayout()
-            entry.setSpacing(6)
-            entry.addWidget(dot)
-            entry.addWidget(label)
+            entry_layout = QHBoxLayout()
+            entry_layout.setSpacing(6)
+            entry_layout.addWidget(dot)
+            entry_layout.addWidget(label)
             wrapper = QWidget(self)
-            wrapper.setLayout(entry)
-            layout.addWidget(wrapper)
-        layout.addStretch(1)
+            wrapper.setLayout(entry_layout)
+            self._layout.addWidget(wrapper)
+        self._layout.addStretch(1)
 
 
 class KpiCard(Panel):

@@ -368,7 +368,7 @@ def main() -> None:
     print(profiler.build_report(total_runtime=total_runtime))
     print("\nTop-ranked images:")
     for rank, entry in enumerate(ranked[:10], start=1):
-        print(f"{rank}. {entry[0]}: {entry[1]:.4f}")
+        print(f"{rank}. {entry[0]}: {entry[1]:.3f}")
     print(f"\nRanked CSV written to {output_paths[0]}")
     if len(output_paths) > 1:
         print(f"Additional CSV files: {', '.join(str(path) for path in output_paths[1:])}")

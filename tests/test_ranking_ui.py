@@ -262,8 +262,8 @@ def test_the_loupe_shows_every_module_score_on_one_line(app) -> None:
             "ai-model": {"score": 0.75, "rank": 3},
         }
     })
-    assert "AI 0.7500 (#3)" in text
-    assert "Classic (SuperAnimal) 0.4200 (#11)" in text
+    assert "AI 0.750 (#3)" in text  # three decimals everywhere - design_system.SCORE_FORMAT
+    assert "Classic (SuperAnimal) 0.420 (#11)" in text
     assert text.index("AI") < text.index("Classic (SuperAnimal)")
     assert LoupeDialog._scores_text({}) == "Unranked"
 
@@ -548,16 +548,18 @@ def test_declining_the_rebuild_prompt_shows_the_plain_error_instead(app, tmp_pat
 # ---------------------------------------------------------------------------
 # Color Source - which strategy's Keep/Reject-styled coloring is on screen.
 #
-# Before this, the Gallery always tinted a card green/red/neutral by
-# review_status alone with no way to tell whether that reflected the AI
-# model, Classic Vision, or the photographer's own decision - impossible to
-# debug the two strategies disagreeing. color_source_options() lists an
-# explicit choice per registered strategy (plus "Review Status", the old
-# behavior, kept as the default); the delegate paints a low-to-high gradient
-# between the same reject/keep colors for whichever one is picked, so a
-# strategy's ranking can be scanned across a folder at a glance without
-# sorting by it. Untested until now - these are the first tests this
-# mechanism had.
+# The Color selector picks ONE of two independent modes, and that mode is
+# the only input to a card's color (see design_system's own module-level
+# comment on the two vocabularies).
+#
+# These tests used to encode the opposite rule: one blended five-value
+# answer where the photographer's decision won and, failing that, the
+# algorithm's binary keep/reject-at-a-threshold suggestion borrowed the very
+# same Keep/Reject colors. That is what made the two kinds of information
+# mutually contaminating - an algorithm-colored grid tinted by whatever had
+# been reviewed, showing a threshold verdict rather than the score it
+# claimed to show, and a User Decision-colored grid that could not be
+# trusted to mean "I decided this". They now assert the separation.
 # ---------------------------------------------------------------------------
 
 
@@ -566,7 +568,7 @@ def test_color_source_options_lists_algorithm_ran_last_review_status_and_every_s
 
     options = color_source_options()
     assert options[0] == (ALGORITHM_RAN_LAST, "Algorithm Ran Last")
-    assert options[1] == (None, "Review Status")
+    assert options[1] == (None, "User Decision"), "renamed from 'Review Status'"
     ids = [source for source, _ in options[2:]]
     assert set(ids) == {info.strategy_id for info in available_strategies()}
     labels = dict(options)
@@ -575,10 +577,11 @@ def test_color_source_options_lists_algorithm_ran_last_review_status_and_every_s
     assert labels["classic-vision-eyepose-v0"] == "Classic Vision Ranking (EyePose-v0, recommended) Score"
 
 
-def test_default_status_is_review_when_no_color_source_is_set(app) -> None:
-    """"Review Status" as Color Source (never called set_color_source, or
-    explicitly None) has no algorithm to fall back to - an undecided image
-    is plain "Review", ignoring any strategy score on the item."""
+def test_user_decision_mode_colors_only_by_the_users_own_decision(app) -> None:
+    """"User Decision" as the Color mode (never called set_color_source, or
+    explicitly None): Keep/Reject/Undecided from the photographer's own
+    decision, ignoring every score, suggestion and filter verdict on the
+    item."""
     from picklikeme.desktop.models.image_item import ImageItem
     from picklikeme.desktop.views.gallery.thumbnail_delegate import ThumbnailCardDelegate
 
@@ -586,45 +589,50 @@ def test_default_status_is_review_when_no_color_source_is_set(app) -> None:
     keep_item = ImageItem(path="/x/a.nef", file_name="a.nef", review_status="keep",
                            ranking_results={"classic-vision": {"score": 0.1}})
     assert delegate._resolve_status(keep_item) == "keep"
-    neutral_item = ImageItem(path="/x/b.nef", file_name="b.nef")
-    assert delegate._resolve_status(neutral_item) == "review"
+    reject_item = ImageItem(path="/x/c.nef", file_name="c.nef", review_status="reject")
+    assert delegate._resolve_status(reject_item) == "reject"
+    undecided_item = ImageItem(path="/x/b.nef", file_name="b.nef")
+    assert delegate._resolve_status(undecided_item) == "undecided"
 
 
-def test_color_source_colors_by_the_chosen_strategy_s_keep_reject_suggestion(app) -> None:
-    """Priority #2 of the coloring policy: with no User Decision, an
-    image's status follows the chosen Color Source's own keep/reject
-    suggestion (ImageItem.algorithm_suggestion) - a binary call at the
-    current threshold, not a score gradient."""
+def test_user_decision_mode_ignores_ranking_results_and_suggestions(app) -> None:
+    """THE regression: a top-scored, cutoff-suggested-Keep image that
+    nobody has reviewed is Undecided in User Decision mode. Before the
+    split, its algorithm suggestion painted it the Keep color, which is
+    exactly how ~5,000 unreviewed images came to look reviewed."""
+    from picklikeme.desktop.models.image_item import ImageItem
+    from picklikeme.desktop.views.gallery.thumbnail_delegate import ThumbnailCardDelegate
+
+    delegate = ThumbnailCardDelegate()  # User Decision mode
+
+    top_scored = ImageItem(
+        path="/x/high.nef", file_name="high.nef",
+        algorithm_suggestion="keep", ai_suggestion="keep", algorithm_decision="keep",
+        ranking_results={"classic-vision": {"score": 0.99, "rank": 1}},
+    )
+    assert delegate._resolve_status(top_scored) == "undecided"
+
+
+def test_algorithm_mode_ignores_the_users_own_decision(app) -> None:
+    """The other direction: an algorithm mode reports what THAT strategy did
+    with the image. A photographer's Keep/Reject on the same frame is a
+    different fact and does not repaint it."""
     from picklikeme.desktop.models.image_item import ImageItem
     from picklikeme.desktop.views.gallery.thumbnail_delegate import ThumbnailCardDelegate
 
     delegate = ThumbnailCardDelegate()
     delegate.set_color_source("classic-vision")
 
-    suggested_reject = ImageItem(path="/x/low.nef", file_name="low.nef", algorithm_suggestion="reject")
-    suggested_keep = ImageItem(path="/x/high.nef", file_name="high.nef", algorithm_suggestion="keep")
-
-    assert delegate._resolve_status(suggested_reject) == "reject"
-    assert delegate._resolve_status(suggested_keep) == "keep"
-
-
-def test_a_user_decision_always_overrides_the_color_source_suggestion(app) -> None:
-    """Priority #1: the photographer's own Keep/Reject wins even when the
-    algorithm's own suggestion, for the very same image, disagrees."""
-    from picklikeme.desktop.models.image_item import ImageItem
-    from picklikeme.desktop.views.gallery.thumbnail_delegate import ThumbnailCardDelegate
-
-    delegate = ThumbnailCardDelegate()
-    delegate.set_color_source("classic-vision")
-
-    user_kept_algo_rejects = ImageItem(
-        path="/x/a.nef", file_name="a.nef", review_status="keep", algorithm_suggestion="reject",
+    user_kept = ImageItem(
+        path="/x/a.nef", file_name="a.nef", review_status="keep",
+        ranking_results={"classic-vision": {"score": 0.2}},
     )
-    user_rejected_algo_keeps = ImageItem(
-        path="/x/b.nef", file_name="b.nef", review_status="reject", algorithm_suggestion="keep",
+    user_rejected = ImageItem(
+        path="/x/b.nef", file_name="b.nef", review_status="reject",
+        ranking_results={"classic-vision": {"score": 0.8}},
     )
-    assert delegate._resolve_status(user_kept_algo_rejects) == "keep"
-    assert delegate._resolve_status(user_rejected_algo_keeps) == "reject"
+    assert delegate._resolve_status(user_kept) == "scored"
+    assert delegate._resolve_status(user_rejected) == "scored"
 
 
 def test_an_image_the_chosen_strategy_explicitly_filtered_gets_filtered_out(app) -> None:
@@ -660,10 +668,9 @@ def test_an_image_the_chosen_strategy_never_touched_gets_skipped(app) -> None:
     assert delegate._resolve_status(untouched) == "skipped"
 
 
-def test_an_image_the_chosen_strategy_scored_with_no_suggestion_stays_review(app) -> None:
-    """Scored (has a ranking_result) but algorithm_suggestion is None (e.g.
-    between thresholds) - still "Review", not "Skipped"/"Filtered Out",
-    since the strategy DID produce a real result for this image."""
+def test_an_image_the_chosen_strategy_scored_is_scored(app) -> None:
+    """A real result for this image from this strategy - "Scored", whatever
+    any threshold would say about it, and never "Skipped"/"Filtered Out"."""
     from picklikeme.desktop.models.image_item import ImageItem
     from picklikeme.desktop.views.gallery.thumbnail_delegate import ThumbnailCardDelegate
 
@@ -674,7 +681,32 @@ def test_an_image_the_chosen_strategy_scored_with_no_suggestion_stays_review(app
         path="/x/w.nef", file_name="w.nef", algorithm_suggestion=None,
         ranking_results={"classic-vision": {"score": 0.5}},
     )
-    assert delegate._resolve_status(scored) == "review"
+    assert delegate._resolve_status(scored) == "scored"
+
+
+def test_algorithm_mode_colors_a_card_by_its_actual_score(app) -> None:
+    """"The color must correspond to that score": across the visible range,
+    the lowest-scoring card is painted at the bottom of the ramp and the
+    highest at the top, with a mid-scoring card strictly between them."""
+    from picklikeme.desktop import theme
+    from picklikeme.desktop.models.image_item import ImageItem
+    from picklikeme.desktop.views.gallery.thumbnail_delegate import ThumbnailCardDelegate
+    from picklikeme.desktop.widgets.design_system import score_ramp_color
+
+    delegate = ThumbnailCardDelegate()
+    delegate.set_color_source("classic-vision")
+    delegate.set_score_range((0.2, 0.8))
+    palette = theme.current_palette()
+
+    def color_of(score: float) -> str:
+        item = ImageItem(path="/x/s.nef", file_name="s.nef",
+                         ranking_results={"classic-vision": {"score": score}})
+        return delegate._status_color(palette, item, delegate._resolve_status(item))
+
+    assert color_of(0.2) == score_ramp_color(palette, 0.0)
+    assert color_of(0.8) == score_ramp_color(palette, 1.0)
+    assert color_of(0.5) == score_ramp_color(palette, 0.5)
+    assert len({color_of(0.2), color_of(0.5), color_of(0.8)}) == 3
 
 
 def test_selecting_a_color_source_propagates_to_the_gallery_delegate(app, tmp_path) -> None:
@@ -785,6 +817,106 @@ def test_a_manually_selected_strategy_does_not_change_when_a_different_strategy_
     try:
         window._color_source = "classic-vision-eyepose-v0"
         assert window._resolve_color_source() == "classic-vision-eyepose-v0"
+    finally:
+        window.close()
+        service.close()
+
+
+# ---------------------------------------------------------------------------
+# "Last Run Algorithm" -> displayed score -> rank -> sorting: one strategy.
+#
+# The card's score badge showed the SELECTED strategy's score while the rank
+# prefix showed the AI model's rank and the default sort ordered by the AI
+# model's score. On a folder ranked only by Crop Sharpness (no AI run at
+# all) that meant Crop Sharpness numbers on cards that carried no rank and
+# were not actually ordered by anything, under a Sort labelled "AI Score".
+# ---------------------------------------------------------------------------
+
+
+def test_the_default_sort_follows_the_selected_algorithm(app, tmp_path) -> None:
+    from picklikeme.desktop.application import ApplicationState, WorkerManager
+    from picklikeme.desktop.main_window import SORT_SELECTED_ALGORITHM, MainWindow
+    from picklikeme.desktop.models.image_item import ImageItem
+    from picklikeme.desktop.services import ReviewService
+    from picklikeme.desktop.settings import DesktopSettings
+
+    service = ReviewService(db_path=tmp_path / "annotations.sqlite")
+    window = MainWindow(
+        state=ApplicationState(), settings=DesktopSettings(),
+        service=service, worker_manager=WorkerManager(),
+    )
+    try:
+        assert window._sort_field == SORT_SELECTED_ALGORITHM
+        # Only "classic-vision" scored these - the AI model never ran.
+        items = [
+            ImageItem(path="/x/low.nef", file_name="low.nef",
+                      ranking_results={"classic-vision": {"score": 0.1, "rank": 3}}),
+            ImageItem(path="/x/high.nef", file_name="high.nef",
+                      ranking_results={"classic-vision": {"score": 0.9, "rank": 1}}),
+            ImageItem(path="/x/mid.nef", file_name="mid.nef",
+                      ranking_results={"classic-vision": {"score": 0.5, "rank": 2}}),
+        ]
+
+        window._color_source = "classic-vision"
+        ordered = [item.file_name for item in window._sort_items(items)]
+        assert ordered == ["high.nef", "mid.nef", "low.nef"], "sorted by the strategy on screen"
+
+        # The old default ("AI Score") has no value for any of them, so they
+        # all fall through to the name ordering - the symptom this replaced.
+        window._sort_field = "score"
+        assert [i.file_name for i in window._sort_items(items)] == ["high.nef", "low.nef", "mid.nef"]
+    finally:
+        window.close()
+        service.close()
+
+
+def test_the_card_rank_comes_from_the_same_strategy_as_the_score_badge(app) -> None:
+    from picklikeme.desktop.models.image_item import ImageItem
+    from picklikeme.desktop.views.gallery.thumbnail_delegate import ThumbnailCardDelegate
+
+    delegate = ThumbnailCardDelegate()
+    item = ImageItem(
+        path="/x/a.nef", file_name="a.nef",
+        ranking_results={"ai-model": {"score": 0.2, "rank": 47},
+                          "classic-vision": {"score": 0.9, "rank": 1}},
+    )
+
+    delegate.set_color_source("classic-vision")
+    assert delegate._selected_score_text(item) == "0.900"
+    assert item.rank_for("classic-vision") == 1, "the rank the card draws alongside that score"
+
+    delegate.set_color_source("ai-model")
+    assert delegate._selected_score_text(item) == "0.200"
+    assert item.rank_for("ai-model") == 47
+
+
+def test_the_score_range_is_measured_over_the_visible_set(app, tmp_path) -> None:
+    from picklikeme.desktop.application import ApplicationState, WorkerManager
+    from picklikeme.desktop.main_window import MainWindow
+    from picklikeme.desktop.models.image_item import ImageItem
+    from picklikeme.desktop.services import ReviewService
+    from picklikeme.desktop.settings import DesktopSettings
+
+    service = ReviewService(db_path=tmp_path / "annotations.sqlite")
+    window = MainWindow(
+        state=ApplicationState(), settings=DesktopSettings(),
+        service=service, worker_manager=WorkerManager(),
+    )
+    try:
+        visible = [
+            ImageItem(path="/x/a.nef", file_name="a.nef",
+                      ranking_results={"classic-vision": {"score": 0.25}}),
+            ImageItem(path="/x/b.nef", file_name="b.nef",
+                      ranking_results={"classic-vision": {"score": 0.75}}),
+            ImageItem(path="/x/c.nef", file_name="c.nef"),  # unscored: not in the range
+        ]
+        assert window._score_range_for(visible, "classic-vision") == (0.25, 0.75)
+        assert window._score_range_for(visible, "ai-model") is None, "nothing this strategy scored"
+        assert window._score_range_for(visible, None) is None, "User Decision mode has no range"
+
+        window._color_source = "classic-vision"
+        window._update_color_source(visible)
+        assert window._gallery_view._delegate._score_range == (0.25, 0.75)
     finally:
         window.close()
         service.close()

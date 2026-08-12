@@ -12,6 +12,12 @@ from ...sidecar import AI_STRATEGY_ID
 class ImageItem:
     path: str
     file_name: str
+    # The photographer's own verdict in the legacy three-value spelling -
+    # "keep"/"reject"/"neutral". Kept because the card's K/R/N buttons, the
+    # status filters and the web page all speak it; `user_decision` below is
+    # the same fact in the explicit vocabulary. Both are the USER's decision
+    # only: an algorithm cutoff recorded for this image (see
+    # ReviewImage.algorithm_decision) never reaches either one.
     review_status: str = "neutral"
     ai_suggestion: str | None = None
     # The same kind of suggestion as ai_suggestion, but for whichever
@@ -59,6 +65,28 @@ class ImageItem:
     burst_size: int = 1
     burst_rank: int = 1
     burst_best: bool = True
+    # A recorded algorithm cutoff for this image ("keep"/"reject"), or None.
+    # Informational only - see ReviewImage.algorithm_decision. Deliberately
+    # NOT folded into review_status/user_decision: that is the confusion the
+    # whole User Decision separation exists to prevent.
+    algorithm_decision: str | None = None
+
+    @property
+    def user_decision(self) -> str:
+        """KEEP / REJECT / UNDECIDED - the photographer's own verdict in the
+        explicit three-state vocabulary, which is what the Grid's User
+        Decision coloring reads (`design_system.resolve_user_decision`).
+        Derived from `review_status`, so the two can never disagree."""
+        from ...review.user_decision import normalize
+
+        return normalize(self.review_status)
+
+    @property
+    def is_decided(self) -> bool:
+        """True only for an explicit user Keep or Reject."""
+        from ...review.user_decision import is_decided
+
+        return is_decided(self.review_status)
 
     @property
     def display_name(self) -> str:

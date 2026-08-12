@@ -116,7 +116,7 @@ def test_average_confidence_card_shows_the_mean_top1_confidence(tmp_path: Path) 
     dialog._experiment_list.setCurrentRow(0)
     app.processEvents()
 
-    assert dialog._species_analysis_tab._confidence_card._value_label.text() == "0.8000"
+    assert dialog._species_analysis_tab._confidence_card._value_label.text() == "0.8000"  # species confidence, not a ranking score
     dialog.close()
 
 
@@ -480,7 +480,7 @@ def test_run_summary_cards_show_acceptance_and_score(tmp_path: Path) -> None:
     assert tab._accepted_card._value_label.text() == "3"
     assert tab._rejected_card._value_label.text() == "1"
     assert tab._acceptance_card._value_label.text() == "75.0%"
-    assert tab._score_card._value_label.text() == "0.7000"
+    assert tab._score_card._value_label.text() == "0.700"  # design_system.SCORE_FORMAT
 
     dialog.close()
 
@@ -516,16 +516,16 @@ def test_run_summary_score_and_quality_table_shows_the_phase_8_fields(tmp_path: 
 
     table = dialog._run_summary_tab._summary_stats_table
     rows = {table.item(r, 0).text(): table.item(r, 1).text() for r in range(table.rowCount())}
-    assert rows["Median Score"] == "0.7000"
-    assert rows["Highest Score"] == "0.9000"
-    assert rows["Lowest Score"] == "0.5000"
+    assert rows["Median Score"] == "0.700"
+    assert rows["Highest Score"] == "0.900"
+    assert rows["Lowest Score"] == "0.500"
     assert rows["Images / Second"] == "0.2000"
     assert rows["Average Runtime (seconds/image)"] == "5.0000"  # 10.0s / 2 images
-    assert rows["Average Eye Confidence"] == "0.7000"
-    assert rows["Average Head Confidence"] == "0.6000"
-    assert rows["Average Eye Sharpness"] == "8.0000"
-    assert rows["Average Subject Sharpness"] == "16.0000"
-    assert rows["Average Subject Size"] == "0.2000"
+    assert rows["Average Eye Confidence"] == "0.700"
+    assert rows["Average Head Confidence"] == "0.600"
+    assert rows["Average Eye Sharpness"] == "8.000"
+    assert rows["Average Subject Sharpness"] == "16.000"
+    assert rows["Average Subject Size"] == "0.200"
 
     dialog.close()
 

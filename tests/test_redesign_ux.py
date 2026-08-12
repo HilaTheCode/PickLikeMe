@@ -546,6 +546,9 @@ def test_overview_kpis_reflect_the_live_folder_not_a_selected_experiment(app, tm
         assert dashboard._overview_tab._kpi_cards["total"]._value_label.text() == "3"
         assert dashboard._overview_tab._kpi_cards["keep"]._value_label.text() == "1"
         assert dashboard._overview_tab._kpi_cards["reject"]._value_label.text() == "1"
-        assert dashboard._overview_tab._kpi_cards["review"]._value_label.text() == "1"
+        # "undecided", not "review": the Overview KPI row now speaks the
+        # selected Color mode's own vocabulary, and no mode selected means
+        # User Decision - Keep/Reject/Undecided.
+        assert dashboard._overview_tab._kpi_cards["undecided"]._value_label.text() == "1"
     finally:
         dashboard.close()

@@ -10,16 +10,22 @@ Three ideas do the work:
 - **The gallery is the union of the ranking and the folder.** An image present
   on disk but absent from the ranking still appears, because the alternative is
   a photograph silently missing from a review of its own shoot.
-- **AI metadata and the photographer's review status are completely separate.**
-  A score, a rank, and the "AI suggests Keep/Reject" hint derived from them are
-  read-only information the model produced. Every image's `review_status` is
-  always exactly one of Keep, Reject or Neutral - the photographer's own,
-  independent verdict - and nothing about the ranking ever changes it by
-  itself. Clearing a decision (one image, or a whole bulk selection) always
-  lands on Neutral, never silently on whatever the model would have picked.
-- **Only Keep/Reject file anything.** `arrange()` reads `review_status` alone;
-  a Neutral image - ranked highly or not ranked at all - is never moved, since
-  "the photographer hasn't looked at it yet" is not a basis to sort it.
+- **Algorithm results and the photographer's User Decision are completely
+  separate, on disk as well as in memory.** A score, a rank, and the "suggests
+  Keep/Reject" hint derived from them are read-only information a model
+  produced. Every image's `user_decision` is exactly one of Keep, Reject or
+  Undecided - the photographer's own, independent verdict - and nothing about
+  the ranking ever produces one. A decision row carries the `source` that
+  wrote it (see `analyzer.annotations.REVIEW_DECISION_SOURCES`), so an
+  algorithm cutoff recorded by "Apply Cutoff" can never later be mistaken for
+  a photographer's click; only DECISION_SOURCE_USER rows are User Decisions.
+  Clearing a decision (one image, or a whole bulk selection) always lands on
+  Undecided, never silently on whatever the model would have picked.
+- **Only an explicit user Keep/Reject files anything.** `arrange()` reads
+  `keep_paths`/`reject_paths`, which read `user_decision` alone; an Undecided
+  image - ranked highly, not ranked at all, or carrying a recorded algorithm
+  cutoff - is never moved, since "the photographer hasn't looked at it yet" is
+  not a basis to sort it.
 """
 
 from __future__ import annotations
@@ -29,7 +35,14 @@ import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from ..analyzer.annotations import REVIEW_KEEP, REVIEW_REASON_OTHER, REVIEW_REJECT, AnnotationStore
+from ..analyzer.annotations import (
+    DECISION_SOURCE_ALGORITHM,
+    DECISION_SOURCE_USER,
+    REVIEW_KEEP,
+    REVIEW_REASON_OTHER,
+    REVIEW_REJECT,
+    AnnotationStore,
+)
 from ..burst_analysis import BurstInfo, ScoredImage, analyze_bursts
 from ..identity import IdentityUnavailable
 from ..organize import (
@@ -104,11 +117,17 @@ class ReviewImage:
     # score/rank - structured metadata for filtering/search/statistics, never
     # written by this application. See thumbnails.detected_category_for.
     detected_category: str | None = None
-    # The photographer's own verdict: REVIEW_KEEP, REVIEW_REJECT, or None.
-    # None *is* Neutral - see review_status - not "no opinion yet from
-    # somewhere else". Meaningless without a decision, and always cleared
-    # alongside one.
+    # The stored verdict for this image: REVIEW_KEEP, REVIEW_REJECT, or None.
+    # None *is* Undecided - see user_decision - not "no opinion yet from
+    # somewhere else". Read together with `decision_source`, ALWAYS: a
+    # decision string on its own does not say who made it, and only
+    # DECISION_SOURCE_USER means the photographer did (see
+    # annotations.REVIEW_DECISION_SOURCES). Meaningless without a decision,
+    # and always cleared alongside one.
     decision: str | None = None
+    # Who recorded `decision` - DECISION_SOURCE_USER or
+    # DECISION_SOURCE_ALGORITHM. None exactly when `decision` is None.
+    decision_source: str | None = None
     reason: str | None = None
     # Free text, only meaningful alongside REVIEW_REASON_OTHER - see
     # AnnotationStore.set_review_decision.
@@ -145,11 +164,53 @@ class ReviewImage:
         return (self.ranking_results.get(strategy_id) or {}).get("score")
 
     @property
+    def user_decision(self) -> str:
+        """The photographer's OWN verdict - KEEP, REJECT or UNDECIDED (see
+        `review.user_decision`). The single source of truth for User Decision
+        coloring, the counts, and `arrange()`.
+
+        A stored decision only counts here when DECISION_SOURCE_USER recorded
+        it. An algorithm's cutoff (DECISION_SOURCE_ALGORITHM - see
+        `apply_algorithm_suggestions`) leaves this UNDECIDED no matter how
+        confident the score behind it was: an image the photographer has
+        never looked at has no verdict, and inventing one from a ranking is
+        the exact confusion this property exists to make impossible.
+        """
+        from .user_decision import UNDECIDED, normalize
+
+        if self.decision_source != DECISION_SOURCE_USER:
+            return UNDECIDED
+        return normalize(self.decision)
+
+    @property
+    def is_decided(self) -> bool:
+        """True only for an explicit user Keep or Reject - what `arrange()`
+        and every "only the images I actually reviewed" caller tests."""
+        from .user_decision import is_decided
+
+        return is_decided(self.user_decision)
+
+    @property
+    def algorithm_decision(self) -> str | None:
+        """A recorded algorithm cutoff for this image, if one was ever
+        applied - purely informational, never a user decision. None when the
+        stored decision (if any) is the photographer's own."""
+        if self.decision_source != DECISION_SOURCE_ALGORITHM:
+            return None
+        return self.decision
+
+    @property
     def review_status(self) -> str:
-        """The one true tri-state status this application ever shows or
-        files by. Always Neutral until the photographer explicitly says
-        otherwise - never inferred from the ranking."""
-        return self.decision or REVIEW_STATUS_NEUTRAL
+        """Legacy spelling of `user_decision` - "keep"/"reject"/"neutral",
+        the vocabulary the web review page, the desktop status filters and
+        the K/R/N buttons already speak. Derived from `user_decision`, so an
+        algorithm-sourced row reads as Neutral here too and no caller can
+        reach a Keep the photographer never made by using the older name.
+        """
+        from .user_decision import UNDECIDED
+
+        decision = self.user_decision
+        return REVIEW_STATUS_NEUTRAL if decision == UNDECIDED else decision
 
     def as_dict(
         self, ai_suggestion: str | None, burst: "BurstInfo | None" = None, algorithm_suggestion: str | None = None
@@ -169,6 +230,18 @@ class ReviewImage:
             "captured_at": self.captured_at,
             "detected_category": self.detected_category,
             "review_status": self.review_status,
+            # The same verdict in the explicit three-state vocabulary -
+            # "keep"/"reject"/"undecided", never None, never inferred. The
+            # desktop Grid's User Decision coloring reads THIS, so "no row in
+            # review_decisions" reaches the UI as a value it has to handle
+            # rather than as an absence it might default to something else.
+            "user_decision": self.user_decision,
+            # Who recorded the stored decision, or None if there is none -
+            # see annotations.REVIEW_DECISION_SOURCES.
+            "decision_source": self.decision_source,
+            # A recorded algorithm cutoff for this image, if one was applied
+            # (informational - never a user decision, never organized).
+            "algorithm_decision": self.algorithm_decision,
             # What the AI ranking alone would recommend at the current
             # threshold - "keep"/"reject", or None if unranked. Informational
             # only; see ReviewSession._ai_suggestions.
@@ -536,19 +609,29 @@ class ReviewSession:
         """
         store = store or self.store
         rows = store.review_decisions()
-        by_hash = {
-            row["image_hash"]: (row["decision"], row.get("reason"), row.get("reason_note")) for row in rows
-        }
-        by_path = {
-            _key(row["image_path"]): (row["decision"], row.get("reason"), row.get("reason_note"))
-            for row in rows
-        }
+
+        def _row(row: dict) -> tuple[str, str, str | None, str | None]:
+            # `source` is read with an explicit fallback rather than trusted
+            # blind: a row from a database written before the column existed
+            # has no origin on record, and DECISION_SOURCE_USER is the
+            # conservative reading (see AnnotationStore's own migration).
+            return (
+                row["decision"],
+                row.get("source") or DECISION_SOURCE_USER,
+                row.get("reason"),
+                row.get("reason_note"),
+            )
+
+        empty: tuple[None, None, None, None] = (None, None, None, None)
+        by_hash = {row["image_hash"]: _row(row) for row in rows}
+        by_path = {_key(row["image_path"]): _row(row) for row in rows}
         matched: set[str] = set()
         with self._state_lock:
             self._decisions_by_hash = by_hash
         for image in self.images:
-            decision, reason, reason_note = by_path.get(_key(image.image_path), (None, None, None))
+            decision, source, reason, reason_note = by_path.get(_key(image.image_path), empty)
             image.decision = decision
+            image.decision_source = source
             image.reason = reason
             image.reason_note = reason_note
             # A decision matched to a path whose file is gone is not really
@@ -578,9 +661,12 @@ class ReviewSession:
                 digest = (store or self.store).identity_of(image.image_path)
             except IdentityUnavailable:
                 continue
-            decision, reason, reason_note = self._decisions_by_hash.get(digest, (None, None, None))
+            decision, source, reason, reason_note = self._decisions_by_hash.get(
+                digest, (None, None, None, None)
+            )
             if decision is not None:
                 image.decision = decision
+                image.decision_source = source
                 image.reason = reason
                 image.reason_note = reason_note
                 recovered += 1
@@ -815,20 +901,35 @@ class ReviewSession:
     # -- the photographer's review status ------------------------------------
 
     def keep_paths(self) -> list[str]:
-        return [i.image_path for i in self.images if i.review_status == REVIEW_STATUS_KEEP]
+        """Images the PHOTOGRAPHER marked Keep - see ReviewImage.user_
+        decision. An algorithm cutoff's own keeps are deliberately absent:
+        this list is what `arrange()` files into `_Selected`."""
+        return [i.image_path for i in self.images if i.user_decision == REVIEW_STATUS_KEEP]
 
     def reject_paths(self) -> list[str]:
-        return [i.image_path for i in self.images if i.review_status == REVIEW_STATUS_REJECT]
+        """Images the photographer marked Reject - see `keep_paths`."""
+        return [i.image_path for i in self.images if i.user_decision == REVIEW_STATUS_REJECT]
 
-    def neutral_paths(self) -> list[str]:
-        return [i.image_path for i in self.images if i.review_status == REVIEW_STATUS_NEUTRAL]
+    def undecided_paths(self) -> list[str]:
+        """Images with NO user decision - never reviewed, or explicitly
+        cleared back to Neutral. Nothing files these."""
+        return [i.image_path for i in self.images if not i.is_decided]
+
+    # The pre-three-state name for `undecided_paths`, kept because "neutral"
+    # is still the wire value the web page and the N button speak.
+    neutral_paths = undecided_paths
 
     def counts(self) -> dict[str, int]:
         return {
             "total": len(self.images),
             "keep": len(self.keep_paths()),
             "reject": len(self.reject_paths()),
-            "neutral": len(self.neutral_paths()),
+            "neutral": len(self.undecided_paths()),
+            # Same three-state tally under the explicit name, plus how many
+            # images carry a recorded ALGORITHM cutoff (informational - not
+            # part of keep/reject/undecided, which are user decisions only).
+            "undecided": len(self.undecided_paths()),
+            "algorithm_decisions": sum(1 for i in self.images if i.algorithm_decision is not None),
             "missing_file": sum(1 for i in self.images if i.missing_file),
         }
 
@@ -911,6 +1012,7 @@ class ReviewSession:
         *,
         reason: str | None = None,
         reason_note: str | None = None,
+        source: str = DECISION_SOURCE_USER,
     ) -> str:
         """Record the photographer's Keep/Reject/Neutral for one image.
 
@@ -924,6 +1026,12 @@ class ReviewSession:
 
         Persisted immediately - a review session's work must never exist only
         in a browser tab. Returns the resulting review_status.
+
+        `source` defaults to DECISION_SOURCE_USER: every review-UI path
+        (card buttons, Loupe, K/R/N shortcuts, bulk multi-select) is the
+        photographer acting, and that default is what makes "I clicked Keep"
+        the only way an image becomes Keep. `_apply_suggestions` is the one
+        caller that passes DECISION_SOURCE_ALGORITHM instead.
         """
         if status not in REVIEW_STATUSES:
             raise InvalidReviewStatus(f"status must be one of {sorted(REVIEW_STATUSES)}, got {status!r}")
@@ -935,8 +1043,11 @@ class ReviewSession:
         else:
             if reason != REVIEW_REASON_OTHER:
                 reason_note = None
-            self.store.set_review_decision(image.image_path, status, reason=reason, reason_note=reason_note)
+            self.store.set_review_decision(
+                image.image_path, status, reason=reason, reason_note=reason_note, source=source
+            )
         image.decision = None if status == REVIEW_STATUS_NEUTRAL else status
+        image.decision_source = None if status == REVIEW_STATUS_NEUTRAL else source
         image.reason = reason
         image.reason_note = reason_note
         return image.review_status
@@ -975,25 +1086,21 @@ class ReviewSession:
         return {"applied": applied, "failed": failed}
 
     def apply_ai_suggestions(self, *, include_decided: bool = False) -> dict:
-        """Bulk-accept the AI's CURRENT suggestion for every ranked image -
-        a fast starting point for a very large shoot: review the exceptions
-        by hand, let this handle the rest.
+        """Record the AI's CURRENT suggestion for every ranked image as an
+        ALGORITHM decision - a snapshot of what the cutoff would pick, kept
+        alongside (never inside) the photographer's own decisions.
 
-        A Neutral image has nothing manual at risk, so it is always updated
-        immediately - no confirmation needed for that part, here or in the
-        page. An image the photographer has ALREADY marked Keep or Reject is
-        only touched when `include_decided=True`; the caller (review/server.py's
-        endpoint, and the page's own two-step flow) is responsible for
-        getting that explicit confirmation first. This method never
-        overwrites manual work silently - it either leaves a decided image
-        alone, or the caller has already agreed to override it.
+        This does NOT review anything on the photographer's behalf. Every row
+        it writes carries DECISION_SOURCE_ALGORITHM, so none of them colors a
+        card as a User Decision, counts toward Keep/Reject, or is filed by
+        `arrange()` - see `_apply_suggestions`. An image the photographer has
+        already decided is never touched at all.
 
-        `conflicts` in the result is the number of already-decided images
-        whose review_status disagrees with the AI's own suggestion - counted
-        on every call, even with `include_decided=False`, so a caller can
-        decide whether asking about a second, confirmed call is even worth
-        it. `overridden` is how many of those were actually changed this
-        call (always 0 unless `include_decided=True`).
+        `conflicts` in the result is the number of user-decided images whose
+        User Decision disagrees with the AI's own suggestion - informational,
+        the same comparison `agreement_stats` makes. `include_decided` only
+        governs re-writing an image's own EARLIER algorithm decision at a new
+        threshold; `overridden` counts those.
 
         Deliberately always the AI model specifically, never whichever
         strategy `burst_strategy`/the desktop Color Source picker currently
@@ -1027,6 +1134,24 @@ class ReviewSession:
         return self._apply_suggestions(self.suggestions_for(strategy_id), include_decided=include_decided)
 
     def _apply_suggestions(self, suggestions: dict[str, str | None], *, include_decided: bool) -> dict:
+        """Record `suggestions` as ALGORITHM decisions (DECISION_SOURCE_
+        ALGORITHM), never user ones.
+
+        This method is where a ranking used to become indistinguishable from
+        a photographer's own review: it wrote the cutoff's keep/reject
+        through the same path a Grid button click uses, into the same rows,
+        with nothing on the row saying which was which. One "Apply Cutoff"
+        on a 5,986-image folder then left every image looking reviewed - the
+        Grid colored them all, the counts claimed them all, and `arrange()`
+        would have filed them all.
+
+        Now the write carries its origin. An algorithm decision is shown as
+        an algorithm decision and is never read as a User Decision by
+        coloring, counts or organizing; a photographer's own Keep/Reject is
+        never touched at all (`include_decided` can only ever override
+        another ALGORITHM row, which is just this method re-running at a
+        different threshold).
+        """
         applied = 0
         overridden = 0
         conflicts = 0
@@ -1034,15 +1159,31 @@ class ReviewSession:
             suggestion = suggestions.get(image.image_path)
             if suggestion is None:
                 continue
-            if image.review_status == REVIEW_STATUS_NEUTRAL:
-                self.set_review_status(image.image_path, suggestion)
+            if image.is_decided:
+                # A real user decision. Counted as a conflict when it
+                # disagrees, so the caller can still report the comparison,
+                # but never overwritten - not even with include_decided.
+                if image.user_decision != suggestion:
+                    conflicts += 1
+                continue
+            if image.algorithm_decision is None:
+                self.set_review_status(image.image_path, suggestion, source=DECISION_SOURCE_ALGORITHM)
                 applied += 1
-            elif image.review_status != suggestion:
-                conflicts += 1
+            elif image.algorithm_decision != suggestion:
                 if include_decided:
-                    self.set_review_status(image.image_path, suggestion)
+                    self.set_review_status(image.image_path, suggestion, source=DECISION_SOURCE_ALGORITHM)
                     overridden += 1
         return {"applied": applied, "overridden": overridden, "conflicts": conflicts}
+
+    def clear_algorithm_decisions(self) -> int:
+        """Undo every recorded algorithm cutoff at once, leaving the
+        photographer's own decisions untouched. Returns how many were
+        removed. The escape hatch for a bulk "Apply Cutoff" - see
+        `_apply_suggestions`."""
+        removed = self.store.clear_review_decisions_by_source(DECISION_SOURCE_ALGORITHM)
+        if removed:
+            self._apply_decisions()
+        return removed
 
     def _image_for(self, image_path: str) -> ReviewImage:
         key = _key(image_path)
@@ -1052,11 +1193,16 @@ class ReviewSession:
         raise KeyError(f"{image_path} is not part of this review session")
 
     def arrange(self, *, dry_run: bool = False) -> OrganizeResult:
-        """File the shoot by the photographer's OWN review status alone: Keep
-        to `_Selected`, Reject to `_Rejected`, Neutral left exactly where it
-        is - ranked highly by the AI or not. The ranking never files anything
-        by itself; only an explicit Keep or Reject does, whether set one
-        image at a time or through a bulk action.
+        """File the shoot by the photographer's OWN User Decision alone: Keep
+        to `_Selected`, Reject to `_Rejected`, Undecided left exactly where
+        it is - ranked highly by an algorithm or not, carrying a recorded
+        algorithm cutoff or not. Only an explicit user Keep or Reject files
+        anything (`keep_paths`/`reject_paths`, which read `user_decision`).
+
+        This is what makes batch reviewing work: decide 200 images, arrange
+        those 200, come back and decide 300 more. The other 5,000 the
+        ranking scored are not candidates for either folder, because nobody
+        has judged them yet.
 
         On a real run the ranking and the stored decisions are both repointed
         at the new locations, so the folder can be reviewed again afterwards.

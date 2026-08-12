@@ -87,6 +87,61 @@ FOCUS_PERCENTILE = 99.0
 NORMALIZE_LOW_PERCENTILE = 5.0
 NORMALIZE_HIGH_PERCENTILE = 95.0
 
+# --- absolute sharpness normalisation --------------------------------------
+#
+# `absolute_sharpness_score` below maps a raw `focus_measure`/`subject_focus_
+# measure` value onto [0, 1] with a FIXED curve, so the same crop scores the
+# same number in a folder of 10 images and in one of 6,000. The constants are
+# the whole point: they are what makes the result absolute rather than a
+# position within whatever happened to be ranked together.
+#
+# Calibrated against 250 crops sampled at random from this project's own crop
+# cache (11,074 cached crops; read-only measurement, seed 7). The observed
+# distribution of `subject_focus_measure`:
+#
+#     min 0.041   P1 0.065   P5 0.143   P25 0.398   P50 0.716
+#     P75 0.948   P95 1.369   P99 1.667   max 1.732
+#
+# SHARPNESS_MIDPOINT is placed at ~the median of that sample, so a typical
+# crop from this archive lands near 0.5 and the usable detail sits in the
+# middle of the scale rather than bunched at one end.
+SHARPNESS_MIDPOINT = 0.70
+# Curve steepness. 1.5 spreads the sampled archive across roughly 0.014 (the
+# blurriest crop measured) to 0.80 (the sharpest), which is the property that
+# matters: no artificial plateau at either end, and every real difference in
+# sharpness still moves the score.
+SHARPNESS_STEEPNESS = 1.5
+
+
+def absolute_sharpness_score(focus_value: float) -> float:
+    """A raw focus measure -> an ABSOLUTE normalised sharpness in [0, 1].
+
+    `x**s / (x**s + k**s)` - strictly increasing, 0 at zero sharpness,
+    asymptotic to 1, and equal to 0.5 exactly at `SHARPNESS_MIDPOINT`.
+
+    Deliberately not `robust_normalize`. That maps the 5th/95th percentiles
+    OF THE CURRENT RUN onto 0 and 1 and clips, which has three properties
+    this must not have: the same image scores differently depending on what
+    it was ranked alongside, the answer changes with the number of images,
+    and - because it clips - the top ~5% and bottom ~5% of every run collapse
+    into flat plateaus at exactly 1.000 and 0.000 no matter how different
+    those images really are. On the calibration sample above, P95 is 1.369
+    while the maximum is 1.732: a 27% spread in real sharpness that
+    percentile clipping would render as an identical 1.000.
+
+    This curve clips nothing. 1.000 is approached but never reached, so a
+    displayed 1.000 would mean "sharper than anything this archive contains"
+    rather than "the sharpest in this particular folder" - which is exactly
+    the difference between an absolute score and a percentile rank.
+
+    A negative or zero measure (a degenerate patch - see `focus_measure`)
+    scores 0.0, sorting it to the bottom without special-casing downstream.
+    """
+    if not np.isfinite(focus_value) or focus_value <= 0.0:
+        return 0.0
+    scaled = (float(focus_value) / SHARPNESS_MIDPOINT) ** SHARPNESS_STEEPNESS
+    return float(scaled / (scaled + 1.0))
+
 
 def _to_gray(image: np.ndarray) -> np.ndarray:
     """Luminance as float32. Accepts RGB or an already-single-channel image."""

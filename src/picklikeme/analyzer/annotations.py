@@ -213,8 +213,31 @@ REVIEW_REJECT = "reject"
 REVIEW_DECISIONS: frozenset[str] = frozenset({REVIEW_KEEP, REVIEW_REJECT})
 
 
+# WHO recorded a decision. A row's `decision` alone cannot answer that, and
+# without the answer an algorithm's cutoff and a photographer's own Keep/
+# Reject are indistinguishable the moment both are on disk - which is exactly
+# how "Apply Cutoff" once turned a 5,986-image ranking into 5,986 rows that
+# every downstream reader (Grid coloring, the counts, `arrange()`) then
+# treated as reviewed-by-hand.
+#
+# DECISION_SOURCE_USER is the ONLY source that means "the photographer
+# decided this": the Grid's Keep/Reject buttons, the Loupe, the K/R/N
+# shortcuts, a bulk multi-select, and Set User Decisions by Subfolders (a
+# photographer's own curation, expressed as folders instead of clicks).
+# DECISION_SOURCE_ALGORITHM is a ranking strategy's cutoff, applied on
+# request - informational, never a user decision, never organized. See
+# review.session.ReviewImage.user_decision.
+DECISION_SOURCE_USER = "user"
+DECISION_SOURCE_ALGORITHM = "algorithm"
+REVIEW_DECISION_SOURCES: frozenset[str] = frozenset({DECISION_SOURCE_USER, DECISION_SOURCE_ALGORITHM})
+
+
 class InvalidReviewDecision(ValueError):
     """Raised for a review decision outside {keep, reject}."""
+
+
+class InvalidDecisionSource(ValueError):
+    """Raised for a decision source outside REVIEW_DECISION_SOURCES."""
 
 
 # Why a manual Keep/Reject overrides the model - optional, and only ever
@@ -538,6 +561,10 @@ class AnnotationStore:
                 -- Deliberately no FOREIGN KEY to annotations_v2: a decision
                 -- must be able to exist for an image that was never diagnosed,
                 -- and deleting a diagnosis must not erase a decision.
+                -- `source` records WHO decided (see REVIEW_DECISION_SOURCES):
+                -- only 'user' rows are the photographer's own verdict. An
+                -- 'algorithm' row is a ranking cutoff someone asked to be
+                -- recorded, and is never read as a user decision anywhere.
                 CREATE TABLE IF NOT EXISTS review_decisions (
                     image_hash  TEXT PRIMARY KEY,
                     decision    TEXT NOT NULL,
@@ -545,7 +572,8 @@ class AnnotationStore:
                     reason_note TEXT,
                     image_path  TEXT NOT NULL,
                     filename    TEXT NOT NULL,
-                    updated_at  TEXT NOT NULL
+                    updated_at  TEXT NOT NULL,
+                    source      TEXT NOT NULL DEFAULT 'user'
                 );
                 CREATE INDEX IF NOT EXISTS idx_review_path ON review_decisions(image_path);
 
@@ -604,6 +632,13 @@ class AnnotationStore:
         # from before those features has the table but not the columns.
         self._ensure_column("review_decisions", "reason", "TEXT")
         self._ensure_column("review_decisions", "reason_note", "TEXT")
+        # `source` predates nothing on a fresh database, but a database from
+        # before it existed has rows whose origin genuinely cannot be
+        # recovered. They backfill to 'user' - the conservative direction:
+        # mistaking a real decision for an algorithm's would silently discard
+        # a photographer's work, while the reverse is visible and fixable
+        # (see clear_review_decisions_by_source).
+        self._ensure_column("review_decisions", "source", f"TEXT NOT NULL DEFAULT '{DECISION_SOURCE_USER}'")
         self.migration = self._migrate_v1()
         self.legacy_field_migration = self._migrate_legacy_fields()
         with self._conn:
@@ -1133,8 +1168,9 @@ class AnnotationStore:
         *,
         reason: str | None = None,
         reason_note: str | None = None,
+        source: str = DECISION_SOURCE_USER,
     ) -> str:
-        """Record a manual Keep or Reject, with an optional reason for the
+        """Record a Keep or Reject, with an optional reason for the
         override. Raises IdentityUnavailable.
 
         Keyed on content identity, so the decision follows the image through
@@ -1144,10 +1180,20 @@ class AnnotationStore:
         without. `reason_note` is free text and only means anything alongside
         REVIEW_REASON_OTHER; given with any other reason (or none), it is
         silently dropped rather than stored somewhere it can't apply to.
+
+        `source` defaults to DECISION_SOURCE_USER because every caller that
+        does not say otherwise is a photographer acting in the review UI. A
+        ranking strategy's own cutoff must pass DECISION_SOURCE_ALGORITHM
+        explicitly - see REVIEW_DECISION_SOURCES for why the distinction is
+        stored rather than inferred.
         """
         if decision not in REVIEW_DECISIONS:
             raise InvalidReviewDecision(
                 f"decision must be one of {sorted(REVIEW_DECISIONS)}, got {decision!r}"
+            )
+        if source not in REVIEW_DECISION_SOURCES:
+            raise InvalidDecisionSource(
+                f"source must be one of {sorted(REVIEW_DECISION_SOURCES)}, got {source!r}"
             )
         if reason is not None and reason not in REVIEW_REASONS:
             raise InvalidReviewReason(
@@ -1161,17 +1207,18 @@ class AnnotationStore:
             self._conn.execute(
                 """
                 INSERT INTO review_decisions
-                    (image_hash, decision, reason, reason_note, image_path, filename, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                    (image_hash, decision, reason, reason_note, image_path, filename, updated_at, source)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(image_hash) DO UPDATE SET
                     decision    = excluded.decision,
                     reason      = excluded.reason,
                     reason_note = excluded.reason_note,
                     image_path  = excluded.image_path,
                     filename    = excluded.filename,
-                    updated_at  = excluded.updated_at
+                    updated_at  = excluded.updated_at,
+                    source      = excluded.source
                 """,
-                (digest, decision, reason, reason_note, str(path), path.name, _now()),
+                (digest, decision, reason, reason_note, str(path), path.name, _now(), source),
             )
         return digest
 
@@ -1193,14 +1240,41 @@ class AnnotationStore:
         that miss - see picklikeme.review.session.
         """
         rows = self._conn.execute(
-            "SELECT image_hash, decision, reason, reason_note, image_path, filename, updated_at FROM review_decisions"
+            "SELECT image_hash, decision, reason, reason_note, image_path, filename, updated_at, source "
+            "FROM review_decisions"
         ).fetchall()
         return [dict(row) for row in rows]
 
-    def review_decision_count(self) -> int:
+    def review_decision_count(self, *, source: str | None = None) -> int:
+        """How many decisions are on record - all of them, or only those a
+        given `source` recorded (see REVIEW_DECISION_SOURCES)."""
+        if source is None:
+            return int(
+                self._conn.execute("SELECT COUNT(*) AS n FROM review_decisions").fetchone()["n"]
+            )
         return int(
-            self._conn.execute("SELECT COUNT(*) AS n FROM review_decisions").fetchone()["n"]
+            self._conn.execute(
+                "SELECT COUNT(*) AS n FROM review_decisions WHERE source = ?", (source,)
+            ).fetchone()["n"]
         )
+
+    def clear_review_decisions_by_source(self, source: str) -> int:
+        """Delete every decision `source` recorded, leaving the other
+        sources' rows untouched. Returns how many rows were removed.
+
+        The undo for a bulk cutoff application: an 'algorithm' sweep can be
+        taken back wholesale without a photographer having to find, one by
+        one, which of thousands of rows they actually made themselves.
+        """
+        if source not in REVIEW_DECISION_SOURCES:
+            raise InvalidDecisionSource(
+                f"source must be one of {sorted(REVIEW_DECISION_SOURCES)}, got {source!r}"
+            )
+        with self._conn:
+            cursor = self._conn.execute("DELETE FROM review_decisions WHERE source = ?", (source,))
+        if cursor.rowcount:
+            logger.info("Cleared %d %s-sourced review decision(s)", cursor.rowcount, source)
+        return int(cursor.rowcount)
 
     def repoint_review_decisions(self, moves: dict[str, "Path"]) -> int:
         """Follow the images that arranging just moved.

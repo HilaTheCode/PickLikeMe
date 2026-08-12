@@ -122,6 +122,27 @@ class FilterCandidate:
     # even for a rejected image.
     eye: "EyeDetection | None" = None
 
+    @property
+    def has_selected_detection(self) -> bool:
+        """Did the crop pipeline actually LOCATE a subject in this frame?
+
+        True only when a real selected detection produced `subject_box`.
+        False for the full-frame fallback, where `subject_box` is the whole
+        decoded frame because nothing more specific was ever found (see
+        `ClassicVisionStrategy._load_candidate`, which leaves `subject_label`
+        None in exactly that case and only that case).
+
+        Read-only and derived - it decides nothing about detection, cropping
+        or filtering, and changes none of them. It exists so a scoring phase
+        can ask "is there a real subject here" explicitly, instead of
+        inferring it from a `subject_label is None` check whose meaning is
+        not obvious at the point of use. A strategy must not treat the
+        fallback box as a measured subject: its area is the frame's area by
+        construction, so any subject-size term computed from it measures
+        nothing about the photograph.
+        """
+        return self.subject_box is not None and self.subject_label is not None
+
 
 class ImageFilter(Protocol):
     """One yes/no question about a candidate.

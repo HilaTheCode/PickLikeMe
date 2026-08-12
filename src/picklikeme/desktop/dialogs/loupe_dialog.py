@@ -76,6 +76,7 @@ from ..models.image_item import ImageItem
 from ..services import ReviewService
 from ..views.gallery.thumbnail_delegate import DOMAIN_BY_STRATEGY
 from ..widgets.design_system import (
+    SCORE_FORMAT,
     RADIUS_LG,
     SPACING,
     AlgorithmResultRow,
@@ -128,7 +129,11 @@ VIEW_MODE_PANEL_VISIBILITY = {
 }
 DEFAULT_VIEW_MODE = VIEW_MODE_FULL_REVIEW
 
-STATUS_LABELS = {"keep": "Keep", "reject": "Reject", "neutral": "Neutral"}
+# The photographer's own User Decision, in the same three-state vocabulary
+# the Grid's legend and counts use - "Undecided", not "Neutral", so the same
+# state is not called two things on two screens (see review.user_decision).
+STATUS_LABELS = {"keep": "Keep", "reject": "Reject", "neutral": "Undecided"}
+
 # Always the dark palette's semantic colors, regardless of the app theme -
 # the Loupe's overlay bar is permanently dark-chrome (see module docstring
 # and theme.py), so it needs colors tuned for that background specifically.
@@ -1125,7 +1130,7 @@ class LoupeDialog(QDialog):
             label = labels.get(strategy_id, strategy_id)
             if score is not None:
                 rank = entry.get("rank")
-                parts.append(f"{label} {score:.4f}" + (f" (#{rank})" if rank else ""))
+                parts.append(f"{label} {score:{SCORE_FORMAT}}" + (f" (#{rank})" if rank else ""))
             else:
                 reason = filter_reasons.get(strategy_id)
                 if reason is None:

@@ -85,14 +85,18 @@ from ..filtering import FilterableRecord, apply_filters
 from ..models.image_item import ImageItem
 from ..views.gallery.thumbnail_delegate import DOMAIN_BY_STRATEGY
 from ..widgets.design_system import (
+    SCORE_FORMAT,
     RADIUS_LG,
     SPACING,
-    STATUS_CATEGORIES,
     STATUS_LABELS as STATUS_CATEGORY_LABELS,
+    USER_DECISION_KEEP,
+    USER_DECISION_LABEL,
+    categories_for_color_source,
     ChartCard,
     KpiCard,
     Panel,
-    resolve_review_status,
+    resolve_status,
+    resolve_user_decision,
     status_color,
 )
 from ..widgets.advanced_filters_panel import AdvancedFiltersPanel
@@ -305,7 +309,9 @@ class DashboardHeaderPanel(QWidget):
 
 
 def _strategy_label_or_review_status(strategy_id: str | None) -> str:
-    return "Review Status" if strategy_id is None else _friendly_strategy_label(strategy_id)
+    """The Color mode's own name - "User Decision" for the non-algorithm
+    mode (see main_window.USER_DECISION_LABEL), otherwise the strategy's."""
+    return USER_DECISION_LABEL if strategy_id is None else _friendly_strategy_label(strategy_id)
 
 
 class ExperimentMetadataPanel(QWidget):
@@ -726,9 +732,19 @@ class RunSummaryTab(QWidget):
         self._rejected_card.set_value(str(rejected))
         self._acceptance_card.set_value(f"{100.0 * accepted / considered:.1f}%" if considered else "n/a")
         score_stats = all_metric_stats.get("score") or stat_fn("score") or {}
-        self._score_card.set_value(f"{score_stats['mean']:.4f}" if score_stats else "n/a")
+        self._score_card.set_value(f"{score_stats['mean']:{SCORE_FORMAT}}" if score_stats else "n/a")
 
         def _fmt(value: float | None) -> str:
+            """A SCORE or a score component - three decimals, the same
+            precision the Grid and the Loupe show (design_system.
+            SCORE_FORMAT)."""
+            return f"{value:{SCORE_FORMAT}}" if value is not None else "n/a"
+
+        def _fmt_rate(value: float | None) -> str:
+            """A throughput/duration, not a score: keeps its own precision,
+            because "0.200 images/second" and "0.2000 images/second" are a
+            measurement of the machine, not of a photograph, and the
+            three-decimal score rule has nothing to say about them."""
             return f"{value:.4f}" if value is not None else "n/a"
 
         eye_confidence_stats = all_metric_stats.get("eye_confidence") or {}
@@ -743,8 +759,8 @@ class RunSummaryTab(QWidget):
             ("Median Score", _fmt(score_stats.get("median"))),
             ("Highest Score", _fmt(score_stats.get("max"))),
             ("Lowest Score", _fmt(score_stats.get("min"))),
-            ("Images / Second", _fmt(summary.get("images_per_second"))),
-            ("Average Runtime (seconds/image)", _fmt(average_runtime)),
+            ("Images / Second", _fmt_rate(summary.get("images_per_second"))),
+            ("Average Runtime (seconds/image)", _fmt_rate(average_runtime)),
             ("Average Eye Confidence", _fmt(eye_confidence_stats.get("mean"))),
             ("Average Head Confidence", _fmt(head_confidence_stats.get("mean"))),
             ("Average Eye Sharpness", _fmt(eye_sharpness_stats.get("mean"))),
@@ -762,7 +778,7 @@ class RunSummaryTab(QWidget):
             for col_index, key in enumerate(("mean", "median", "min", "max"), start=1):
                 value = metric_stats.get(key)
                 self._metric_stats_table.setItem(
-                    row_index, col_index, QTableWidgetItem(f"{value:.4f}" if value is not None else "n/a")
+                    row_index, col_index, QTableWidgetItem(f"{value:{SCORE_FORMAT}}" if value is not None else "n/a")
                 )
         self._metric_stats_table.resizeColumnsToContents()
         self._metric_stats_table.horizontalHeader().setStretchLastSection(True)
@@ -783,7 +799,7 @@ class RunSummaryTab(QWidget):
         for name in metric_names:
             metric_stats = all_metric_stats.get(name)
             if metric_stats:
-                rows.append((f"Mean {name}", f"{metric_stats['mean']:.4f}"))
+                rows.append((f"Mean {name}", f"{metric_stats['mean']:{SCORE_FORMAT}}"))
         # The full experiment record (model id/version, species list hash,
         # GPU, thresholds, ...) lives in params for a species run - see
         # species.experiment.ExperimentMetadata.to_dict(). Shown generically
@@ -1157,7 +1173,7 @@ def _build_run_records(
 def _live_score(item: ImageItem, color_source: str | None) -> float | None:
     """The one score an Overview/Domains chart plots for `item` - the
     resolved Color Source's own score, or the AI model's when no strategy
-    is selected ("Review Status") - the same fallback `MainWindow._apply_
+    is selected ("User Decision") - the same fallback `MainWindow._apply_
     cutoff` already uses, so a Dashboard opened from the live Review
     context never disagrees with what the Grid itself is showing."""
     from ...sidecar import AI_STRATEGY_ID
@@ -1191,17 +1207,16 @@ class OverviewTab(QWidget):
         self._items: list[ImageItem] = []
         self._color_source: str | None = None
 
+        # One KPI card per category of the CURRENTLY selected Color mode -
+        # Keep/Reject/Undecided, or Scored/Filtered Out/Skipped. Rebuilt by
+        # `_rebuild_kpi_row` when the mode changes, because the two modes
+        # count genuinely different things and a fixed five-card row would
+        # have to invent a number for whichever three do not apply.
         self._kpi_cards: dict[str, KpiCard] = {}
-        kpi_row = QHBoxLayout()
-        kpi_row.setSpacing(SPACING * 2)
-        total_card = KpiCard("Total Images", parent=self)
-        kpi_row.addWidget(total_card)
-        self._kpi_cards["total"] = total_card
-        palette_now = theme.current_palette()
-        for status in STATUS_CATEGORIES:
-            card = KpiCard(STATUS_CATEGORY_LABELS[status], value_color=status_color(palette_now, status), parent=self)
-            kpi_row.addWidget(card)
-            self._kpi_cards[status] = card
+        self._kpi_row = QHBoxLayout()
+        self._kpi_row.setSpacing(SPACING * 2)
+        self._rebuild_kpi_row()
+        kpi_row = self._kpi_row
 
         self._score_distribution = ChartCard("Score Distribution", parent=self)
         self._top_algorithms = ChartCard("Top Algorithms (Avg Score)", parent=self)
@@ -1226,18 +1241,41 @@ class OverviewTab(QWidget):
         layout.addLayout(charts_row, 1)
         layout.addWidget(self._insights_panel)
 
+    def _categories(self) -> tuple[str, ...]:
+        return categories_for_color_source(self._color_source)
+
+    def _rebuild_kpi_row(self) -> None:
+        while self._kpi_row.count():
+            entry = self._kpi_row.takeAt(0)
+            widget = entry.widget()
+            if widget is not None:
+                widget.deleteLater()
+        self._kpi_cards = {}
+        total_card = KpiCard("Total Images", parent=self)
+        self._kpi_row.addWidget(total_card)
+        self._kpi_cards["total"] = total_card
+        palette_now = theme.current_palette()
+        for status in self._categories():
+            card = KpiCard(STATUS_CATEGORY_LABELS[status], value_color=status_color(palette_now, status), parent=self)
+            self._kpi_row.addWidget(card)
+            self._kpi_cards[status] = card
+
     def set_items(self, items: list[ImageItem], *, color_source: str | None) -> None:
+        mode_changed = categories_for_color_source(color_source) != self._categories()
         self._items = items
         self._color_source = color_source
+        if mode_changed:
+            self._rebuild_kpi_row()
         self._refresh()
 
     def _refresh(self) -> None:
         items = self._items
-        counts = {status: 0 for status in STATUS_CATEGORIES}
+        categories = self._categories()
+        counts = {status: 0 for status in categories}
         for item in items:
-            counts[resolve_review_status(item, self._color_source)] += 1
+            counts[resolve_status(item, self._color_source)] += 1
         self._kpi_cards["total"].set_value(str(len(items)))
-        for status in STATUS_CATEGORIES:
+        for status in categories:
             self._kpi_cards[status].set_value(str(counts[status]))
 
         self._draw_score_distribution()
@@ -1307,9 +1345,19 @@ class OverviewTab(QWidget):
                 "eye-detection-capable algorithm."
             )
 
-        lines.append(f"• {100 * counts['keep'] / total:.0f}% are currently in Keep.")
-        if counts["review"]:
-            lines.append(f"• {counts['review']} image(s) still need manual review.")
+        # Phrased against whichever mode is selected: "in Keep" is a User
+        # Decision fact and simply does not exist while an algorithm's own
+        # Scored/Filtered/Skipped breakdown is on screen.
+        decided = sum(1 for item in self._items if item.is_decided)
+        kept = sum(1 for item in self._items if resolve_user_decision(item) == USER_DECISION_KEEP)
+        lines.append(f"• You have decided {decided} of {total} image(s); {kept} of them Keep.")
+        if total - decided:
+            lines.append(f"• {total - decided} image(s) are still undecided.")
+        if self._color_source is not None:
+            lines.append(
+                f"• {counts.get('scored', 0)} image(s) scored by the selected algorithm, "
+                f"{counts.get('filtered', 0)} filtered out, {counts.get('skipped', 0)} never examined."
+            )
 
         self._insights_label.setText("\n".join(lines) if lines else "No insights yet - rank this folder first.")
 
@@ -1485,7 +1533,7 @@ class QualityTab(QWidget):
         super().__init__(parent)
         self._items: list[ImageItem] = []
         self._detection_rate = ChartCard("Detection Success Rate", parent=self)
-        self._keep_rate = ChartCard("Keep Rate by Algorithm", parent=self)
+        self._keep_rate = ChartCard("User Keep Rate Among Scored", parent=self)
         self._detection_rate.setMaximumHeight(220)
         self._keep_rate.setMaximumHeight(220)
         charts_row = QHBoxLayout()
@@ -1528,7 +1576,14 @@ class QualityTab(QWidget):
         for info in available_strategies():
             scored = [item for item in items if info.strategy_id in item.ranking_results]
             if scored:
-                kept = sum(1 for item in scored if resolve_review_status(item, info.strategy_id) == "keep")
+                # Of the images THIS algorithm scored, how many did the
+                # photographer themselves keep - a User Decision rate, which
+                # is the only thing that makes it a comparison between the
+                # algorithm and a human. It previously read the blended
+                # resolver, so for an image nobody had reviewed it counted
+                # the algorithm's OWN cutoff suggestion as a keep and the
+                # chart largely measured the threshold against itself.
+                kept = sum(1 for item in scored if resolve_user_decision(item) == USER_DECISION_KEEP)
                 keep_rates.append((labels.get(info.strategy_id, info.strategy_id), kept / len(scored)))
         keep_card.set_empty(not keep_rates)
         if keep_rates:

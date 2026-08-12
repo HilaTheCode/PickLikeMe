@@ -34,6 +34,7 @@ from picklikeme.review.session import (
     InvalidReviewStatus,
     ReviewSession,
 )
+from picklikeme.review.user_decision import UNDECIDED
 from picklikeme.sidecar import AI_STRATEGY_ID, ranking_path
 
 
@@ -394,11 +395,11 @@ class BulkReviewStatusTests(SessionTestCase):
 
 
 class ApplyAiSuggestionsTests(SessionTestCase):
-    """Bulk-accepting the AI's current suggestion - the ONE path by which the
-    ranking is ever allowed to set a review status, and only because the
-    photographer explicitly asked for it, once."""
+    """Recording the AI's current cutoff - an ALGORITHM decision, kept
+    strictly beside the photographer's own. No path here ever produces a
+    User Decision: that is the whole point of the two sources."""
 
-    def test_applies_the_suggestion_to_every_neutral_ranked_image(self):
+    def test_records_an_algorithm_decision_and_leaves_every_user_decision_undecided(self):
         shoot, images, _ = build_shoot(self.root, ranked=10)
         session = self.session(shoot, keep_percent=30)
 
@@ -406,9 +407,15 @@ class ApplyAiSuggestionsTests(SessionTestCase):
 
         self.assertEqual(result["applied"], 10)
         for path in images[:3]:
-            self.assertEqual(session._image_for(str(path)).review_status, REVIEW_STATUS_KEEP)
+            self.assertEqual(session._image_for(str(path)).algorithm_decision, REVIEW_STATUS_KEEP)
         for path in images[3:]:
-            self.assertEqual(session._image_for(str(path)).review_status, REVIEW_STATUS_REJECT)
+            self.assertEqual(session._image_for(str(path)).algorithm_decision, REVIEW_STATUS_REJECT)
+        for path in images:
+            image = session._image_for(str(path))
+            self.assertEqual(image.user_decision, UNDECIDED)
+            self.assertEqual(image.review_status, REVIEW_STATUS_NEUTRAL)
+        self.assertEqual(session.keep_paths(), [], "a cutoff never selects anything")
+        self.assertEqual(session.reject_paths(), [])
 
     def test_never_touches_an_image_already_decided(self):
         shoot, images, _ = build_shoot(self.root, ranked=10)
@@ -430,13 +437,15 @@ class ApplyAiSuggestionsTests(SessionTestCase):
         for path in extra:
             self.assertEqual(session._image_for(str(path)).review_status, REVIEW_STATUS_NEUTRAL)
 
-    def test_is_persisted_immediately(self):
+    def test_is_persisted_immediately_as_an_algorithm_decision(self):
         shoot, images, _ = build_shoot(self.root, ranked=4)
         session = self.session(shoot, keep_percent=50)
         session.apply_ai_suggestions()
 
         reopened = self.session(shoot, keep_percent=50)
-        self.assertEqual(reopened._image_for(str(images[0])).review_status, REVIEW_STATUS_KEEP)
+        image = reopened._image_for(str(images[0]))
+        self.assertEqual(image.algorithm_decision, REVIEW_STATUS_KEEP)
+        self.assertEqual(image.user_decision, UNDECIDED, "reloading must not promote it to a user decision")
 
     def test_running_it_twice_is_a_no_op_the_second_time(self):
         shoot, _, _ = build_shoot(self.root, ranked=6)
@@ -445,7 +454,7 @@ class ApplyAiSuggestionsTests(SessionTestCase):
 
         again = session.apply_ai_suggestions()
 
-        self.assertEqual(again["applied"], 0, "nothing is Neutral any more")
+        self.assertEqual(again["applied"], 0, "every image already carries this cutoff's decision")
 
     def test_conflicts_are_reported_but_not_touched_by_default(self):
         """Phase 9: never silently overwrite a photographer's own Keep/Reject
@@ -475,8 +484,11 @@ class ApplyAiSuggestionsTests(SessionTestCase):
         result = session.apply_ai_suggestions(include_decided=True)
 
         self.assertEqual(result["conflicts"], 1)
-        self.assertEqual(result["overridden"], 1)
-        self.assertEqual(session._image_for(best).review_status, REVIEW_STATUS_KEEP, "now matches the AI")
+        self.assertEqual(result["overridden"], 0, "include_decided can never reach a USER decision")
+        self.assertEqual(
+            session._image_for(best).review_status, REVIEW_STATUS_REJECT,
+            "the photographer's own Reject survives, however confident the AI is",
+        )
         self.assertEqual(session._image_for(agreeing).review_status, REVIEW_STATUS_KEEP, "already agreed, untouched")
 
     def test_include_decided_still_leaves_agreeing_decided_images_alone(self):
@@ -518,9 +530,12 @@ class ApplyAlgorithmSuggestionsTests(SessionTestCase):
 
         self.assertEqual(result["applied"], 4)
         # Reversed order: the AI's WORST pick (images[-1]) has the highest
-        # "classic-vision" score, so it - not images[0] - is Kept.
-        self.assertEqual(session._image_for(str(images[-1])).review_status, REVIEW_STATUS_KEEP)
-        self.assertEqual(session._image_for(str(images[0])).review_status, REVIEW_STATUS_REJECT)
+        # "classic-vision" score, so it - not images[0] - is the cutoff's Keep.
+        self.assertEqual(session._image_for(str(images[-1])).algorithm_decision, REVIEW_STATUS_KEEP)
+        self.assertEqual(session._image_for(str(images[0])).algorithm_decision, REVIEW_STATUS_REJECT)
+        # ...and neither of them is a User Decision.
+        self.assertEqual(session.keep_paths(), [])
+        self.assertEqual(session.reject_paths(), [])
 
     def test_never_touches_an_image_the_given_strategy_never_scored(self):
         shoot, images, _ = build_shoot(self.root, ranked=4)
@@ -535,9 +550,13 @@ class ApplyAlgorithmSuggestionsTests(SessionTestCase):
 
         self.assertEqual(result["applied"], 2, "only the two images that strategy actually scored")
         for path in images[2:]:
+            self.assertIsNone(session._image_for(str(path)).algorithm_decision)
             self.assertEqual(session._image_for(str(path)).review_status, REVIEW_STATUS_NEUTRAL)
 
-    def test_never_touches_an_image_already_decided_unless_told_to(self):
+    def test_never_touches_a_user_decision_even_with_include_decided(self):
+        """include_decided governs re-writing an EARLIER ALGORITHM decision at
+        a new threshold. It is not, and can never become, permission to
+        overwrite something the photographer decided."""
         shoot, images, _ = build_shoot(self.root, ranked=4)
         session = self.session(shoot, keep_percent=50)
         other_strategy = "classic-vision"
@@ -552,8 +571,12 @@ class ApplyAlgorithmSuggestionsTests(SessionTestCase):
         self.assertEqual(session._image_for(str(images[-1])).review_status, REVIEW_STATUS_REJECT)
 
         result = session.apply_algorithm_suggestions(other_strategy, include_decided=True)
-        self.assertEqual(result["overridden"], 1)
-        self.assertEqual(session._image_for(str(images[-1])).review_status, REVIEW_STATUS_KEEP)
+        self.assertEqual(result["overridden"], 0)
+        self.assertEqual(session._image_for(str(images[-1])).review_status, REVIEW_STATUS_REJECT)
+        self.assertIsNone(
+            session._image_for(str(images[-1])).algorithm_decision,
+            "a user-decided image carries no algorithm decision to shadow it",
+        )
 
     def test_apply_ai_suggestions_is_unaffected_and_stays_ai_specific(self):
         """Regression: adding apply_algorithm_suggestions must not change
@@ -572,8 +595,8 @@ class ApplyAlgorithmSuggestionsTests(SessionTestCase):
 
         # AI model order preserved (images[0] best -> Keep), unaffected by
         # classic-vision's reversed scores on the very same images.
-        self.assertEqual(session._image_for(str(images[0])).review_status, REVIEW_STATUS_KEEP)
-        self.assertEqual(session._image_for(str(images[-1])).review_status, REVIEW_STATUS_REJECT)
+        self.assertEqual(session._image_for(str(images[0])).algorithm_decision, REVIEW_STATUS_KEEP)
+        self.assertEqual(session._image_for(str(images[-1])).algorithm_decision, REVIEW_STATUS_REJECT)
 
 
 class AgreementStatsTests(SessionTestCase):

@@ -24,7 +24,16 @@ from PySide6.QtGui import QColor, QFont, QFontMetrics, QPainter, QPainterPath, Q
 from PySide6.QtWidgets import QAbstractItemDelegate, QStyle
 
 from ... import theme
-from ...widgets.design_system import RADIUS_MD, STATUS_LABELS, resolve_review_status, status_bg, status_color
+from ...widgets.design_system import (
+    ALGORITHM_SCORED,
+    RADIUS_MD,
+    STATUS_LABELS,
+    format_score,
+    resolve_status,
+    score_ramp_color,
+    status_bg,
+    status_color,
+)
 
 STATUS_ORDER = ("keep", "reject", "neutral")
 STATUS_SYMBOLS = {"keep": "✓", "reject": "✗", "neutral": "○"}
@@ -76,17 +85,28 @@ class ThumbnailCardDelegate(QAbstractItemDelegate):
         self._button_font = QFont()
         self._button_font.setPointSize(9)
         self._button_font.setBold(True)
-        # None (the default) means "Review Status" - no algorithm selected,
-        # so Priority #2 of the coloring policy (see _resolve_status) has no
-        # algorithm to fall back to. Otherwise a strategy id, kept in sync
-        # with ReviewSession.burst_strategy by MainWindow._resolve_color_
-        # source, which is what ImageItem.algorithm_suggestion is itself
-        # computed against.
+        # None (the default) means "User Decision" - color every card by the
+        # photographer's own Keep/Reject/Undecided and nothing else.
+        # Otherwise a strategy id, and the card is colored by THAT strategy's
+        # own score (see _resolve_status / _score_fraction).
         self._color_source: str | None = None
+        # The lowest/highest score the selected strategy produced across the
+        # currently visible set - the ends of the color ramp, so the tint
+        # spreads over the range actually on screen rather than over a
+        # theoretical 0..1 nothing occupies. None until a set is measured
+        # (see set_score_range), in which case every scored card is drawn at
+        # the top of the ramp rather than guessing a range.
+        self._score_range: tuple[float, float] | None = None
         self._show_burst_badge = False
 
     def set_color_source(self, strategy_id: str | None) -> None:
         self._color_source = strategy_id
+
+    def set_score_range(self, score_range: tuple[float, float] | None) -> None:
+        """The (min, max) of the selected strategy's scores over the visible
+        cards - recomputed by MainWindow whenever the visible set or the
+        Color mode changes."""
+        self._score_range = score_range
 
     def set_show_burst_badge(self, enabled: bool) -> None:
         self._show_burst_badge = enabled
@@ -140,7 +160,8 @@ class ThumbnailCardDelegate(QAbstractItemDelegate):
             painter.fillPath(path, wash)
 
         status = self._resolve_status(item)
-        border_color = QColor(palette.selection_border) if is_selected else QColor(status_color(palette, status))
+        status_paint = self._status_color(palette, item, status)
+        border_color = QColor(palette.selection_border) if is_selected else QColor(status_paint)
         border_width = 3 if is_selected else 2
         painter.setPen(QPen(border_color, border_width))
         painter.setBrush(Qt.BrushStyle.NoBrush)
@@ -177,7 +198,14 @@ class ThumbnailCardDelegate(QAbstractItemDelegate):
         name_rect = QRect(card_rect.x() + self.PADDING, text_y, card_rect.width() - 2 * self.PADDING, self.NAME_ROW_HEIGHT)
         painter.setFont(self._name_font)
         painter.setPen(QColor(palette.text_primary))
-        rank_prefix = f"{item.rank:03d}  " if item.rank else ""
+        # The rank shown must belong to the SAME strategy as the score badge
+        # below it - previously this was always the AI model's own rank while
+        # the badge showed the selected strategy's score, so a folder ranked
+        # by anything else showed a Crop Sharpness number next to an AI-model
+        # position (or, far more often, no number at all). User Decision mode
+        # selects no algorithm, so there is no rank to show either.
+        rank = item.rank_for(self._color_source) if self._color_source else None
+        rank_prefix = f"{rank:03d}  " if rank else ""
         elided_name = QFontMetrics(self._name_font).elidedText(
             f"{rank_prefix}{item.display_name}", Qt.TextElideMode.ElideRight, name_rect.width()
         )
@@ -186,55 +214,64 @@ class ThumbnailCardDelegate(QAbstractItemDelegate):
         meta_rect = QRect(name_rect)
         meta_rect.moveTop(name_rect.bottom())
         meta_rect.setHeight(self.META_ROW_HEIGHT)
-        self._draw_meta_row(painter, palette, meta_rect, item, status)
+        self._draw_meta_row(painter, palette, meta_rect, item, status, status_paint)
 
         self._draw_buttons(painter, palette, card_rect, item)
 
         painter.restore()
 
     def _resolve_status(self, item) -> str:
-        """The five-category status this card belongs to - see
-        `desktop.widgets.design_system.STATUS_CATEGORIES`. The
-        photographer's own review_status always wins (Keep/Reject render in
-        their fixed colors regardless of any algorithm score). Only once an
-        image has no User Decision (still Neutral) does the currently
-        selected Color Source get a say - and even then only a binary
-        keep/reject call, via `ImageItem.algorithm_suggestion` (already
-        computed against whichever strategy is selected, at the current
-        keep-percent threshold - see `ReviewSession.suggestions_for`'s own
-        docstring), never a score gradient.
+        """Which category this card belongs to UNDER THE SELECTED COLOR MODE,
+        and only that mode - see `design_system.resolve_status`.
 
-        Two distinct "the algorithm has no opinion" outcomes, not one: a
-        strategy that recorded an explicit filter reason for this image
-        (`item.filter_reasons`) DID examine it and excluded it - "Filtered
-        Out". A strategy with no ranking_result AND no filter_reasons entry
-        at all for this image never touched it - "Skipped". Collapsing
-        both into one bucket (as the pre-redesign "Skipped" color did) lost
-        exactly the distinction the design spec calls out by name
-        ("Skipped is intentionally different from Reject" - and, per this
-        rule, from Filtered Out too).
+        User Decision mode (`self._color_source is None`): Keep / Reject /
+        Undecided, from `item.user_decision`. An image nobody has reviewed is
+        Undecided; no score, suggestion, cutoff or recorded algorithm
+        decision can make it anything else.
 
-        "Review Status" as the Color Source (self._color_source is None)
-        has no algorithm to fall back to for Priority #2 - an undecided
-        image is plain "Review", exactly as an undecided image always was.
+        Algorithm mode (a strategy id): Scored / Filtered Out / Skipped, from
+        that strategy's own result. Scored cards are additionally tinted by
+        their actual score (`_status_color`). The photographer's decisions do
+        not participate - that is what having two separate modes means.
 
-        A thin wrapper around `design_system.resolve_review_status` - kept
-        as one shared implementation so the Grid and the Analytics
-        Dashboard's Overview/Domains tabs can never disagree about how many
-        images are "Keep" for the same folder/Color Source.
+        A thin wrapper around the shared implementation so the Grid and the
+        Analytics Dashboard can never disagree about a card.
         """
-        return resolve_review_status(item, self._color_source)
+        return resolve_status(item, self._color_source)
+
+    def _status_color(self, palette, item, status: str) -> str:
+        """The card's border color. In an algorithm mode a Scored card is
+        painted from its own score's position in the visible range (see
+        `design_system.score_ramp_color`), which is what makes the color
+        actually correspond to the number in the badge; every other case is
+        the category's flat color."""
+        if self._color_source is not None and status == ALGORITHM_SCORED:
+            return score_ramp_color(palette, self._score_fraction(item))
+        return status_color(palette, status)
+
+    def _score_fraction(self, item) -> float:
+        """Where this card's score sits between the lowest and highest the
+        selected strategy produced across the visible set - 1.0 when the
+        range is unknown or degenerate (every visible card scored the same),
+        since a flat range has no ordering to show."""
+        score = item.score_for(self._color_source)
+        if score is None or self._score_range is None:
+            return 1.0
+        low, high = self._score_range
+        if high <= low:
+            return 1.0
+        return (score - low) / (high - low)
 
     def _selected_score_text(self, item) -> str:
         """The ONE score this card shows - the currently selected Color
-        Source's own, normalized `0.xxx` (never every module's score at
-        once - see the design spec's own "do not show every algorithm
-        score on each thumbnail" rule). "Review Status" (no strategy
-        selected) has no single algorithm to draw a score from."""
+        mode's own strategy, at the shared three-decimal score precision
+        (`design_system.format_score`) - never every module's score at once,
+        per the design spec's own "do not show every algorithm score on each
+        thumbnail" rule. "User Decision" mode selects no algorithm, so there
+        is no score to draw."""
         if self._color_source is None:
             return "—"
-        score = item.score_for(self._color_source)
-        return f"{score:.3f}" if score is not None else "—"
+        return format_score(item.score_for(self._color_source))
 
     def _draw_score_badge(self, painter: QPainter, palette: theme.Palette, thumb_rect: QRect, item) -> None:
         text = self._selected_score_text(item)
@@ -251,7 +288,9 @@ class ThumbnailCardDelegate(QAbstractItemDelegate):
         painter.setPen(QColor(palette.text_primary))
         painter.drawText(badge_rect, Qt.AlignmentFlag.AlignCenter, text)
 
-    def _draw_meta_row(self, painter: QPainter, palette: theme.Palette, rect: QRect, item, status: str) -> None:
+    def _draw_meta_row(
+        self, painter: QPainter, palette: theme.Palette, rect: QRect, item, status: str, status_paint: str
+    ) -> None:
         painter.setFont(self._meta_font)
         metrics = QFontMetrics(self._meta_font)
 
@@ -272,7 +311,7 @@ class ThumbnailCardDelegate(QAbstractItemDelegate):
         status_rect = QRect(rect)
         status_rect.setX(rect.x() + time_rect.width())
         status_rect.setWidth(rect.width() - time_rect.width() - (metrics.horizontalAdvance(domain) + 8 if domain else 0))
-        painter.setPen(QColor(status_color(palette, status)))
+        painter.setPen(QColor(status_paint))
         font = QFont(self._meta_font)
         font.setBold(True)
         painter.setFont(font)

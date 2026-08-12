@@ -213,7 +213,7 @@ def _section_differences(data: _ReportData) -> str:
         )
     rows = []
     for image in data.disagreements:
-        score = f"{image.score:.4f}" if image.score is not None else "&mdash;"
+        score = f"{image.score:.3f}" if image.score is not None else "&mdash;"
         ai = _ai_decision_for(image).capitalize()
         rows.append(
             f"<tr><td>{_e(image.filename)}</td><td>{ai}</td>"

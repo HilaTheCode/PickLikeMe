@@ -636,7 +636,7 @@ function card(image, index){
       '</div>';
   const score = image.score == null
     ? 'No score'
-    : 'Score ' + image.score.toFixed(4) + (image.rank ? ' &middot; Rank ' + image.rank.toLocaleString() : '');
+    : 'Score ' + image.score.toFixed(3) + (image.rank ? ' &middot; Rank ' + image.rank.toLocaleString() : '');
   // The AI's own suggestion, kept visually separate from review_status (see
   // .ai-chip) - it is a hint, never the photographer's actual decision.
   const aiChip = image.ai_suggestion
@@ -807,7 +807,7 @@ const Lightbox = (function(){
     q('#lb-counter').textContent = (index + 1) + ' / ' + images().length;
     q('#lb-filename').textContent = image.filename;
     q('#lb-score').textContent = image.score == null ? 'No score'
-      : 'Score ' + image.score.toFixed(4) + (image.rank ? ' · Rank ' + image.rank.toLocaleString() : '');
+      : 'Score ' + image.score.toFixed(3) + (image.rank ? ' · Rank ' + image.rank.toLocaleString() : '');
     q('#lb-ai').textContent = image.ai_suggestion ? 'AI suggests ' + cap(image.ai_suggestion) : '';
     q('#lb-ai').style.display = image.ai_suggestion ? '' : 'none';
     updateZoomIndicator();

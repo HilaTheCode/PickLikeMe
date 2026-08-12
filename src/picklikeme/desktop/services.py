@@ -76,10 +76,17 @@ class ReviewService:
     def apply_algorithm_suggestions(self, strategy_id: str, *, include_decided: bool = False) -> dict[str, Any]:
         """See ReviewSession.apply_algorithm_suggestions - the same bulk
         cutoff-application as apply_ai_suggestions above, but against
-        `strategy_id`'s own suggestions rather than always the AI model."""
+        `strategy_id`'s own suggestions rather than always the AI model.
+        Records ALGORITHM decisions; a photographer's own Keep/Reject is
+        never overwritten."""
         result = self.session.apply_algorithm_suggestions(strategy_id, include_decided=include_decided)
         result["state"] = self.load_session()
         return result
+
+    def clear_algorithm_decisions(self) -> int:
+        """See ReviewSession.clear_algorithm_decisions - drop every recorded
+        algorithm cutoff, leaving User Decisions alone."""
+        return self.session.clear_algorithm_decisions()
 
     def thumbnail_path(self, image_path: str, *, with_boxes: bool = False) -> Path | None:
         return review_thumbnail(image_path, with_boxes=with_boxes, strategy_id=self.session.burst_strategy)

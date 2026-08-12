@@ -48,6 +48,7 @@ from .widgets.design_system import (
     RADIUS_LG,
     RADIUS_SM,
     SPACING,
+    USER_DECISION_LABEL,
     LabeledCombo,
     LabeledSearch,
     Panel,
@@ -106,7 +107,7 @@ FILTER_LABELS = {
     "all": "All",
     "keep": "Keep",
     "reject": "Reject",
-    "neutral": "Neutral",
+    "neutral": "Undecided",
     "ai_keep": "AI Keep",
     "ai_reject": "AI Reject",
     "ai_keep_user_reject": "Conflict: AI Keep / You Reject",
@@ -140,8 +141,25 @@ DEFAULT_BURST_SORT_MODE = BURST_SORT_BURST_SCORE
 # kept as the default because it is what the window opens on and what
 # ReviewSession's own load order already matches.
 SORT_SCORE_PREFIX = "score:"
-SORT_FIELDS = ("score", "filename", "captured_at")
-SORT_FIELD_LABELS = {"score": "AI Score", "filename": "File Name", "captured_at": "Capture Time"}
+# "Whichever algorithm the Color selector currently names" - resolved on
+# every sort (_sort_items) through the same _resolve_color_source the Grid's
+# own coloring and score badge use, so the number shown on a card and the
+# order the cards are in always come from ONE strategy.
+#
+# It is the default because the alternative was worse in exactly the case
+# that matters: the bare "score" field below is the AI model's score
+# specifically, so a folder ranked only by Crop Sharpness opened showing
+# Crop Sharpness scores on every card while sorting them by an AI score
+# none of them had - i.e. not sorted at all, and with no rank number, while
+# appearing to be "sorted by score".
+SORT_SELECTED_ALGORITHM = "score:__selected__"
+SORT_FIELDS = (SORT_SELECTED_ALGORITHM, "score", "filename", "captured_at")
+SORT_FIELD_LABELS = {
+    SORT_SELECTED_ALGORITHM: "Selected Algorithm Score",
+    "score": "AI Score",
+    "filename": "File Name",
+    "captured_at": "Capture Time",
+}
 
 
 def sort_options() -> list[tuple[str, str]]:
@@ -149,11 +167,15 @@ def sort_options() -> list[tuple[str, str]]:
 
     Built from the ranking registry rather than listed, so a new module
     becomes sortable at the same moment it becomes runnable. The AI model is
-    already covered by the default "score" field, so it is not repeated.
+    already covered by the "score" field, so it is not repeated.
+    `SORT_SELECTED_ALGORITHM` leads: see its own comment above.
     """
     from ..ranking import DEFAULT_STRATEGY_ID, available_strategies
 
-    options = [("score", SORT_FIELD_LABELS["score"])]
+    options = [
+        (SORT_SELECTED_ALGORITHM, SORT_FIELD_LABELS[SORT_SELECTED_ALGORITHM]),
+        ("score", SORT_FIELD_LABELS["score"]),
+    ]
     for info in available_strategies():
         if info.strategy_id == DEFAULT_STRATEGY_ID:
             continue
@@ -170,32 +192,44 @@ def sort_options() -> list[tuple[str, str]]:
 # it is used, rather than freezing to whatever that happened to be at
 # selection time. Not a real strategy_id (never registered in `ranking`),
 # so it can never collide with one - deliberately not `None`, which already
-# means "Review Status" (see below).
+# means "User Decision" (see below).
 ALGORITHM_RAN_LAST = "__algorithm_ran_last__"
+
+# USER_DECISION_LABEL ("User Decision") is defined in design_system, next to
+# the categories that mode selects - imported above.
 
 
 def color_source_options() -> list[tuple[str | None, str]]:
     """(strategy_id_or_sentinel_or_None, label) for the Color combo - one
-    entry per analysis module, plus "Algorithm Ran Last" and "Review
-    Status".
+    entry per analysis module, plus "Algorithm Ran Last" and "User
+    Decision".
 
-    `ALGORITHM_RAN_LAST` (listed first - the default a freshly opened
-    folder starts on, see `MainWindow.latest_run_strategy`) means "whichever
-    strategy actually produced this folder's most recent completed run" -
-    re-resolved every time it is used (`MainWindow._resolve_color_source`),
-    never pinned to one specific strategy the way picking it by name is.
-    `None` means "tint a card's background by review status" - Keep/Reject
-    green/red, Neutral the plain background - exactly today's behavior.
-    Anything else (a real strategy_id) tints the background by that
-    strategy's own score instead (low to high, across whatever is currently
-    visible), for scanning a Classic Vision-ranked folder's ordering at a
-    glance without needing to sort by it first. The per-strategy entries are
-    built from the registry, like `sort_options`, so a future module is
-    colorable the moment it is runnable.
+    Two genuinely different KINDS of mode, and the selected one is the ONLY
+    input to a card's color (see `design_system.resolve_status`):
+
+    `None` -> "User Decision": Keep / Reject / Undecided, from the
+    photographer's own decisions alone. An image nobody has reviewed is
+    Undecided and stays neutral no matter what any algorithm scored it, what
+    the cutoff would suggest, or whether an algorithm cutoff was ever
+    recorded for it.
+
+    A real strategy_id -> that strategy's own SCORE, tinted low to high
+    across whatever is currently visible, for scanning a folder's ordering
+    at a glance without sorting by it first. `ALGORITHM_RAN_LAST` (listed
+    first - the default a freshly opened folder starts on, see
+    `ReviewSession.latest_run_strategy`) is the same thing for "whichever
+    strategy actually produced this folder's most recent completed run",
+    re-resolved every time it is used (`MainWindow._resolve_color_source`)
+    rather than pinned at selection time. The per-strategy entries are built
+    from the registry, like `sort_options`, so a future module is colorable
+    the moment it is runnable.
     """
     from ..ranking import available_strategies
 
-    options: list[tuple[str | None, str]] = [(ALGORITHM_RAN_LAST, "Algorithm Ran Last"), (None, "Review Status")]
+    options: list[tuple[str | None, str]] = [
+        (ALGORITHM_RAN_LAST, "Algorithm Ran Last"),
+        (None, USER_DECISION_LABEL),
+    ]
     for info in available_strategies():
         options.append((info.strategy_id, f"{info.display_name} Score"))
     return options
@@ -249,7 +283,10 @@ class MainWindow(QMainWindow):
         # the incremental-lookup marker _refresh_species_cache relies on.
         self._species_by_path: dict[str, Any] = {}
         self._current_filter = "all"
-        self._sort_field = "score"  # matches ReviewSession.load()'s own default ordering
+        # Follows the Color selector's own strategy, so the score shown on a
+        # card and the order the cards are in always come from the same
+        # algorithm - see SORT_SELECTED_ALGORITHM.
+        self._sort_field = SORT_SELECTED_ALGORITHM
         self._sort_ascending = False
         self._show_detector_boxes = False
         # See color_source_options() docstring below, and the "Collapse
@@ -506,7 +543,11 @@ class MainWindow(QMainWindow):
         legend_panel = Panel(radius=RADIUS_LG, parent=self._central_widget)
         legend_layout = QVBoxLayout(legend_panel)
         legend_layout.setContentsMargins(SPACING * 2, SPACING, SPACING * 2, SPACING)
-        legend_layout.addWidget(StatusLegend(parent=legend_panel))
+        # The legend lists the categories the CURRENTLY selected Color mode
+        # produces (Keep/Reject/Undecided, or Scored/Filtered Out/Skipped) -
+        # kept on the window so _update_color_source can re-point it.
+        self._status_legend = StatusLegend(color_source=self._resolve_color_source(), parent=legend_panel)
+        legend_layout.addWidget(self._status_legend)
         main_column.addWidget(legend_panel)
         main_column_widget = QWidget(self._central_widget)
         main_column_widget.setLayout(main_column)
@@ -803,11 +844,20 @@ class MainWindow(QMainWindow):
         self._rank_action.setMenu(self._rank_menu)
         self._apply_cutoff_action = self._make_action(
             "Apply Cutoff", icon=SP.SP_DialogOkButton,
-            tooltip="Apply the AI keep-percent cutoff to the current folder", triggered=self._apply_cutoff,
+            tooltip="Record the selected algorithm's keep-percent cutoff — an algorithm decision, "
+                    "not a User Decision",
+            triggered=self._apply_cutoff,
+        )
+        self._clear_algorithm_decisions_action = self._make_action(
+            "Clear Algorithm Decisions", icon=SP.SP_DialogResetButton,
+            tooltip="Discard every recorded algorithm cutoff — your own Keep/Reject decisions are kept",
+            triggered=self._clear_algorithm_decisions,
         )
         self._organize_action = self._make_action(
             "Organize…", icon=SP.SP_DirIcon,
-            tooltip="Move Keep/Reject images into Selected/Rejected folders", triggered=self._organize,
+            tooltip="Move your Keep/Reject images into Selected/Rejected folders — "
+                    "undecided images are left alone",
+            triggered=self._organize,
         )
         self._species_action = self._make_action(
             "Organize by Species…", icon=SP.SP_FileDialogListView,
@@ -922,6 +972,7 @@ class MainWindow(QMainWindow):
         tools_menu = menu_bar.addMenu("Tools")
         tools_menu.addMenu(self._rank_menu)
         tools_menu.addAction(self._apply_cutoff_action)
+        tools_menu.addAction(self._clear_algorithm_decisions_action)
         tools_menu.addSeparator()
         tools_menu.addAction(self._organize_action)
         tools_menu.addAction(self._species_action)
@@ -944,17 +995,20 @@ class MainWindow(QMainWindow):
         self.setStatusBar(status_bar)
 
     def _update_status_counts(self, counts: dict[str, Any]) -> None:
-        """Keep/Reject/Neutral breakdown, color-coded to match the gallery
-        cards - the same at-a-glance density the web review header gives."""
+        """The USER DECISION breakdown - Keep / Reject / Undecided - color-
+        coded to match the gallery cards. Counts what the photographer has
+        actually decided (ReviewSession.counts reads `user_decision`), so a
+        freshly ranked folder reads "Undecided <everything>" rather than
+        claiming a review that never happened."""
         self._last_counts = counts
         palette = theme.current_palette()
         keep = counts.get("keep", 0)
         reject = counts.get("reject", 0)
-        neutral = counts.get("neutral", 0)
+        undecided = counts.get("undecided", counts.get("neutral", 0))
         self._counts_label.setText(
             f'<span style="color:{palette.keep_fg}">Keep {keep}</span>&nbsp;&nbsp;'
             f'<span style="color:{palette.reject_fg}">Reject {reject}</span>&nbsp;&nbsp;'
-            f'<span style="color:{palette.neutral_fg}">Neutral {neutral}</span>'
+            f'<span style="color:{palette.filtered_fg}">Undecided {undecided}</span>'
         )
 
     def _restore_state(self) -> None:
@@ -1188,6 +1242,7 @@ class MainWindow(QMainWindow):
                 path=image.get("image_path") or "",
                 file_name=Path(image.get("image_path") or "").name,
                 review_status=image.get("review_status", "neutral"),
+                algorithm_decision=image.get("algorithm_decision"),
                 ai_suggestion=image.get("ai_suggestion"),
                 algorithm_suggestion=image.get("algorithm_suggestion"),
                 captured_at=image.get("captured_at"),
@@ -1458,14 +1513,14 @@ class MainWindow(QMainWindow):
         folder's own "Algorithm Ran Last" (`ReviewSession.
         latest_run_strategy`) rather than whatever the combo happened
         to be showing from a previously-open folder, or its own first-item
-        default ("Review Status", index 0 - see `color_source_options`).
+        default ("User Decision" - see `color_source_options`).
 
         Before this existed, `_color_source` (a plain UI-local variable, set
         ONLY by `_on_color_source_changed`) was never synchronised FROM
         `ReviewSession.burst_strategy` - only ever pushed the other
         direction, combo -> session. On a freshly opened folder that had
         been ranked only by a non-default strategy, that meant the combo
-        kept showing "Review Status" while the session had already
+        kept showing "User Decision" while the session had already
         (correctly, after `latest_run_strategy`) selected the strategy
         that actually has data - a real, visible mismatch between what the
         photographer sees selected and what the Grid/Cutoff/Filter actually
@@ -1483,11 +1538,11 @@ class MainWindow(QMainWindow):
         self._color_combo.blockSignals(False)
         resolved = self._resolve_color_source()
         self.service.set_burst_strategy(resolved or DEFAULT_STRATEGY_ID)
-        self._gallery_view.set_color_source(resolved)
+        self._update_color_source(self._gallery_model.items())
 
     def _resolve_color_source(self) -> str | None:
         """What `self._color_source` actually means right now: a real
-        strategy_id, `None` (Review Status), or - if it is the
+        strategy_id, `None` (User Decision), or - if it is the
         `ALGORITHM_RAN_LAST` sentinel - whichever strategy
         `ReviewSession.latest_run_strategy` currently resolves to, re-checked
         on every call rather than cached, so it always tracks the true
@@ -1503,9 +1558,9 @@ class MainWindow(QMainWindow):
     def _on_color_source_changed(self, index: int) -> None:
         self._color_source = self._color_combo.itemData(index)
         # Burst Analysis ranks each burst's members by this same "selected
-        # ranking strategy" (see ReviewSession.set_burst_strategy) - "Review
-        # Status" (None) is not a ranking strategy, so that case falls back
-        # to the AI model, same as burst_strategy's own default.
+        # ranking strategy" (see ReviewSession.set_burst_strategy) - "User
+        # Decision" (None) is not a ranking strategy at all, so that case
+        # falls back to the AI model, same as burst_strategy's own default.
         self.service.set_burst_strategy(self._resolve_color_source() or DEFAULT_STRATEGY_ID)
         # Scroll-preserving (see _refresh_preserving_scroll's own docstring,
         # Manual QA Issue 1): switching Color Source recolors the whole
@@ -1522,15 +1577,29 @@ class MainWindow(QMainWindow):
             return
         self._refresh_preserving_scroll(self.service.set_keep_percent(percent))
 
-    def _update_color_source(self, items: list[ImageItem]) -> None:  # noqa: ARG002 - kept for call-site stability
-        """Propagate the chosen Color Source to the gallery so Priority #2
-        of the coloring policy (an undecided image's background, via
-        ImageItem.algorithm_suggestion) uses the right strategy - see
-        ThumbnailCardDelegate._get_background_color's own docstring.
-        `items` is no longer used: algorithm_suggestion is already computed
-        per-item against the current threshold, so there is no separate
-        score range to derive from whichever set is currently visible."""
-        self._gallery_view.set_color_source(self._resolve_color_source())
+    def _update_color_source(self, items: list[ImageItem]) -> None:
+        """Propagate the chosen Color mode - and, for an algorithm mode, the
+        score range it spans - to the gallery.
+
+        `items` is the currently VISIBLE set, and the range is measured over
+        exactly that: an algorithm-colored card is tinted by where its own
+        score sits between the lowest and highest on screen (see
+        `ThumbnailCardDelegate._score_fraction`), which is what makes the
+        color correspond to the score rather than to a keep/reject verdict
+        at some threshold. User Decision mode has no range at all.
+        """
+        strategy_id = self._resolve_color_source()
+        self._gallery_view.set_color_source(strategy_id, score_range=self._score_range_for(items, strategy_id))
+        self._status_legend.set_color_source(strategy_id)
+
+    @staticmethod
+    def _score_range_for(items: list[ImageItem], strategy_id: str | None) -> tuple[float, float] | None:
+        """(min, max) of `strategy_id`'s own scores across `items`, or None
+        when there is no algorithm selected or nothing it scored."""
+        if strategy_id is None:
+            return None
+        scores = [score for item in items if (score := item.score_for(strategy_id)) is not None]
+        return (min(scores), max(scores)) if scores else None
 
     @staticmethod
     def _filter_items(items: list[ImageItem], current_filter: str) -> list[ImageItem]:
@@ -1602,6 +1671,14 @@ class MainWindow(QMainWindow):
         descending would be more confusing than useful."""
         field = self._sort_field
 
+        if field == SORT_SELECTED_ALGORITHM:
+            # Resolved here, once per sort, rather than stored: the Color
+            # selector's "Algorithm Ran Last" is itself dynamic, so freezing
+            # a strategy id at the moment Sort was chosen would drift out of
+            # step with the scores the cards are actually showing.
+            selected = self._resolve_color_source()
+            field = f"{SORT_SCORE_PREFIX}{selected}" if selected else "filename"
+
         def value_of(item: ImageItem):
             if field == "filename":
                 return item.display_name.lower()
@@ -1646,30 +1723,29 @@ class MainWindow(QMainWindow):
             self._cutoff_spin.setValue(preset)
 
     def _apply_cutoff(self) -> None:
-        """Set the cutoff threshold, then apply the resulting suggestions to
-        the gallery - mirrors the web review UI's "Apply AI Suggestions"
-        behavior (review/session.py's apply_ai_suggestions, server.py's
-        /api/review/apply-ai-suggestions), not previously wired into the
-        desktop at all. A Neutral image has nothing manual at risk and is
-        always updated. An image already marked Keep/Reject that disagrees
-        with the new threshold is only overridden after an explicit
-        confirmation showing exactly how many go each direction - "3
-        conflicts" doesn't tell a photographer whether they're about to lose
-        3 Keeps or 3 Rejects, which matters.
+        """Record the selected algorithm's current cutoff for this folder -
+        as an ALGORITHM decision, never as a User Decision.
 
-        Applies whichever strategy the Color Source picker currently shows
-        (self._color_source, same fallback-to-AI-model rule as
-        _on_color_source_changed), via ReviewSession.apply_algorithm_
-        suggestions - not the fixed-AI-model apply_ai_suggestions. Before
-        this, "Apply Cutoff" always wrote the AI model's own suggestion
-        regardless of Color Source, so applying a cutoff while viewing a
-        different algorithm's coloring ("Color by Algorithm") could leave a
-        clearly-top-scored image under THAT algorithm Reject-colored,
-        because the AI model - not the algorithm on screen - had actually
-        decided the cutoff. See apply_algorithm_suggestions's own docstring.
+        This action is what taught the whole codebase the difference. It used
+        to write the cutoff's keep/reject straight into `review_decisions`
+        through the same call a Grid button click uses, confirming only the
+        handful of CONFLICTS with already-decided images and silently
+        sweeping every undecided one. One click on a 5,986-image folder
+        therefore produced 5,986 rows that were, from that moment on,
+        indistinguishable from images the photographer had reviewed by hand:
+        the Grid colored them all as decisions, the counts claimed them, and
+        Arrange would have filed all of them into _Selected/_Rejected.
+
+        Now every row it writes carries DECISION_SOURCE_ALGORITHM (see
+        ReviewSession._apply_suggestions), so none of them is ever read as a
+        User Decision; an image the photographer HAS decided is not touched
+        at all; and the confirmation states up front how many images this is
+        about to record something for, rather than mentioning only the
+        conflicts. Applies whichever strategy the Color picker currently
+        shows, same fallback-to-AI-model rule as _on_color_source_changed.
         """
         if not self.state.current_folder:
-            self._set_status("Open a folder before setting the AI cutoff")
+            self._set_status("Open a folder before applying an algorithm cutoff")
             return
         strategy_id = self._resolve_color_source() or DEFAULT_STRATEGY_ID
         strategy_label = self._color_combo.currentText() if self._color_source else "AI Model"
@@ -1677,50 +1753,70 @@ class MainWindow(QMainWindow):
         state = self.service.set_keep_percent(percent)
         self._refresh_preserving_scroll(state)
 
-        keep_to_reject = 0
-        reject_to_keep = 0
+        # Two different populations, counted separately because they mean
+        # different things: images this will WRITE something for (no user
+        # decision), and images it will leave alone but whose owner disagrees
+        # with the algorithm (a real user decision - reported, never touched).
+        to_write = 0
+        conflicts = 0
         for image in state.get("images", []):
-            status = image.get("review_status")
             suggestion = image.get("algorithm_suggestion")
-            if suggestion is None or status not in ("keep", "reject") or suggestion == status:
+            if suggestion is None:
                 continue
-            if status == "keep":
-                keep_to_reject += 1
+            decision = image.get("review_status")
+            if decision in ("keep", "reject"):
+                conflicts += suggestion != decision
             else:
-                reject_to_keep += 1
-        conflicts = keep_to_reject + reject_to_keep
+                to_write += 1
 
-        include_decided = False
-        if conflicts:
-            message = (
-                f"At this {percent:g}% cutoff, {strategy_label} disagrees with {conflicts} image(s) "
-                "you already decided:\n\n"
-                f"    {keep_to_reject} marked Keep would become Reject\n"
-                f"    {reject_to_keep} marked Reject would become Keep\n\n"
-                f"Override these manual decisions to match {strategy_label}? Neutral images are "
-                "always updated to its suggestion regardless."
-            )
-            confirm = QMessageBox.question(
-                self, "PeakPic - Apply Cutoff", message,
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No,
-            )
-            include_decided = confirm == QMessageBox.StandardButton.Yes
+        message = (
+            f"Record {strategy_label}'s {percent:g}% cutoff for {to_write} image(s)?\n\n"
+            "This is an ALGORITHM decision, shown when you color the grid by this algorithm. "
+            "It is not a User Decision: it does not color the grid in User Decision mode, and "
+            "Arrange will not file these images.\n\n"
+            f"{conflicts} image(s) you decided yourself disagree with this cutoff; those are left "
+            "exactly as you set them."
+        )
+        confirm = QMessageBox.question(
+            self, "PeakPic - Apply Cutoff", message,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            self._set_status("Apply Cutoff cancelled - no decisions recorded")
+            return
 
-        result = self.service.apply_algorithm_suggestions(strategy_id, include_decided=include_decided)
+        result = self.service.apply_algorithm_suggestions(strategy_id, include_decided=True)
         self._refresh_from_state(result["state"])
-        if include_decided:
-            self._set_status(
-                f"AI cutoff set to {percent:g}% - applied to {result['applied']} neutral image(s), "
-                f"overrode {result['overridden']} manual decision(s)"
-            )
-        elif conflicts:
-            self._set_status(
-                f"AI cutoff set to {percent:g}% - applied to {result['applied']} neutral image(s); "
-                f"{conflicts} manual decision(s) left unchanged"
-            )
-        else:
-            self._set_status(f"AI cutoff set to {percent:g}% - applied to {result['applied']} neutral image(s)")
+        self._set_status(
+            f"{strategy_label} cutoff at {percent:g}% recorded for "
+            f"{result['applied'] + result['overridden']} image(s) as algorithm decisions; "
+            f"{conflicts} of your own decision(s) left unchanged"
+        )
+
+    def _clear_algorithm_decisions(self) -> None:
+        """Undo every recorded algorithm cutoff for this folder, leaving the
+        photographer's own Keep/Reject untouched - the escape hatch for an
+        "Apply Cutoff" that was not what was wanted (see _apply_cutoff)."""
+        if not self.state.current_folder:
+            self._set_status("Open a folder first")
+            return
+        recorded = self._last_counts.get("algorithm_decisions", 0)
+        if not recorded:
+            self._set_status("No algorithm decisions recorded for this folder")
+            return
+        confirm = QMessageBox.question(
+            self, "PeakPic - Clear Algorithm Decisions",
+            f"Discard {recorded} recorded algorithm decision(s)?\n\n"
+            "Your own Keep/Reject decisions are not affected.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+        removed = self.service.clear_algorithm_decisions()
+        self._refresh_preserving_scroll(self.service.load_session())
+        self._set_status(f"Cleared {removed} algorithm decision(s)")
 
     # -- review actions -------------------------------------------------------
 
@@ -2032,15 +2128,22 @@ class MainWindow(QMainWindow):
     # -- organize (Selected/Rejected) -------------------------------------------
 
     def _organize(self) -> None:
+        """File by USER DECISION only - see ReviewSession.arrange. The
+        preview counts come from `keep_paths`/`reject_paths`, which read
+        `user_decision`, so the numbers in this dialog are exactly the images
+        the photographer has decided and nothing else: a ranking result, an
+        algorithm cutoff recorded by Apply Cutoff, or a high score is not a
+        reason to move a file."""
         if not self.state.current_folder:
             self._set_status("Open a folder before organizing it")
             return
         preview = self.service.arrange(dry_run=True)
+        undecided = self._last_counts.get("undecided", self._last_counts.get("neutral", 0))
         message = (
-            f"This will move:\n"
-            f"  {preview['selected']} image(s) -> {preview['selected_dir']}\n"
-            f"  {preview['rejected']} image(s) -> {preview['rejected_dir']}\n\n"
-            "Neutral images are left where they are. Continue?"
+            f"This will move the images you decided yourself:\n"
+            f"  {preview['selected']} Keep -> {preview['selected_dir']}\n"
+            f"  {preview['rejected']} Reject -> {preview['rejected_dir']}\n\n"
+            f"{undecided} undecided image(s) are left exactly where they are. Continue?"
         )
         confirm = QMessageBox.question(self, "PeakPic - Organize", message)
         if confirm != QMessageBox.StandardButton.Yes:

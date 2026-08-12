@@ -178,7 +178,13 @@ def test_filter_off_crop_sharpness_ranks_a_fallback_only_image(tmp_path, monkeyp
 
     metrics = read_metrics_report(folder)["metrics"][path]
     assert metrics["crop_sharpness"] > 0.0
-    assert metrics["relative_subject_size"] == pytest.approx(1.0)  # whole frame, per the fallback default
+    # NOT measured for a fallback image. The "subject box" here is the whole
+    # frame by construction, so a subject-size term computed from it would be
+    # a flat 1.0 - the maximum possible bonus, handed to every image in which
+    # nothing was actually found. See crop_sharpness.measure/combine: the
+    # term is absent, and the score is sharpness alone.
+    assert metrics["relative_subject_size"] is None
+    assert metrics["has_subject_detection"] is False
 
 
 # ---------------------------------------------------------------------------

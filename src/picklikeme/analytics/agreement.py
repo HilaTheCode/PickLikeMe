@@ -30,7 +30,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from ..analyzer.annotations import REVIEW_KEEP, REVIEW_REJECT, AnnotationStore
+from ..analyzer.annotations import DECISION_SOURCE_USER, REVIEW_KEEP, REVIEW_REJECT, AnnotationStore
 from ..identity import IdentityUnavailable
 from .store import AnalyticsStore
 
@@ -92,8 +92,19 @@ def user_decisions_for_paths(annotation_store: AnnotationStore, paths: list[str]
     report that conflated them would misrepresent which of the two is
     actually true. One bulk read (`review_decisions()`), not one query per
     path - the same discipline `ReviewSession`'s own fast-path identity
-    matching already uses."""
-    current_decision = {row["image_hash"]: row["decision"] for row in annotation_store.review_decisions()}
+    matching already uses.
+
+    DECISION_SOURCE_USER rows only. This function's entire purpose is
+    comparing an algorithm against a HUMAN, so a decision an algorithm's own
+    cutoff recorded (see `AnnotationStore.set_review_decision`'s `source`)
+    is not evidence here - counting it would have the run's agreement
+    statistics quietly measuring the cutoff against itself and reporting
+    near-perfect agreement for a folder nobody had reviewed."""
+    current_decision = {
+        row["image_hash"]: row["decision"]
+        for row in annotation_store.review_decisions()
+        if (row.get("source") or DECISION_SOURCE_USER) == DECISION_SOURCE_USER
+    }
     result: dict[str, str] = {}
     for path in paths:
         try:
