@@ -752,14 +752,30 @@ class MissingDataTests(SessionTestCase):
         # ones are untouched by the AI's own opinion of them.
         self.assertEqual(session.counts()["neutral"], len(ranked))
 
-    def test_a_ranking_row_whose_file_is_gone_is_shown_not_dropped(self):
+    def test_a_ranking_row_whose_file_is_gone_is_dropped_not_shown(self):
+        """REVERSED deliberately (see tests/test_folder_sync.py's own module
+        docstring). This used to assert the opposite - the row was kept "so
+        the gap is visible" - which is a defensible thing to want and was
+        wrong in practice: a photograph filed away by Arrange could never
+        leave the grid, and when it was still findable at its new path it
+        appeared twice, once scored-but-absent and once real-but-scoreless.
+
+        The gallery now shows what is on the disk. The ranking row itself is
+        NOT deleted - it stays in the CSV and returns with the file - it is
+        simply not rendered while the file is absent.
+        """
         shoot, images, _ = build_shoot(self.root, ranked=4)
         images[1].unlink()
 
         session = self.session(shoot, keep_percent=50)
 
-        self.assertEqual(session.counts()["total"], 4, "the row is kept so the gap is visible")
-        self.assertEqual(session.counts()["missing_file"], 1)
+        self.assertEqual(session.counts()["total"], 3)
+        self.assertEqual(session.counts()["missing_file"], 0)
+        self.assertNotIn(images[1].name, {i.filename for i in session.images})
+        self.assertIn(
+            images[1].name, ranking_path(shoot).read_text(encoding="utf-8"),
+            "the row is preserved for when the file comes back",
+        )
 
     def test_a_folder_with_no_ranking_still_opens(self):
         """Every image Neutral is a reviewable state, not a crash."""
@@ -802,7 +818,13 @@ class DetectedCategoryTests(SessionTestCase):
 
     def test_a_missing_file_is_never_asked_for_a_category(self):
         """Consistent with captured_at: there is nothing to read a category
-        from for a file that is not there, and it must not raise."""
+        from for a file that is not there, and it must not raise.
+
+        The guarantee now holds one step earlier and more strongly - a file
+        that is not on disk never enters the gallery at all, so nothing can
+        query it - but it is still worth asserting here, because THIS is the
+        property downstream code depends on.
+        """
         shoot, images, _ = build_shoot(self.root, ranked=4)
         images[1].unlink()
 
@@ -811,7 +833,8 @@ class DetectedCategoryTests(SessionTestCase):
 
         queried_paths = [call.args[0] for call in detected.call_args_list]
         self.assertNotIn(str(images[1]), queried_paths, "a missing file has nothing to read a category from")
-        self.assertIsNone(session._image_for(str(images[1])).detected_category)
+        with self.assertRaises(KeyError):
+            session._image_for(str(images[1]))  # not in the gallery at all to be asked
 
     def test_is_exposed_in_the_wire_format(self):
         shoot, images, _ = build_shoot(self.root, ranked=1)

@@ -334,6 +334,27 @@ class ReviewSession:
             self.warnings: list[str] = []
         self.load()
 
+    def refresh(self) -> None:
+        """Re-sync the gallery with what is on disk right now, and nothing
+        else.
+
+        A rescan of the open folder: files that have appeared since it was
+        opened are added, files that have gone are dropped, and everything
+        still there keeps exactly the score, rank, filter verdict and User
+        Decision it already had. This deliberately writes NOTHING - no
+        ranking is re-run, no crop is built, no decision is created, moved or
+        cleared. It re-reads the same four read-only sources `load` always
+        reads (the folder, the strategy CSVs, the filter/metric reports, and
+        the annotation store), so "refresh" can never be the step that
+        changed a result.
+
+        A no-op when no folder is open, rather than an error: Refresh is a
+        toolbar button a photographer may press at any time.
+        """
+        if self.input_folder is None:
+            return
+        self.load()
+
     def latest_run_strategy(self) -> str:
         """"Algorithm Ran Last": whichever strategy actually produced this
         folder's most recent completed ranking run, not a hard-coded
@@ -379,7 +400,33 @@ class ReviewSession:
         return AI_STRATEGY_ID
 
     def load(self) -> None:
-        """(Re)build the gallery from the ranking, the folder, and the store.
+        """(Re)build the gallery from the folder, the ranking, and the store.
+
+        **The folder scan is the source of truth for MEMBERSHIP.** An image is
+        in the gallery if and only if it is on disk under `input_folder` right
+        now (`_enumerate_folder`, which follows the existing Open Folder
+        contract - subfolders included, so a shoot already filed into
+        `_Selected`/`_Rejected` can still be re-reviewed). The rankings supply
+        scores for those images; they never add one.
+
+        That order matters, and it used to be the other way around: every row
+        of every strategy's CSV was added unconditionally and the disk scan
+        was merely additive. A file that had moved out of the folder - filed
+        by Arrange, moved in Finder, renamed - therefore stayed in the grid
+        forever, because deleting it from disk cannot delete it from a CSV
+        written last week. Worse, when the file was still findable at its new
+        path the SAME photograph appeared twice: once as its stale ranked row
+        (with a score, pointing at a file that is no longer there) and once as
+        a freshly-enumerated on-disk row (real, but matching no CSV row, so
+        scoreless and Undecided). That pair is exactly the "undecided image
+        with no score" a photographer sees next to an identical-looking
+        scored one.
+
+        Historical ranking and review data for an absent file is NOT deleted -
+        it stays in the CSVs and the annotation store, and returns with the
+        file if it comes back. It is simply not rendered while the file is
+        absent, which is the only honest thing to draw for a photograph that
+        is not there.
 
         The initial view is exposed immediately and the rest of the metadata is
         filled in progressively in the background so the UI can start showing
@@ -389,17 +436,25 @@ class ReviewSession:
             self._clear()
             return
 
-        generation = self._loading_generation + 1
-        self._loading_generation = generation
+        # Claimed under the same lock the background pass compare-and-sets
+        # against (see `_background_load`), so "is my generation still the
+        # current one?" and "publish my list" cannot interleave.
+        with self._state_lock:
+            generation = self._loading_generation + 1
+            self._loading_generation = generation
         self._set_loading_state("scanning", "Scanning images…", 5, False)
 
-        ranked = self._load_ranked()
         on_disk = self._enumerate_folder()
+        present = {_key(str(path)) for path in on_disk}
+        ranked = self._load_ranked()
         images: list[ReviewImage] = []
         seen: set[str] = set()
         for image in ranked:
+            key = _key(image.image_path)
+            if key not in present:
+                continue
             images.append(image)
-            seen.add(_key(image.image_path))
+            seen.add(key)
         for path in on_disk:
             if _key(str(path)) in seen:
                 continue
@@ -463,7 +518,23 @@ class ReviewSession:
                             image.image_path, detected_category_for
                         )
                         if index % 25 == 0 or index == len(images) - 1:
+                            # Compare-and-set, atomically. `images` is a
+                            # snapshot taken when this pass started; by the
+                            # time it is published a newer `load` may already
+                            # have replaced the gallery, and writing the
+                            # snapshot back would RESURRECT whatever that load
+                            # had just dropped. That is not theoretical: a
+                            # Refresh or an Arrange immediately after opening a
+                            # folder raced the still-running metadata pass of
+                            # the open, and the files that had just been
+                            # removed from the grid reappeared in it. Checking
+                            # the generation outside this lock (as the loop
+                            # guard above does, for cheap early exit) is not
+                            # enough on its own - the whole of `load` fits in
+                            # the window between that check and this write.
                             with self._state_lock:
+                                if generation != self._loading_generation:
+                                    return
                                 self.images = list(images)
                             percent = 20 + int(70 * (index + 1) / max(1, len(images)))
                             self._set_loading_state("loading-categories", "Loading categories…", percent, False)

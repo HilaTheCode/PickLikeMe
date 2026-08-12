@@ -616,6 +616,15 @@ class MainWindow(QMainWindow):
         export_btn.clicked.connect(self._import_action.trigger)
         layout.addWidget(export_btn)
 
+        # Sits with the other one-click actions rather than in a menu: after
+        # anything moves files behind the app's back (Finder, another tool,
+        # an Arrange run from a different open folder) this is the one
+        # control that makes the grid agree with the disk again.
+        self._refresh_button = PrimaryButton("Refresh", "Folder", parent=bar)
+        self._refresh_button.setToolTip(self._refresh_action.toolTip())
+        self._refresh_button.clicked.connect(self._refresh_action.trigger)
+        layout.addWidget(self._refresh_button)
+
         layout.addStretch(1)
 
         self._color_combo.setParent(bar)
@@ -787,6 +796,16 @@ class MainWindow(QMainWindow):
             "Open Folder…", icon=SP.SP_DirOpenIcon, shortcut=QKeySequence.Open,
             tooltip="Open a folder of images to review", triggered=self._open_folder_dialog,
         )
+        # Refresh Folder is a READ-ONLY resync of the grid with the disk (see
+        # ReviewSession.refresh): it adds files that appeared, drops files
+        # that are gone, and touches no score, decision, crop or ranking. F5
+        # because that is what "reload what I am looking at" is bound to
+        # everywhere else a photographer works.
+        self._refresh_action = self._make_action(
+            "Refresh Folder", icon=SP.SP_BrowserReload, shortcut=QKeySequence.Refresh,
+            tooltip="Rescan the open folder for added or removed files",
+            triggered=self._refresh_folder,
+        )
         self._import_action = self._make_action(
             "Import Selected…", icon=SP.SP_ArrowDown,
             tooltip="Copy Keep-marked images to another folder", triggered=self._import_selected,
@@ -899,6 +918,7 @@ class MainWindow(QMainWindow):
             is_valid=lambda path: Path(path).is_dir(),
         )
         file_menu.addSeparator()
+        file_menu.addAction(self._refresh_action)
         file_menu.addAction(self._import_action)
         file_menu.addSeparator()
         file_menu.addAction(self._settings_action)
@@ -2149,8 +2169,41 @@ class MainWindow(QMainWindow):
         if confirm != QMessageBox.StandardButton.Yes:
             return
         result = self.service.arrange(dry_run=False)
-        self._refresh_from_state(self.service.load_session())
+        # An explicit rescan, not `load_session()`. Arrange has just moved
+        # files out of this folder, so the grid it was showing a moment ago
+        # is stale by construction - and `load_session` only re-serialises
+        # whatever the session already holds, it does not look at the disk.
+        # Going through refresh_folder means the "files that moved are gone
+        # from the grid" guarantee is this call site's, not a side effect of
+        # arrange happening to reload when it found something to move.
+        self._refresh_from_state(self.service.refresh_folder())
         self._set_status(f"Organized {result['moved']} image(s); {result['errors']} error(s)")
+
+    # -- refresh -----------------------------------------------------------------
+
+    def _refresh_folder(self) -> None:
+        """Resync the grid with the folder on disk (Refresh Folder / F5).
+
+        Read-only by construction: everything it can change comes from
+        re-reading the folder, the strategy CSVs and the annotation store, so
+        no score, decision, crop or ranking can be altered by pressing it -
+        see `ReviewSession.refresh`.
+
+        Reports the delta rather than a bare "done", because the whole reason
+        to press this is to find out whether the disk still matches what is
+        on screen; "no change" is as useful an answer as "3 removed".
+        """
+        if not self.state.current_folder:
+            self._set_status("Open a folder before refreshing it")
+            return
+        before = {item.path for item in self._all_items}
+        self._refresh_from_state(self.service.refresh_folder())
+        after = {item.path for item in self._all_items}
+        added, removed = len(after - before), len(before - after)
+        if added or removed:
+            self._set_status(f"Refreshed: {added} added, {removed} removed ({len(after)} images)")
+        else:
+            self._set_status(f"Refreshed: no change ({len(after)} images)")
 
     # -- import selected ---------------------------------------------------------
 
@@ -2206,7 +2259,9 @@ class MainWindow(QMainWindow):
             )
 
         def _on_success(result: dict[str, Any]) -> None:
-            self._refresh_from_state(self.service.load_session())
+            # Same reasoning as _organize: this moved files, so the grid has
+            # to be rebuilt from the disk rather than re-serialised.
+            self._refresh_from_state(self.service.refresh_folder())
             self._set_status(f"Organized {result.get('moved', 0)} image(s) into species folders")
 
         def _on_error(message: str) -> None:

@@ -41,6 +41,26 @@ class ReviewService:
         state["recovered"] = recovered
         return state
 
+    def refresh_folder(self) -> dict[str, Any]:
+        """Rescan the open folder and return the resynced state - what the
+        Refresh action calls.
+
+        `reconcile_by_identity` runs for the same reason it runs on
+        `open_folder`: a file that appeared under a new path since the last
+        scan (moved in Finder, filed by an Arrange this session did not
+        perform) is a NEW gallery row by path, and its owner's decision would
+        otherwise be invisible until the next full reopen. It only hashes
+        images that are currently undecided AND whose stored decision failed
+        to match anything by path, so a folder where nothing moved pays
+        nothing for it.
+
+        Returns the same state dict `load_session` returns, so every caller
+        refreshes the UI through one path.
+        """
+        self.session.refresh()
+        self.session.reconcile_by_identity()
+        return self.load_session()
+
     def load_session(self) -> dict[str, Any]:
         return self.session.as_dict()
 
