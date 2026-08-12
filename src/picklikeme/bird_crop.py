@@ -6,8 +6,22 @@ around it (small safety margin, aspect ratio preserved), and cache the crop so
 training never re-detects or re-decodes RAW.
 
 The module, its classes, and its functions keep "bird" in their names for
-historical reasons (the project started bird-only) — the detector now accepts
-any of the COCO animal classes in SUPPORTED_ANIMAL_CLASSES.
+historical reasons (the project started bird-only) — crop selection is now
+completely class-agnostic (see "COCO is a localization tool" below).
+
+**COCO is a localization tool, not the authority on what is in the frame.**
+The detector's one job here is to answer "where might the subject be?" — it
+is never asked "is this a valid wildlife subject?". Its class labels are
+therefore recorded for display and cataloguing (see `detection_category`),
+and are read by nothing in the crop path: no class is preferred, and no
+class disqualifies a box from becoming the crop. This is not a stylistic
+preference, it is a correctness requirement. COCO has no primate class at
+all, and the classes it does have are routinely wrong on real wildlife -
+gating crops on them means an image full of monkeys is treated exactly like
+an empty frame. Measured on this project's own 5,986-image archive under the
+old class gate: 1,506 images contained confident detections (median best
+confidence 0.886) that produced no crop at all, purely because COCO had
+labelled them "person".
 
 Design notes:
 - Detection uses torchvision's COCO-pretrained Faster R-CNN v2. It runs once,
@@ -20,8 +34,9 @@ Design notes:
 - Cache entries are keyed by the absolute source path only, so one cache is
   reusable across model input sizes (384/512/640): detect once, letterbox to
   any size at load time.
-- If no supported animal is detected, the full frame is cached as the fallback,
-  so every image still yields an input and is never re-detected.
+- If the detector returns no boxes AT ALL, the full frame is cached as the
+  fallback, so every image still yields an input and is never re-detected.
+  That is the only cause of the fallback - see select_best_detection.
 
 **This cache is Vision Cache infrastructure, not a training-only
 optimization.** It is the shared image source for every Computer Vision
@@ -55,15 +70,18 @@ v6/v7 = successive individual-selection policies (see "Crop selection policy"
 below); v8 = individual selection became a weighted centre/area/confidence
 score with no confidence floor, so a v7-or-earlier cache's `selected`
 detection was chosen by a materially different rule and must not be read as
-if this one had produced it.
+if this one had produced it. v9 = the COCO class gate was removed from crop
+selection entirely and the area term became a scaled/capped size score, so a
+v8 cache can differ in BOTH which box was selected and whether one was
+selected at all.
 
 Crop selection policy
 ----------------------
 Faster R-CNN's own postprocessing already does the filtering that is NOT
-policy: it drops anything below its own score threshold, keeps only the
-accepted classes (SUPPORTED_ANIMAL_CLASSES by default), and runs per-class
-non-maximum suppression. What is left after that - the *surviving*
-detections - still often number more than one (two classes competing for the
+policy: it drops anything below its own score threshold and runs per-class
+non-maximum suppression. Everything that survives that is a candidate,
+whatever class it was labelled - see "COCO is a localization tool" above.
+Candidates still often number more than one (two classes competing for the
 same animal, a second animal in frame, a false detection in the background),
 and something has to decide what to crop to. That is `select_best_detection`.
 
@@ -148,7 +166,8 @@ and something has to decide what to crop to. That is `select_best_detection`.
   found something in every one of those frames. On this project's own
   archive that was 1,582 of 5,986 images.
 
-- **v8 (current): one weighted score over three normalised signals;
+- **v8 (superseded by v9's two refinements, otherwise intact): one weighted
+  score over three normalised signals;
   candidates are never rejected.** Where a subject sits in the frame is the
   photographer's own compositional statement, and it was the missing input.
   Every candidate is scored on a fixed 50/30/20 blend of centre proximity,
@@ -178,6 +197,44 @@ and something has to decide what to crop to. That is `select_best_detection`.
 
   Group scenes are unaffected - that branch is evaluated first and never
   reaches the individual scoring path at all.
+
+- **v9 (current): the class gate is gone, and the size term is scaled.**
+  v8 removed the confidence floor but left a second, larger filter standing
+  upstream of it: `BirdDetector` only offered `select_best_detection` the
+  boxes whose COCO class was in SUPPORTED_ANIMAL_CLASSES. That gate, not
+  confidence, was what actually produced most of v7's 1,582 fallbacks - on
+  re-examination 1,506 of them held confident boxes labelled "person", and
+  every one of them was discarded unseen. See "COCO is a localization tool"
+  at the top of this module for why gating on COCO's opinion is wrong in
+  principle as well as in measurement. v9 therefore scores EVERY detection
+  the model returns above `conf_threshold`, whatever its label, and records
+  every one of them so the runners-up are visible. Two changes, both
+  deliberate:
+
+  1. **No class filter anywhere in the crop path.** `BirdDetector.classes`
+     and `.catalogue_classes` are gone rather than left inert, because a
+     parameter that silently no longer gates anything is worse than no
+     parameter. SUPPORTED_ANIMAL_CLASSES/CATALOGUED_CLASSES survive as what
+     they always should have been on their own: the review app's DISPLAY
+     taxonomy (see `detection_category`), read by nothing in this path.
+  2. **The area term became a scaled, capped size score.** Raw area
+     fraction is a terrible 0-1 signal for wildlife: a perfectly framed
+     bird occupies ~6.5% of the frame, so the raw fraction handed almost
+     every real subject ~0.065 out of a possible 1.0 and the 30% area term
+     was, in practice, nearly dead weight. `subject_size_score` scales by
+     10 and caps at 1.0, so 10% of the frame or more is a full score and
+     the term does real work over the range wildlife photographs actually
+     occupy. The same scaled value is what `ranking.crop_sharpness` scores
+     its 20% size term on, so "subject size" means one thing in both
+     layers.
+
+  Known and accepted consequence, flagged rather than silently absorbed:
+  because every class now counts toward the candidate list, a cluttered
+  frame reaches `group_scene_threshold` (10) more easily than it did when
+  only animals counted. Group-scene handling itself is deliberately
+  UNCHANGED here (see `_group_scene_detection`); if that threshold proves
+  wrong under the new candidate set it is its own decision, not a silent
+  side effect of this one.
 """
 
 from __future__ import annotations
@@ -194,6 +251,17 @@ import numpy as np
 
 from .profiling import PROFILE
 
+# ---------------------------------------------------------------------------
+# COCO class ids - a DISPLAY TAXONOMY ONLY.
+#
+# Nothing below this point gates crop selection. These names exist so the
+# review app can say "a bird was detected here" instead of "class 16"; see
+# `detection_category` and the module docstring's "COCO is a localization
+# tool" note. A future reader looking for the crop-eligibility rule will not
+# find one here, because there isn't one - `select_best_detection` scores
+# every box the detector returns and never reads `label`.
+# ---------------------------------------------------------------------------
+
 # COCO category indices in torchvision's detection weights metadata
 # (FasterRCNN_ResNet50_FPN_V2_Weights.COCO_V1.meta["categories"]). The animal
 # classes are contiguous: bird(16) .. giraffe(25).
@@ -208,11 +276,9 @@ WILDLIFE_CLASSES: dict[int, str] = {
     25: "giraffe",
 }
 
-# The remaining COCO animal classes. Included because supporting them costs
-# nothing beyond these five entries (the selection logic is class-agnostic),
-# and a horse/cow/sheep in frame is the photo's subject just as much as a
-# zebra is. Restrict with BirdDetector(classes=WILDLIFE_CLASSES) if a run
-# should consider wildlife only.
+# The remaining COCO animal classes. Named for the same display reason as
+# WILDLIFE_CLASSES above - a horse/cow/sheep in frame is the photo's subject
+# just as much as a zebra is, and the review app should be able to say so.
 DOMESTIC_ANIMAL_CLASSES: dict[int, str] = {
     17: "cat",
     18: "dog",
@@ -223,23 +289,26 @@ DOMESTIC_ANIMAL_CLASSES: dict[int, str] = {
 
 SUPPORTED_ANIMAL_CLASSES: dict[int, str] = {**WILDLIFE_CLASSES, **DOMESTIC_ANIMAL_CLASSES}
 
-# A person in frame - never a crop target (see BirdDetector.catalogue_classes
-# below for why this is not folded into SUPPORTED_ANIMAL_CLASSES), but a
-# subject worth cataloguing: a birder, a ranger, a researcher handling an
-# animal are all common in a wildlife archive, and "who else is in this
-# photo" is exactly the kind of thing the review app's filtering/search
-# should be able to answer.
+# A person in frame: a birder, a ranger, a researcher handling an animal are
+# all common in a wildlife archive, and "who else is in this photo" is
+# exactly the kind of thing the review app's filtering/search should be able
+# to answer.
+#
+# A person IS crop-eligible, like every other class. It was not, through v8,
+# on the reasoning that a bystander must never steal the crop from the real
+# subject - correct as an aim, but enforced with the wrong instrument. COCO
+# does not have a primate class, so a monkey is frequently labelled "person",
+# and the gate meant to exclude bystanders was in fact excluding the subject.
+# The composition-based `selection_score` handles the bystander case on its
+# own terms instead: someone standing at the edge of the frame loses to the
+# centred animal on position, which is the thing that actually distinguishes
+# them.
 COCO_PERSON_CLASS = 1
 
-# Every class this project catalogues at all, for the review app's
-# structured subject metadata (see detection_category) - a strict superset of
-# SUPPORTED_ANIMAL_CLASSES. Kept as a separate set rather than folding person
-# into SUPPORTED_ANIMAL_CLASSES itself: that set also gates crop-TARGET
-# eligibility (BirdDetector.classes, via select_best_detection), and a person
-# standing near the actual wildlife subject must never be able to win that
-# selection and crop the training input to the wrong thing. Cataloguing and
-# crop-target selection are related but different questions - see
-# BirdDetector.detect_with_all, which answers both from one forward pass.
+# Every class this project has a display name for. Read by the review app's
+# structured subject metadata (see detection_category) and by nothing in the
+# crop path. A detection whose class is absent here is still a perfectly
+# valid crop candidate; it simply has no category to show.
 CATALOGUED_CLASSES: dict[int, str] = {COCO_PERSON_CLASS: "person", **SUPPORTED_ANIMAL_CLASSES}
 
 
@@ -300,7 +369,7 @@ def detection_category(label: int) -> str | None:
     return COCO_CLASS_CATEGORY.get(int(label))
 
 
-CROP_CACHE_VERSION = "v8"
+CROP_CACHE_VERSION = "v9"
 CROP_PARAMS_FILENAME = "crop_params.json"
 
 # Cache entries live in cache_dir/<first 2 hex chars of digest>/<digest><ext>,
@@ -334,7 +403,7 @@ IMAGE_FORMAT_EXTENSIONS: dict[str, str] = {"jpeg": ".jpg", "png": ".png"}
 # touch. Nothing reads the value for selection any more.
 DEFAULT_MIN_CROP_CONFIDENCE = 0.6
 
-# The fixed weights of the v8 selection score. Deliberately module-level
+# The fixed weights of the selection score. Deliberately module-level
 # constants rather than CropParams fields: for this experiment they are not
 # a per-run knob, and adding them to CropParams would put them into the
 # cache-identity comparison and every strategy's parameter dialog for no
@@ -342,6 +411,19 @@ DEFAULT_MIN_CROP_CONFIDENCE = 0.6
 SELECTION_WEIGHT_CENTER = 0.50
 SELECTION_WEIGHT_AREA = 0.30
 SELECTION_WEIGHT_CONFIDENCE = 0.20
+
+# How hard `subject_size_score` scales a raw area fraction before capping at
+# 1.0. At 10, a subject filling 10% of the frame scores a full 1.0 and
+# everything below is linear (1% -> 0.10, 5% -> 0.50, 6.5% -> 0.65).
+#
+# Chosen from this project's own archive rather than by taste: across 4,404
+# real detected subjects the median relative size is 0.0654 and the 90th
+# percentile 0.3183. Scored on the raw fraction, half of all real subjects
+# contributed under 0.07 of a possible 1.0 to whatever weighted that term,
+# making it nearly inert; the cap costs only the top decile, which is
+# already unambiguously "fills the frame" and does not need to be ranked
+# against itself. See the module docstring's v9 entry.
+SIZE_SCORE_SCALE = 10.0
 
 # At or above this many surviving detections, the image is treated as a group
 # scene: the crop target becomes the box enclosing all of them, not a single
@@ -460,21 +542,51 @@ def relative_box_area(
     return _clamp01(box_area(box) / frame_area)
 
 
+def subject_size_score(area_fraction: float) -> float:
+    """A raw area fraction turned into a usable 0-1 size signal:
+    `clamp01(SIZE_SCORE_SCALE * area_fraction)`.
+
+    THE single definition of "how big is this subject, as a score" for the
+    whole project - `selection_score`'s 30% area term and
+    `ranking.crop_sharpness`'s 20% size term both call it, so subject size
+    cannot come to mean two different things at two different layers. Takes
+    a fraction rather than a box so the ranking layer, which stores the
+    fraction and no longer has the box, can reach the identical curve.
+
+    See SIZE_SCORE_SCALE for why the scale is 10 and why capping is not a
+    loss of signal.
+    """
+    return _clamp01(SIZE_SCORE_SCALE * float(area_fraction))
+
+
+def relative_size_score(
+    box: tuple[float, float, float, float], source_size: tuple[int, int]
+) -> float:
+    """`subject_size_score` of `box`'s own area fraction - the box-shaped
+    convenience for callers that still have the box."""
+    return subject_size_score(relative_box_area(box, source_size))
+
+
 def selection_score(detection: "BirdDetection", source_size: tuple[int, int]) -> float:
     """How strongly `detection` looks like the photograph's intended subject,
-    in [0, 1]. The v8 crop-selection policy, in one place:
+    in [0, 1]. The v9 crop-selection policy, in one place:
 
-        0.50 * center_proximity + 0.30 * relative_area + 0.20 * confidence
+        0.50 * center_proximity + 0.30 * size_score + 0.20 * confidence
 
     Every term is independently normalised to [0, 1] and the weights sum to
     1.0, so the result is directly comparable across images of any
-    resolution. See the module docstring's "v8" entry for why position is
-    weighted above area and confidence combined, and why there is no longer
-    any confidence floor that can reject a candidate outright.
+    resolution. See the module docstring's "v8"/"v9" entries for why position
+    is weighted above the other two combined, why there is no confidence
+    floor that can reject a candidate outright, and why the size term is the
+    scaled `subject_size_score` rather than the raw area fraction.
+
+    **This function never reads `detection.label`, and must never start to.**
+    It is an ordering over candidate regions, not a judgement about what they
+    contain - see the module docstring's "COCO is a localization tool" note.
     """
     return (
         SELECTION_WEIGHT_CENTER * center_proximity(detection.box, source_size)
-        + SELECTION_WEIGHT_AREA * relative_box_area(detection.box, source_size)
+        + SELECTION_WEIGHT_AREA * relative_size_score(detection.box, source_size)
         + SELECTION_WEIGHT_CONFIDENCE * _clamp01(detection.score)
     )
 
@@ -739,10 +851,15 @@ def select_best_detection(
     source_size: tuple[int, int],
     group_scene_threshold: int = DEFAULT_GROUP_SCENE_THRESHOLD,
 ) -> BirdDetection | None:
-    """The crop target build_crop should use, chosen from every detection that
-    has already passed class and confidence filtering (and, upstream of this,
-    the detector's own per-class NMS - see the module docstring's "Crop
-    selection policy" section).
+    """The crop target build_crop should use, chosen from every detection the
+    model returned above its confidence threshold (and, upstream of this, the
+    detector's own per-class NMS - see the module docstring's "Crop selection
+    policy" section).
+
+    `candidates` is deliberately unfiltered by class: whatever COCO called
+    each box, it competes here on composition alone. See the module
+    docstring's "COCO is a localization tool" note for why gating on the
+    label is a correctness bug rather than a tuning choice.
 
     `source_size` is the FULL FRAME's (width, height) in pixels - required,
     because centre proximity is meaningless without it, and a silent default
@@ -753,13 +870,14 @@ def select_best_detection(
 
     - **Fewer than `group_scene_threshold`: the highest `selection_score`
       wins.** Every candidate is scored on the fixed 50/30/20 blend of centre
-      proximity, relative area and confidence, and the best one is selected.
+      proximity, scaled size and confidence, and the best one is selected.
       No candidate is ever rejected: if there are candidates at all, exactly
-      one of them comes back. See the module docstring's "v8" entry for why
-      position outweighs the other two combined, and why the confidence floor
-      this used to apply was removed rather than lowered. Detector- and
-      class-agnostic: nothing here reads `label`, so this applies identically
-      to any current or future catalogued class.
+      one of them comes back. See the module docstring's "v8"/"v9" entries
+      for why position outweighs the other two combined, and why both the
+      confidence floor and the class gate this used to apply were removed
+      rather than relaxed. Detector- and class-agnostic: nothing here reads
+      `label`, so this applies identically to a bird, a person, a species
+      COCO has never heard of, or a misclassification.
 
     - **`group_scene_threshold` or more: the image is a group scene.**
       UNCHANGED by v8. Picking one detection out of a flock, a herd or a
@@ -778,12 +896,12 @@ def select_best_detection(
     comparison, so the two can never disagree about the crop target.
 
     Returns None for one reason only: `candidates` is empty, i.e. the
-    detector found nothing at all. That is now the sole cause of
-    `build_crop`'s full-frame fallback. Before v8 there was a second,
-    indistinguishable cause - candidates existed but none cleared an
-    absolute confidence floor - which meant a frame the detector HAD found
+    detector found nothing at all. That is the sole cause of `build_crop`'s
+    full-frame fallback. Through v7 there were three indistinguishable
+    causes - nothing detected, nothing above the confidence floor, or
+    nothing of an accepted COCO class - so a frame the detector HAD found
     something in was filed identically to an empty one (1,582 of 5,986
-    images on this project's own archive).
+    images on this project's own archive, 1,506 of them class-gated).
     """
     if not candidates:
         return None
@@ -827,21 +945,21 @@ class NormalizedCrop:
 
 
 class BirdDetector:
-    """COCO-pretrained Faster R-CNN v2 restricted to a set of animal classes.
+    """COCO-pretrained Faster R-CNN v2, used purely as a region proposer.
 
-    Two class sets, deliberately kept separate:
+    **There is no class filter.** Every box the model returns at or above
+    `conf_threshold` is a crop candidate and is recorded, whatever COCO
+    labelled it. The `classes`/`catalogue_classes` parameters this had
+    through v8 are gone, not defaulted-to-everything: they gated crop
+    eligibility on COCO's opinion of the species, which discarded 1,506 real
+    subjects on this project's own archive and is structurally incapable of
+    handling an animal COCO cannot name (a primate, most importantly). See
+    the module docstring's "COCO is a localization tool" note and its v9
+    entry.
 
-    - `classes` (default SUPPORTED_ANIMAL_CLASSES: wildlife + the remaining
-      COCO animals) gates crop-TARGET eligibility - what `select_best_detection`
-      is even allowed to consider. Pass `classes` to restrict it (e.g.
-      WILDLIFE_CLASSES, or {COCO_BIRD_CLASS} to reproduce the original
-      bird-only behavior).
-    - `catalogue_classes` (default CATALOGUED_CLASSES: `classes` plus person)
-      gates what gets RECORDED at all, for the review app's structured
-      subject metadata (see detection_category). A person must never win the
-      crop - a birder or ranger standing near the actual subject stealing the
-      training crop would be a real bug - but is still worth cataloguing, so
-      it is recorded without ever being a crop candidate.
+    `conf_threshold` remains, and is a different thing: it is the model's own
+    noise floor, deciding whether a box exists at all rather than whether an
+    existing box is allowed to win. Once a box exists it always competes.
 
     torch/torchvision are imported lazily so that modules which only need the
     bbox math or cache-path helpers (e.g. RawImageLoader) don't pull the heavy
@@ -852,8 +970,6 @@ class BirdDetector:
         self,
         device: str = "cpu",
         conf_threshold: float = 0.30,
-        classes: "dict[int, str] | set[int] | None" = None,
-        catalogue_classes: "dict[int, str] | set[int] | None" = None,
         min_crop_confidence: float = DEFAULT_MIN_CROP_CONFIDENCE,
         group_scene_threshold: int = DEFAULT_GROUP_SCENE_THRESHOLD,
     ):
@@ -866,17 +982,6 @@ class BirdDetector:
         self._torch = torch
         self.device = device
         self.conf_threshold = conf_threshold
-        self.classes = frozenset(SUPPORTED_ANIMAL_CLASSES if classes is None else classes)
-        # Always a superset of `classes`: cataloguing must never be narrower
-        # than what can win the crop, or a real crop target would go
-        # unrecorded. Whatever the caller passes for `classes` still applies
-        # (a caller restricting to WILDLIFE_CLASSES gets a matching narrower
-        # catalogue too, unless it also passes its own catalogue_classes).
-        self.catalogue_classes = frozenset(
-            (CATALOGUED_CLASSES if classes is None else self.classes)
-            if catalogue_classes is None
-            else catalogue_classes
-        )
         # Accepted and stored, but NO LONGER USED for crop selection - see
         # DEFAULT_MIN_CROP_CONFIDENCE for why the parameter is retained.
         self.min_crop_confidence = min_crop_confidence
@@ -885,16 +990,20 @@ class BirdDetector:
         self.model = fasterrcnn_resnet50_fpn_v2(weights=weights).to(device).eval()
 
     def detect_with_all(self, image_rgb: np.ndarray) -> "tuple[BirdDetection | None, list[BirdDetection]]":
-        """(winner, every catalogued detection) from a **single** forward pass.
+        """(winner, every detection) from a **single** forward pass.
 
         Exists so a caller that wants the runners-up - the false-negative
         diagnostic overlay, or the review app's subject cataloguing - does
-        not have to run inference a second time. The winner is chosen by
-        select_best_detection() from the `classes`-eligible subset only, the
-        same function detect_best_bird() delegates to, so the two can never
-        disagree; the full returned list may be broader (see
-        catalogue_classes) and can include detections (e.g. a person) that
-        were never in contention for it.
+        not have to run inference a second time.
+
+        The two returned things are now drawn from the SAME list: the winner
+        is `select_best_detection`'s pick from exactly the detections also
+        returned as the second element. That equality is the point, and it is
+        what makes the Loupe's overlay honest - every yellow runner-up box
+        really was in contention for the green one. Through v8 the recorded
+        list was a superset of the eligible one, so an image could show boxes
+        that had been silently barred from winning, which is precisely how a
+        frame full of confident detections came to look like an empty frame.
         """
         torch = self._torch
         with PROFILE.stage("detector preprocess"):
@@ -911,27 +1020,27 @@ class BirdDetector:
             labels = output["labels"].cpu().numpy()
             scores = output["scores"].cpu().numpy()
 
-            catalogued: list[BirdDetection] = [
+            # Confidence only - no class filter (see the class docstring).
+            candidates: list[BirdDetection] = [
                 BirdDetection(box=tuple(float(v) for v in box), score=float(score), label=int(label))
                 for box, label, score in zip(boxes, labels, scores)
-                if int(label) in self.catalogue_classes and score >= self.conf_threshold
+                if score >= self.conf_threshold
             ]
-            crop_candidates = [d for d in catalogued if d.label in self.classes]
             # (width, height) - the frame the boxes are measured against,
             # so centre proximity is computed against the real image.
             height, width = image_rgb.shape[:2]
-            best = select_best_detection(crop_candidates, (width, height), self.group_scene_threshold)
-        return best, catalogued
+            best = select_best_detection(candidates, (width, height), self.group_scene_threshold)
+        return best, candidates
 
     def detect_best_bird(self, image_rgb: np.ndarray) -> BirdDetection | None:
         """The detection build_crop should crop to, or None only if the
-        detector found no class-eligible candidate at all.
+        detector returned no boxes at all.
 
         This is the single source of truth for subject selection: everything
         that needs a box goes through here (or through detect_with_all, which
         this delegates to, so the two entry points always agree). What "best"
         means is entirely select_best_detection()'s policy - the highest
-        `selection_score` (50% centre proximity, 30% relative area, 20%
+        `selection_score` (50% centre proximity, 30% scaled size, 20%
         confidence) below `group_scene_threshold` detections, the enclosing
         box of the whole group at or above it; see the module docstring's
         "Crop selection policy" section.

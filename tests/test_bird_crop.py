@@ -41,9 +41,11 @@ from picklikeme.bird_crop import (
     expand_and_clamp_box,
     read_crop_params,
     relative_box_area,
+    relative_size_score,
     save_crop_png,
     select_best_detection,
     selection_score,
+    subject_size_score,
     write_crop_params,
 )
 from picklikeme.raw_io import RawImageLoader
@@ -54,25 +56,22 @@ def _detector_with_fake_model(
     labels,
     scores,
     conf_threshold=0.3,
-    classes=None,
-    catalogue_classes=None,
     min_crop_confidence=DEFAULT_MIN_CROP_CONFIDENCE,
     group_scene_threshold=DEFAULT_GROUP_SCENE_THRESHOLD,
 ):
     """A BirdDetector whose torchvision model is replaced by a fixed output, so
     the real selection logic (select_best_detection, via detect_best_bird /
     detect_with_all) can be tested without downloading or running the actual
-    network."""
+    network.
+
+    There is deliberately no `classes`/`catalogue_classes` knob to set up:
+    v9 removed both, and this helper mirroring the real constructor is what
+    keeps a test from configuring a class gate that production no longer has.
+    """
     detector = BirdDetector.__new__(BirdDetector)
     detector._torch = torch
     detector.device = "cpu"
     detector.conf_threshold = conf_threshold
-    detector.classes = frozenset(SUPPORTED_ANIMAL_CLASSES if classes is None else classes)
-    detector.catalogue_classes = frozenset(
-        (CATALOGUED_CLASSES if classes is None else detector.classes)
-        if catalogue_classes is None
-        else catalogue_classes
-    )
     detector.min_crop_confidence = min_crop_confidence
     detector.group_scene_threshold = group_scene_threshold
     output = {
@@ -86,14 +85,16 @@ def _detector_with_fake_model(
 
 class SelectBestDetectionTests(unittest.TestCase):
     """The individual-selection policy itself, tested directly and
-    independent of the detector/model plumbing: v8 (see bird_crop.py's module
+    independent of the detector/model plumbing: v9 (see bird_crop.py's module
     docstring) - every candidate is scored on a fixed
 
-        0.50 * centre proximity + 0.30 * relative area + 0.20 * confidence
+        0.50 * centre proximity + 0.30 * size score + 0.20 * confidence
 
-    and the highest score wins. No candidate is ever rejected, so a non-empty
-    candidate list always yields exactly one winner and the full-frame
-    fallback has exactly one cause: nothing was detected at all.
+    and the highest score wins. The size score is `subject_size_score`:
+    the area fraction scaled by 10 and capped at 1.0, NOT the raw fraction.
+    No candidate is ever rejected - not by confidence, not by class - so a
+    non-empty candidate list always yields exactly one winner and the
+    full-frame fallback has exactly one cause: nothing was detected at all.
     """
 
     # A square frame keeps the hand-computed expectations below readable -
@@ -125,38 +126,107 @@ class SelectBestDetectionTests(unittest.TestCase):
         # Same size, same confidence - position is the only difference.
         self.assertIs(select_best_detection([off_centre, centred], self.FRAME), centred)
 
-    def test_centre_proximity_can_outweigh_both_area_and_confidence_together(self):
-        """It is weighted at 50%, i.e. more than the other two combined -
-        the whole point of v8. A small, unconfident, centred subject beats a
-        large, very confident one in the corner."""
+    def test_a_centred_candidate_beats_the_best_possible_corner_candidate(self):
+        """The exact guarantee the 50% weight buys, stated as the bound it
+        actually is: a candidate centred on the frame corner scores 0 on the
+        centre term, so its ceiling is 0.30 + 0.20 = 0.50 however large and
+        however confident it is. Any candidate at the frame's centre clears
+        that on the centre term alone."""
         centred = BirdDetection(box=self._box_at(500, 500, 100), score=0.31, label=COCO_BIRD_CLASS)
-        corner = BirdDetection(box=(0, 0, 400, 400), score=0.99, label=COCO_BIRD_CLASS)
+        # Centre exactly on the frame corner, maximal size and confidence.
+        corner = BirdDetection(box=(900, 900, 1100, 1100), score=1.0, label=COCO_BIRD_CLASS)
 
+        self.assertLessEqual(selection_score(corner, self.FRAME), 0.50)
+        self.assertGreater(selection_score(centred, self.FRAME), 0.50)
         self.assertIs(select_best_detection([corner, centred], self.FRAME), centred)
+
+    def test_scaling_the_size_term_made_a_large_off_centre_subject_competitive(self):
+        """A real, deliberate behaviour change from v8, pinned so it is a
+        decision rather than a surprise.
+
+        These two candidates are the pair v8's own test used to assert that
+        centre proximity "outweighs area and confidence together". Under v8
+        the corner box's raw area fraction (0.16) contributed 0.048 and the
+        centred box won 0.592 to 0.446. Under v9 that same 16% is past the
+        size cap and contributes the full 0.30, and the corner box wins
+        0.698 to 0.592.
+
+        This is the intended trade: the size term was nearly inert before and
+        now does real work. Centre proximity still dominates at equal size
+        (see the test above and `_beats_an_identical_off_centre_one`), but it
+        no longer overrides a subject that is genuinely much larger.
+        """
+        centred = BirdDetection(box=self._box_at(500, 500, 100), score=0.31, label=COCO_BIRD_CLASS)
+        large_off_centre = BirdDetection(box=(0, 0, 400, 400), score=0.99, label=COCO_BIRD_CLASS)
+
+        self.assertAlmostEqual(selection_score(centred, self.FRAME), 0.592)
+        self.assertAlmostEqual(selection_score(large_off_centre, self.FRAME), 0.698)
+        self.assertIs(
+            select_best_detection([large_off_centre, centred], self.FRAME), large_off_centre
+        )
 
     # -- 2/3/4. the exact composite ------------------------------------------
 
-    def test_the_composite_is_exactly_50_centre_30_area_20_confidence(self):
+    def test_the_composite_is_exactly_50_centre_30_size_20_confidence(self):
         detection = BirdDetection(box=(400, 400, 600, 600), score=0.5, label=COCO_BIRD_CLASS)
 
         score = selection_score(detection, self.FRAME)
 
-        # Centred exactly -> 1.0; 200x200 of 1000x1000 -> 0.04 relative area.
-        expected = 0.50 * 1.0 + 0.30 * 0.04 + 0.20 * 0.5
+        # Centred exactly -> 1.0; 200x200 of 1000x1000 -> 0.04 area fraction
+        # -> 10 * 0.04 = 0.40 size score.
+        expected = 0.50 * 1.0 + 0.30 * 0.40 + 0.20 * 0.5
         self.assertAlmostEqual(score, expected)
-        self.assertAlmostEqual(score, 0.612)
+        self.assertAlmostEqual(score, 0.72)
 
-    def test_area_contributes_exactly_thirty_percent(self):
+    def test_size_contributes_exactly_thirty_percent_of_the_scaled_score(self):
         """Two candidates identical but for size, both dead-centre: the score
-        gap must be exactly 0.30 * the relative-area difference."""
+        gap must be exactly 0.30 * the SIZE-SCORE difference - the scaled and
+        capped value, not the raw area fraction."""
+        # 1% and 4% of the frame -> size scores 0.10 and 0.40, both below
+        # the cap so the difference is a real one.
         small = BirdDetection(box=self._box_at(500, 500, 100), score=0.5, label=COCO_BIRD_CLASS)
-        large = BirdDetection(box=self._box_at(500, 500, 300), score=0.5, label=COCO_BIRD_CLASS)
+        large = BirdDetection(box=self._box_at(500, 500, 200), score=0.5, label=COCO_BIRD_CLASS)
 
         gap = selection_score(large, self.FRAME) - selection_score(small, self.FRAME)
 
-        expected_area_gap = (300.0 * 300.0 - 100.0 * 100.0) / (1000.0 * 1000.0)
-        self.assertAlmostEqual(gap, 0.30 * expected_area_gap)
+        self.assertAlmostEqual(gap, 0.30 * (0.40 - 0.10))
         self.assertIs(select_best_detection([small, large], self.FRAME), large)
+
+    def test_the_size_term_uses_ten_times_the_area_fraction_capped_at_one(self):
+        """The exact curve the spec names: clamp01(10 * area_fraction)."""
+        cases = {
+            0.01: 0.10,   # 1% of the frame
+            0.05: 0.50,
+            0.065: 0.65,  # this archive's median real subject
+            0.10: 1.00,   # the cap
+            0.20: 1.00,
+            0.90: 1.00,
+        }
+        for fraction, expected in cases.items():
+            with self.subTest(fraction=fraction):
+                self.assertAlmostEqual(subject_size_score(fraction), expected)
+
+    def test_the_size_score_is_reachable_from_a_box_and_matches_the_fraction_form(self):
+        box = self._box_at(500, 500, 200)  # 4% of a 1000x1000 frame
+        self.assertAlmostEqual(relative_box_area(box, self.FRAME), 0.04)
+        self.assertAlmostEqual(relative_size_score(box, self.FRAME), 0.40)
+        self.assertAlmostEqual(
+            relative_size_score(box, self.FRAME),
+            subject_size_score(relative_box_area(box, self.FRAME)),
+        )
+
+    def test_two_subjects_past_the_cap_are_separated_by_position_not_size(self):
+        """A deliberate consequence of capping: above 10% of the frame the
+        size term stops discriminating, and the remaining 70% of the score
+        decides. Pinned so the cap's cost is visible rather than surprising."""
+        big_off_centre = BirdDetection(box=self._box_at(800, 800, 400), score=0.5, label=COCO_BIRD_CLASS)
+        bigger_centred = BirdDetection(box=self._box_at(500, 500, 350), score=0.5, label=COCO_BIRD_CLASS)
+
+        self.assertAlmostEqual(relative_size_score(big_off_centre.box, self.FRAME), 1.0)
+        self.assertAlmostEqual(relative_size_score(bigger_centred.box, self.FRAME), 1.0)
+        self.assertIs(
+            select_best_detection([big_off_centre, bigger_centred], self.FRAME), bigger_centred
+        )
 
     def test_confidence_contributes_exactly_twenty_percent(self):
         """Identical geometry, different confidence - the gap must be exactly
@@ -291,6 +361,123 @@ class SelectBestDetectionTests(unittest.TestCase):
         background_bird = BirdDetection(box=(0, 0, 20, 20), score=0.99, label=COCO_BIRD_CLASS)
 
         self.assertIs(select_best_detection([intended_subject, background_bird], self.FRAME), intended_subject)
+
+
+class SelectionIsClassAgnosticTests(unittest.TestCase):
+    """v9's central requirement: COCO is a LOCALIZATION tool, and its class
+    label must not decide whether a box can be cropped to.
+
+    The detector answers "where might the subject be?", never "is this a
+    valid wildlife subject?". These tests are the guard on that - if a class
+    gate is ever reintroduced anywhere in the crop path, several of them fail
+    immediately.
+    """
+
+    FRAME = (1000, 1000)
+
+    @staticmethod
+    def _box_at(cx, cy, size=10.0):
+        return (cx - size / 2, cy - size / 2, cx + size / 2, cy + size / 2)
+
+    # Classes spanning every category the old gate distinguished: an accepted
+    # animal, the specifically-excluded person, and three COCO classes this
+    # project has never catalogued at all (car, potted plant, teddy bear -
+    # the last being a real label COCO gives primates and other unsupported
+    # animals).
+    CLASS_IDS = (COCO_BIRD_CLASS, COCO_PERSON_CLASS, 3, 64, 88)
+
+    def test_the_winner_is_identical_whatever_class_the_candidates_carry(self):
+        """The same geometry must produce the same selection under every
+        label, including labels with no category at all."""
+        for class_id in self.CLASS_IDS:
+            with self.subTest(class_id=class_id):
+                centred = BirdDetection(box=self._box_at(500, 500, 200), score=0.5, label=class_id)
+                corner = BirdDetection(box=self._box_at(950, 950, 200), score=0.5, label=class_id)
+                self.assertIs(select_best_detection([corner, centred], self.FRAME), centred)
+
+    def test_the_score_is_identical_across_classes_for_identical_geometry(self):
+        box = self._box_at(400, 600, 150)
+        scores = {
+            class_id: selection_score(BirdDetection(box=box, score=0.7, label=class_id), self.FRAME)
+            for class_id in self.CLASS_IDS
+        }
+        self.assertEqual(
+            len(set(round(v, 12) for v in scores.values())), 1, f"class changed the score: {scores}"
+        )
+
+    def test_a_person_wins_when_it_has_the_highest_composite_score(self):
+        """Explicitly permitted, and the single most important case: COCO has
+        no primate class, so a monkey is routinely labelled "person". A gate
+        that excludes people excludes those monkeys."""
+        person = BirdDetection(box=self._box_at(500, 500, 300), score=0.95, label=COCO_PERSON_CLASS)
+        bird = BirdDetection(box=self._box_at(950, 60, 40), score=0.99, label=COCO_BIRD_CLASS)
+
+        winner = select_best_detection([bird, person], self.FRAME)
+
+        self.assertIs(winner, person)
+        self.assertEqual(winner.label, COCO_PERSON_CLASS)
+
+    def test_an_uncatalogued_class_wins_when_it_has_the_highest_composite_score(self):
+        """A class the project has no display name for at all is still a
+        perfectly good candidate REGION - which is the only thing selection
+        is choosing between."""
+        unknown = BirdDetection(box=self._box_at(500, 500, 300), score=0.9, label=88)  # "teddy bear"
+        bird = BirdDetection(box=self._box_at(950, 60, 40), score=0.99, label=COCO_BIRD_CLASS)
+
+        winner = select_best_detection([bird, unknown], self.FRAME)
+
+        self.assertIs(winner, unknown)
+        self.assertIsNone(detection_category(88), "and it genuinely has no category to fall back on")
+
+    def test_a_person_only_frame_still_produces_a_selection(self):
+        """THE regression from the real archive. Under v8 this image had
+        confident boxes, no selection, and was filed as a full-frame fallback
+        - identically to an image the detector found nothing in at all. On
+        this project's 5,986-image DCIM tree that was 1,506 images, whose
+        best candidate confidence had a median of 0.886."""
+        people = [
+            BirdDetection(box=(1827, 1057, 2260, 2469), score=0.9994, label=COCO_PERSON_CLASS),
+            BirdDetection(box=(1191, 1183, 1544, 1773), score=0.9816, label=COCO_PERSON_CLASS),
+        ]
+
+        winner = select_best_detection(people, (5496, 3672))
+
+        self.assertIsNotNone(winner, "person-only boxes must not mean 'nothing was detected'")
+        self.assertIs(winner, people[0], "the larger, more central of the two")
+
+    def test_no_class_can_be_eliminated_by_being_the_only_candidate(self):
+        for class_id in (*self.CLASS_IDS, 999):  # 999: not a COCO class at all
+            with self.subTest(class_id=class_id):
+                only = BirdDetection(box=self._box_at(500, 500, 100), score=0.05, label=class_id)
+                self.assertIs(select_best_detection([only], self.FRAME), only)
+
+    def test_selection_never_reads_the_label_attribute(self):
+        """Structural, not behavioural: a detection whose `label` raises on
+        access must still be selectable. This catches a class gate added
+        anywhere in the scoring path, including one that only reads the label
+        to break a tie."""
+
+        class LabelExplodes:
+            """Duck-typed like a BirdDetection, minus a readable class."""
+
+            def __init__(self, box, score):
+                self.box = box
+                self.score = score
+
+            @property
+            def label(self):
+                raise AssertionError("selection must never read a detection's class")
+
+        candidate = LabelExplodes(self._box_at(500, 500, 200), 0.8)
+
+        self.assertAlmostEqual(
+            selection_score(candidate, self.FRAME),
+            selection_score(
+                BirdDetection(box=self._box_at(500, 500, 200), score=0.8, label=COCO_BIRD_CLASS),
+                self.FRAME,
+            ),
+        )
+        self.assertIs(select_best_detection([candidate], self.FRAME), candidate)
 
 
 def _flock(count: int, start_score: float = 0.5) -> list[BirdDetection]:
@@ -488,77 +675,144 @@ class DetectBestBirdTests(unittest.TestCase):
         )
         self.assertEqual(detector.best_bird_box(self.IMG), (5.0, 5.0, 20.0, 20.0))
 
-    def test_none_when_only_non_birds_or_below_threshold(self):
+    def test_none_only_when_every_box_is_below_the_detector_threshold(self):
+        """The sole route to None at the detector level. A high-confidence
+        non-animal no longer contributes to it - v9's whole point - so this
+        pins the case where the model genuinely produced nothing usable."""
         detector = _detector_with_fake_model(
             boxes=[[0, 0, 10, 10], [5, 5, 20, 20]],
-            labels=[COCO_BIRD_CLASS, 1],  # bird below threshold, person high
-            scores=[0.1, 0.99],
+            labels=[COCO_BIRD_CLASS, COCO_PERSON_CLASS],
+            scores=[0.1, 0.2],  # both below conf_threshold 0.3
         )
         self.assertIsNone(detector.detect_best_bird(self.IMG))
         self.assertIsNone(detector.best_bird_box(self.IMG))
 
+    def test_a_high_confidence_non_animal_no_longer_produces_none(self):
+        """The same input as the v8 test this replaces (bird below the
+        threshold, person well above it), asserting the opposite outcome."""
+        detector = _detector_with_fake_model(
+            boxes=[[0, 0, 10, 10], [5, 5, 20, 20]],
+            labels=[COCO_BIRD_CLASS, COCO_PERSON_CLASS],
+            scores=[0.1, 0.99],
+        )
+        detection = detector.detect_best_bird(self.IMG)
+
+        self.assertIsNotNone(detection)
+        self.assertEqual(detection.label, COCO_PERSON_CLASS)
+        self.assertEqual(detector.best_bird_box(self.IMG), (5.0, 5.0, 20.0, 20.0))
+
     def test_a_real_model_output_with_a_flock_becomes_a_group_scene(self):
-        """End to end through the real filtering (class + confidence), not
-        just select_best_detection() in isolation: a raw model output with
-        ten accepted birds plus an excluded person must still correctly
-        count only the ten toward the group threshold."""
-        boxes = [[i * 15, 0, i * 15 + 8, 8] for i in range(10)] + [[500, 500, 520, 520]]
-        labels = [COCO_BIRD_CLASS] * 10 + [1]  # ten birds + a person (excluded by class)
-        scores = [0.5 + i * 0.01 for i in range(10)] + [0.99]
+        """End to end through the real confidence filtering, not just
+        select_best_detection() in isolation: ten birds above the threshold
+        are a group scene, and the enclosing box covers all ten."""
+        boxes = [[i * 15, 0, i * 15 + 8, 8] for i in range(10)]
+        labels = [COCO_BIRD_CLASS] * 10
+        scores = [0.5 + i * 0.01 for i in range(10)]
         detector = _detector_with_fake_model(boxes=boxes, labels=labels, scores=scores)
 
         detection = detector.detect_best_bird(self.IMG)
-        expected = enclosing_box([tuple(float(v) for v in b) for b in boxes[:10]])
+        expected = enclosing_box([tuple(float(v) for v in b) for b in boxes])
         self.assertEqual(detection.box, expected)
 
+    def test_a_non_animal_box_now_counts_toward_the_group_scene_threshold(self):
+        """A flagged, accepted consequence of removing the class gate (see
+        bird_crop's v9 note): candidates of ANY class count toward
+        `group_scene_threshold`, so nine birds plus one person is a group
+        scene where under v8 it was nine birds and an individual selection.
+        Pinned here so the interaction is a recorded decision rather than a
+        surprise in the field."""
+        boxes = [[i * 15, 0, i * 15 + 8, 8] for i in range(9)] + [[500, 500, 520, 520]]
+        labels = [COCO_BIRD_CLASS] * 9 + [COCO_PERSON_CLASS]
+        scores = [0.5 + i * 0.01 for i in range(9)] + [0.99]
+        detector = _detector_with_fake_model(boxes=boxes, labels=labels, scores=scores)
 
-class CatalogueClassesTests(unittest.TestCase):
-    """A person is catalogued (recorded, exposed as metadata) but must never
-    be a crop TARGET - the two are different questions BirdDetector answers
-    from the same forward pass (see catalogue_classes vs classes)."""
+        detection = detector.detect_best_bird(self.IMG)
+
+        expected = enclosing_box([tuple(float(v) for v in b) for b in boxes])
+        self.assertEqual(detection.box, expected, "all ten boxes, person included, are the group")
+
+
+class RecordedDetectionsTests(unittest.TestCase):
+    """What `detect_with_all` records, and its relationship to what can win.
+
+    Through v8 these were two different sets: `catalogue_classes` decided
+    what was recorded, `classes` decided what could be cropped to, and the
+    first was a strict superset of the second. v9 collapses them - every box
+    above `conf_threshold` is both recorded and eligible - so an image can
+    never again display candidate boxes that were barred from winning.
+    """
 
     IMG = np.zeros((40, 40, 3), dtype=np.uint8)
 
-    def test_a_person_is_recorded_in_all_detections_but_never_wins(self):
+    def test_the_winner_is_drawn_from_exactly_the_recorded_detections(self):
         detector = _detector_with_fake_model(
-            boxes=[[0, 0, 10, 10], [0, 0, 39, 39]],  # small bird, huge person
+            boxes=[[0, 0, 10, 10], [0, 0, 39, 39], [1, 1, 5, 5]],
+            labels=[COCO_BIRD_CLASS, COCO_PERSON_CLASS, 88],
+            scores=[0.7, 0.99, 0.5],
+        )
+        winner, recorded = detector.detect_with_all(self.IMG)
+
+        self.assertEqual(len(recorded), 3, "every candidate is recorded, whatever its class")
+        self.assertIn(winner, recorded, "and the winner is one of them")
+
+    def test_a_person_is_recorded_and_may_win(self):
+        """The inverse of the v8 test this replaces. The large, confident,
+        near-centred person wins over the tiny corner bird - on composition,
+        which is the only thing selection judges."""
+        detector = _detector_with_fake_model(
+            boxes=[[0, 0, 10, 10], [0, 0, 39, 39]],  # small corner bird, huge person
             labels=[COCO_BIRD_CLASS, COCO_PERSON_CLASS],
-            scores=[0.7, 0.99],  # bird above min_crop_confidence's own default (0.6)
+            scores=[0.7, 0.99],
         )
-        winner, catalogued = detector.detect_with_all(self.IMG)
+        winner, recorded = detector.detect_with_all(self.IMG)
 
-        self.assertEqual(winner.label, COCO_BIRD_CLASS, "the person must never win the crop, however large/confident")
-        self.assertEqual(len(catalogued), 2, "but both are still catalogued")
-        self.assertIn(COCO_PERSON_CLASS, [d.label for d in catalogued])
+        self.assertEqual(winner.label, COCO_PERSON_CLASS)
+        self.assertEqual(len(recorded), 2)
 
-    def test_catalogue_classes_defaults_to_a_superset_of_classes(self):
+    def test_the_detector_exposes_no_class_gate_at_all(self):
+        """Structural: the attributes that used to gate crop eligibility are
+        gone, not merely defaulted wide. A future reader cannot set them back
+        without noticing they no longer exist."""
         detector = _detector_with_fake_model(boxes=[], labels=[], scores=[])
-        self.assertTrue(detector.classes <= detector.catalogue_classes)
-        self.assertIn(COCO_PERSON_CLASS, detector.catalogue_classes)
-        self.assertNotIn(COCO_PERSON_CLASS, detector.classes, "a person is never a crop target by default")
+        self.assertFalse(hasattr(detector, "classes"))
+        self.assertFalse(hasattr(detector, "catalogue_classes"))
 
-    def test_restricting_classes_also_narrows_the_default_catalogue(self):
-        """Passing a restricted `classes` (e.g. WILDLIFE_CLASSES) without an
-        explicit catalogue_classes must not silently catalogue the full
-        default set - the caller asked for a narrower detector."""
-        detector = _detector_with_fake_model(
-            boxes=[], labels=[], scores=[], classes=WILDLIFE_CLASSES
-        )
-        self.assertEqual(detector.catalogue_classes, frozenset(WILDLIFE_CLASSES))
-
-    def test_an_explicit_catalogue_classes_is_honoured_even_when_classes_is_restricted(self):
-        detector = _detector_with_fake_model(
-            boxes=[], labels=[], scores=[], classes={COCO_BIRD_CLASS}, catalogue_classes=CATALOGUED_CLASSES
-        )
-        self.assertEqual(detector.catalogue_classes, frozenset(CATALOGUED_CLASSES))
-
-    def test_only_a_person_present_yields_no_crop_winner(self):
+    def test_only_a_person_present_still_yields_a_crop_winner(self):
+        """The 1,506-image regression, at the detector level."""
         detector = _detector_with_fake_model(
             boxes=[[0, 0, 39, 39]], labels=[COCO_PERSON_CLASS], scores=[0.99]
         )
-        self.assertIsNone(detector.detect_best_bird(self.IMG))
-        _, catalogued = detector.detect_with_all(self.IMG)
-        self.assertEqual(len(catalogued), 1, "still catalogued, even with no crop winner at all")
+        winner, recorded = detector.detect_with_all(self.IMG)
+
+        self.assertIsNotNone(winner, "a person-only frame is not an empty frame")
+        self.assertEqual(winner.label, COCO_PERSON_CLASS)
+        self.assertEqual(len(recorded), 1)
+        self.assertIsNotNone(detector.best_bird_box(self.IMG))
+
+    def test_an_uncatalogued_class_is_recorded_and_can_win(self):
+        detector = _detector_with_fake_model(
+            boxes=[[0, 0, 39, 39]], labels=[88], scores=[0.8]  # "teddy bear"
+        )
+        winner, recorded = detector.detect_with_all(self.IMG)
+
+        self.assertIsNotNone(winner)
+        self.assertEqual(winner.label, 88)
+        self.assertEqual(len(recorded), 1)
+
+    def test_confidence_still_decides_whether_a_box_exists_at_all(self):
+        """`conf_threshold` is NOT a class gate and is deliberately kept: it
+        decides whether the model produced a box worth calling a candidate,
+        not whether an existing candidate is allowed to win."""
+        detector = _detector_with_fake_model(
+            boxes=[[0, 0, 10, 10], [5, 5, 30, 30]],
+            labels=[COCO_BIRD_CLASS, COCO_PERSON_CLASS],
+            scores=[0.1, 0.99],  # the bird is below the detector's own floor
+            conf_threshold=0.3,
+        )
+        winner, recorded = detector.detect_with_all(self.IMG)
+
+        self.assertEqual(len(recorded), 1, "the sub-threshold box is not a candidate at all")
+        self.assertEqual(winner.label, COCO_PERSON_CLASS)
 
 
 class DetectionCategoryTests(unittest.TestCase):
@@ -626,26 +880,24 @@ class SupportedClassTests(unittest.TestCase):
                 self.assertIsNotNone(detection)
                 self.assertEqual(detection.label, index)
 
-    def test_selection_is_class_agnostic_and_decided_purely_by_the_score(self):
-        # A tiny, near-perfectly-confident bird in the corner against a much
-        # larger, central, far less confident elephant. The elephant wins
-        # (0.370 vs 0.342) - not because it is an elephant, but because
-        # position and area together outweigh the confidence gap. Nothing in
-        # the selection path reads `label` at all.
+    def test_selection_is_decided_purely_by_the_score_not_the_class(self):
+        # A tiny, near-perfectly-confident bird in the corner against a
+        # larger, dead-centre, far less confident elephant, both fully inside
+        # the 40x40 frame. The elephant wins 0.870 to 0.341 - not because it
+        # is an elephant, but because position and size together outweigh the
+        # confidence gap. Nothing in the selection path reads `label` at all.
         detector = _detector_with_fake_model(
-            boxes=[[0, 0, 10, 10], [5, 5, 90, 90]],
+            boxes=[[0, 0, 6, 6], [12, 12, 28, 28]],
             labels=[COCO_BIRD_CLASS, 22],
             scores=[0.99, 0.35],
         )
         detection = detector.detect_best_bird(self.IMG)
-        self.assertEqual(detection.box, (5.0, 5.0, 90.0, 90.0))
+        self.assertEqual(detection.box, (12.0, 12.0, 28.0, 28.0))
         self.assertEqual(detection.label, 22)
 
-    def test_class_has_no_priority_once_both_detections_clear_the_reliability_floor(self):
-        # With both confidences clearing min_crop_confidence's default floor
-        # (0.6), area decides - and it must not favour one class over another.
+    def test_two_animal_classes_are_ranked_only_by_composition(self):
         detector = _detector_with_fake_model(
-            boxes=[[0, 0, 100, 100], [0, 0, 96, 100]],  # areas 10000 vs 9600
+            boxes=[[0, 0, 100, 100], [0, 0, 96, 100]],
             labels=[COCO_BIRD_CLASS, 22],
             scores=[0.9, 0.82],
         )
@@ -653,26 +905,27 @@ class SupportedClassTests(unittest.TestCase):
         self.assertEqual(detection.label, COCO_BIRD_CLASS)
         self.assertEqual(detection.box, (0.0, 0.0, 100.0, 100.0))
 
-    def test_non_animal_classes_are_still_rejected(self):
-        # person(1), car(3), airplane(5) must never be cropped to, however
-        # confident the detector is.
+    def test_non_animal_classes_are_now_valid_crop_candidates(self):
+        """The inverse of the v8 test this replaces. person(1), car(3) and
+        airplane(5) are all candidate REGIONS; the biggest, most central of
+        them wins, which is the only question selection asks."""
         detector = _detector_with_fake_model(
             boxes=[[0, 0, 10, 10], [1, 1, 5, 5], [2, 2, 8, 8]],
-            labels=[1, 3, 5],
+            labels=[COCO_PERSON_CLASS, 3, 5],
             scores=[0.99, 0.98, 0.97],
         )
-        self.assertIsNone(detector.detect_best_bird(self.IMG))
-
-    def test_classes_argument_can_restrict_back_to_birds_only(self):
-        detector = _detector_with_fake_model(
-            boxes=[[0, 0, 10, 10], [5, 5, 20, 20]],
-            labels=[COCO_BIRD_CLASS, 24],  # zebra scores higher but is excluded
-            scores=[0.6, 0.95],
-            classes={COCO_BIRD_CLASS},
-        )
         detection = detector.detect_best_bird(self.IMG)
-        self.assertEqual(detection.label, COCO_BIRD_CLASS)
+
+        self.assertIsNotNone(detection)
+        self.assertEqual(detection.label, COCO_PERSON_CLASS)
         self.assertEqual(detection.box, (0.0, 0.0, 10.0, 10.0))
+
+    def test_no_argument_exists_to_restrict_selection_back_to_birds_only(self):
+        """v9 removed `classes` deliberately rather than defaulting it wide,
+        so a caller cannot quietly reinstate the gate this change exists to
+        remove."""
+        with self.assertRaises(TypeError):
+            BirdDetector(classes={COCO_BIRD_CLASS})
 
 
 class BoxGeometryTests(unittest.TestCase):
@@ -979,6 +1232,37 @@ class BuildCropSelectsTheBestScoringDetectionTests(unittest.TestCase):
         self.assertIsNotNone(result.expanded_box)
         self.assertEqual(result.detection.box, (40.0, 40.0, 60.0, 60.0), "the centred one")
         self.assertNotEqual(result.crop.shape[:2], frame.shape[:2], "not the full-frame fallback")
+
+    def test_a_person_only_frame_produces_a_real_crop_not_the_full_frame(self):
+        """The v9 invariant end to end, and THE regression this change is
+        for: boxes of a class the old gate excluded still produce a real
+        crop rather than the full-frame fallback."""
+        frame = np.zeros((100, 100, 3), dtype=np.uint8)
+        detector = _detector_with_fake_model(
+            boxes=[[40, 40, 60, 60], [0, 0, 8, 8]],
+            labels=[COCO_PERSON_CLASS, COCO_PERSON_CLASS],
+            scores=[0.9, 0.95],
+        )
+        result = build_crop(frame, detector, CropParams(margin_frac=0.0), collect_detections=True)
+
+        self.assertIsNotNone(result.detection, "person boxes are candidates like any other")
+        self.assertEqual(result.detection.label, COCO_PERSON_CLASS)
+        self.assertEqual(result.detection.box, (40.0, 40.0, 60.0, 60.0), "the centred one")
+        self.assertNotEqual(result.crop.shape[:2], frame.shape[:2], "not the full-frame fallback")
+        self.assertEqual(len(result.all_detections), 2, "and both are recorded for the overlay")
+
+    def test_zero_detections_is_the_only_route_to_the_full_frame_fallback(self):
+        """The other half of the invariant: nothing detected at all IS still
+        a full-frame fallback, unchanged, and the crop really is the frame."""
+        frame = np.zeros((100, 100, 3), dtype=np.uint8)
+        detector = _detector_with_fake_model(boxes=[], labels=[], scores=[])
+
+        result = build_crop(frame, detector, CropParams(margin_frac=0.0), collect_detections=True)
+
+        self.assertIsNone(result.detection)
+        self.assertIsNone(result.expanded_box)
+        self.assertEqual(result.all_detections, [])
+        self.assertEqual(result.crop.shape[:2], frame.shape[:2], "the whole frame, unchanged")
 
 
 class BuildCropHandlesGroupScenesTests(unittest.TestCase):

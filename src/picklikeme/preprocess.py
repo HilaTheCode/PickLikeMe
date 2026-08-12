@@ -46,7 +46,6 @@ from .bird_crop import (
     SELECTION_WEIGHT_AREA,
     SELECTION_WEIGHT_CENTER,
     SELECTION_WEIGHT_CONFIDENCE,
-    SUPPORTED_ANIMAL_CLASSES,
     BirdDetector,
     CropParams,
     build_crop,
@@ -234,14 +233,15 @@ def build_cache(
 
     print(f"Building crop cache for {total:,} images on device={device}")
     print(f"  {'cache dir:':<20}{Path(cache_dir).resolve()}")
-    print(f"  {'accepted classes:':<20}{', '.join(sorted(SUPPORTED_ANIMAL_CLASSES.values()))}")
+    print(f"  {'accepted classes:':<20}all (COCO class does not gate crop selection)")
     print(f"  {'min confidence:':<20}{params.conf_threshold}")
-    # Describes the CURRENT policy (bird_crop v8) - no candidate is rejected,
-    # and the winner is the highest weighted score. params.min_crop_confidence
-    # is deliberately not mentioned: it no longer affects selection.
+    # Describes the CURRENT policy (bird_crop v9) - every detection above
+    # conf_threshold competes whatever its class, and the winner is the
+    # highest weighted score. params.min_crop_confidence is deliberately not
+    # mentioned: it no longer affects selection.
     print(
         f"  {'selection:':<20}highest score wins "
-        f"({SELECTION_WEIGHT_CENTER:.0%} centre + {SELECTION_WEIGHT_AREA:.0%} area "
+        f"({SELECTION_WEIGHT_CENTER:.0%} centre + {SELECTION_WEIGHT_AREA:.0%} size "
         f"+ {SELECTION_WEIGHT_CONFIDENCE:.0%} confidence); no candidate is rejected"
     )
     print(

@@ -83,6 +83,7 @@ def test_crop_sharpness_declares_its_metrics_for_the_loupe_diagnostics_line():
     assert labels == {
         "crop_sharpness": "Crop Sharpness",
         "relative_subject_size": "Relative Subject Size",
+        "subject_size_score": "Subject Size Score",
         "has_subject_detection": "Subject Detected",
     }
 
@@ -252,9 +253,19 @@ def test_crop_sharpness_ranks_a_folder_with_no_eye_detector_involved(tmp_path, m
     for values in metrics_report["metrics"].values():
         # has_subject_detection rides along so a reader can tell a "subject
         # fills 0% of the frame" from "no subject was located at all".
-        assert set(values) == {"crop_sharpness", "relative_subject_size", "has_subject_detection"}
+        assert set(values) == {
+            "crop_sharpness",
+            "relative_subject_size",
+            "subject_size_score",
+            "has_subject_detection",
+        }
         assert values["has_subject_detection"] is True, "this fixture writes a real detection"
         assert values["relative_subject_size"] is not None
+        # The raw measurement and what it was worth are both recorded, and
+        # are genuinely different numbers (see write_metrics_report).
+        assert values["subject_size_score"] == pytest.approx(
+            min(1.0, 10.0 * values["relative_subject_size"])
+        )
 
     from picklikeme.ranking.classic import read_filter_report
 
@@ -331,33 +342,65 @@ def test_a_real_subject_crop_scores_80_percent_sharpness_and_20_percent_size():
     from picklikeme.ranking.metrics import absolute_sharpness_score
 
     metric = ImageMetrics(
-        image_path="a.nef", crop_sharpness=0.70, relative_subject_size=0.25,
+        image_path="a.nef", crop_sharpness=0.70, relative_subject_size=0.05,
         has_subject_detection=True,
     )
     (score,) = combine([metric], CropSharpnessParams().normalized_weights())
 
-    expected = 0.8 * absolute_sharpness_score(0.70) + 0.2 * 0.25
+    # 0.05 of the frame -> a size SCORE of 0.50 (x10, capped at 1.0), not
+    # the raw fraction.
+    expected = 0.8 * absolute_sharpness_score(0.70) + 0.2 * 0.50
     assert score == pytest.approx(expected)
     # ...and 0.70 is the calibrated midpoint, so the sharpness half is 0.5.
-    assert score == pytest.approx(0.8 * 0.5 + 0.2 * 0.25)
+    assert score == pytest.approx(0.8 * 0.5 + 0.2 * 0.50)
+
+
+def test_the_size_term_uses_the_scaled_capped_score_not_the_raw_fraction():
+    """v3's first correction. On the raw fraction a well-framed subject
+    (~6.5% of the frame, this archive's median) contributed 0.013 of an
+    available 0.20 and the term was nearly inert; scaled it contributes
+    0.130."""
+    from picklikeme.bird_crop import subject_size_score
+
+    metric = ImageMetrics(image_path="m.nef", crop_sharpness=0.70, relative_subject_size=0.065,
+                          has_subject_detection=True)
+    (score,) = combine([metric], CropSharpnessParams().normalized_weights())
+
+    assert subject_size_score(0.065) == pytest.approx(0.65)
+    assert score == pytest.approx(0.8 * 0.5 + 0.2 * 0.65)
+    assert score != pytest.approx(0.8 * 0.5 + 0.2 * 0.065), "the raw fraction is not used"
 
 
 def test_the_subject_size_term_actually_moves_a_real_crop_s_score():
     small = ImageMetrics(image_path="s.nef", crop_sharpness=0.7, relative_subject_size=0.02,
                          has_subject_detection=True)
-    large = ImageMetrics(image_path="l.nef", crop_sharpness=0.7, relative_subject_size=0.60,
+    large = ImageMetrics(image_path="l.nef", crop_sharpness=0.7, relative_subject_size=0.06,
                          has_subject_detection=True)
 
     scores = combine([small, large], CropSharpnessParams().normalized_weights())
 
     assert scores[1] > scores[0], "identical sharpness - the size bonus is the only difference"
-    assert scores[1] - scores[0] == pytest.approx(0.2 * (0.60 - 0.02))
+    # Size scores 0.20 and 0.60, both below the cap.
+    assert scores[1] - scores[0] == pytest.approx(0.2 * (0.60 - 0.20))
 
 
-# --- full-frame fallback: 100% sharpness, no size term ---------------------
+def test_two_subjects_past_the_size_cap_score_identically_on_the_size_term():
+    """The cap's accepted cost, pinned. Above 10% of the frame the size term
+    stops discriminating and sharpness alone separates the two."""
+    big = ImageMetrics(image_path="b.nef", crop_sharpness=0.7, relative_subject_size=0.15,
+                       has_subject_detection=True)
+    huge = ImageMetrics(image_path="h.nef", crop_sharpness=0.7, relative_subject_size=0.75,
+                        has_subject_detection=True)
+
+    scores = combine([big, huge], CropSharpnessParams().normalized_weights())
+
+    assert scores[0] == pytest.approx(scores[1])
 
 
-def test_the_full_frame_fallback_scores_100_percent_sharpness():
+# --- full-frame fallback: sharpness x no_subject_factor, no size term ------
+
+
+def test_the_full_frame_fallback_scores_sharpness_times_the_no_subject_factor():
     from picklikeme.ranking.metrics import absolute_sharpness_score
 
     metric = ImageMetrics(
@@ -366,14 +409,80 @@ def test_the_full_frame_fallback_scores_100_percent_sharpness():
     )
     (score,) = combine([metric], CropSharpnessParams().normalized_weights())
 
-    assert score == pytest.approx(absolute_sharpness_score(0.70))
-    assert score == pytest.approx(0.5), "the calibrated midpoint, undiluted by any size term"
+    assert score == pytest.approx(absolute_sharpness_score(0.70) * 0.80)
+    # 0.70 is the calibrated midpoint -> 0.5 sharpness, discounted to 0.40.
+    assert score == pytest.approx(0.40)
+
+
+def test_the_default_no_subject_factor_is_zero_point_eight():
+    from picklikeme.ranking.crop_sharpness import DEFAULT_NO_SUBJECT_FACTOR
+
+    assert DEFAULT_NO_SUBJECT_FACTOR == 0.80
+    assert CropSharpnessParams().no_subject_factor == 0.80
+    spec = next(s for s in CropSharpnessParams.specs() if s.name == "no_subject_factor")
+    assert spec.default == 0.80
+    # combine()'s own default must agree, so a caller that omits it entirely
+    # cannot get a different answer from the dialog's default.
+    metric = ImageMetrics(image_path="f.nef", crop_sharpness=0.70,
+                          relative_subject_size=None, has_subject_detection=False)
+    assert combine([metric], CropSharpnessParams().normalized_weights()) == pytest.approx(
+        combine([metric], CropSharpnessParams().normalized_weights(), no_subject_factor=0.80)
+    )
+
+
+def test_the_no_subject_factor_is_configurable_and_scales_the_fallback():
+    from picklikeme.ranking.metrics import absolute_sharpness_score
+
+    metric = ImageMetrics(image_path="f.nef", crop_sharpness=0.70,
+                          relative_subject_size=None, has_subject_detection=False)
+    sharpness = absolute_sharpness_score(0.70)
+
+    for factor in (0.0, 0.25, 0.5, 0.8, 1.0):
+        (score,) = combine(
+            [metric], CropSharpnessParams().normalized_weights(), no_subject_factor=factor
+        )
+        assert score == pytest.approx(sharpness * factor)
+
+
+def test_the_no_subject_factor_is_applied_after_normalisation_not_before():
+    """It must scale the NORMALISED score, never the raw focus measure. The
+    two differ because absolute_sharpness_score is a Hill curve, so
+    f(0.8x) != 0.8*f(x) - applying it early would bend the curve instead of
+    scaling the result."""
+    from picklikeme.ranking.metrics import absolute_sharpness_score
+
+    raw = 1.40
+    metric = ImageMetrics(image_path="f.nef", crop_sharpness=raw,
+                          relative_subject_size=None, has_subject_detection=False)
+    (score,) = combine([metric], CropSharpnessParams().normalized_weights(), no_subject_factor=0.8)
+
+    after = absolute_sharpness_score(raw) * 0.8
+    before = absolute_sharpness_score(raw * 0.8)
+    assert after != pytest.approx(before), "the two orders must be genuinely distinguishable here"
+    assert score == pytest.approx(after)
+    assert score != pytest.approx(before)
+
+
+def test_the_no_subject_factor_never_touches_a_detected_image():
+    from picklikeme.ranking.metrics import absolute_sharpness_score
+
+    detected = ImageMetrics(image_path="d.nef", crop_sharpness=0.7,
+                            relative_subject_size=0.05, has_subject_detection=True)
+    expected = 0.8 * absolute_sharpness_score(0.7) + 0.2 * 0.50
+
+    for factor in (0.0, 0.5, 1.0):
+        (score,) = combine(
+            [detected], CropSharpnessParams().normalized_weights(), no_subject_factor=factor
+        )
+        assert score == pytest.approx(expected)
 
 
 def test_the_full_frame_fallback_never_receives_a_subject_size_contribution():
-    """THE regression. The fallback's "subject box" is the whole frame, so a
-    subject-size term computed from it would be 1.0 - the maximum possible
-    bonus, handed to every image in which nothing was found."""
+    """THE original regression. The fallback's "subject box" is the whole
+    frame, so a subject-size term computed from it would be 1.0 - the maximum
+    possible bonus, handed to every image in which nothing was found. The
+    v3 discount changes the sharpness half only; the size term is still
+    absent rather than zeroed."""
     metric = measure(_fallback_candidate())
 
     assert metric.has_subject_detection is False
@@ -382,15 +491,27 @@ def test_the_full_frame_fallback_never_receives_a_subject_size_contribution():
     (score,) = combine([metric], CropSharpnessParams().normalized_weights())
     from picklikeme.ranking.metrics import absolute_sharpness_score
 
-    assert score == pytest.approx(absolute_sharpness_score(metric.crop_sharpness))
-    # Explicitly NOT the two shapes a size term could have taken.
-    assert score != pytest.approx(0.8 * absolute_sharpness_score(metric.crop_sharpness) + 0.2 * 1.0)
-    assert score != pytest.approx(0.8 * absolute_sharpness_score(metric.crop_sharpness))
+    sharpness = absolute_sharpness_score(metric.crop_sharpness)
+    assert score == pytest.approx(sharpness * 0.80)
+    # Explicitly NOT a size term of 1.0 ("the subject fills the frame").
+    assert score != pytest.approx(0.8 * sharpness + 0.2 * 1.0)
+
+    # A size term of 0.0 is the other lie available, and at the default
+    # factor it is numerically indistinguishable from the real formula
+    # (0.8*s + 0.2*0 == s*0.8). A different factor separates them: if the
+    # size term were merely being zeroed, changing the factor would do
+    # nothing at all.
+    (half,) = combine(
+        [metric], CropSharpnessParams().normalized_weights(), no_subject_factor=0.5
+    )
+    assert half == pytest.approx(sharpness * 0.5)
+    assert half != pytest.approx(0.8 * sharpness + 0.2 * 0.0)
 
 
-def test_a_fallback_image_is_scored_purely_on_sharpness_whatever_the_weights():
+def test_a_fallback_image_is_scored_without_a_size_term_whatever_the_weights():
     """Even a size-heavy configuration cannot give a fallback image a size
-    bonus - there is nothing to weight."""
+    bonus - there is nothing to weight. The weights are not consulted at all
+    on this branch."""
     metric = ImageMetrics(image_path="f.nef", crop_sharpness=1.2, relative_subject_size=None,
                           has_subject_detection=False)
     from picklikeme.ranking.metrics import absolute_sharpness_score
@@ -401,22 +522,31 @@ def test_a_fallback_image_is_scored_purely_on_sharpness_whatever_the_weights():
         {"crop_sharpness_weight": 1.0, "relative_subject_size_weight": 0.0},
     ):
         (score,) = combine([metric], weights)
-        assert score == pytest.approx(absolute_sharpness_score(1.2))
+        assert score == pytest.approx(absolute_sharpness_score(1.2) * 0.80)
 
 
-def test_a_fallback_image_and_a_detected_image_of_equal_sharpness_differ_only_by_the_bonus():
+def test_a_fallback_no_longer_beats_a_detected_image_of_equal_sharpness():
+    """The v2 failure this correction exists for. Undetected images averaged
+    0.543 against 0.337 for detected ones on the real archive and took 199 of
+    the top 200 places, because 1.00 * sharpness beat 0.80 * sharpness +
+    a size term worth almost nothing."""
     from picklikeme.ranking.metrics import absolute_sharpness_score
 
-    detected = ImageMetrics(image_path="d.nef", crop_sharpness=0.9, relative_subject_size=0.30,
+    detected = ImageMetrics(image_path="d.nef", crop_sharpness=0.9, relative_subject_size=0.065,
                             has_subject_detection=True)
     fallback = ImageMetrics(image_path="f.nef", crop_sharpness=0.9, relative_subject_size=None,
                             has_subject_detection=False)
 
-    detected_score, fallback_score = combine([detected, fallback], CropSharpnessParams().normalized_weights())
+    detected_score, fallback_score = combine(
+        [detected, fallback], CropSharpnessParams().normalized_weights()
+    )
 
     sharpness = absolute_sharpness_score(0.9)
-    assert fallback_score == pytest.approx(sharpness)
-    assert detected_score == pytest.approx(0.8 * sharpness + 0.2 * 0.30)
+    assert fallback_score == pytest.approx(sharpness * 0.80)
+    assert detected_score == pytest.approx(0.8 * sharpness + 0.2 * 0.65)
+    assert detected_score > fallback_score, (
+        "a real, typically-framed subject must beat an undetected frame of equal sharpness"
+    )
 
 
 # --- the sharpness score is absolute, in 0-1, and not a percentile ---------
@@ -514,6 +644,49 @@ def test_no_plateau_at_the_top_of_the_scale():
     assert "0.000" not in bottom
 
 
+def test_every_final_score_stays_within_zero_and_one_on_both_branches():
+    """Not just the sharpness term - the combined score, for detected and
+    undetected images alike, across extreme inputs and every factor."""
+    weights = CropSharpnessParams().normalized_weights()
+    metrics = [
+        ImageMetrics(image_path=f"d{i}.nef", crop_sharpness=raw, relative_subject_size=size,
+                     has_subject_detection=True)
+        for i, (raw, size) in enumerate(
+            [(0.0, 0.0), (1e-6, 1e-6), (0.7, 0.065), (1.8, 0.5), (1e6, 1.0), (1e12, 0.99)]
+        )
+    ] + [
+        ImageMetrics(image_path=f"f{i}.nef", crop_sharpness=raw, relative_subject_size=None,
+                     has_subject_detection=False)
+        for i, raw in enumerate([0.0, 1e-6, 0.7, 1.8, 1e6, 1e12])
+    ]
+
+    for factor in (0.0, 0.5, 0.8, 1.0):
+        for score in combine(metrics, weights, no_subject_factor=factor):
+            assert 0.0 <= score <= 1.0, (factor, score)
+
+
+def test_the_fallback_score_is_also_folder_independent():
+    """The no_subject_factor is a constant, not a distribution statistic, so
+    an undetected image scores the same number alone as in a crowd - the same
+    absolute guarantee the detected branch already has."""
+    weights = CropSharpnessParams().normalized_weights()
+    subject = ImageMetrics(image_path="f.nef", crop_sharpness=0.65,
+                           relative_subject_size=None, has_subject_detection=False)
+
+    alone = combine([subject], weights)[0]
+    crowd = combine(
+        [subject]
+        + [
+            ImageMetrics(image_path=f"n{i}.nef", crop_sharpness=0.02 * i,
+                         relative_subject_size=None, has_subject_detection=False)
+            for i in range(1, 200)
+        ],
+        weights,
+    )[0]
+
+    assert alone == pytest.approx(crowd)
+
+
 def test_the_calibrated_midpoint_scores_exactly_one_half():
     from picklikeme.ranking.metrics import SHARPNESS_MIDPOINT, absolute_sharpness_score
 
@@ -591,7 +764,63 @@ def test_a_full_frame_fallback_image_is_scored_end_to_end_without_a_size_term(tm
     values = read_metrics_report(folder)["metrics"][str(image)]
     assert values["has_subject_detection"] is False
     assert values["relative_subject_size"] is None, "never measured for a frame with no subject"
+    assert values["subject_size_score"] is None, "and neither is the score derived from it"
 
     (_name, score) = result["top"][0]
-    assert score == pytest.approx(absolute_sharpness_score(values["crop_sharpness"]))
+    assert score == pytest.approx(absolute_sharpness_score(values["crop_sharpness"]) * 0.80)
     assert 0.0 <= score <= 1.0
+
+
+# --- the No Subject Factor as a real dialog parameter -----------------------
+
+
+@pytest.fixture
+def qt_app():
+    from PySide6.QtWidgets import QApplication
+
+    application = QApplication.instance() or QApplication([])
+    yield application
+
+
+def test_the_no_subject_factor_appears_in_the_parameter_dialog(qt_app) -> None:
+    """It has to be reachable by the photographer, not just by `combine`.
+    The generated dialog builds itself from `specs()`, so this asserts the
+    spec actually produces a spin box - and that it is NOT in the Weights
+    section, where it would be normalised against the 80/20 pair and stop
+    meaning what it means."""
+    from picklikeme.desktop.dialogs.workflow_dialogs import AlgorithmParametersDialog
+    from picklikeme.ranking.base import GROUP_WEIGHTS
+
+    dialog = AlgorithmParametersDialog(
+        params_cls=CropSharpnessParams, title="Crop Sharpness — Parameters"
+    )
+    try:
+        assert "no_subject_factor" in dialog._spins
+        spin = dialog._spins["no_subject_factor"]
+        assert spin.value() == pytest.approx(0.80)
+        assert spin.decimals() == 2, "0.80 must not round to a bare 1"
+        assert (spin.minimum(), spin.maximum()) == (0.0, 1.0)
+
+        spec = next(s for s in CropSharpnessParams.specs() if s.name == "no_subject_factor")
+        assert spec.group != GROUP_WEIGHTS
+
+        spin.setValue(0.35)
+        assert dialog.parameters().no_subject_factor == pytest.approx(0.35)
+
+        dialog.reset_to_defaults()
+        assert dialog.parameters().no_subject_factor == pytest.approx(0.80)
+    finally:
+        dialog.close()
+
+
+def test_the_no_subject_factor_survives_a_round_trip_through_from_values() -> None:
+    """The path the dialog's raw {name: value} mapping actually takes."""
+    params = CropSharpnessParams.from_values(
+        {"crop_sharpness_weight": 80.0, "relative_subject_size_weight": 20.0,
+         "no_subject_factor": 0.35, "use_subject_filter": False}
+    )
+    assert params.no_subject_factor == pytest.approx(0.35)
+    assert params.normalized_weights() == {
+        "crop_sharpness_weight": pytest.approx(0.8),
+        "relative_subject_size_weight": pytest.approx(0.2),
+    }, "and it never leaks into the normalised weights"

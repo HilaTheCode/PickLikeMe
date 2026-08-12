@@ -301,11 +301,11 @@ class CacheVersionMismatchTests(unittest.TestCase):
         """Pins the version string itself, so a future accidental revert of
         the bump is caught immediately rather than silently reopening this
         exact hole."""
-        self.assertEqual(CROP_CACHE_VERSION, "v8")
-        self.assertEqual(CropParams().version, "v8")
+        self.assertEqual(CROP_CACHE_VERSION, "v9")
+        self.assertEqual(CropParams().version, "v9")
 
     def test_an_older_cache_params_file_with_a_since_renamed_field_does_not_crash(self):
-        """The literal v5 -> v8 scenario (EyePose Investigation Phase 1,
+        """The literal v5 -> v9 scenario (EyePose Investigation Phase 1,
         Part 1/7): a real older crop_params.json has field names (`area_tie_frac`,
         then `confidence_tie_frac`) the current `CropParams` no longer has at
         all (now `min_crop_confidence` - see bird_crop.py's module
@@ -366,7 +366,7 @@ class CacheVersionMismatchTests(unittest.TestCase):
 
             self.assertEqual(stats["cached"], 3, "a stale cache must be rebuilt in full, not skipped")
             self.assertEqual(len(decoder.decoded), 3)
-            self.assertEqual(read_crop_params(cache).version, "v8")
+            self.assertEqual(read_crop_params(cache).version, "v9")
 
     def test_a_cache_already_at_the_current_version_is_reused_normally(self):
         """The mismatch guard must not become a reason to always rebuild -

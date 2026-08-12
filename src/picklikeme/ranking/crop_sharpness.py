@@ -20,14 +20,26 @@ visible or not - an image with a valid crop always produces a sharpness
 value, however low.
 
 **The score is absolute, and it has two forms.** An image whose crop came
-from a REAL subject detection scores `0.80 * sharpness + 0.20 * relative
-subject size`. An image that fell back to the whole frame - nothing was
-located in it - scores `1.00 * sharpness`, with no subject-size term at all,
-because there is no subject whose size could be measured. Both terms are
-fixed maps onto [0, 1] (`metrics.absolute_sharpness_score` and
-`normalized_subject_size`), never a percentile within the current run, so a
-crop's score does not change with the size or composition of the folder it
-was ranked in. See `combine`.
+from a REAL subject detection scores `0.80 * sharpness + 0.20 * size score`,
+where the size score is `bird_crop.subject_size_score` - the raw area
+fraction scaled by 10 and capped at 1.0, the identical curve the crop
+pipeline's own selection uses. An image that fell back to the whole frame -
+the detector returned nothing at all - scores `sharpness *
+no_subject_factor` (default 0.80), with no size term of any kind, because
+there is no subject whose size could be measured. Both terms are fixed maps
+onto [0, 1] (`metrics.absolute_sharpness_score` and `subject_size_score`),
+never a percentile within the current run, so a crop's score does not change
+with the size or composition of the folder it was ranked in. See `combine`.
+
+**Why the fallback is penalised rather than merely un-bonused.** Scoring it
+at a plain `1.00 * sharpness` was measurably wrong on this project's own
+5,986-image archive: undetected images averaged 0.543 against 0.337 for
+detected ones, and took 199 of the top 200 places. The arithmetic is
+inescapable - a real subject pays `0.8 * sharpness + 0.2 * size` while a
+fallback collected the full `1.0 * sharpness`, so "nothing was found here"
+was worth about +0.09 of pure advantage. `no_subject_factor` is the knob
+that prices that back, and it is a ranking parameter rather than a constant
+because the right price is an empirical question this run exists to answer.
 
 Same two-phase shape as `ranking.classic` (filter, then measure/score for
 survivors), and the same sidecar conventions (`sidecar.discover_metric_reports`
@@ -49,12 +61,19 @@ from typing import Callable
 from ..analytics import DEFAULT_ANALYTICS_DB, record_run
 from ..analytics.environment import resolve_environment_info
 from ..auto_crop import resolve_device
-from ..bird_crop import CropParams
+from ..bird_crop import CropParams, subject_size_score
 from ..config import DEFAULT_CROP_CACHE_DIR, DEFAULT_MAX_CSV_ROWS
 from ..dataset import UnlabeledImageDataset
 from ..preprocess import build_cache
 from ..sidecar import SIDECAR_DIRNAME, ensure_sidecar_dir, strategy_ranking_path, write_run_metadata
-from .base import GROUP_WEIGHTS, ParamSpec, StrategyInfo, WeightedParams, use_subject_filter_spec
+from .base import (
+    GROUP_THRESHOLDS,
+    GROUP_WEIGHTS,
+    ParamSpec,
+    StrategyInfo,
+    WeightedParams,
+    use_subject_filter_spec,
+)
 from .classic import analysis_targets, read_filter_report, write_filter_report
 from .classic import ClassicVisionStrategy as _ClassicVisionStrategy
 from .filters import FilterChain, SubjectFilter
@@ -74,13 +93,24 @@ STRATEGY_ID = "crop-sharpness"
 # fraction it already is, and a full-frame-fallback image is scored on
 # sharpness alone with no subject-size term at all. A v1 score and a v2
 # score for the same image are not comparable.
-ALGORITHM_VERSION = "2"
+#
+# v3: two corrections found by ranking the real archive under v2 (see the
+# module docstring). The size term now uses `bird_crop.subject_size_score`
+# (scaled x10, capped at 1.0) instead of the raw area fraction, which under
+# v2 handed a well-framed subject ~0.065 of a possible 1.0 and made the 20%
+# term nearly inert; and the full-frame fallback is multiplied by
+# `no_subject_factor` (default 0.80) instead of collecting an undiscounted
+# 1.00 * sharpness, which had made "no subject was found" a scoring
+# advantage worth roughly +0.09. Sharpness itself is untouched - still the
+# same absolute, folder-independent curve v2 introduced.
+ALGORITHM_VERSION = "3"
 
 METRICS_REPORT_FILENAME = "crop-sharpness_metrics.json"
 
 METRIC_LABELS: dict[str, str] = {
     "crop_sharpness": "Crop Sharpness",
     "relative_subject_size": "Relative Subject Size",
+    "subject_size_score": "Subject Size Score",
     # Recorded alongside the two measurements so a diagnostics reader can
     # tell "this subject fills 0% of the frame" from "no subject was located
     # at all, so there was nothing to measure" - the second is why
@@ -89,6 +119,32 @@ METRIC_LABELS: dict[str, str] = {
     # rather than the raw dict key.
     "has_subject_detection": "Subject Detected",
 }
+
+
+# How much of its sharpness score an image keeps when the detector found
+# nothing at all to crop to. 1.0 would restore the v2 behaviour that put 199
+# of this archive's top 200 places into undetected frames; 0.0 would exclude
+# them from contention entirely. 0.80 is the starting point for the run that
+# will decide the real value - see the module docstring.
+DEFAULT_NO_SUBJECT_FACTOR = 0.80
+
+
+def _no_subject_factor_spec() -> ParamSpec:
+    return ParamSpec(
+        name="no_subject_factor",
+        label="No subject factor",
+        default=DEFAULT_NO_SUBJECT_FACTOR,
+        minimum=0.0,
+        maximum=1.0,
+        group=GROUP_THRESHOLDS,
+        decimals=2,
+        help=(
+            "What an image keeps when the detector found no subject at all. Its whole-frame "
+            "sharpness score is multiplied by this, and it receives no subject-size bonus. "
+            "1.00 leaves undetected images undiscounted (which put them at the top of the "
+            "ranking); lower values push them down."
+        ),
+    )
 
 
 def _scoring_weight_specs() -> tuple[ParamSpec, ...]:
@@ -119,14 +175,22 @@ class CropSharpnessParams(WeightedParams):
     """The two weights this strategy combines - 80/20 by default, but any
     two non-negative numbers mean the same thing (see
     `WeightedParams.normalized_weights`): a photographer typing 4/1 gets an
-    identical ranking to the 80/20 default."""
+    identical ranking to the 80/20 default.
+
+    `no_subject_factor` is deliberately NOT one of those weights: it is not
+    normalised against them and does not compete with them, because it
+    applies to the branch where neither of them is used at all (see
+    `combine`). Declaring it in GROUP_THRESHOLDS rather than GROUP_WEIGHTS is
+    what keeps `normalized_weights` from silently folding it in.
+    """
 
     crop_sharpness_weight: float = 80.0
     relative_subject_size_weight: float = 20.0
+    no_subject_factor: float = DEFAULT_NO_SUBJECT_FACTOR
 
     @classmethod
     def specs(cls) -> tuple[ParamSpec, ...]:
-        return (*_scoring_weight_specs(), use_subject_filter_spec())
+        return (*_scoring_weight_specs(), _no_subject_factor_spec(), use_subject_filter_spec())
 
 
 @dataclass
@@ -179,49 +243,64 @@ def measure(candidate) -> ImageMetrics:
     )
 
 
-def combine(metrics: list[ImageMetrics], weights: dict[str, float]) -> list[float]:
+def combine(
+    metrics: list[ImageMetrics],
+    weights: dict[str, float],
+    *,
+    no_subject_factor: float = DEFAULT_NO_SUBJECT_FACTOR,
+) -> list[float]:
     """One score per image, on an ABSOLUTE 0-1 scale.
 
     Two cases, and the difference between them is the point:
 
     **A real subject crop** - the pipeline located a subject - scores
-    `0.80 * sharpness + 0.20 * relative subject size` (the configured
-    weights; 80/20 by default).
+    `0.80 * sharpness + 0.20 * size_score` (the configured weights; 80/20 by
+    default). `size_score` is `bird_crop.subject_size_score` of the stored
+    area fraction: scaled by 10, capped at 1.0. The raw fraction this used
+    through v2 was the wrong shape for the job - a well-framed wildlife
+    subject occupies ~6.5% of the frame, so it contributed ~0.013 of the
+    available 0.20 and the term barely moved the ranking.
 
-    **The full-frame fallback** - no subject was located - scores
-    `1.00 * sharpness`. The subject-size term is not down-weighted or
-    defaulted to zero, it is ABSENT: the sharpness weight is renormalised to
-    the whole score, so a fallback image is judged purely on how sharp it is
-    and is neither rewarded nor punished for a subject nobody found. Scoring
-    it as `0.8 * sharpness + 0.2 * <something>` would need a value for
+    **The full-frame fallback** - the detector returned nothing at all -
+    scores `sharpness * no_subject_factor`. There is still no size term of
+    any kind: not down-weighted, not zeroed, ABSENT. Scoring it as
+    `0.8 * sharpness + 0.2 * <something>` would need a value for
     `<something>`, and every available choice is a lie - 1.0 says the subject
     fills the frame, 0.0 says it is invisibly small, and both are claims
-    about a subject that was never detected.
+    about a subject that was never detected. What changed in v3 is only that
+    the remaining sharpness score is discounted rather than taken at face
+    value, because taking it at face value made an undetected frame beat a
+    detected one of equal sharpness (see the module docstring's measurements).
+
+    The factor multiplies the NORMALISED score, never the raw focus measure -
+    the two are not interchangeable, since `absolute_sharpness_score` is a
+    Hill curve and `f(0.8x) != 0.8*f(x)`. Applying it before normalisation
+    would bend the curve instead of scaling the result.
 
     Both terms are absolute. Sharpness goes through
     `metrics.absolute_sharpness_score` (a fixed curve - see its docstring),
-    and `normalized_subject_size` is already an absolute area fraction in
-    [0, 1]. Neither consults the other images in the run, so this function is
-    a pure per-image map: the same crop scores the same number whether it is
-    ranked alone or alongside 6,000 others. `robust_normalize`, which this
-    used on both terms before, made the result a position within the current
-    folder's distribution instead - two runs over different subsets of the
-    same shoot could not be compared, and the clipping flattened the top and
-    bottom of every run onto identical 1.000/0.000 plateaus.
+    and `subject_size_score` is a fixed map of an absolute area fraction.
+    Neither consults the other images in the run, so this function is a pure
+    per-image map: the same crop scores the same number whether it is ranked
+    alone or alongside 6,000 others. `robust_normalize`, which this used on
+    both terms before, made the result a position within the current folder's
+    distribution instead - two runs over different subsets of the same shoot
+    could not be compared, and the clipping flattened the top and bottom of
+    every run onto identical 1.000/0.000 plateaus.
     """
     sharpness_weight = weights["crop_sharpness_weight"]
     size_weight = weights["relative_subject_size_weight"]
     total = sharpness_weight + size_weight
+    factor = min(1.0, max(0.0, float(no_subject_factor)))
     scores: list[float] = []
     for metric in metrics:
         sharpness = absolute_sharpness_score(metric.crop_sharpness)
         if not metric.has_subject_detection or metric.relative_subject_size is None:
-            scores.append(sharpness)
+            scores.append(sharpness * factor)
             continue
+        size = subject_size_score(metric.relative_subject_size)
         scores.append(
-            (sharpness_weight * sharpness + size_weight * metric.relative_subject_size) / total
-            if total > 0
-            else 0.0
+            (sharpness_weight * sharpness + size_weight * size) / total if total > 0 else 0.0
         )
     return scores
 
@@ -243,6 +322,18 @@ def write_metrics_report(input_folder: str | Path, metrics: list[ImageMetrics]) 
                 # ImageMetrics. A reader that shows this must show "not
                 # measured", never 0.0.
                 "relative_subject_size": m.relative_subject_size,
+                # The scaled/capped value `combine` actually scores (see
+                # bird_crop.subject_size_score). Recorded next to the raw
+                # fraction rather than instead of it: the fraction is the
+                # honest measurement ("this subject fills 6.5% of the
+                # frame") and this is what that measurement was worth,
+                # which are different questions a diagnostics reader asks
+                # at different times. Null on a fallback, like the fraction.
+                "subject_size_score": (
+                    subject_size_score(m.relative_subject_size)
+                    if m.relative_subject_size is not None
+                    else None
+                ),
                 "has_subject_detection": m.has_subject_detection,
             }
             for m in metrics
@@ -352,7 +443,9 @@ class CropSharpnessStrategy:
 
         if on_stage is not None:
             on_stage("Scoring and writing the ranking")
-        scores = combine(measurements, params.normalized_weights())
+        scores = combine(
+            measurements, params.normalized_weights(), no_subject_factor=params.no_subject_factor
+        )
         ranked = [
             (Path(m.image_path).name, score, 0, str(m.image_path))
             for m, score in zip(measurements, scores)
@@ -390,7 +483,10 @@ class CropSharpnessStrategy:
                     "score": score_by_path[m.image_path],
                     "crop_sharpness": m.crop_sharpness,
                     **(
-                        {"relative_subject_size": m.relative_subject_size}
+                        {
+                            "relative_subject_size": m.relative_subject_size,
+                            "subject_size_score": subject_size_score(m.relative_subject_size),
+                        }
                         if m.relative_subject_size is not None
                         else {}
                     ),
@@ -404,6 +500,10 @@ class CropSharpnessStrategy:
             params={
                 "algorithm_version": ALGORITHM_VERSION,
                 "weights": params.normalized_weights(),
+                # Recorded alongside the weights because it changes the
+                # ranking exactly as much as they do - a run comparison that
+                # could not see it would attribute its effect to the weights.
+                "no_subject_factor": params.no_subject_factor,
                 **resolve_environment_info(),
             },
             device=resolved_device,
