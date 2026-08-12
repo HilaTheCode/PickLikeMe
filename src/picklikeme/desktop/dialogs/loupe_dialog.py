@@ -77,6 +77,7 @@ from ..services import ReviewService
 from ..views.gallery.thumbnail_delegate import DOMAIN_BY_STRATEGY
 from ..widgets.design_system import (
     SCORE_FORMAT,
+    format_metric_value,
     RADIUS_LG,
     SPACING,
     AlgorithmResultRow,
@@ -1164,7 +1165,9 @@ class LoupeDialog(QDialog):
             if not values:
                 continue
             names = names_by_strategy.get(strategy_id, {})
-            breakdown = "  ".join(f"{names.get(name, name)}: {value:.3f}" for name, value in values.items())
+            breakdown = "  ".join(
+                f"{names.get(name, name)}: {format_metric_value(value)}" for name, value in values.items()
+            )
             lines.append(f"{strategy_labels.get(strategy_id, strategy_id)} - {breakdown}")
         return "\n".join(lines)
 
@@ -1565,7 +1568,7 @@ class LoupeDialog(QDialog):
         strategy_metrics = (info.get("metrics") or {}).get(self._elements_source_id or "") or {}
         names = metric_labels().get(self._elements_source_id or "", {})
         for name, value in strategy_metrics.items():
-            rows.append((names.get(name, name), f"{value:.3f}"))
+            rows.append((names.get(name, name), format_metric_value(value)))
 
         if not rows:
             rows.append(("Status", "No detection data for this algorithm"))

@@ -73,12 +73,18 @@ def test_crop_sharpness_has_a_score_label():
     assert score_labels()["crop-sharpness"] == "Crop Sharpness"
 
 
-def test_crop_sharpness_declares_its_two_metrics_for_the_loupe_diagnostics_line():
+def test_crop_sharpness_declares_its_metrics_for_the_loupe_diagnostics_line():
     """metric_labels() is read generically by loupe_dialog._diagnostics_text
     (see ranking/__init__.py's own docstring) - declaring metric_labels here
-    is the entire integration needed for the two new fields to appear there."""
+    is the entire integration needed for these fields to appear there.
+    has_subject_detection is labelled too, so a full-frame-fallback image's
+    line reads "Subject Detected: no" rather than showing the raw dict key."""
     labels = metric_labels()["crop-sharpness"]
-    assert labels == {"crop_sharpness": "Crop Sharpness", "relative_subject_size": "Relative Subject Size"}
+    assert labels == {
+        "crop_sharpness": "Crop Sharpness",
+        "relative_subject_size": "Relative Subject Size",
+        "has_subject_detection": "Subject Detected",
+    }
 
 
 def test_crop_sharpness_has_no_eye_detector():

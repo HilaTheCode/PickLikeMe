@@ -50,6 +50,41 @@ def format_score(value: float | None, *, empty: str = "—") -> str:
     return empty if value is None else f"{value:{SCORE_FORMAT}}"
 
 
+def format_metric_value(value: object, *, absent: str = "not measured") -> str:
+    """One raw per-metric measurement from a strategy's metrics report, as a
+    diagnostics line shows it.
+
+    A metrics report is a dict of whatever that strategy chose to record, so
+    a value here is NOT guaranteed to be a float. Two cases this must
+    survive, both real:
+
+    - `None` - the metric genuinely was not measured for this image, which is
+      a different fact from measuring zero. Crop Sharpness records
+      `relative_subject_size: null` for a full-frame-fallback image, because
+      no subject was ever located to measure (see
+      `ranking.crop_sharpness.ImageMetrics`). Formatting that with `:.3f`
+      raises `TypeError: unsupported format string passed to
+      NoneType.__format__`, and because this runs inside the Loupe's own
+      construction, the exception escaped through the `doubleClicked` slot -
+      where Qt prints it to a stderr a windowed app never shows and then
+      simply does not open the dialog. The symptom was a card that silently
+      did nothing when double-clicked, on the 1,582 of 5,986 images with no
+      detected subject.
+    - a bool/str flag such as `has_subject_detection` - happens to survive
+      `:.3f` (bool is an int), but "1.000" is a nonsense rendering of True.
+
+    Anything numeric renders at the shared three-decimal score precision;
+    everything else renders as itself.
+    """
+    if value is None:
+        return absent
+    if isinstance(value, bool):
+        return "yes" if value else "no"
+    if isinstance(value, (int, float)):
+        return f"{value:{SCORE_FORMAT}}"
+    return str(value)
+
+
 SPACING = 8
 RADIUS_SM = 7
 RADIUS_MD = 9

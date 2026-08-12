@@ -690,3 +690,78 @@ def test_a_missing_preview_source_still_shows_a_warning_not_a_silent_blank(app, 
     finally:
         dialog.close()
         service.close()
+
+
+# ---------------------------------------------------------------------------
+# A metrics value the Loupe cannot format must never stop the Loupe opening.
+#
+# THE regression: Crop Sharpness records `relative_subject_size: null` for a
+# full-frame-fallback image (no subject was located, so there was nothing to
+# measure - see ranking.crop_sharpness.ImageMetrics). The diagnostics line
+# formatted every metric with `:.3f`, which raises TypeError on None. That
+# ran inside the Loupe's own construction, so the exception escaped through
+# the `doubleClicked` slot - Qt prints it to a stderr a windowed app never
+# shows, then simply does not open the dialog. The symptom was a card that
+# silently did nothing when double-clicked, on 1,582 of 5,986 real images.
+# ---------------------------------------------------------------------------
+
+
+def test_a_none_metric_renders_as_not_measured_instead_of_raising() -> None:
+    from picklikeme.desktop.widgets.design_system import format_metric_value
+
+    assert format_metric_value(None) == "not measured"
+    assert format_metric_value(0.0) == "0.000", "zero is a measurement, not an absence"
+    assert format_metric_value(0.1754747) == "0.175"
+
+
+def test_a_non_numeric_metric_never_raises_either() -> None:
+    """A metrics report is whatever the strategy chose to record, so a value
+    is not guaranteed to be a float. `has_subject_detection` is a bool, and
+    bool survives `:.3f` (bool is an int) as a nonsense "1.000"."""
+    from picklikeme.desktop.widgets.design_system import format_metric_value
+
+    assert format_metric_value(True) == "yes"
+    assert format_metric_value(False) == "no"
+    assert format_metric_value("n/a") == "n/a"
+
+
+def test_the_diagnostics_line_survives_a_full_frame_fallback_images_metrics(app) -> None:
+    """The exact payload `ranking.crop_sharpness.write_metrics_report` writes
+    for an image with no detected subject, through the real method."""
+    from picklikeme.desktop.dialogs.loupe_dialog import LoupeDialog
+
+    fallback = {
+        "metrics": {
+            "crop-sharpness": {
+                "crop_sharpness": 1.1090635061264038,
+                "relative_subject_size": None,
+                "has_subject_detection": False,
+            }
+        }
+    }
+
+    text = LoupeDialog._diagnostics_text(fallback)
+
+    assert "not measured" in text
+    assert "1.109" in text
+    assert "Relative Subject Size" in text
+
+
+def test_the_diagnostics_line_still_shows_a_real_subject_size(app) -> None:
+    from picklikeme.desktop.dialogs.loupe_dialog import LoupeDialog
+
+    detected = {
+        "metrics": {
+            "crop-sharpness": {
+                "crop_sharpness": 0.8218353986740112,
+                "relative_subject_size": 0.17547475564033874,
+                "has_subject_detection": True,
+            }
+        }
+    }
+
+    text = LoupeDialog._diagnostics_text(detected)
+
+    assert "0.822" in text
+    assert "0.175" in text
+    assert "not measured" not in text

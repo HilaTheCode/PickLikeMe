@@ -81,6 +81,13 @@ METRICS_REPORT_FILENAME = "crop-sharpness_metrics.json"
 METRIC_LABELS: dict[str, str] = {
     "crop_sharpness": "Crop Sharpness",
     "relative_subject_size": "Relative Subject Size",
+    # Recorded alongside the two measurements so a diagnostics reader can
+    # tell "this subject fills 0% of the frame" from "no subject was located
+    # at all, so there was nothing to measure" - the second is why
+    # relative_subject_size is null rather than 0.0 for a full-frame
+    # fallback. Labelled here so the Loupe's own line shows a sentence
+    # rather than the raw dict key.
+    "has_subject_detection": "Subject Detected",
 }
 
 

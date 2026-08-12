@@ -31,15 +31,19 @@ from picklikeme.bird_crop import (
     CropParams,
     box_area,
     build_crop,
+    center_proximity,
     crop_cache_path,
     crop_to_box,
     detection_category,
+    detections_cache_path,
     downscale_long_side,
     enclosing_box,
     expand_and_clamp_box,
     read_crop_params,
+    relative_box_area,
     save_crop_png,
     select_best_detection,
+    selection_score,
     write_crop_params,
 )
 from picklikeme.raw_io import RawImageLoader
@@ -81,96 +85,212 @@ def _detector_with_fake_model(
 
 
 class SelectBestDetectionTests(unittest.TestCase):
-    """The selection policy itself, tested directly and independent of the
-    detector/model plumbing: v7 policy (see bird_crop.py's module docstring)
-    - an absolute confidence floor (min_crop_confidence) discards unreliable
-    candidates outright; area then decides among whatever survives. Neither
-    a pure area-first policy (v3-v5) nor a pure confidence-first one (v6)
-    survived contact with real data - see the EyePose Investigation Phase 1
-    report's "Detection selection policy" discussion for the algebraic proof
-    that a linear weighted score can't satisfy both failure modes either."""
+    """The individual-selection policy itself, tested directly and
+    independent of the detector/model plumbing: v8 (see bird_crop.py's module
+    docstring) - every candidate is scored on a fixed
+
+        0.50 * centre proximity + 0.30 * relative area + 0.20 * confidence
+
+    and the highest score wins. No candidate is ever rejected, so a non-empty
+    candidate list always yields exactly one winner and the full-frame
+    fallback has exactly one cause: nothing was detected at all.
+    """
+
+    # A square frame keeps the hand-computed expectations below readable -
+    # centre proximity is resolution-independent (see its own test).
+    FRAME = (1000, 1000)
+
+    @staticmethod
+    def _box_at(cx, cy, size=10.0):
+        """A `size`x`size` box centred on (cx, cy)."""
+        return (cx - size / 2, cy - size / 2, cx + size / 2, cy + size / 2)
 
     def test_empty_candidates_returns_none(self):
-        self.assertIsNone(select_best_detection([]))
+        """The ONLY route to None, and therefore the only cause of
+        build_crop's full-frame fallback."""
+        self.assertIsNone(select_best_detection([], self.FRAME))
 
-    def test_a_single_candidate_above_the_floor_is_returned_regardless_of_score(self):
-        only = BirdDetection(box=(0, 0, 5, 5), score=0.61, label=COCO_BIRD_CLASS)
-        self.assertIs(select_best_detection([only]), only)
+    def test_a_single_candidate_is_always_returned_whatever_its_confidence(self):
+        for score in (0.01, 0.31, 0.6, 0.99):
+            with self.subTest(score=score):
+                only = BirdDetection(box=(0, 0, 5, 5), score=score, label=COCO_BIRD_CLASS)
+                self.assertIs(select_best_detection([only], self.FRAME), only)
 
-    def test_a_single_candidate_below_the_floor_is_rejected_not_returned(self):
-        """No candidate to fall back to - this is a deliberate "no reliable
-        subject" outcome (build_crop's full-frame fallback takes over), not
-        a bug - see the module docstring's "v7" entry."""
-        only = BirdDetection(box=(0, 0, 5, 5), score=0.31, label=COCO_BIRD_CLASS)
-        self.assertIsNone(select_best_detection([only], min_crop_confidence=0.6))
+    # -- 1. centre proximity decides between otherwise-similar candidates ----
 
-    def test_an_unreliable_detection_never_wins_however_large_its_box(self):
-        unreliable = BirdDetection(box=(0, 0, 1000, 1000), score=0.31, label=COCO_BIRD_CLASS)  # huge, low confidence
-        reliable = BirdDetection(box=(0, 0, 10, 10), score=0.99, label=COCO_BIRD_CLASS)  # tiny, high confidence
-        self.assertIs(select_best_detection([unreliable, reliable], min_crop_confidence=0.6), reliable)
+    def test_a_centred_candidate_beats_an_identical_off_centre_one(self):
+        centred = BirdDetection(box=self._box_at(500, 500, 100), score=0.8, label=COCO_BIRD_CLASS)
+        off_centre = BirdDetection(box=self._box_at(900, 900, 100), score=0.8, label=COCO_BIRD_CLASS)
 
-    def test_the_largest_of_several_reliable_candidates_wins(self):
-        """Once every candidate has cleared the reliability floor, area (not
-        confidence) decides - restoring v3's original intent among
-        genuinely comparable candidates."""
-        small_but_more_confident = BirdDetection(box=(0, 0, 10, 10), score=0.95, label=COCO_BIRD_CLASS)
-        large_and_reliable = BirdDetection(box=(0, 0, 100, 100), score=0.75, label=COCO_BIRD_CLASS)
-        self.assertIs(
-            select_best_detection([small_but_more_confident, large_and_reliable], min_crop_confidence=0.6),
-            large_and_reliable,
-        )
+        # Same size, same confidence - position is the only difference.
+        self.assertIs(select_best_detection([off_centre, centred], self.FRAME), centred)
 
-    def test_the_floor_is_an_absolute_value_not_relative_to_the_winner(self):
-        """The historical bug this policy replaces (v6): a relative tie band
-        could never protect a moderately-confident real subject from a very
-        confident small distractor, because the distractor's own confidence
-        set the band. An absolute floor has no such relationship - both
-        clearing 0.6 is what matters, not their ratio to each other."""
-        intended_subject = BirdDetection(box=(0, 0, 100, 100), score=0.75, label=COCO_BIRD_CLASS)  # large, real
-        small_distractor = BirdDetection(box=(0, 0, 5, 5), score=0.99, label=COCO_BIRD_CLASS)  # tiny, very confident
-        self.assertIs(
-            select_best_detection([intended_subject, small_distractor], min_crop_confidence=0.6),
-            intended_subject,
-        )
+    def test_centre_proximity_can_outweigh_both_area_and_confidence_together(self):
+        """It is weighted at 50%, i.e. more than the other two combined -
+        the whole point of v8. A small, unconfident, centred subject beats a
+        large, very confident one in the corner."""
+        centred = BirdDetection(box=self._box_at(500, 500, 100), score=0.31, label=COCO_BIRD_CLASS)
+        corner = BirdDetection(box=(0, 0, 400, 400), score=0.99, label=COCO_BIRD_CLASS)
 
-    def test_the_floor_boundary_is_inclusive(self):
-        exactly_at_floor = BirdDetection(box=(0, 0, 100, 100), score=0.6, label=COCO_BIRD_CLASS)
-        self.assertIs(select_best_detection([exactly_at_floor], min_crop_confidence=0.6), exactly_at_floor)
+        self.assertIs(select_best_detection([corner, centred], self.FRAME), centred)
 
-    def test_min_crop_confidence_is_a_parameter_not_a_hardcoded_constant(self):
-        a = BirdDetection(box=(0, 0, 10, 10), score=0.5, label=COCO_BIRD_CLASS)
-        # At the default floor (0.6), 0.5 does not clear it.
-        self.assertIsNone(select_best_detection([a]))
-        # Lowering the floor admits it.
-        self.assertIs(select_best_detection([a], min_crop_confidence=0.4), a)
+    # -- 2/3/4. the exact composite ------------------------------------------
+
+    def test_the_composite_is_exactly_50_centre_30_area_20_confidence(self):
+        detection = BirdDetection(box=(400, 400, 600, 600), score=0.5, label=COCO_BIRD_CLASS)
+
+        score = selection_score(detection, self.FRAME)
+
+        # Centred exactly -> 1.0; 200x200 of 1000x1000 -> 0.04 relative area.
+        expected = 0.50 * 1.0 + 0.30 * 0.04 + 0.20 * 0.5
+        self.assertAlmostEqual(score, expected)
+        self.assertAlmostEqual(score, 0.612)
+
+    def test_area_contributes_exactly_thirty_percent(self):
+        """Two candidates identical but for size, both dead-centre: the score
+        gap must be exactly 0.30 * the relative-area difference."""
+        small = BirdDetection(box=self._box_at(500, 500, 100), score=0.5, label=COCO_BIRD_CLASS)
+        large = BirdDetection(box=self._box_at(500, 500, 300), score=0.5, label=COCO_BIRD_CLASS)
+
+        gap = selection_score(large, self.FRAME) - selection_score(small, self.FRAME)
+
+        expected_area_gap = (300.0 * 300.0 - 100.0 * 100.0) / (1000.0 * 1000.0)
+        self.assertAlmostEqual(gap, 0.30 * expected_area_gap)
+        self.assertIs(select_best_detection([small, large], self.FRAME), large)
+
+    def test_confidence_contributes_exactly_twenty_percent(self):
+        """Identical geometry, different confidence - the gap must be exactly
+        0.20 * the confidence difference."""
+        unsure = BirdDetection(box=self._box_at(500, 500, 100), score=0.20, label=COCO_BIRD_CLASS)
+        sure = BirdDetection(box=self._box_at(500, 500, 100), score=0.90, label=COCO_BIRD_CLASS)
+
+        gap = selection_score(sure, self.FRAME) - selection_score(unsure, self.FRAME)
+
+        self.assertAlmostEqual(gap, 0.20 * (0.90 - 0.20))
+        self.assertIs(select_best_detection([unsure, sure], self.FRAME), sure)
+
+    # -- 5. no confidence floor ----------------------------------------------
+
+    def test_a_candidate_below_the_old_floor_still_wins_on_composite_score(self):
+        """THE behavioural change. Under v7 this candidate (0.31, below the
+        0.6 floor) was discarded outright and the image fell through to the
+        full-frame fallback despite a real detection existing."""
+        below_old_floor = BirdDetection(box=self._box_at(500, 500, 200), score=0.31, label=COCO_BIRD_CLASS)
+
+        self.assertIs(select_best_detection([below_old_floor], self.FRAME), below_old_floor)
+
+    def test_every_candidate_below_the_old_floor_still_yields_a_selection(self):
+        candidates = [
+            BirdDetection(box=self._box_at(200, 200, 50), score=0.05, label=COCO_BIRD_CLASS),
+            BirdDetection(box=self._box_at(500, 500, 50), score=0.10, label=COCO_BIRD_CLASS),
+            BirdDetection(box=self._box_at(800, 800, 50), score=0.15, label=COCO_BIRD_CLASS),
+        ]
+
+        winner = select_best_detection(candidates, self.FRAME)
+
+        self.assertIsNotNone(winner, "candidates existing must always produce a selection")
+        self.assertIs(winner, candidates[1], "the centred one")
+
+    # -- 6. always exactly one winner ----------------------------------------
+
+    def test_many_candidates_always_produce_exactly_one_winner(self):
+        for count in range(1, DEFAULT_GROUP_SCENE_THRESHOLD):
+            with self.subTest(count=count):
+                candidates = [
+                    BirdDetection(box=self._box_at(100 * (i + 1), 100 * (i + 1), 40),
+                                  score=0.1 * (i + 1), label=COCO_BIRD_CLASS)
+                    for i in range(count)
+                ]
+                winner = select_best_detection(candidates, self.FRAME)
+                self.assertIsNotNone(winner)
+                self.assertEqual(sum(1 for c in candidates if c is winner), 1)
+
+    # -- 8/9. centre-proximity normalisation ---------------------------------
+
+    def test_centre_proximity_is_one_at_the_centre_and_zero_at_a_corner(self):
+        self.assertAlmostEqual(center_proximity(self._box_at(500, 500, 0), self.FRAME), 1.0)
+        for corner in ((0, 0), (1000, 0), (0, 1000), (1000, 1000)):
+            with self.subTest(corner=corner):
+                self.assertAlmostEqual(center_proximity(self._box_at(*corner, 0), self.FRAME), 0.0)
+
+    def test_centre_proximity_is_one_half_halfway_to_a_corner(self):
+        """Linear in Euclidean distance, normalised by the centre-to-corner
+        distance - so the midpoint of that diagonal is exactly 0.5."""
+        self.assertAlmostEqual(center_proximity(self._box_at(750, 750, 0), self.FRAME), 0.5)
+
+    def test_centre_proximity_is_resolution_independent(self):
+        """The same RELATIVE position must score identically at any size -
+        otherwise a 6000px frame and a 600px one would rank differently."""
+        scores = [
+            center_proximity(self._box_at(w * 0.75, h * 0.75, 0), (w, h))
+            for w, h in ((1000, 1000), (6000, 6000), (600, 400), (4000, 3000), (100, 100))
+        ]
+        for value in scores:
+            self.assertAlmostEqual(value, scores[0])
+        self.assertAlmostEqual(scores[0], 0.5)
+
+    def test_centre_proximity_stays_within_zero_and_one_for_a_box_outside_the_frame(self):
+        """A detector box can extend past the frame edge; clamping keeps the
+        term well-defined instead of going negative."""
+        self.assertEqual(center_proximity(self._box_at(-5000, -5000, 0), self.FRAME), 0.0)
+
+    def test_a_degenerate_frame_does_not_crash_the_selection(self):
+        candidates = [BirdDetection(box=(0, 0, 10, 10), score=0.5, label=COCO_BIRD_CLASS)]
+        self.assertIs(select_best_detection(candidates, (0, 0)), candidates[0])
+
+    def test_relative_area_is_box_area_over_frame_area_clamped(self):
+        self.assertAlmostEqual(relative_box_area((0, 0, 500, 500), self.FRAME), 0.25)
+        self.assertAlmostEqual(relative_box_area((0, 0, 1000, 1000), self.FRAME), 1.0)
+        # A box larger than the frame clamps rather than exceeding 1.0.
+        self.assertAlmostEqual(relative_box_area((0, 0, 5000, 5000), self.FRAME), 1.0)
+
+    def test_the_score_is_always_within_zero_and_one(self):
+        for box, score in (
+            ((0, 0, 1000, 1000), 1.0), ((0, 0, 1, 1), 0.0),
+            ((-100, -100, 2000, 2000), 1.5), (self._box_at(500, 500, 10), -0.5),
+        ):
+            with self.subTest(box=box, score=score):
+                value = selection_score(BirdDetection(box=box, score=score, label=COCO_BIRD_CLASS), self.FRAME)
+                self.assertGreaterEqual(value, 0.0)
+                self.assertLessEqual(value, 1.0)
 
     def test_never_returns_a_detection_absent_from_the_input(self):
         candidates = [
-            BirdDetection(box=(0, 0, 10, 10), score=s, label=COCO_BIRD_CLASS) for s in (0.61, 0.75, 0.99)
+            BirdDetection(box=self._box_at(300 + 100 * i, 500, 40), score=s, label=COCO_BIRD_CLASS)
+            for i, s in enumerate((0.61, 0.75, 0.99))
         ]
-        self.assertIn(select_best_detection(candidates), candidates)
+        self.assertIn(select_best_detection(candidates, self.FRAME), candidates)
 
-    def test_a_real_false_positive_no_longer_beats_a_confident_true_positive(self):
+    # -- the two historical failure modes still resolve correctly ------------
+
+    def test_the_real_cow_false_positive_still_loses_to_the_confident_bird(self):
         """The exact failure mode found during the EyePose investigation
         (docs/EyePose_Investigation_Phase_1.md's Q1, image DSC03129): a
         0.998-confidence bird lost the crop to an unrelated, much larger,
-        0.458-confidence false positive (originally mislabelled "cow"). At
-        the default 0.6 floor, the false positive never even reaches the
-        area comparison."""
+        0.458-confidence false positive (originally mislabelled "cow").
+
+        v7 resolved it with an absolute confidence floor the false positive
+        could not clear. v8 has no floor at all, so this is a real check
+        that removing it did not reopen the case: the bird is both nearer
+        the frame centre and far more confident, and wins 0.626 to 0.442
+        even though the false positive's box is ~8x larger."""
+        frame = (6000, 4000)  # the source frame these real boxes came from
         bird = BirdDetection(box=(2158.2, 929.6, 3071.4, 2090.5), score=0.998, label=COCO_BIRD_CLASS)
         false_positive = BirdDetection(box=(18.2, 0.0, 2329.1, 3642.3), score=0.458, label=21)  # cow
-        self.assertIs(select_best_detection([bird, false_positive]), bird)
 
-    def test_reconstructed_historical_failure_mode_also_resolves_correctly(self):
-        """A plausible reconstruction (not measured data - flagged as such
-        in the report) of the failure v3 was originally built to fix, and
-        v6 reopened: a legitimately-real, moderately-confident intended
-        subject competing against a small, very-confident background bird.
-        Both clear the default 0.6 floor, so area (not confidence) decides,
-        and the intended subject - the larger of the two - wins."""
+        self.assertIs(select_best_detection([bird, false_positive], frame), bird)
+        self.assertGreater(selection_score(bird, frame), selection_score(false_positive, frame))
+
+    def test_a_small_very_confident_distractor_still_loses_to_the_intended_subject(self):
+        """A plausible reconstruction (not measured data - flagged as such in
+        the report) of the failure v3 was built to fix and v6 reopened: a
+        legitimately-real, moderately-confident intended subject against a
+        small, very-confident background bird. Under v8 the subject wins on
+        centre proximity and area together, despite the lower confidence."""
         intended_subject = BirdDetection(box=(0, 0, 300, 300), score=0.75, label=COCO_BIRD_CLASS)
         background_bird = BirdDetection(box=(0, 0, 20, 20), score=0.99, label=COCO_BIRD_CLASS)
-        self.assertIs(select_best_detection([intended_subject, background_bird]), intended_subject)
+
+        self.assertIs(select_best_detection([intended_subject, background_bird], self.FRAME), intended_subject)
 
 
 def _flock(count: int, start_score: float = 0.5) -> list[BirdDetection]:
@@ -186,37 +306,39 @@ class GroupSceneSelectionTests(unittest.TestCase):
     """select_best_detection()'s other policy: at or above group_scene_threshold
     surviving detections, no individual is selected - the target becomes the
     box enclosing the whole group. Intentional for wildlife photography, where
-    a flock/herd/colony is often the actual subject, not any one animal in it."""
+    a flock/herd/colony is often the actual subject, not any one animal in it.
 
-    def test_fewer_than_the_threshold_uses_the_normal_largest_box_policy(self):
-        candidates = _flock(9)  # scores 0.50-0.58 - below min_crop_confidence's own default (0.6)
-        # min_crop_confidence=0.0: this test is about the group-scene boundary,
-        # not the reliability floor - isolate the one behaviour under test.
-        winner = select_best_detection(candidates, min_crop_confidence=0.0, group_scene_threshold=10)
+    UNCHANGED by v8. This branch is evaluated before any individual scoring,
+    so neither the new composite score nor `source_size` participates in it -
+    these tests are the guard on that, and they assert exactly what they
+    asserted under v7."""
+
+    FRAME = (1000, 1000)
+
+    def test_fewer_than_the_threshold_uses_normal_individual_selection(self):
+        candidates = _flock(9)  # below the threshold: individual selection applies
+        winner = select_best_detection(candidates, self.FRAME, group_scene_threshold=10)
         self.assertIn(winner, candidates, "below threshold, the winner must be one real detection")
         self.assertNotEqual(winner.box, enclosing_box([c.box for c in candidates]))
 
     def test_exactly_the_threshold_is_a_group_scene(self):
         candidates = _flock(10)
-        winner = select_best_detection(candidates, group_scene_threshold=10)
+        winner = select_best_detection(candidates, self.FRAME, group_scene_threshold=10)
         self.assertNotIn(winner, candidates, "a group scene's box must not be any single detection")
         self.assertEqual(winner.box, enclosing_box([c.box for c in candidates]))
 
     def test_more_than_the_threshold_is_a_group_scene(self):
         candidates = _flock(25)
-        winner = select_best_detection(candidates, group_scene_threshold=10)
+        winner = select_best_detection(candidates, self.FRAME, group_scene_threshold=10)
         self.assertEqual(winner.box, enclosing_box([c.box for c in candidates]))
 
     def test_the_threshold_is_configurable(self):
-        candidates = _flock(4)  # scores 0.50-0.53 - below min_crop_confidence's own default (0.6)
+        candidates = _flock(4)
         # Below a threshold of 5, normal per-detection selection applies...
-        # min_crop_confidence=0.0 isolates the group-scene boundary under
-        # test from the (unrelated) reliability floor - see the sibling test
-        # above.
-        normal = select_best_detection(candidates, min_crop_confidence=0.0, group_scene_threshold=5)
+        normal = select_best_detection(candidates, self.FRAME, group_scene_threshold=5)
         self.assertIn(normal, candidates)
         # ...but the same 4 detections are a group scene once the threshold is lowered to 4.
-        group = select_best_detection(candidates, group_scene_threshold=4)
+        group = select_best_detection(candidates, self.FRAME, group_scene_threshold=4)
         self.assertEqual(group.box, enclosing_box([c.box for c in candidates]))
 
     def test_the_group_box_encloses_every_valid_detection_with_mixed_sizes(self):
@@ -232,7 +354,7 @@ class GroupSceneSelectionTests(unittest.TestCase):
             *(_flock(5, start_score=0.3))  # pad up to the default threshold of 10
         ]
         self.assertGreaterEqual(len(candidates), 10)
-        winner = select_best_detection(candidates, group_scene_threshold=10)
+        winner = select_best_detection(candidates, self.FRAME, group_scene_threshold=10)
 
         expected = enclosing_box([c.box for c in candidates])
         self.assertEqual(winner.box, expected)
@@ -249,21 +371,28 @@ class GroupSceneSelectionTests(unittest.TestCase):
         """score/label are informational only (crop geometry uses the box),
         but they should still mean something rather than being arbitrary."""
         candidates = _flock(10)
-        winner = select_best_detection(candidates, group_scene_threshold=10)
+        winner = select_best_detection(candidates, self.FRAME, group_scene_threshold=10)
         most_confident = max(candidates, key=lambda d: d.score)
         self.assertEqual(winner.score, most_confident.score)
         self.assertEqual(winner.label, most_confident.label)
 
-    def test_group_scene_ignores_min_crop_confidence(self):
-        """The reliability gate is a below-threshold concept only - it must
-        not leak into (or change) group-scene selection, even when set so
-        strict that no individual candidate would ever pass it."""
+    def test_group_scene_is_unaffected_by_the_frame_it_is_measured_against(self):
+        """v8 guard: the individual path scores candidates against the frame,
+        so a different `source_size` reorders individual selection. A group
+        scene must be identical either way - it never scores anything."""
         candidates = _flock(10)
-        permissive = select_best_detection(candidates, min_crop_confidence=0.0, group_scene_threshold=10)
-        strict = select_best_detection(candidates, min_crop_confidence=1.0, group_scene_threshold=10)
         expected = enclosing_box([c.box for c in candidates])
-        self.assertEqual(permissive.box, expected)
-        self.assertEqual(strict.box, expected)
+        for frame in ((1000, 1000), (6000, 4000), (100, 100), (0, 0)):
+            with self.subTest(frame=frame):
+                winner = select_best_detection(candidates, frame, group_scene_threshold=10)
+                self.assertEqual(winner.box, expected)
+
+    def test_group_scene_never_rejects_low_confidence_members(self):
+        """_flock()'s scores (0.50-0.58) all sit below v7's removed 0.6 floor;
+        the group box must still enclose every one of them."""
+        candidates = _flock(10)
+        winner = select_best_detection(candidates, self.FRAME, group_scene_threshold=10)
+        self.assertEqual(winner.box, enclosing_box([c.box for c in candidates]))
 
 
 class EnclosingBoxTests(unittest.TestCase):
@@ -297,7 +426,7 @@ class BoxAreaTests(unittest.TestCase):
 class DetectBestBirdTests(unittest.TestCase):
     IMG = np.zeros((40, 40, 3), dtype=np.uint8)
 
-    def test_picks_the_most_confident_animal_above_threshold(self):
+    def test_picks_the_best_scoring_animal_and_never_a_person(self):
         detector = _detector_with_fake_model(
             boxes=[[0, 0, 10, 10], [5, 5, 30, 30], [1, 1, 2, 2]],
             labels=[COCO_BIRD_CLASS, COCO_BIRD_CLASS, 1],  # two birds + a person
@@ -305,12 +434,14 @@ class DetectBestBirdTests(unittest.TestCase):
         )
         detection = detector.detect_best_bird(self.IMG)
         self.assertIsInstance(detection, BirdDetection)
-        # The smaller (0,0,10,10) bird wins: its own confidence (0.99) clears
-        # min_crop_confidence's default floor (0.6), the larger (5,5,30,30)
-        # one (0.31) does not, and the person is never crop-eligible at all
-        # regardless of its own (higher still) score.
-        self.assertEqual(detection.box, (0.0, 0.0, 10.0, 10.0))
-        self.assertAlmostEqual(detection.score, 0.99, places=5)
+        # In this 40x40 frame the larger (5,5,30,30) bird is nearly centred
+        # and fills 39% of it: 0.617 against the corner bird's 0.342, so it
+        # wins despite its much lower confidence (0.31 vs 0.99). Under v7's
+        # removed floor the 0.31 candidate was discarded and the corner bird
+        # won instead - this is the v8 behaviour change, end to end.
+        self.assertEqual(detection.box, (5.0, 5.0, 30.0, 30.0))
+        self.assertAlmostEqual(detection.score, 0.31, places=5)
+        # The person is never crop-eligible, whatever it scores.
         self.assertEqual(detection.label, COCO_BIRD_CLASS)
 
     def test_confidence_dominates_area_even_with_a_much_larger_less_confident_box(self):
@@ -495,18 +626,20 @@ class SupportedClassTests(unittest.TestCase):
                 self.assertIsNotNone(detection)
                 self.assertEqual(detection.label, index)
 
-    def test_the_most_confident_animal_wins_regardless_of_class_or_area(self):
-        # A bird with a tiny box and near-perfect confidence must beat a much
-        # larger elephant whose own confidence (0.35) never even clears the
-        # reliability floor: neither class nor box size can compensate for that.
+    def test_selection_is_class_agnostic_and_decided_purely_by_the_score(self):
+        # A tiny, near-perfectly-confident bird in the corner against a much
+        # larger, central, far less confident elephant. The elephant wins
+        # (0.370 vs 0.342) - not because it is an elephant, but because
+        # position and area together outweigh the confidence gap. Nothing in
+        # the selection path reads `label` at all.
         detector = _detector_with_fake_model(
             boxes=[[0, 0, 10, 10], [5, 5, 90, 90]],
             labels=[COCO_BIRD_CLASS, 22],
             scores=[0.99, 0.35],
         )
         detection = detector.detect_best_bird(self.IMG)
-        self.assertEqual(detection.box, (0.0, 0.0, 10.0, 10.0))
-        self.assertEqual(detection.label, COCO_BIRD_CLASS)
+        self.assertEqual(detection.box, (5.0, 5.0, 90.0, 90.0))
+        self.assertEqual(detection.label, 22)
 
     def test_class_has_no_priority_once_both_detections_clear_the_reliability_floor(self):
         # With both confidences clearing min_crop_confidence's default floor
@@ -805,19 +938,16 @@ class LoaderCropCacheTests(unittest.TestCase):
             self.assertEqual(image.shape, (32, 32, 3))
 
 
-class BuildCropRejectsUnreliableDetectionsTests(unittest.TestCase):
+class BuildCropSelectsTheBestScoringDetectionTests(unittest.TestCase):
     """End to end through build_crop with the real BirdDetector (fake model
-    output): the pixels actually cached must come from the detection that
-    clears the reliability floor, not the larger-but-unreliable one - closing
-    the loop from selection policy to the crop training/EyePose will see. See
-    docs/EyePose_Investigation_Phase_1.md's Q1 for the real failure mode
-    (a large, low-confidence false positive winning the crop) this v7 policy
-    fixes."""
+    output): the pixels actually cached must come from the highest-scoring
+    detection - closing the loop from selection policy to the crop that
+    training and EyePose will actually see."""
 
-    def test_the_cached_crop_comes_from_the_reliable_detection(self):
+    def test_the_cached_crop_comes_from_the_best_scoring_detection(self):
         frame = np.zeros((100, 100, 3), dtype=np.uint8)
-        frame[10:20, 10:20] = (255, 0, 0)     # small, reliable region
-        frame[30:90, 30:90] = (0, 255, 0)     # large, unreliable region
+        frame[10:20, 10:20] = (255, 0, 0)     # small, off-centre, very confident
+        frame[30:90, 30:90] = (0, 255, 0)     # large, central, barely confident
 
         detector = _detector_with_fake_model(
             boxes=[[10, 10, 20, 20], [30, 30, 90, 90]],
@@ -826,10 +956,29 @@ class BuildCropRejectsUnreliableDetectionsTests(unittest.TestCase):
         )
         result = build_crop(frame, detector, CropParams(margin_frac=0.0), collect_detections=True)
 
-        self.assertEqual(result.detection.box, (10.0, 10.0, 20.0, 20.0))
-        # The cached crop is the small red region, not the large green one.
+        # Green scores 0.570 (centred, 36% of the frame) against red's 0.351
+        # (a corner box at 1%), so the low-confidence central subject wins -
+        # v7's removed floor would have discarded it and cropped the red box.
+        self.assertEqual(result.detection.box, (30.0, 30.0, 90.0, 90.0))
         mean_pixel = result.crop.reshape(-1, 3).mean(axis=0)
-        self.assertGreater(mean_pixel[0], mean_pixel[1], "crop should be the small red box, not the large green one")
+        self.assertGreater(mean_pixel[1], mean_pixel[0], "crop should be the central green box")
+
+    def test_candidates_existing_never_produces_the_full_frame_fallback(self):
+        """The v8 invariant end to end: however unconfident every candidate
+        is, a detection was found, so a real crop - not the full frame - is
+        what gets cached."""
+        frame = np.zeros((100, 100, 3), dtype=np.uint8)
+        detector = _detector_with_fake_model(
+            boxes=[[40, 40, 60, 60], [0, 0, 8, 8]],
+            labels=[COCO_BIRD_CLASS, COCO_BIRD_CLASS],
+            scores=[0.31, 0.35],  # both far below v7's removed 0.6 floor
+        )
+        result = build_crop(frame, detector, CropParams(margin_frac=0.0), collect_detections=True)
+
+        self.assertIsNotNone(result.detection, "candidates existed - there must be a selection")
+        self.assertIsNotNone(result.expanded_box)
+        self.assertEqual(result.detection.box, (40.0, 40.0, 60.0, 60.0), "the centred one")
+        self.assertNotEqual(result.crop.shape[:2], frame.shape[:2], "not the full-frame fallback")
 
 
 class BuildCropHandlesGroupScenesTests(unittest.TestCase):
@@ -893,3 +1042,62 @@ class BuildCropHandlesGroupScenesTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SelectedDetectionIsPersistedAndDisplayedTests(unittest.TestCase):
+    """The winner of `select_best_detection` is what reaches the cache as
+    `selected`, and what the overlay draws GREEN - every other candidate is
+    persisted alongside it and drawn yellow. This closes the loop from the
+    v8 scoring rule to what the photographer actually sees on screen."""
+
+    def test_the_best_scoring_candidate_is_the_one_saved_as_selected(self):
+        import json
+
+        from picklikeme.bird_crop import save_detections
+
+        frame = np.zeros((100, 100, 3), dtype=np.uint8)
+        detector = _detector_with_fake_model(
+            boxes=[[40, 40, 60, 60], [0, 0, 10, 10], [85, 85, 95, 95]],
+            labels=[COCO_BIRD_CLASS] * 3,
+            scores=[0.31, 0.99, 0.95],
+        )
+        result = build_crop(frame, detector, CropParams(margin_frac=0.0), collect_detections=True)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            image_path = str(Path(tmp) / "shot.arw")
+            save_detections(tmp, image_path, result)
+            # Sharded path - always computed, never guessed (see crop_cache_path).
+            payload = json.loads(detections_cache_path(tmp, image_path).read_text(encoding="utf-8"))
+
+        # The centred, least-confident candidate wins and is persisted as
+        # `selected`; all three are persisted in `detections`.
+        self.assertEqual(payload["selected"]["box"], [40.0, 40.0, 60.0, 60.0])
+        self.assertEqual(len(payload["detections"]), 3)
+
+    def test_the_selected_box_renders_green_and_the_rest_yellow(self):
+        """`analyzer.detections` marks exactly the box whose coordinates match
+        `selected`; the Loupe draws that one with SELECTED_BOX (green) and
+        every other with OTHER_BOX (yellow) - see loupe_dialog's overlay."""
+        from picklikeme.analyzer.contactsheets import OTHER_BOX, SELECTED_BOX
+        from picklikeme.analyzer.detections import _from_payload
+
+        payload = {
+            "source_size": [100, 100],
+            "selected": {"box": [40.0, 40.0, 60.0, 60.0], "score": 0.31, "label": COCO_BIRD_CLASS},
+            "detections": [
+                {"box": [40.0, 40.0, 60.0, 60.0], "score": 0.31, "label": COCO_BIRD_CLASS},
+                {"box": [0.0, 0.0, 10.0, 10.0], "score": 0.99, "label": COCO_BIRD_CLASS},
+                {"box": [85.0, 85.0, 95.0, 95.0], "score": 0.95, "label": COCO_BIRD_CLASS},
+            ],
+            "expanded_box": [40.0, 40.0, 60.0, 60.0],
+        }
+
+        record = _from_payload(payload, origin="cache")
+
+        self.assertIsNotNone(record.selected)
+        self.assertEqual((record.selected.x1, record.selected.y1), (40.0, 40.0))
+        self.assertEqual(len(record.others), 2, "the two runners-up")
+        self.assertNotIn((40.0, 40.0), [(b.x1, b.y1) for b in record.others])
+        # Green vs yellow, so a change to either constant fails here.
+        self.assertEqual(SELECTED_BOX, (16, 185, 129))
+        self.assertEqual(OTHER_BOX, (250, 204, 21))
